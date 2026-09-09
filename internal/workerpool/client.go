@@ -242,6 +242,11 @@ func (c *client) fail(cause error) {
 	waiting := make([]*pending, 0, len(c.pending))
 	ids := make([]uint64, 0, len(c.pending))
 	for id, p := range c.pending {
+		// abandoned is written by abandon under c.mu, so it must be read
+		// here, under the same lock, not after it is released.
+		if p.abandoned {
+			continue
+		}
 		waiting = append(waiting, p)
 		ids = append(ids, id)
 	}
@@ -249,9 +254,6 @@ func (c *client) fail(cause error) {
 	c.mu.Unlock()
 
 	for i, p := range waiting {
-		if p.abandoned {
-			continue
-		}
 		select {
 		case p.ch <- result{f: wproto.NewErr(ids[i], cause, nil)}:
 		default:

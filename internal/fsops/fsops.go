@@ -49,6 +49,92 @@ func SetIDMap(m *idmap.Map) { idMap.Store(m) }
 // IDMap returns the installed resolver, or nil.
 func IDMap() *idmap.Map { return idMap.Load() }
 
+// resolveWithin maps an API path to its OS path and, when a jail is
+// configured, refuses one that leaves the jail through a symlink.
+//
+// fsx.Root.OS is lexical: it cannot see that a directory inside the jail is a
+// symlink to /etc, and open(2) and ReadDir follow such a link happily — which
+// is how a jailed daemon used to enumerate and download the whole host
+// filesystem. Every component is therefore resolved with filepath.EvalSymlinks
+// and the result must still be under the base. A path that does not exist is
+// let through so the caller's own syscall reports the honest ENOENT, after the
+// deepest ancestor that does exist has been checked.
+//
+// Accepted TOCTOU window: this is a check, not a lock. Between EvalSymlinks
+// here and the syscall the caller makes next, a component could be replaced by
+// a symlink pointing out of the jail, and the operation would follow it. The
+// window is accepted for M0 and documented in
+// docs/design/backend-packaging-plan.md §2.0: the jail is defence in depth
+// behind the kernel's own permission check — the worker already runs as the
+// signed-in user — rather than the only thing between a request and the host.
+// The race-free version (openat2 with RESOLVE_IN_ROOT, or an O_PATH walk) is
+// M1 work, when the mutating operations arrive and the stakes change.
+func resolveWithin(r fsx.Root, apiPath string) (string, error) {
+	osPath, err := r.OS(apiPath)
+	if err != nil {
+		return "", err
+	}
+	if !r.Jailed() {
+		return osPath, nil
+	}
+	resolved, err := filepath.EvalSymlinks(osPath)
+	if err != nil {
+		parent := filepath.Dir(osPath)
+		if parent == osPath {
+			return osPath, nil
+		}
+		if resolved, err = filepath.EvalSymlinks(parent); err != nil {
+			// Nothing along the path resolves, so there is nothing to reach
+			// through it either; the caller's syscall will say so.
+			return osPath, nil
+		}
+	}
+	if !insideBase(r, resolved) {
+		return "", fmt.Errorf("%q leaves the jail root through a symlink: %w", apiPath, fsx.ErrOutsideRoot)
+	}
+	return osPath, nil
+}
+
+// resolveParentWithin is resolveWithin for an operation that must not follow
+// the final component itself: Stat and Readlink describe the link, not its
+// target, so a symlink pointing out of the jail is a legitimate thing to
+// report on. The directories leading to it still have to stay inside.
+func resolveParentWithin(r fsx.Root, apiPath string) (string, error) {
+	osPath, err := r.OS(apiPath)
+	if err != nil {
+		return "", err
+	}
+	if !r.Jailed() {
+		return osPath, nil
+	}
+	if parent := fsx.Parent(apiPath); parent != apiPath {
+		if _, err := resolveWithin(r, parent); err != nil {
+			return "", err
+		}
+	}
+	return osPath, nil
+}
+
+// insideBase reports whether a symlink-resolved OS path is still under the
+// jail. The base is resolved too when the direct comparison fails: a jail
+// reached through a symlink (/tmp on a Mac) or spelled as a Windows 8.3 short
+// name resolves to a different string than the one the operator configured,
+// and refusing the entire jail over a spelling would be worse than useless.
+func insideBase(r fsx.Root, osPath string) bool {
+	if r.Contains(osPath) {
+		return true
+	}
+	real, err := filepath.EvalSymlinks(r.Base())
+	if err != nil {
+		return false
+	}
+	rr, err := fsx.NewRoot(real)
+	if err != nil {
+		return false
+	}
+	return rr.Contains(osPath)
+}
+
 // List returns one page of a directory listing (backend plan §2.1).
 //
 // The listing is read with one getdents pass and one Info per entry — on Linux
@@ -76,7 +162,10 @@ func List(ctx context.Context, r fsx.Root, plat *platform.Platform, dir string, 
 		return fsx.Listing{}, err
 	}
 
-	osDir := r.OS(clean)
+	osDir, err := resolveWithin(r, clean)
+	if err != nil {
+		return fsx.Listing{}, err
+	}
 	f, err := os.Open(osDir)
 	if err != nil {
 		// A directory we cannot read is an error, not a partial listing: a
@@ -122,7 +211,11 @@ func List(ctx context.Context, r fsx.Root, plat *platform.Platform, dir string, 
 				e.MountPoint = true
 			}
 			if e.IsSymlink {
-				resolveLink(&e, r, r.OS(child), o.ResolveLinks || shareDir, o.ResolveLinks)
+				// A name this host cannot express as a path (a backslash on
+				// Windows) is still listed; only its target stays unresolved.
+				if childOS, err := r.OS(child); err == nil {
+					resolveLink(&e, r, childOS, o.ResolveLinks || shareDir, o.ResolveLinks)
+				}
 			}
 			if shareDir {
 				// §2.2: at /share we return everything and label it. The
@@ -193,7 +286,17 @@ func statPath(ctx context.Context, r fsx.Root, plat *platform.Platform, p string
 	if err := ctx.Err(); err != nil {
 		return fsx.Entry{}, err
 	}
-	osPath := r.OS(clean)
+	var osPath string
+	if follow {
+		// The follow variant reaches the target, so the target has to be
+		// inside the jail; the plain one only describes the link itself.
+		osPath, err = resolveWithin(r, clean)
+	} else {
+		osPath, err = resolveParentWithin(r, clean)
+	}
+	if err != nil {
+		return fsx.Entry{}, err
+	}
 	var fi os.FileInfo
 	if follow {
 		fi, err = os.Stat(osPath)
@@ -231,7 +334,11 @@ func Readlink(ctx context.Context, r fsx.Root, p string) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	return os.Readlink(r.OS(clean))
+	osPath, err := resolveParentWithin(r, clean)
+	if err != nil {
+		return "", err
+	}
+	return os.Readlink(osPath)
 }
 
 // OpenRead opens a regular file for reading as this process's identity — which
@@ -247,6 +354,14 @@ func Readlink(ctx context.Context, r fsx.Root, p string) (string, error) {
 //
 // Directories, devices, fifos and sockets are refused with fsx.ErrUnsupported:
 // a download is bytes, and opening a fifo would block the worker forever.
+//
+// "Would block forever" is not hypothetical, which is why the Linux open also
+// carries O_NONBLOCK: open(2) on a fifo with no writer blocks inside the
+// syscall, where neither the HTTP deadline nor the pool's call timeout can
+// reach it, and 64 such requests would take every worker slot in the daemon.
+// The descriptor is put back into blocking mode only once fstat has proved it
+// is a regular file — the check has to be on the descriptor, since checking
+// the name first would just be a race.
 func OpenRead(ctx context.Context, r fsx.Root, p string) (*os.File, fsx.Entry, error) {
 	clean, err := fsx.Clean(p)
 	if err != nil {
@@ -255,7 +370,11 @@ func OpenRead(ctx context.Context, r fsx.Root, p string) (*os.File, fsx.Entry, e
 	if err := ctx.Err(); err != nil {
 		return nil, fsx.Entry{}, err
 	}
-	f, err := os.OpenFile(r.OS(clean), openReadFlags(), 0)
+	osPath, err := resolveWithin(r, clean)
+	if err != nil {
+		return nil, fsx.Entry{}, err
+	}
+	f, err := os.OpenFile(osPath, openReadFlags(), 0)
 	if err != nil {
 		return nil, fsx.Entry{}, err
 	}
@@ -268,6 +387,10 @@ func OpenRead(ctx context.Context, r fsx.Root, p string) (*os.File, fsx.Entry, e
 		f.Close()
 		return nil, fsx.Entry{}, fmt.Errorf("%q is a %s, not a regular file: %w",
 			clean, fsx.TypeString(fi.Mode()), fsx.ErrUnsupported)
+	}
+	if err := clearNonblock(f); err != nil {
+		f.Close()
+		return nil, fsx.Entry{}, fmt.Errorf("restoring blocking mode on %q: %w", clean, err)
 	}
 	return f, newEntry(clean, []byte(fsx.Base(clean)), fi, IDMap()), nil
 }

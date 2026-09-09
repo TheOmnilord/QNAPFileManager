@@ -9,6 +9,9 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -25,6 +28,10 @@ import (
 type client struct {
 	key string
 	who backend.Principal
+	// cred is the identity this worker's kernel credentials were fixed at, in
+	// a form that can be compared. It never changes for the life of the
+	// process, which is the whole reason acquire has to compare it.
+	cred creds
 
 	tr  wproto.Transport
 	cmd *exec.Cmd // nil in in-process mode
@@ -48,6 +55,44 @@ type client struct {
 	started     time.Time
 	hello       wproto.HelloResp
 	terminating bool
+	// retiring marks a worker that must not take new work — its credentials
+	// have been superseded — and that is stopped as soon as the calls it
+	// already accepted have finished.
+	retiring bool
+}
+
+// creds is a principal's kernel identity, reduced to something comparable.
+// Groups are sorted and de-duplicated first: the identity source may hand back
+// the same membership in a different order, and respawning a worker over that
+// would be a self-inflicted restart storm.
+type creds struct {
+	uid, gid int
+	groups   string
+	root     bool
+}
+
+func credsOf(who backend.Principal) creds {
+	sorted := make([]int, 0, len(who.Groups))
+	seen := make(map[int]bool, len(who.Groups))
+	for _, g := range who.Groups {
+		if !seen[g] {
+			seen[g] = true
+			sorted = append(sorted, g)
+		}
+	}
+	sort.Ints(sorted)
+	var b strings.Builder
+	for i, g := range sorted {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(strconv.Itoa(g))
+	}
+	return creds{uid: who.UID, gid: who.GID, groups: b.String(), root: who.Root}
+}
+
+func (c creds) String() string {
+	return fmt.Sprintf("uid=%d gid=%d groups=[%s] root=%t", c.uid, c.gid, c.groups, c.root)
 }
 
 type result struct {
@@ -59,6 +104,7 @@ func newClient(who backend.Principal) *client {
 	return &client{
 		key:     who.Key(),
 		who:     who,
+		cred:    credsOf(who),
 		exited:  make(chan struct{}),
 		gone:    make(chan struct{}),
 		pending: map[uint64]chan result{},
@@ -89,13 +135,28 @@ func (c *client) hold(now time.Time) time.Duration {
 	return idle
 }
 
-func (c *client) done(now time.Time) {
+// done releases one in-flight call and reports whether that was the last one a
+// retiring worker was waiting for, so the caller can stop it.
+func (c *client) done(now time.Time) (retireNow bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.inflight > 0 {
 		c.inflight--
 	}
 	c.lastUsed = now
+	return c.retiring && c.inflight == 0 && !c.terminating
+}
+
+// markRetired flags a worker as superseded and reports whether it can be
+// stopped straight away. A worker with calls in flight is left to finish them:
+// its credentials are stale, but the operations already accepted were
+// authorised under them, and killing a download mid-stream to apply a group
+// change a moment sooner would be the worse trade.
+func (c *client) markRetired() (idleNow bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.retiring = true
+	return c.inflight == 0 && !c.terminating
 }
 
 func (c *client) busy() bool {

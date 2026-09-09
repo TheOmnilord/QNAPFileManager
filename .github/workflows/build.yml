@@ -81,8 +81,26 @@ jobs:
       - run: go vet ./...
       - run: go test ./...
 
+  # Every real-process impersonation test is guarded by requireLinuxRoot and
+  # therefore skips in the unprivileged `test` job: the production credential
+  # boundary — spawning a worker as another uid, and the kernel refusing it
+  # what that user may not have — would otherwise be untested in CI, which
+  # CLAUDE.md's testing rule (root and ZFS behaviour is covered by the CI jobs)
+  # says it must not be. sudo -E env "PATH=$PATH" keeps the toolchain setup-go
+  # put on the runner's PATH, which a plain sudo drops with secure_path.
+  test-linux-root:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - run: sudo -E env "PATH=$PATH" go test ./internal/workerpool/... ./internal/fsops/... ./internal/worker/... -run . -count=1
+
   package:
-    needs: [test, test-windows]
+    needs: [test, test-windows, test-linux-root]
     runs-on: ubuntu-latest
     permissions:
       contents: write # attaching the QPKGs to a release

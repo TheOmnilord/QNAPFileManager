@@ -1,6 +1,7 @@
 package qtsauth
 
 import (
+	"container/list"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -13,8 +14,10 @@ import (
 // Cache lifetimes. PLAN.md decision 3: "60 s cache with single-flight;
 // unconditional revalidation before any write".
 const (
-	DefaultPositiveTTL = 60 * time.Second
-	DefaultNegativeTTL = 10 * time.Second
+	DefaultPositiveTTL     = 60 * time.Second
+	DefaultNegativeTTL     = 10 * time.Second
+	DefaultMaxCacheEntries = 4096
+	cachePruneInterval     = 64
 )
 
 // Session is the outcome of a successful verification. It carries only what
@@ -70,12 +73,16 @@ type Verifier struct {
 	// DefaultNegativeTTL when zero.
 	PositiveTTL time.Duration
 	NegativeTTL time.Duration
+	// MaxCacheEntries bounds cached answers; nonpositive values use 4096.
+	MaxCacheEntries int
 
 	// Now is the clock, for tests. nil means time.Now.
 	Now func() time.Time
 
 	mu       sync.Mutex
 	cache    map[string]cacheEntry
+	order    list.List // oldest insertion first; independent of in-flight calls
+	inserts  uint64
 	inflight map[string]*flight
 }
 
@@ -83,6 +90,7 @@ type cacheEntry struct {
 	sess    Session
 	err     error
 	expires time.Time
+	order   *list.Element
 }
 
 type flight struct {
@@ -170,7 +178,24 @@ func (v *Verifier) Verify(ctx context.Context, cred Cred) (Session, error) {
 		ttl = v.negativeTTL()
 	}
 	v.mu.Lock()
-	v.cache[key] = cacheEntry{sess: sess, err: err, expires: v.now().Add(ttl)}
+	now := v.now()
+	v.inserts++
+	if v.inserts%cachePruneInterval == 0 {
+		for k, e := range v.cache {
+			if !now.Before(e.expires) {
+				v.removeCached(k)
+			}
+		}
+	}
+	v.removeCached(key)
+	v.cache[key] = cacheEntry{sess: sess, err: err, expires: now.Add(ttl), order: v.order.PushBack(key)}
+	maxEntries := v.MaxCacheEntries
+	if maxEntries <= 0 {
+		maxEntries = DefaultMaxCacheEntries
+	}
+	for len(v.cache) > maxEntries {
+		v.removeCached(v.order.Front().Value.(string))
+	}
 	delete(v.inflight, key)
 	v.mu.Unlock()
 
@@ -179,12 +204,20 @@ func (v *Verifier) Verify(ctx context.Context, cred Cred) (Session, error) {
 	return sess, err
 }
 
+// removeCached requires mu. Eviction never changes an in-flight verification.
+func (v *Verifier) removeCached(key string) {
+	if e, ok := v.cache[key]; ok {
+		v.order.Remove(e.order)
+		delete(v.cache, key)
+	}
+}
+
 // Invalidate drops any cached answer for a credential. Call it on QTS sign-out
 // and before any write.
 func (v *Verifier) Invalidate(cred Cred) {
 	key := CacheKey(cred)
 	v.mu.Lock()
-	delete(v.cache, key)
+	v.removeCached(key)
 	v.mu.Unlock()
 }
 
@@ -192,6 +225,7 @@ func (v *Verifier) Invalidate(cred Cred) {
 func (v *Verifier) InvalidateAll() {
 	v.mu.Lock()
 	v.cache = map[string]cacheEntry{}
+	v.order.Init()
 	v.mu.Unlock()
 }
 

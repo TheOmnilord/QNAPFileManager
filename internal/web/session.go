@@ -50,20 +50,31 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (*session,
 	if c, err := r.Cookie("qfm_sid"); err == nil {
 		old = s.sessions[c.Value]
 	}
-	// Reclaim expired sessions without a background goroutine/lifecycle leak.
+	sessions := make(map[string]*session, len(s.sessions))
 	for id, sess := range s.sessions {
-		sess.mu.Lock()
+		sessions[id] = sess
+	}
+	s.mu.Unlock()
+	// Reclaim idle expired sessions. A busy session may be verifying with QTS
+	// or NSS; neither the map lock nor another request should wait for it.
+	for id, sess := range sessions {
+		if !sess.mu.TryLock() {
+			continue
+		}
 		if !now.Before(sess.expires) {
 			sess.dead = true
-			delete(s.sessions, id)
+			s.mu.Lock()
+			if s.sessions[id] == sess {
+				delete(s.sessions, id)
+			}
+			s.mu.Unlock()
 		}
 		sess.mu.Unlock()
 	}
-	s.mu.Unlock()
 	cred, hasCred := qtsauth.FromRequest(r)
 	if old != nil {
 		old.mu.Lock()
-		invalid := old.dead
+		invalid := old.dead || !time.Now().Before(old.expires)
 		if s.pinned == nil && hasCred && qtsauth.CacheKey(cred) != old.binding {
 			invalid = true
 		}

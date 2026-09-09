@@ -3,6 +3,7 @@ package qtsauth
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -349,6 +350,87 @@ func TestCacheKeySeparatesFields(t *testing.T) {
 	}
 	if len(a) != 64 {
 		t.Errorf("cache key length = %d, want 64 hex characters", len(a))
+	}
+}
+
+func TestFailedCredentialsCacheBounded(t *testing.T) {
+	srv, hits := countingServer(t, fixtureDenied)
+	v := newTestVerifier(srv)
+	// Reuse the test connection so 10,000 attempts exercise cache pressure
+	// without exhausting Windows' ephemeral ports.
+	v.Client.HTTP = srv.Client()
+	v.Now = func() time.Time { return time.Unix(1_700_000_000, 0) }
+	for i := 0; i < 10000; i++ {
+		_, err := v.Verify(context.Background(), Cred{Kind: KindSID, Token: fmt.Sprintf("failed-%d", i)})
+		if !errors.Is(err, ErrNotAuthenticated) {
+			t.Fatal(err)
+		}
+		if len(v.cache) > DefaultMaxCacheEntries || v.order.Len() != len(v.cache) {
+			t.Fatalf("after %d attempts: cache=%d order=%d", i+1, len(v.cache), v.order.Len())
+		}
+	}
+	if len(v.cache) != DefaultMaxCacheEntries || atomic.LoadInt32(hits) != 10000 {
+		t.Fatalf("cache=%d hits=%d", len(v.cache), atomic.LoadInt32(hits))
+	}
+}
+
+func TestPrunePreservesUnexpiredEntries(t *testing.T) {
+	srv, hits := countingServer(t, fixtureAdmin)
+	v := newTestVerifier(srv)
+	now := time.Unix(1_700_000_000, 0)
+	v.Now = func() time.Time { return now }
+	valid := Cred{Kind: KindSID, Token: "valid"}
+	if _, err := v.Verify(context.Background(), valid); err != nil {
+		t.Fatal(err)
+	}
+	expired := Cred{Kind: KindQToken, Token: "missing-user"}
+	if _, err := v.Verify(context.Background(), expired); !errors.Is(err, ErrNotAuthenticated) {
+		t.Fatal(err)
+	}
+	now = now.Add(DefaultNegativeTTL)
+	for i := 0; i < cachePruneInterval; i++ {
+		_, err := v.Verify(context.Background(), Cred{Kind: KindQToken, Token: fmt.Sprintf("missing-user-%d", i)})
+		if !errors.Is(err, ErrNotAuthenticated) {
+			t.Fatal(err)
+		}
+	}
+	if _, ok := v.cache[CacheKey(expired)]; ok {
+		t.Fatal("expired entry survived pruning")
+	}
+	if _, ok := v.cache[CacheKey(valid)]; !ok {
+		t.Fatal("unexpired positive entry was pruned")
+	}
+	if _, err := v.Verify(context.Background(), valid); err != nil {
+		t.Fatal(err)
+	}
+	if n := atomic.LoadInt32(hits); n != 1 {
+		t.Fatalf("valid credential was reverified: %d hits", n)
+	}
+}
+
+func TestCacheEvictsOldestInsertion(t *testing.T) {
+	srv, hits := countingServer(t, fixtureAdmin)
+	v := newTestVerifier(srv)
+	v.MaxCacheEntries = 2
+	v.Now = func() time.Time { return time.Unix(1_700_000_000, 0) }
+	for _, token := range []string{"oldest", "second", "oldest", "newest"} {
+		if _, err := v.Verify(context.Background(), Cred{Kind: KindSID, Token: token}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, ok := v.cache[CacheKey(Cred{Kind: KindSID, Token: "oldest"})]; ok {
+		t.Fatal("oldest insertion was retained")
+	}
+	if len(v.cache) != 2 || v.order.Len() != 2 || atomic.LoadInt32(hits) != 3 {
+		t.Fatalf("cache=%d order=%d hits=%d", len(v.cache), v.order.Len(), atomic.LoadInt32(hits))
+	}
+	v.Invalidate(Cred{Kind: KindSID, Token: "second"})
+	if len(v.cache) != 1 || v.order.Len() != 1 {
+		t.Fatal("Invalidate left an eviction entry")
+	}
+	v.InvalidateAll()
+	if len(v.cache) != 0 || v.order.Len() != 0 {
+		t.Fatal("InvalidateAll left eviction entries")
 	}
 }
 

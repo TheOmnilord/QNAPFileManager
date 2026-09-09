@@ -1,25 +1,29 @@
 import {api} from './api.js';
 import {$,el,error,pathArgs,route,heightRule,announce} from './dom.js';
 import {state,update,selected,countSelected,subscribe} from './state.js';
-import {nameCell,isDirectory,isReadable,directoryNotice} from './badges.js';
+import {nameCell,isDirectory,isReadable,isSymlink,actionHint,directoryNotice} from './badges.js';
 import {view,download,properties} from './viewer.js';
-const PAGE = 500;
+const DEFAULT_PAGE = 500;
+let pageSize = DEFAULT_PAGE;
 let topHeight,bottomHeight;
 const pending = new Map();
 let typeAhead = '', typedAt = 0;
 const rowHeight = () => matchMedia('(max-width:30rem)').matches ? 44 : 36;
-export const entryAt = index => state.pages.get(Math.floor(index/PAGE))?.[index%PAGE];
+export const entryAt = index => state.pages.get(Math.floor(index/pageSize))?.[index%pageSize];
 export const focused = () => entryAt(state.focus);
 const navigable = e => e && !(e.volumeRoot && state.path==='/share') && (!state.filter || e.name.toLocaleLowerCase().includes(state.filter.toLocaleLowerCase()));
-function query(offset) { return {...pathArgs(state),offset,limit:PAGE,sort:state.sort,desc:state.desc,hidden:state.hidden,volumes:false}; }
+function query(offset) { return {...pathArgs(state),offset,limit:pageSize,sort:state.sort,desc:state.desc,hidden:state.hidden,volumes:false}; }
 
 async function page(number,generation) {
  if (state.pages.has(number)) return;
  const key = `${generation}:${number}`;
  if (pending.has(key)) return pending.get(key);
  const request = (async () => {
-  const data = await api('api/fs/list',query(number*PAGE));
+  const data = await api('api/fs/list',query(number*pageSize));
   if (generation !== state.generation || !state.session) return;
+  if (!Number.isInteger(data.limit) || data.limit < 1) throw new Error('Invalid listing page size.');
+  if (number === 0) pageSize = data.limit;
+  else if (data.limit !== pageSize) throw new Error('Listing page size changed. Refresh to continue.');
   const pages = new Map(state.pages); pages.set(number,data.entries);
   update({pages,total:data.total,loading:false});
   if (number === 0) directoryNotice(data);
@@ -31,12 +35,13 @@ async function page(number,generation) {
 
 export async function loadList() {
  const generation = state.generation+1;
+ pageSize = DEFAULT_PAGE;
  update({generation,pages:new Map(),total:0,selection:new Set(),exclude:false,focus:0,anchor:0,loading:true});
  $('#listViewport').scrollTop = 0; $('#status').textContent = 'Loading…'; render();
  try {
   await page(0,generation);
   if (generation !== state.generation) return;
-  if (state.total <= 2000) for (let n=1;n<Math.ceil(state.total/PAGE);n++) await page(n,generation);
+  if (state.total <= 2000) for (let n=1;generation===state.generation && n<Math.ceil(state.total/pageSize);n++) await page(n,generation);
   render();
  } catch(err) { if (generation === state.generation) { update({loading:false}); error(err); } }
 }
@@ -61,6 +66,8 @@ function status() {
  const e = focused(), one = n === 1 && e && selected(state.focus);
  $('#btnDownload').disabled = !one || !isReadable(e);
  $('#btnView').disabled = !one || !isReadable(e);
+ const hint = one && !isReadable(e) ? actionHint(e) : '';
+ $('#btnDownload').title = hint; $('#btnView').title = hint;
  $('#btnProps').disabled = !one;
 }
 
@@ -82,7 +89,7 @@ export function render() {
  const needed = new Set();
  for (let i=start;i<end;i++) {
   const e = entryAt(i);
-  if (!e) { needed.add(Math.floor(i/PAGE)); rows.push(el('div',{class:'fileRow','aria-hidden':'true'},'Loading…')); continue; }
+  if (!e) { needed.add(Math.floor(i/pageSize)); rows.push(el('div',{class:'fileRow','aria-hidden':'true'},'Loading…')); continue; }
   // Preserve virtual row geometry even while filtering the loaded page.
   const match = !state.filter || e.name.toLocaleLowerCase().includes(state.filter.toLocaleLowerCase());
   const row = el('div',{id:`row-${i}`,role:'row',class:`fileRow ${e.class || ''}${match ? '' : ' filtered'}${e.volumeRoot && state.path==='/share' ? ' volumeRow' : ''}${!isDirectory(e) && !isReadable(e) ? ' special' : ''}`,tabindex:i===state.focus ? '0' : '-1','aria-rowindex':i+2,'aria-selected':selected(i),'data-name':e.name,'data-kind':e.type,'data-idx':i});
@@ -118,17 +125,17 @@ async function move(index,event) {
  const v = $('#listViewport'),h = rowHeight();
  if (index*h < v.scrollTop) v.scrollTop = index*h;
  if ((index+1)*h > v.scrollTop+v.clientHeight) v.scrollTop = (index+1)*h-v.clientHeight;
- await page(Math.floor(index/PAGE),state.generation); render(); focusRow();
+ await page(Math.floor(index/pageSize),state.generation); render(); focusRow();
 }
 
 export function contextMenu(e) {
  if (!e) return;
  const menu = $('#ctxMenu'); menu.replaceChildren();
- const actions = [['Open',() => open(e)],['Properties',() => properties(e)],['Copy full path',async () => { try { await navigator.clipboard.writeText(e.path); announce('Path copied.'); } catch { error(new Error('Could not copy the path. Use the path field to copy it.')); } }]];
- if (isReadable(e)) actions.splice(1,0,['View text',() => view(e)],['Download',() => download(e)]);
- if (e.linkResolved) actions.push(['Go to symlink target',() => { location.hash = route({path:e.linkResolved}); }]);
- for (const [label,action] of actions) { const b = el('button',{role:'menuitem',tabindex:'-1'},label); b.addEventListener('click',() => { menu.hidden=true; action(); }); menu.append(b); }
- menu.hidden=false; menu.firstElementChild.tabIndex=0; menu.firstElementChild.focus();
+ const actions = [['Open',() => open(e),!isDirectory(e) && !isReadable(e)],['Properties',() => properties(e)],['Copy full path',async () => { try { await navigator.clipboard.writeText(e.path); announce('Path copied.'); } catch { error(new Error('Could not copy the path. Use the path field to copy it.')); } }]];
+ if (isReadable(e) || isSymlink(e) && !e.linkResolved) actions.splice(1,0,['View text',() => view(e),!isReadable(e)],['Download',() => download(e),!isReadable(e)]);
+ if (isSymlink(e) && (e.targetType === 'dir' || !e.linkResolved)) actions.push(['Go to target',() => { location.hash = route({path:e.linkResolved}); },!e.linkResolved]);
+ for (const [label,action,disabled] of actions) { const b = el('button',{role:'menuitem',tabindex:'-1'},label); b.disabled=!!disabled; if (disabled) b.title=actionHint(e); b.addEventListener('click',() => { menu.hidden=true; action(); }); menu.append(b); }
+ menu.hidden=false; const first=menu.querySelector('button:not(:disabled)'); first.tabIndex=0; first.focus();
 }
 
 export function initList() {
@@ -164,7 +171,7 @@ export function initList() {
   default:
    if (ev.key.length===1 && !ctrl && !ev.altKey) {
     typeAhead = Date.now()-typedAt > 700 ? ev.key : typeAhead+ev.key; typedAt=Date.now();
-    for (const [p,entries] of state.pages) { const n = entries.findIndex(e => e.name.toLocaleLowerCase().startsWith(typeAhead.toLocaleLowerCase())); if (n>=0) { move(p*PAGE+n,ev).catch(error); break; } }
+    for (const [p,entries] of state.pages) { const n = entries.findIndex(e => e.name.toLocaleLowerCase().startsWith(typeAhead.toLocaleLowerCase())); if (n>=0) { move(p*pageSize+n,ev).catch(error); break; } }
    }
    return;
   }
@@ -172,7 +179,7 @@ export function initList() {
  });
  const menu = $('#ctxMenu');
  menu.addEventListener('keydown',ev => {
-  const items=[...menu.children], i=items.indexOf(document.activeElement);
+  const items=[...menu.querySelectorAll('button:not(:disabled)')], i=items.indexOf(document.activeElement);
   if (ev.key==='Escape') { menu.hidden=true; focusRow(); }
   else if (ev.key==='ArrowDown' || ev.key==='ArrowUp') { ev.preventDefault(); items[(i+(ev.key==='ArrowDown' ? 1 : items.length-1))%items.length].focus(); }
  });

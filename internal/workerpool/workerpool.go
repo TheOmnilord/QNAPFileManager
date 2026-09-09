@@ -120,6 +120,11 @@ type Options struct {
 	// Now is the clock. Nil means time.Now; tests replace it to age workers
 	// without sleeping.
 	Now func() time.Time
+
+	// newWorker replaces the spawn half of bringing a worker up (the hello
+	// handshake still runs). Production leaves it nil; tests inject one that
+	// fails, or one that blocks, to exercise the accounting around it.
+	newWorker func(backend.Principal) (*client, error)
 }
 
 func (o Options) normalise() Options {
@@ -183,7 +188,13 @@ type budget struct {
 
 // New builds the pool the daemon runs with. plat and ids may be nil; the
 // worker then detects the mount table itself and reports numeric ownership.
-func New(cfg config.Config, root fsx.Root, plat *platform.Platform, ids *idmap.Map) *Pool {
+//
+// logger is the daemon's own logger and must be passed: a worker's stdout and
+// stderr, its panic stacks and every lifecycle event are written through it,
+// and normalise would otherwise substitute io.Discard and throw away exactly
+// the diagnostics an operator who started the daemon with -log came for. A nil
+// logger is still tolerated, for a caller that genuinely wants silence.
+func New(cfg config.Config, root fsx.Root, plat *platform.Platform, ids *idmap.Map, logger *log.Logger) *Pool {
 	idle, err := cfg.Worker.IdleTimeoutDuration()
 	if err != nil {
 		idle = 0 // Validate rejects this at startup; be harmless if it slips through.
@@ -203,6 +214,7 @@ func New(cfg config.Config, root fsx.Root, plat *platform.Platform, ids *idmap.M
 			ListMax:      cfg.Limits.ListMax,
 			MaxTextBytes: cfg.Limits.MaxTextBytes,
 		},
+		Logger: logger,
 	})
 }
 
@@ -483,12 +495,20 @@ func (p *Pool) acquire(ctx context.Context, who backend.Principal) (*client, err
 	return nil, fmt.Errorf("%s: %w", who.Key(), ErrWorkerUnavailable)
 }
 
-func (p *Pool) release(c *client) { c.done(p.now()) }
+// release ends one caller's hold. A worker retired for a credential change
+// while this call was in flight is stopped here, once it is the last one out.
+func (p *Pool) release(c *client) {
+	if c.done(p.now()) {
+		p.opts.Logger.Printf("workerpool: stopping the superseded worker for %s (pid %d) now that its calls have finished", c.key, c.pid)
+		go p.terminate(c)
+	}
+}
 
 // get finds or creates the worker for who. It returns whether the worker was
 // just spawned and, if not, how long it had been idle.
 func (p *Pool) get(ctx context.Context, who backend.Principal) (c *client, fresh bool, idleFor time.Duration, err error) {
 	key := who.Key()
+	want := credsOf(who)
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, false, 0, err
@@ -501,6 +521,24 @@ func (p *Pool) get(ctx context.Context, who backend.Principal) (c *client, fresh
 		}
 		if c := p.workers[key]; c != nil {
 			if !c.isDead() {
+				if c.cred != want {
+					// The user's primary group or supplementary groups
+					// changed. A process's credentials are fixed at fork
+					// time, so this worker would keep the memberships the
+					// user has just lost — and lack the ones just granted —
+					// for as long as it lived. It is dropped from the map
+					// here, which makes the next pass spawn a fresh one, and
+					// stopped as soon as its in-flight calls are done.
+					delete(p.workers, key)
+					stale := c
+					p.mu.Unlock()
+					p.opts.Logger.Printf("workerpool: retiring the worker for %s: credentials changed from %s to %s",
+						key, stale.cred, want)
+					if stale.markRetired() {
+						go p.terminate(stale)
+					}
+					continue
+				}
 				idle := c.hold(now)
 				p.mu.Unlock()
 				return c, false, idle, nil
@@ -543,8 +581,21 @@ func (p *Pool) get(ctx context.Context, who backend.Principal) (c *client, fresh
 
 		p.mu.Lock()
 		delete(p.spawning, key)
+		blocked := false
 		switch {
 		case err != nil:
+			// A worker that died before answering hello never entered
+			// p.workers, so the crash-accounting path in the branch above
+			// cannot charge it. Without this, a worker that fails at startup
+			// — a bad binary, an impossible credential, a hung handshake —
+			// could be respawned on every request forever.
+			//
+			// A caller who gave up while the spawn was running is not evidence
+			// of anything being broken, so a cancelled request is not charged:
+			// six abandoned page loads must not lock a user out for a minute.
+			if ctx.Err() == nil {
+				blocked = p.noteRestartLocked(key, p.now())
+			}
 		case p.closed:
 			err = ErrClosed
 		default:
@@ -558,6 +609,10 @@ func (p *Pool) get(ctx context.Context, who backend.Principal) (c *client, fresh
 			if nc != nil {
 				go p.terminate(nc)
 			}
+			if blocked {
+				err = fmt.Errorf("%s failed to start (%v), not restarting it for another %s: %w",
+					key, err, p.opts.RestartCooldown, ErrWorkerUnavailable)
+			}
 			return nil, false, 0, err
 		}
 		return nc, true, 0, nil
@@ -567,8 +622,14 @@ func (p *Pool) get(ctx context.Context, who backend.Principal) (c *client, fresh
 // makeRoomLocked evicts the least recently used idle worker when the pool is
 // full. If every worker is busy the caller is told so rather than queued
 // behind an unbounded wait (§2.6).
+//
+// A worker that is still being spawned counts against Max exactly as a running
+// one does. It is a reservation, not a hint: twenty simultaneous logins all
+// pass this check before any of their workers has finished coming up, and
+// counting only p.workers let them all through — twenty-two processes with
+// Max: 1, and the memory ceiling an operator set on a 1 GB ARM NAS gone.
 func (p *Pool) makeRoomLocked(now time.Time) error {
-	if len(p.workers) < p.opts.Max {
+	if len(p.workers)+len(p.spawning) < p.opts.Max {
 		return nil
 	}
 	var (
@@ -584,7 +645,8 @@ func (p *Pool) makeRoomLocked(now time.Time) error {
 		}
 	}
 	if victim == nil {
-		return fmt.Errorf("%d workers are running and all of them are busy: %w", len(p.workers), ErrWorkerBusy)
+		return fmt.Errorf("%d workers are running (%d more are starting) and none of them is idle: %w",
+			len(p.workers), len(p.spawning), ErrWorkerBusy)
 	}
 	delete(p.workers, victimKey)
 	p.opts.Logger.Printf("workerpool: evicting the least recently used idle worker %s (pid %d)", victimKey, victim.pid)
@@ -594,8 +656,8 @@ func (p *Pool) makeRoomLocked(now time.Time) error {
 
 // noteRestartLocked charges one crash to a uid and blocks further restarts
 // once the budget is spent, so a worker that crashes on startup cannot
-// fork-bomb the NAS.
-func (p *Pool) noteRestartLocked(key string, now time.Time) {
+// fork-bomb the NAS. It reports whether the key is blocked from here on.
+func (p *Pool) noteRestartLocked(key string, now time.Time) bool {
 	b := p.budgets[key]
 	if b == nil {
 		b = &budget{}
@@ -612,6 +674,7 @@ func (p *Pool) noteRestartLocked(key string, now time.Time) {
 	if len(b.times) > p.opts.RestartBudget {
 		b.blockedUntil = now.Add(p.opts.RestartCooldown)
 	}
+	return now.Before(b.blockedUntil)
 }
 
 // retire removes a worker from the map (if it is still the current one for its
@@ -620,7 +683,7 @@ func (p *Pool) retire(c *client, cause error) {
 	p.mu.Lock()
 	if cur, ok := p.workers[c.key]; ok && cur == c {
 		delete(p.workers, c.key)
-		p.noteRestartLocked(c.key, p.now())
+		_ = p.noteRestartLocked(c.key, p.now())
 	}
 	p.mu.Unlock()
 	c.fail(cause)
@@ -634,9 +697,12 @@ func (p *Pool) spawn(ctx context.Context, who backend.Principal) (*client, error
 		c   *client
 		err error
 	)
-	if p.opts.Mode == ModeInProcess {
+	switch {
+	case p.opts.newWorker != nil:
+		c, err = p.opts.newWorker(who)
+	case p.opts.Mode == ModeInProcess:
 		c, err = p.spawnInProcess(who)
-	} else {
+	default:
 		c, err = p.spawnProcess(who)
 	}
 	if err != nil {

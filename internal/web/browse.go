@@ -97,7 +97,10 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request, sess *session) {
 	if p == "/share" && s.ramShare() {
 		listing.Notes = append(listing.Notes, "/share is a RAM disk. Store files in a shared folder, not directly here; files here disappear on reboot.")
 	}
-	writeJSON(w, listing)
+	writeJSON(w, struct {
+		fsx.Listing
+		Limit int `json:"limit"`
+	}{Listing: listing, Limit: limit})
 }
 
 func (s *Server) ramShare() bool {

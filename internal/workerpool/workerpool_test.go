@@ -3,6 +3,7 @@ package workerpool
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"log"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -107,6 +109,18 @@ func testPool(t *testing.T, tweak func(*Options)) (*Pool, *clock) {
 		}
 	})
 	return p, c
+}
+
+// workerForTest is the current worker for a key, read under the pool lock.
+func (p *Pool) workerForTest(t *testing.T, key string) *client {
+	t.Helper()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	c := p.workers[key]
+	if c == nil {
+		t.Fatalf("no worker for %q", key)
+	}
+	return c
 }
 
 func alice() backend.Principal {
@@ -543,6 +557,212 @@ func TestCancelledCallerIsNotSent(t *testing.T) {
 	}
 	if after := p.Stats()[0].Calls; after != before {
 		t.Errorf("calls went from %d to %d; nothing should have been sent", before, after)
+	}
+}
+
+// TestCredentialChangeRetiresTheWorker: a worker's kernel credentials are
+// fixed at fork time, so when the user's groups change the process has to go.
+// Reusing it by uid alone kept revoked memberships alive for as long as the
+// worker did.
+func TestCredentialChangeRetiresTheWorker(t *testing.T) {
+	p, _ := testPool(t, nil)
+	ctx := context.Background()
+	before := backend.Principal{User: "alice", UID: 1001, GID: 1001, Groups: []int{100, 1001}}
+	if err := p.Ping(ctx, before); err != nil {
+		t.Fatal(err)
+	}
+	first := p.workerForTest(t, before.Key())
+
+	// The same membership in another order, or listed twice, is the same
+	// identity: respawning over that would be a self-inflicted restart storm.
+	same := before
+	same.Groups = []int{1001, 100, 100}
+	if err := p.Ping(ctx, same); err != nil {
+		t.Fatal(err)
+	}
+	if got := p.workerForTest(t, same.Key()); got != first {
+		t.Fatal("reordered groups must not respawn the worker")
+	}
+
+	// Losing a group must retire it.
+	after := before
+	after.Groups = []int{1001}
+	if err := p.Ping(ctx, after); err != nil {
+		t.Fatal(err)
+	}
+	second := p.workerForTest(t, after.Key())
+	if second == first {
+		t.Fatal("the worker outlived a credential change")
+	}
+	if second.cred != credsOf(after) {
+		t.Fatalf("the new worker carries %s, want %s", second.cred, credsOf(after))
+	}
+	select {
+	case <-first.gone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the superseded worker was never stopped")
+	}
+	if s := p.Stats(); len(s) != 1 {
+		t.Fatalf("%d workers, want exactly one for the key: %+v", len(s), s)
+	}
+
+	// The primary gid counts too, and so does root mode — which has its own
+	// key, so it gets its own worker rather than retiring this one.
+	gid := after
+	gid.GID = 50
+	if err := p.Ping(ctx, gid); err != nil {
+		t.Fatal(err)
+	}
+	if third := p.workerForTest(t, gid.Key()); third == second {
+		t.Fatal("a changed primary gid must retire the worker")
+	}
+}
+
+// TestCredentialChangeWaitsForInFlightCalls: the retirement must not cut off
+// work that was already accepted under the old credentials.
+func TestCredentialChangeWaitsForInFlightCalls(t *testing.T) {
+	p, _ := testPool(t, nil)
+	ctx := context.Background()
+	who := alice()
+	c, err := p.acquire(ctx, who)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	changed := who
+	changed.Groups = []int{7}
+	if err := p.Ping(ctx, changed); err != nil {
+		t.Fatal(err)
+	}
+	if p.workerForTest(t, changed.Key()) == c {
+		t.Fatal("the pool kept handing out the stale worker")
+	}
+	if c.isDead() {
+		t.Fatal("a worker with a call in flight was killed under its caller")
+	}
+	if _, _, err := p.call(ctx, c, wproto.OpPing, nil); err != nil {
+		t.Fatalf("the retiring worker stopped serving the call it had accepted: %v", err)
+	}
+
+	p.release(c)
+	select {
+	case <-c.gone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the retiring worker was not stopped once its calls finished")
+	}
+}
+
+// TestPendingSpawnsCountAgainstMax: twenty simultaneous first requests for
+// twenty uids used to pass the capacity check together, because a reservation
+// in p.spawning was not counted — twenty-two processes with Max: 1.
+func TestPendingSpawnsCountAgainstMax(t *testing.T) {
+	const max = 2
+	gate := make(chan struct{})
+	var (
+		mu         sync.Mutex
+		live, peak int
+		p          *Pool
+	)
+	p, _ = testPool(t, func(o *Options) {
+		o.Max = max
+		o.newWorker = func(who backend.Principal) (*client, error) {
+			mu.Lock()
+			live++
+			if live > peak {
+				peak = live
+			}
+			mu.Unlock()
+			defer func() {
+				mu.Lock()
+				live--
+				mu.Unlock()
+			}()
+			// Hold the reservation open so every other request meets a pool
+			// that is full of pending spawns rather than of workers.
+			<-gate
+			return p.spawnInProcess(who)
+		}
+	})
+
+	const n = 20
+	ctx := context.Background()
+	errs := make(chan error, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs <- p.Ping(ctx, backend.Principal{User: fmt.Sprintf("u%d", i), UID: 3000 + i, GID: 100})
+		}(i)
+	}
+	time.AfterFunc(300*time.Millisecond, func() { close(gate) })
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		// Being told the pool is full is the correct answer for the requests
+		// that did not get a slot; anything else is not.
+		if err != nil && !errors.Is(err, ErrWorkerBusy) {
+			t.Fatalf("ping: %v", err)
+		}
+	}
+	mu.Lock()
+	got := peak
+	mu.Unlock()
+	if got > max {
+		t.Fatalf("%d workers were being started at once, want at most Max=%d", got, max)
+	}
+	if s := p.Stats(); len(s) > max {
+		t.Fatalf("%d live workers, want at most %d: %+v", len(s), max, s)
+	}
+}
+
+// TestFailedStartupChargesTheRestartBudget: a worker that dies before
+// answering hello never enters p.workers, so the crash-accounting path cannot
+// see it. Uncharged, a permanently broken worker was respawned on every single
+// request.
+func TestFailedStartupChargesTheRestartBudget(t *testing.T) {
+	boom := errors.New("the worker exited before hello")
+	var spawns atomic.Int64
+	p, _ := testPool(t, func(o *Options) {
+		o.RestartBudget = 2
+		o.RestartWindow = time.Minute
+		o.RestartCooldown = time.Minute
+		o.newWorker = func(backend.Principal) (*client, error) {
+			spawns.Add(1)
+			return nil, boom
+		}
+	})
+	ctx := context.Background()
+	who := alice()
+
+	// The budget pays for the first two failures, which are reported as what
+	// they are rather than as a lockout.
+	for i := 0; i < 2; i++ {
+		err := p.Ping(ctx, who)
+		if !errors.Is(err, boom) {
+			t.Fatalf("ping %d = %v, want the startup failure itself", i, err)
+		}
+		if errors.Is(err, ErrWorkerUnavailable) {
+			t.Fatalf("ping %d locked the uid out while the budget still had room", i)
+		}
+	}
+	// The one that spends it says so...
+	if err := p.Ping(ctx, who); !errors.Is(err, ErrWorkerUnavailable) {
+		t.Fatalf("the failure that spends the budget = %v, want ErrWorkerUnavailable", err)
+	}
+	tried := spawns.Load()
+	if tried != 3 {
+		t.Fatalf("%d spawn attempts, want 3", tried)
+	}
+	// ...and afterwards nothing is even attempted until the cooldown passes.
+	for i := 0; i < 3; i++ {
+		if err := p.Ping(ctx, who); !errors.Is(err, ErrWorkerUnavailable) {
+			t.Fatalf("during the cooldown, ping = %v, want ErrWorkerUnavailable", err)
+		}
+	}
+	if n := spawns.Load() - tried; n != 0 {
+		t.Fatalf("%d processes were started after the budget was spent, want none", n)
 	}
 }
 

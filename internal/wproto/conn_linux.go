@@ -8,11 +8,24 @@ import (
 	"syscall"
 )
 
-// WriteFrame sends one frame, with fds attached through SCM_RIGHTS, in a
-// single WriteMsgUnix. One frame per sendmsg is a requirement, not a
-// convenience: Linux does not merge stream data across a sendmsg that carried
-// ancillary data, so an fd-bearing frame is always delivered whole and the fds
-// cannot end up attached to the wrong message.
+// WriteFrame sends one frame, with fds attached through SCM_RIGHTS on the
+// first sendmsg. One sendmsg per frame for the ancillary data is a
+// requirement, not a convenience: Linux does not merge stream data across a
+// sendmsg that carried ancillary data, so the descriptors always arrive
+// attached to the beginning of the frame they belong to and cannot end up on
+// the wrong message.
+//
+// The payload itself may still be split. A stream socket accepts only what
+// fits in its send buffer, and a 5 000-entry listing is roughly 1.5 MB against
+// a default buffer of a couple of hundred kilobytes, so a short write is the
+// normal case for a large reply rather than an exotic one. Abandoning the rest
+// of the frame there desynchronised the framing for every reply after it. The
+// remainder is therefore written with plain Write calls, which carry no
+// ancillary data and so cannot duplicate the descriptors.
+//
+// The caller must hold the transport's write lock across this whole function —
+// Transport.Write does — or a second frame's bytes could be interleaved into
+// the middle of this one.
 //
 // The caller keeps ownership of fds: they are duplicated into the receiving
 // process, and the sender still has to close its own copies.
@@ -33,10 +46,33 @@ func WriteFrame(c *net.UnixConn, f Frame, fds []int) error {
 	if oobn != len(oob) {
 		return fmt.Errorf("sent %d of %d ancillary bytes: %w", oobn, len(oob), ErrProtocol)
 	}
-	// A short write on a stream socket after ancillary data has already gone
-	// out cannot be retried without splitting the fds from their frame.
-	if n != len(buf) {
-		return fmt.Errorf("short write, %d of %d bytes: %w", n, len(buf), ErrProtocol)
+	if n < 0 {
+		return fmt.Errorf("sendmsg reported %d bytes: %w", n, ErrProtocol)
+	}
+	// The descriptors have gone out with the first chunk and must not be sent
+	// again, so the rest of the frame goes as ordinary writes.
+	return writeRest(c, buf, n)
+}
+
+// writeRest finishes a payload whose first n bytes are already on the wire.
+// It is split out so the loop can be tested against a writer that deliberately
+// writes one byte at a time, which no real socket does often enough to trust
+// to chance.
+func writeRest(w io.Writer, buf []byte, n int) error {
+	for n < len(buf) {
+		m, err := w.Write(buf[n:])
+		if m > 0 {
+			n += m
+		}
+		if err != nil {
+			return err
+		}
+		if m <= 0 {
+			// io.Writer forbids this, but a zero-byte write that reports no
+			// error would spin here forever, and this loop runs in the daemon
+			// that serves every user.
+			return fmt.Errorf("the connection accepted %d of %d bytes and then stalled: %w", n, len(buf), ErrProtocol)
+		}
 	}
 	return nil
 }

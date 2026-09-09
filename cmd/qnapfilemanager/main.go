@@ -242,7 +242,15 @@ func runServe(args []string, stderr io.Writer) error {
 	}
 	logger := log.New(logw, "", log.LstdFlags|log.LUTC)
 
-	ids := idmap.Open(root.OS("/etc/passwd"), root.OS("/etc/group"))
+	passwdPath, err := root.OS("/etc/passwd")
+	if err != nil {
+		return err
+	}
+	groupPath, err := root.OS("/etc/group")
+	if err != nil {
+		return err
+	}
+	ids := idmap.Open(passwdPath, groupPath)
 	var pinned *backend.Principal
 	if o.impersonate != "" {
 		ident, resolveErr := ids.Resolve(context.Background(), o.impersonate)
@@ -266,7 +274,7 @@ func runServe(args []string, stderr io.Writer) error {
 		verifier = qtsauth.NewVerifier(client)
 	}
 	plat := platform.Detect()
-	b := workerpool.New(cfg, root, plat, ids)
+	b := workerpool.New(cfg, root, plat, ids, logger)
 	defer func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()

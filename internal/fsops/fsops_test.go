@@ -641,6 +641,100 @@ func TestOpenReadRefusesASymlinkOnLinux(t *testing.T) {
 	}
 }
 
+// TestSymlinkEscapesFromTheJailAreRefused: with -jail, a directory symlink
+// inside the jail pointing out of it was followed by os.Open — so List
+// enumerated the host's directory and OpenRead downloaded its children, since
+// O_NOFOLLOW only ever protected the final component.
+func TestSymlinkEscapesFromTheJailAreRefused(t *testing.T) {
+	requireSymlinks(t)
+	r, base := fixture(t)
+	outside := tempDir(t)
+	mkdir(t, outside, "secret")
+	write(t, outside, "secret/passwd", "root:x:0:0:")
+	if err := os.Symlink(filepath.Join(outside, "secret"), filepath.Join(base, "escape")); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	if l, err := List(ctx, r, nil, "/escape", fsx.ListOptions{}); !errors.Is(err, fsx.ErrOutsideRoot) {
+		t.Fatalf("listing through an escaping symlink = %v (entries %v), want ErrOutsideRoot", err, names(l))
+	}
+	if _, _, err := OpenRead(ctx, r, "/escape/passwd"); !errors.Is(err, fsx.ErrOutsideRoot) {
+		t.Fatalf("downloading through an escaping symlink = %v, want ErrOutsideRoot", err)
+	}
+	// A path that does not exist out there is refused on the ancestor that
+	// does, rather than leaking the difference between a missing file and a
+	// present one.
+	if _, _, err := OpenRead(ctx, r, "/escape/nothing-here"); !errors.Is(err, fsx.ErrOutsideRoot) {
+		t.Fatalf("a missing file behind an escaping symlink = %v, want ErrOutsideRoot", err)
+	}
+	if _, err := StatFollow(ctx, r, nil, "/escape"); !errors.Is(err, fsx.ErrOutsideRoot) {
+		t.Fatalf("statting through an escaping symlink = %v, want ErrOutsideRoot", err)
+	}
+
+	// The link itself is inside the jail and stays fully visible: hiding it
+	// would be lying about the directory. What it must not do is leak where it
+	// points on the host.
+	e, err := Stat(ctx, r, nil, "/escape")
+	if err != nil {
+		t.Fatalf("stat of the link itself: %v", err)
+	}
+	if !e.IsSymlink || e.LinkResolved != "" {
+		t.Errorf("link entry = %+v, want a symlink with no resolved path", e)
+	}
+	if _, err := Readlink(ctx, r, "/escape"); err != nil {
+		t.Errorf("readlink of the link itself: %v", err)
+	}
+	l, err := List(ctx, r, nil, "/", fsx.ListOptions{ResolveLinks: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if le, ok := find(l, "escape"); !ok || !le.IsSymlink || le.LinkResolved != "" {
+		t.Errorf("the escaping link in the parent listing = %+v (present: %v)", le, ok)
+	}
+
+	// A symlink that stays inside is untouched by any of this.
+	if err := os.Symlink(filepath.Join(base, "a", "sub"), filepath.Join(base, "inside")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := List(ctx, r, nil, "/inside", fsx.ListOptions{}); err != nil {
+		t.Fatalf("listing through a symlink that stays inside the jail: %v", err)
+	}
+	inside, _, err := OpenRead(ctx, r, "/inside/two.txt")
+	if err != nil {
+		t.Fatalf("reading through a symlink that stays inside the jail: %v", err)
+	}
+	inside.Close()
+}
+
+// Without a jail there is nothing to contain, so the containment check must
+// not start refusing paths on the NAS, where Root is the identity.
+func TestUnjailedRootFollowsSymlinks(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// An API path is POSIX-absolute, so the identity mapping cannot
+		// address a drive-lettered temporary directory at all.
+		t.Skip("the unjailed mapping is only addressable where paths start at /")
+	}
+	requireSymlinks(t)
+	base := tempDir(t)
+	mkdir(t, base, "real")
+	write(t, base, "real/file.txt", "hi")
+	if err := os.Symlink(filepath.Join(base, "real"), filepath.Join(base, "link")); err != nil {
+		t.Fatal(err)
+	}
+	var r fsx.Root // the identity mapping production runs with
+	if r.Jailed() {
+		t.Fatal("the zero Root must be the identity")
+	}
+	l, err := List(context.Background(), r, nil, filepath.ToSlash(filepath.Join(base, "link")), fsx.ListOptions{})
+	if err != nil {
+		t.Fatalf("listing through a symlink without a jail: %v", err)
+	}
+	if _, ok := find(l, "file.txt"); !ok {
+		t.Fatalf("entries = %v", names(l))
+	}
+}
+
 func TestNotesForARAMDisk(t *testing.T) {
 	plat, err := platform.FromMountinfo(strings.NewReader(shareMountinfo))
 	if err != nil {

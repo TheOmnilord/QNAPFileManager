@@ -26,8 +26,8 @@ func TestRootIdentity(t *testing.T) {
 		t.Fatal(`NewRoot("/") must be the identity`)
 	}
 	want := filepath.FromSlash("/etc/passwd")
-	if got := r.OS("/etc/passwd"); got != want {
-		t.Fatalf("OS = %q, want %q", got, want)
+	if got, err := r.OS("/etc/passwd"); err != nil || got != want {
+		t.Fatalf("OS = %q, %v, want %q", got, err, want)
 	}
 	api, err := r.API(want)
 	if err != nil {
@@ -65,8 +65,9 @@ func TestRootWindowsStyleBase(t *testing.T) {
 		{"/share/../etc", base + `\etc`},
 	}
 	for _, c := range cases {
-		if got := r.OS(c.api); got != c.os {
-			t.Errorf("OS(%q) = %q, want %q", c.api, got, c.os)
+		got, err := r.OS(c.api)
+		if err != nil || got != c.os {
+			t.Errorf("OS(%q) = %q, %v, want %q", c.api, got, err, c.os)
 		}
 	}
 	for _, c := range cases[:3] {
@@ -90,6 +91,57 @@ func TestRootWindowsStyleBase(t *testing.T) {
 	}
 }
 
+// TestRootBackslashTraversal is the Windows escape the round-one review found:
+// fsx.Clean treats "\" as a filename character, filepath.Join treats it as a
+// separator, and "/..\..\PLAN.md" therefore used to land above the jail. The
+// table branches on runtime.GOOS rather than living behind a build tag, so
+// both halves are compiled — and vetted — on every platform.
+func TestRootBackslashTraversal(t *testing.T) {
+	base := t.TempDir()
+	r, err := NewRoot(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []string{
+		`/..\..\PLAN.md`,             // the escape itself
+		`/share\..\..\..\etc\shadow`, // and a deeper one
+		`/a\b`,                       // an ordinary Linux filename with a backslash in it
+		`/share/Public/back\slash`,   // as written from a Windows SMB client
+		"/etc/passwd",
+	}
+	for _, api := range cases {
+		got, err := r.OS(api)
+		// On Windows every backslash is refused, escaping or not: the
+		// character cannot appear in a filename there, so nothing legitimate
+		// is lost and no join can be talked into climbing out. On Linux they
+		// are all ordinary names and none of them may leave the jail.
+		if runtime.GOOS == "windows" && strings.ContainsRune(api, '\\') {
+			if !errors.Is(err, ErrOutsideRoot) {
+				t.Errorf("OS(%q) = %q, %v; want ErrOutsideRoot on Windows", api, got, err)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("OS(%q): %v", api, err)
+			continue
+		}
+		if !r.Contains(got) {
+			t.Errorf("OS(%q) = %q, which is outside %q", api, got, base)
+		}
+		if _, err := r.API(got); err != nil {
+			t.Errorf("API(%q): %v", got, err)
+		}
+	}
+	// Contains is the boundary check the mapping leans on, so it must compare
+	// whole elements rather than string prefixes.
+	if r.Contains(base + "-sibling") {
+		t.Error("a sibling directory sharing the base's prefix must not be contained")
+	}
+	if !r.Contains(base) {
+		t.Error("the base itself is contained")
+	}
+}
+
 // The same round trip against a real temporary directory, which is what every
 // other test in the tree will use.
 func TestRootTempDirRoundTrip(t *testing.T) {
@@ -99,7 +151,10 @@ func TestRootTempDirRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, api := range []string{"/", "/etc", "/etc/passwd", "/share/Public/a #b.txt", "/share/Bilder – 2024"} {
-		osPath := r.OS(api)
+		osPath, err := r.OS(api)
+		if err != nil {
+			t.Fatalf("OS(%q): %v", api, err)
+		}
 		if !strings.HasPrefix(osPath, base) {
 			t.Fatalf("OS(%q) = %q, which is not under %q", api, osPath, base)
 		}
@@ -116,8 +171,10 @@ func TestRootTempDirRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r2.OS("/etc") != r.OS("/etc") {
-		t.Fatalf("trailing separator changed the mapping: %q vs %q", r2.OS("/etc"), r.OS("/etc"))
+	with, err1 := r2.OS("/etc")
+	without, err2 := r.OS("/etc")
+	if err1 != nil || err2 != nil || with != without {
+		t.Fatalf("trailing separator changed the mapping: %q (%v) vs %q (%v)", with, err1, without, err2)
 	}
 	if _, err := r.API(filepath.Join(filepath.Dir(base), "elsewhere")); !errors.Is(err, ErrOutsideRoot) {
 		t.Fatalf("a sibling directory must be outside the root, got %v", err)

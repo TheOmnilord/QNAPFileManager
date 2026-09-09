@@ -1,11 +1,14 @@
 import {$,el,route} from './dom.js';
-export const isDirectory = e => e.type === 'dir' || e.targetType === 'dir';
-export const isReadable = e => e.type === 'file' || e.targetType === 'file';
+export const isSymlink = e => e.isSymlink || e.type === 'symlink';
+export const isDirectory = e => isSymlink(e) ? !!e.linkResolved && e.targetType === 'dir' : e.type === 'dir';
+export const isReadable = e => isSymlink(e) ? !!e.linkResolved && e.targetType === 'file' : e.type === 'file';
+export const fileTarget = e => isSymlink(e) ? {path:e.linkResolved} : e;
+export const actionHint = e => isSymlink(e) && !e.linkResolved ? 'Symlink target is broken or unavailable.' : 'Only regular files can be viewed or downloaded.';
 export function nameCell(entry) {
  const cell = el('span',{role:'gridcell',class:'name',title:entry.path});
  const glyph = entry.isSymlink ? '🔗' : isDirectory(entry) ? '📁' : entry.type === 'file' ? '📄' : '⚙';
  cell.append(el('span',{'aria-hidden':'true',class:'badge'},glyph));
- const broken = entry.isSymlink && !entry.targetType;
+ const broken = isSymlink(entry) && !entry.linkResolved;
  cell.append(el('span',{class:`nameText${broken ? ' broken' : ''}`},entry.name));
  if (entry.class === 'protected') cell.append(el('span',{class:'badge',title:'Protected system path','aria-label':'Protected system path'},'🛡'));
  if (entry.mountPoint) cell.append(el('span',{class:'badge',title:'Mount point','aria-label':'Mount point'},'⏏'));

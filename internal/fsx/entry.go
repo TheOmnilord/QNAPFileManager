@@ -124,7 +124,11 @@ type ListOptions struct {
 	ResolveLinks bool   `json:"resolveLinks,omitempty"`
 	Sort         string `json:"sort,omitempty"`
 	Desc         bool   `json:"desc,omitempty"`
-	Offset       int    `json:"offset,omitempty"`
+	// DirsFirst groups directories above everything else, whatever the sort
+	// key and whatever Desc says — reversing that grouping is not what anyone
+	// means by "sort descending".
+	DirsFirst bool `json:"dirsFirst,omitempty"`
+	Offset    int  `json:"offset,omitempty"`
 	// Limit defaults to DefaultListLimit and is capped at MaxListLimit.
 	Limit int `json:"limit,omitempty"`
 }

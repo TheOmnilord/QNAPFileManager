@@ -42,8 +42,9 @@ type Web struct {
 	// ProxyPrefix is QPKG_PROXY_PATH, e.g. "/qnapfilemanager". The mux is
 	// served at both "/" and the prefix, so it works whether or not QTS's
 	// generated rule strips it. No trailing slash.
-	ProxyPrefix string     `json:"proxyPrefix"`
-	BreakGlass  BreakGlass `json:"breakGlass"`
+	ProxyPrefix    string     `json:"proxyPrefix"`
+	FrameAncestors []string   `json:"frameAncestors,omitempty"`
+	BreakGlass     BreakGlass `json:"breakGlass"`
 }
 
 // BreakGlass is the second listener. It exists because this is the tool an

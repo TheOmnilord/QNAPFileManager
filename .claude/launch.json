@@ -13,7 +13,9 @@
         "-jail",
         "testdata/fakeroot",
         "-addr",
-        "127.0.0.1:8899"
+        "127.0.0.1:8899",
+        "-impersonate",
+        "sveinung"
       ],
       "port": 8899
     }

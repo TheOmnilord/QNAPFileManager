@@ -42,17 +42,14 @@ func TestIsWorkerInvocation(t *testing.T) {
 	}
 }
 
-func TestRunWorkerNotImplemented(t *testing.T) {
+func TestRunWorkerRejectsInvalidUID(t *testing.T) {
 	var out, errOut bytes.Buffer
-	code := runWorker([]string{"-worker", "-uid", "1000"}, &out, &errOut)
+	code := runWorker([]string{"-worker", "-uid", "-1"}, &out, &errOut)
 	if code != 2 {
 		t.Fatalf("exit code = %d, want 2", code)
 	}
-	if !bytes.Contains(out.Bytes(), []byte("worker mode not implemented")) {
-		t.Fatalf("stdout = %q", out.String())
-	}
-	if !bytes.Contains(out.Bytes(), []byte("1000")) {
-		t.Fatalf("the uid must be reported, got %q", out.String())
+	if !bytes.Contains(errOut.Bytes(), []byte("uid -1")) {
+		t.Fatalf("the rejected uid must be reported, got %q", errOut.String())
 	}
 }
 
@@ -103,7 +100,7 @@ func TestSessionReflectsReadOnlyOff(t *testing.T) {
 
 func TestUnknownRouteIs404JSON(t *testing.T) {
 	s := newServer(config.Default(), fsx.Root{}, log.New(io.Discard, "", 0))
-	for _, p := range []string{"/", "/api/fs/list", "/index.html"} {
+	for _, p := range []string{"/missing", "/api/missing"} {
 		rec := httptest.NewRecorder()
 		s.handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, p, nil))
 		if rec.Code != http.StatusNotFound {
@@ -122,11 +119,8 @@ func TestSessionRejectsWrongMethod(t *testing.T) {
 	s := newServer(config.Default(), fsx.Root{}, log.New(io.Discard, "", 0))
 	rec := httptest.NewRecorder()
 	s.handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/session", nil))
-	if rec.Code != http.StatusMethodNotAllowed {
-		t.Fatalf("status = %d, want 405", rec.Code)
-	}
-	if a := rec.Header().Get("Allow"); a == "" {
-		t.Error("a 405 must name the methods it allows")
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 before method dispatch", rec.Code)
 	}
 }
 

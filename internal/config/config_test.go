@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -45,7 +46,7 @@ func TestLoadMissingFileIsDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("a missing config is the first-run state, not an error: %v", err)
 	}
-	if c != Default() {
+	if !reflect.DeepEqual(c, Default()) {
 		t.Fatalf("Load = %+v, want the defaults", c)
 	}
 }

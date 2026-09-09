@@ -15,13 +15,21 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
 
+	"qnapfilemanager/internal/backend"
 	"qnapfilemanager/internal/config"
 	"qnapfilemanager/internal/fsx"
+	"qnapfilemanager/internal/idmap"
 	"qnapfilemanager/internal/logfile"
+	"qnapfilemanager/internal/platform"
+	"qnapfilemanager/internal/qtsauth"
+	"qnapfilemanager/internal/web"
+	"qnapfilemanager/internal/worker"
+	"qnapfilemanager/internal/workerpool"
 )
 
 // version is set by the linker: -X main.version=$VERSION. "dev" is what a
@@ -99,9 +107,7 @@ func isWorkerInvocation(args []string) bool {
 	return false
 }
 
-// runWorker is the entry point of an impersonated worker process. The worker
-// milestone fills this in; until then it exits non-zero so a front-end that
-// spawns one gets a clear failure rather than a process that sits there.
+// runWorker consumes the inherited socket only after checking its effective uid.
 func runWorker(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("worker", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -110,8 +116,31 @@ func runWorker(args []string, stdout, stderr io.Writer) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	fmt.Fprintf(stdout, "worker mode not implemented (uid %d)\n", *uid)
-	return 2
+	if *uid < 0 || runtime.GOOS != "linux" || os.Getuid() != *uid {
+		fmt.Fprintf(stderr, "worker identity mismatch or unsupported platform (uid %d)\n", *uid)
+		return 2
+	}
+	file := os.NewFile(3, "qfm-worker")
+	if file == nil {
+		fmt.Fprintln(stderr, "missing worker socket")
+		return 2
+	}
+	conn, err := net.FileConn(file)
+	file.Close()
+	if err != nil {
+		fmt.Fprintf(stderr, "worker socket: %v\n", err)
+		return 2
+	}
+	defer conn.Close()
+	if _, ok := conn.(*net.UnixConn); !ok {
+		fmt.Fprintln(stderr, "worker requires a Unix socket")
+		return 2
+	}
+	if err := worker.Run(context.Background(), conn, worker.Options{Version: version, Log: log.New(stderr, "worker: ", log.LstdFlags)}); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	return 0
 }
 
 type serveOptions struct {
@@ -213,21 +242,58 @@ func runServe(args []string, stderr io.Writer) error {
 	}
 	logger := log.New(logw, "", log.LstdFlags|log.LUTC)
 
+	ids := idmap.Open(root.OS("/etc/passwd"), root.OS("/etc/group"))
+	var pinned *backend.Principal
+	if o.impersonate != "" {
+		ident, resolveErr := ids.Resolve(context.Background(), o.impersonate)
+		if resolveErr != nil {
+			if runtime.GOOS != "windows" || !root.Jailed() {
+				return fmt.Errorf("resolving -impersonate: %w", resolveErr)
+			}
+			// Windows has no Unix credentials. This label is confined to the dev jail;
+			// it is never a root fallback or a simulation of kernel permissions.
+			ident = idmap.Ident{Name: o.impersonate, UID: 1000, GID: 1000, Groups: []int{1000}}
+			logger.Printf("Windows dev identity %q uses the current Windows account; Unix permissions are not simulated", o.impersonate)
+		}
+		pinned = &backend.Principal{User: ident.Name, UID: ident.UID, GID: ident.GID, Groups: ident.Groups, Root: false}
+	}
+	var verifier *qtsauth.Verifier
+	if runtime.GOOS == "linux" && cfg.Auth.Mode != config.AuthLocal {
+		client := qtsauth.Detect("/etc/config/uLinux.conf")
+		if cfg.Auth.QTSPort != 0 {
+			client = qtsauth.New(fmt.Sprintf("http://127.0.0.1:%d", cfg.Auth.QTSPort))
+		}
+		verifier = qtsauth.NewVerifier(client)
+	}
+	plat := platform.Detect()
+	b := workerpool.New(cfg, root, plat, ids)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		if err := b.Shutdown(ctx); err != nil {
+			logger.Printf("worker shutdown: %v", err)
+		}
+	}()
 	srv := newServer(cfg, root, logger)
+	srv.frontend = web.New(cfg, poolBackend{b}, verifier, ids, plat, pinned, version, logger).Handler()
 	return srv.run(context.Background())
 }
 
-// server is the placeholder front-end. It answers /api/session so the CI smoke
-// test and the dev loop have something real to talk to; internal/web replaces
-// it wholesale in M1.
+// server owns listener lifetime; internal/web owns the HTTP application.
 type server struct {
-	cfg    config.Config
-	root   fsx.Root
-	logger *log.Logger
+	cfg      config.Config
+	root     fsx.Root
+	logger   *log.Logger
+	frontend http.Handler
 }
 
+// Adapt the pool's concrete diagnostic slice to web's optional Stats contract.
+type poolBackend struct{ *workerpool.Pool }
+
+func (b poolBackend) Stats() any { return b.Pool.Stats() }
+
 func newServer(cfg config.Config, root fsx.Root, logger *log.Logger) *server {
-	return &server{cfg: cfg, root: root, logger: logger}
+	return &server{cfg: cfg, root: root, logger: logger, frontend: web.New(cfg, nil, nil, nil, nil, nil, version, logger).Handler()}
 }
 
 // sessionResponse is the shape the UI polls on first load.
@@ -237,38 +303,7 @@ type sessionResponse struct {
 	ReadOnly      bool   `json:"readOnly"`
 }
 
-func (s *server) handler() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/api/session", s.handleSession)
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		writeJSONError(w, http.StatusNotFound, "not_found", "no such endpoint")
-	})
-	if p := s.cfg.Web.ProxyPrefix; p != "" {
-		// QTS's generated Apache rule may or may not strip the prefix
-		// (identity plan §5.2, still to be verified on the NAS), so the mux is
-		// mounted under both. StripPrefix hands the inner mux the same paths
-		// either way.
-		outer := http.NewServeMux()
-		outer.Handle(p+"/", http.StripPrefix(p, mux))
-		outer.Handle(p, http.RedirectHandler(p+"/", http.StatusMovedPermanently))
-		outer.Handle("/", mux)
-		return outer
-	}
-	return mux
-}
-
-func (s *server) handleSession(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		w.Header().Set("Allow", "GET, HEAD")
-		writeJSONError(w, http.StatusMethodNotAllowed, "bad_request", "use GET")
-		return
-	}
-	writeJSON(w, http.StatusOK, sessionResponse{
-		Authenticated: false,
-		Version:       version,
-		ReadOnly:      s.cfg.ReadOnly,
-	})
-}
+func (s *server) handler() http.Handler { return s.frontend }
 
 func (s *server) run(ctx context.Context) error {
 	ln, err := net.Listen("tcp", s.cfg.Web.Listen)

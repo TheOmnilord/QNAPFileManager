@@ -15,7 +15,7 @@ env:
   # Pinned to the exact patch: govulncheck gates stdlib advisories against
   # whatever toolchain built the tree, so a floating minor means a Go security
   # release reddens CI until the runner image catches up.
-  GO_VERSION: '1.26.5'
+  GO_VERSION: '1.26.8'
 
 jobs:
   test:
@@ -99,8 +99,35 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
       - run: sudo -E env "PATH=$PATH" go test ./internal/workerpool/... ./internal/fsops/... ./internal/worker/... -run . -count=1
 
+  # QuTS hero mounts one ZFS dataset per shared folder, and that single fact
+  # drives the crossing rule, the EXDEV pre-flight, the trash root and the
+  # aclmode warning (PLAN.md decisions 9-11). Synthetic mountinfo proves the
+  # parser, not the kernel — so this job builds a real file-backed pool and
+  # runs the tests gated by QFM_ZFS_TEST against it. It is the only hero
+  # coverage that exists without hardware.
+  test-zfs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      # Installs zfsutils-linux, loads the module (falling back to
+      # linux-modules-extra for the running kernel), mounts a tmpfs on /share
+      # the way QTS has it and builds two pools with three datasets.
+      - name: Build the file-backed ZFS fixture
+        run: sudo bash scripts/ci-zfs-setup.sh
+      # Root because the pool and its datasets are root-owned, and because the
+      # mount table under test describes this machine. sudo -E env "PATH=$PATH"
+      # keeps the toolchain setup-go put on the runner's PATH, which a plain
+      # sudo drops with secure_path.
+      - name: Run the ZFS integration tests
+        run: sudo -E env "PATH=$PATH" QFM_ZFS_TEST=1 go test -count=1 -run 'ZFS' ./internal/platform/... ./internal/fsops/...
+
   package:
-    needs: [test, test-windows, test-linux-root]
+    needs: [test, test-windows, test-linux-root, test-zfs]
     runs-on: ubuntu-latest
     permissions:
       contents: write # attaching the QPKGs to a release

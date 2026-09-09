@@ -1,0 +1,15 @@
+# Shell scripts and QPKG control files must be LF — they run on the NAS
+# (busybox sh) and inside Linux CI containers.
+*.sh text eol=lf
+qpkg/package_routines text eol=lf
+qpkg/qpkg.cfg text eol=lf
+
+# Keep source, docs and workflow files LF across dev machines.
+*.go text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.html text eol=lf
+*.css text eol=lf
+*.js text eol=lf

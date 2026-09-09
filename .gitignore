@@ -1,0 +1,23 @@
+# Build output
+/dist/
+/qpkg/build/
+/qpkg/x86_64/
+/qpkg/arm_64/
+*.qpkg
+
+# Local config and daemon state written beside it by `serve` (see .claude/launch.json).
+config.json
+dev-config.json
+audit.jsonl
+*.log
+*.log.1
+self-signed.crt
+self-signed.key
+
+# Generated fake root for the Windows dev loop (scripts/make-fakeroot.ps1).
+/testdata/fakeroot/
+
+# Editor and OS noise
+.vscode/
+.idea/
+Thumbs.db

@@ -1194,3 +1194,221 @@ func TestUnknownOpIsUnsupported(t *testing.T) {
 		t.Fatalf("err = %v, want ErrUnsupported", err)
 	}
 }
+
+// stuckWorker is a worker that answers every frame and never dies: its kill
+// closes the pipe and returns, and exited stays open — which is what a process
+// parked in uninterruptible filesystem I/O looks like from here. Signals do not
+// reach it, and no amount of waiting makes it go.
+//
+// The returned release ends the pretence, so the test can watch the slot come
+// back and so nothing is left blocked when the test is over.
+func stuckWorker(t *testing.T, who backend.Principal) (*client, func()) {
+	t.Helper()
+	ours, theirs := net.Pipe()
+	c := newClient(who)
+	c.tr = wproto.NewTransport(ours)
+	c.pid = 4242
+	c.kill = func(context.Context) { _ = theirs.Close() }
+
+	peer := wproto.NewTransport(theirs)
+	go func() {
+		for {
+			f, files, err := peer.Read()
+			closeAll(files)
+			if err != nil {
+				return
+			}
+			var body any
+			if f.Op == wproto.OpHello {
+				body = wproto.HelloResp{PID: 4242, UID: who.UID, GID: who.GID}
+			}
+			resp, err := wproto.NewOK(f.ID, body)
+			if err != nil {
+				return
+			}
+			if err := peer.Write(resp, nil); err != nil {
+				return
+			}
+		}
+	}()
+
+	var once sync.Once
+	release := func() { once.Do(func() { close(c.exited) }) }
+	t.Cleanup(release)
+	return c, release
+}
+
+// TestAWorkerThatWillNotExitKeepsItsSlot: the retirement accounting used to
+// give a slot back after a timeout whether or not the process had gone. A
+// worker stuck in uninterruptible I/O therefore survived while its replacement
+// started beside it — over the Max an operator set on a 1 GB NAS — and, worse,
+// the pool had dropped its last reference to it, so the shutdown that followed
+// could find nothing to wait for. The slot now stays reserved until the kernel
+// says the process is gone.
+func TestAWorkerThatWillNotExitKeepsItsSlot(t *testing.T) {
+	var (
+		mu      sync.Mutex
+		release func()
+	)
+	p, clk := testPool(t, func(o *Options) {
+		o.Max = 1
+		// Short enough that the janitor's own sweep interval (a quarter of it,
+		// floored at a second) comes round promptly.
+		o.IdleTimeout = 4 * time.Second
+		o.newWorker = func(who backend.Principal) (*client, error) {
+			c, rel := stuckWorker(t, who)
+			mu.Lock()
+			release = rel
+			mu.Unlock()
+			return c, nil
+		}
+	})
+	ctx := context.Background()
+	if err := p.Ping(ctx, alice()); err != nil {
+		t.Fatal(err)
+	}
+	c := p.workerForTest(t, alice().Key())
+
+	// Let the janitor retire it, and wait until the signal ladder has run.
+	clk.advance(time.Minute)
+	select {
+	case <-c.gone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the idle worker was never retired")
+	}
+
+	// It has been terminated and it has not exited. Nothing may take its place —
+	// not now, and not after the grace the accounting used to give up at, which
+	// is why this waits past stuckWorkerReport rather than sampling once.
+	bob := backend.Principal{User: "bob", UID: 1002, GID: 1002}
+	time.Sleep(stuckWorkerReport + 2*time.Second)
+	if err := p.Ping(ctx, bob); !errors.Is(err, ErrWorkerBusy) {
+		t.Fatalf("err = %v, want ErrWorkerBusy: a worker that has not exited still holds its slot", err)
+	}
+	if n := p.liveForTest(); n != 1 {
+		t.Fatalf("%d live workers, want 1", n)
+	}
+	deadline := time.Now()
+
+	// Once the kernel finally lets go, the slot comes back on its own.
+	mu.Lock()
+	rel := release
+	mu.Unlock()
+	rel()
+	for {
+		if err := p.Ping(ctx, bob); err == nil {
+			break
+		} else if !errors.Is(err, ErrWorkerBusy) {
+			t.Fatalf("ping after the stuck worker exited: %v", err)
+		}
+		if time.Now().After(deadline.Add(20 * time.Second)) {
+			t.Fatal("the slot was never released after the process exited")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestShutdownCancelsAndAwaitsAPendingStartup: a worker in the middle of its
+// hello lives in p.spawning and nowhere else. Shutdown collected p.workers and
+// p.retiring, so it walked straight past that startup, reported success and
+// closed the jail root — and the process the handshake produced was then
+// registered for termination by a goroutine belonging to a pool that was
+// supposed to be gone.
+func TestShutdownCancelsAndAwaitsAPendingStartup(t *testing.T) {
+	root, _ := testTree(t)
+	started := make(chan *client, 1)
+	p := NewWithOptions(Options{
+		Root:      root,
+		InProcess: true,
+		Logger:    log.New(io.Discard, "", 0),
+		newWorker: func(who backend.Principal) (*client, error) {
+			// The process comes up and then never answers hello — the slow NAS
+			// a shutdown has to be able to interrupt.
+			c := newClient(who)
+			tr := newFakeTransport()
+			c.tr = tr
+			c.kill = func(context.Context) { _ = tr.Close(); close(c.exited) }
+			started <- c
+			return c, nil
+		},
+	})
+
+	pinged := make(chan error, 1)
+	go func() { pinged <- p.Ping(context.Background(), alice()) }()
+
+	var c *client
+	select {
+	case c = <-started:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the startup never began")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	begin := time.Now()
+	if err := p.Shutdown(ctx); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+	if el := time.Since(begin); el >= helloTimeout {
+		t.Fatalf("shutdown took %s: it waited for the handshake to time out rather than cancelling it", el)
+	}
+	select {
+	case <-c.exited:
+	default:
+		t.Fatal("shutdown returned while a worker that was still starting up was running")
+	}
+	if n := p.liveForTest(); n != 0 {
+		t.Fatalf("%d workers left behind by shutdown, want 0", n)
+	}
+	select {
+	case <-pinged:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the request that was starting the worker never returned")
+	}
+}
+
+// TestAFailedWriteRetiresTheWorker: a write that fails or times out leaves the
+// framing desynchronised and the worker on the other end still running its
+// handler. Failing the client settles only this end of the conversation; the
+// process was left for the next acquire or the idle sweep to notice, which for
+// a worker wedged mid-handler could be never.
+func TestAFailedWriteRetiresTheWorker(t *testing.T) {
+	p := NewWithOptions(Options{InProcess: true, CallTimeout: 500 * time.Millisecond, Logger: log.New(io.Discard, "", 0)})
+	t.Cleanup(func() { _ = p.Shutdown(context.Background()) })
+
+	ours, theirs := net.Pipe()
+	t.Cleanup(func() { _ = theirs.Close() })
+	c := newClient(alice())
+	c.tr = wproto.NewTransport(ours)
+	killed := make(chan struct{})
+	c.kill = func(context.Context) { close(killed); close(c.exited) }
+	go c.readLoop(nil)
+
+	// Registered the way a completed spawn would leave it, so the retirement is
+	// visible in the pool's own accounting rather than only in this client.
+	p.mu.Lock()
+	p.workers[c.key] = c
+	p.mu.Unlock()
+
+	if _, _, err := p.call(context.Background(), c, wproto.OpPing, nil); err == nil {
+		t.Fatal("the write must fail against a peer that never reads")
+	} else if !errors.Is(err, fsx.ErrWorkerGone) {
+		t.Fatalf("err = %v, want ErrWorkerGone", err)
+	}
+
+	select {
+	case <-killed:
+	case <-time.After(30 * time.Second):
+		t.Fatal("a terminal write failure left the worker process running")
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		if n := p.liveForTest(); n == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the worker was never taken out of the pool's accounting")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}

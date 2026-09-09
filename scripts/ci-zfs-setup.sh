@@ -110,20 +110,67 @@ ensure_share() {
 # 3. The pools
 # ---------------------------------------------------------------------------
 
+# FIXTURE_PROP is stamped on the root dataset at creation time and is the only
+# thing that makes a pool this script's to modify. A pool that happens to be
+# called qfmpool on somebody's machine is not this fixture, and a script running
+# as root must not decide otherwise from a name.
+FIXTURE_PROP=qfm:fixture
+
+# pool_vdevs <pool> — the full paths of a pool's leaf vdevs, one per line.
+# -P asks for whole paths; the pool's own summary line is the first one and is
+# dropped, and anything that is not a path (a "mirror-0" row) with it.
+pool_vdevs() {
+	zpool list -vHP "$1" 2>/dev/null | awk 'NR > 1 && $1 ~ /^\// { print $1 }'
+}
+
+# assert_ours <pool> <image> — abort unless the imported pool is the fixture
+# this script built: marked with FIXTURE_PROP and backed only by image files in
+# IMG_DIR. Everything that follows (mountpoint changes, dataset creation, file
+# writes) modifies the pool, so nothing may run before this says yes.
+assert_ours() {
+	local pool=$1 img=$2 marker vdevs vd want found=0
+	marker=$(zfs get -H -o value "$FIXTURE_PROP" "$pool" 2>/dev/null || true)
+	[ "$marker" = "1" ] || die "pool $pool exists but is not a fixture built by this script ($FIXTURE_PROP=${marker:-unset}). Refusing to modify it; destroy it by hand (zpool destroy $pool) if it really is disposable."
+	vdevs=$(pool_vdevs "$pool")
+	[ -n "$vdevs" ] || die "pool $pool exists but its vdevs could not be read. Refusing to modify it."
+	want=$(readlink -f "$img" 2>/dev/null || printf '%s' "$img")
+	while IFS= read -r vd; do
+		[ -n "$vd" ] || continue
+		case "$vd" in
+		"$IMG_DIR"/*) ;;
+		*) die "pool $pool is backed by $vd, which is outside $IMG_DIR. Refusing to modify it." ;;
+		esac
+		[ "$vd" = "$want" ] && found=1
+	done <<-EOF
+		$vdevs
+	EOF
+	[ "$found" = 1 ] || die "pool $pool is not backed by $img (vdevs: $(printf '%s' "$vdevs" | tr '\n' ' ')). Refusing to modify it."
+}
+
 # ensure_pool <pool> <image> <mountpoint>
+#
+# A pool is created only when its image file is absent. If the image is there,
+# it is the previous run's fixture and the only correct move is to import it: an
+# import that fails is a fault to report, never permission to delete the image
+# and truncate a replacement over whatever it held.
 ensure_pool() {
 	local pool=$1 img=$2 mp=$3
 	if zpool list -H -o name "$pool" >/dev/null 2>&1; then
 		log "pool $pool is already imported"
-	elif [ -f "$img" ] && zpool import -d "$IMG_DIR" -N -f "$pool" >/dev/null 2>&1; then
-		log "re-imported the existing pool $pool from $img"
+		assert_ours "$pool" "$img"
+	elif [ -e "$img" ]; then
+		log "importing the existing pool $pool from $img"
+		zpool import -d "$IMG_DIR" -N -f "$pool" >/dev/null 2>&1 ||
+			die "$img exists but pool $pool could not be imported from it. Refusing to destroy it and start over: inspect it (zpool import -d $IMG_DIR) and remove $img by hand if it really is disposable."
+		assert_ours "$pool" "$img"
 	else
 		log "creating pool $pool on $img ($IMG_SIZE)"
-		rm -f "$img"
 		truncate -s "$IMG_SIZE" "$img"
 		# -f: the image is a plain file, which zpool otherwise questions.
 		# ashift=12 keeps it quiet about sector sizes on a loop-less vdev.
-		zpool create -f -o ashift=12 -O compression=off -m "$mp" "$pool" "$img"
+		# The marker is set here and nowhere else, so only a pool this script
+		# created can ever pass assert_ours.
+		zpool create -f -o ashift=12 -O compression=off -O "$FIXTURE_PROP=1" -m "$mp" "$pool" "$img"
 	fi
 	# Re-assert the mountpoint on every run: a re-imported pool remembers the
 	# property, but a fresh tmpfs on /share means the directory is gone.

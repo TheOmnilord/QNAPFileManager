@@ -60,7 +60,22 @@ function select(index,event={}) {
   set.has(index) ? set.delete(index) : set.add(index);
  } else { set.clear(); set.add(index); exclude = false; }
  update({selection:set,exclude,focus:index,anchor:event.shiftKey ? state.anchor : index});
- render();
+ syncSelection();
+}
+
+function syncSelection() {
+ // Keep click targets alive so the browser can dispatch a desktop double-click.
+ let hasFocusRow = false;
+ for (const row of $('#listRows').querySelectorAll('[data-idx]')) {
+  const index = Number(row.dataset.idx), active = index === state.focus && navigable(entryAt(index));
+  const isSelected = selected(index);
+  row.classList.toggle('selected',isSelected);
+  row.setAttribute('aria-selected',String(isSelected));
+  row.tabIndex = active ? 0 : -1;
+  if (active) hasFocusRow = true;
+ }
+ $('#list').tabIndex = hasFocusRow ? -1 : 0;
+ if (!state.loading && state.session) status();
 }
 
 function status() {
@@ -86,7 +101,6 @@ export function render() {
  }
  topHeight(start*h); bottomHeight(Math.max(0,state.total-end)*h);
  $('#list').setAttribute('aria-rowcount',String(state.total+1));
- $('#list').tabIndex = navigable(focused()) && state.focus >= start && state.focus < end ? -1 : 0;
  $('#list').setAttribute('aria-busy',String(state.loading));
  const rows = [];
  const needed = new Set();
@@ -100,13 +114,13 @@ export function render() {
   row.addEventListener('click',ev => { select(i,ev); focusRow(); if (matchMedia('(max-width:30rem)').matches && !ev.ctrlKey && !ev.shiftKey) open(e); });
   row.addEventListener('dblclick',() => open(e));
   row.addEventListener('contextmenu',ev => { ev.preventDefault(); select(i); contextMenu(e); });
-  row.addEventListener('focus',() => { if (state.focus !== i) update({focus:i}); });
+  row.addEventListener('focus',() => { if (state.focus !== i) { update({focus:i}); syncSelection(); } });
   rows.push(row);
  }
  $('#listRows').replaceChildren(...rows);
+ syncSelection();
  $('#listEmpty').hidden = state.loading || state.total !== 0;
  if (hadFocus) focusRow();
- if (!state.loading && state.session) status();
  const valid=sessionGuard(),generation=state.generation;
  for (const n of needed) page(n,generation).catch(err => { if (valid() && generation===state.generation) error(err); });
 }
@@ -127,12 +141,15 @@ async function move(index,event) {
   if (index < 0 || index >= state.total) return;
  }
  if (event.ctrlKey || event.metaKey) update({focus:index}); else select(index,event);
- const v = $('#listViewport'),h = rowHeight();
+ const v = $('#listViewport'),h = rowHeight(), previousScroll = v.scrollTop;
  if (index*h < v.scrollTop) v.scrollTop = index*h;
  if ((index+1)*h > v.scrollTop+v.clientHeight) v.scrollTop = (index+1)*h-v.clientHeight;
  try { await page(Math.floor(index/pageSize),generation); }
  catch(err) { if (valid() && generation===state.generation) error(err); return; }
- if (valid() && generation===state.generation) { render(); focusRow(); }
+ if (valid() && generation===state.generation) {
+  if (v.scrollTop !== previousScroll) render(); else syncSelection();
+  focusRow();
+ }
 }
 
 export function contextMenu(e) {
@@ -169,12 +186,12 @@ export function initList() {
   case 'PageUp': index=state.focus-Math.floor($('#listViewport').clientHeight/rowHeight()); break;
   case 'PageDown': index=state.focus+Math.floor($('#listViewport').clientHeight/rowHeight()); break;
   case ' ': select(state.focus,{toggle:true}); focusRow(); break;
-  case 'a': case 'A': if (!ctrl) return; update({exclude:true,selection:new Set()}); render(); break;
+  case 'a': case 'A': if (!ctrl) return; update({exclude:true,selection:new Set()}); syncSelection(); break;
   case 'Enter': if (ev.altKey) properties(focused()); else open(focused()); break;
   case 'F4': view(focused()); break;
   case 'ContextMenu': contextMenu(focused()); break;
   case 'F10': if (!ev.shiftKey) return; contextMenu(focused()); break;
-  case 'Escape': update({selection:new Set(),exclude:false}); render(); break;
+  case 'Escape': update({selection:new Set(),exclude:false}); syncSelection(); break;
   default:
    if (ev.key.length===1 && !ctrl && !ev.altKey) {
     typeAhead = Date.now()-typedAt > 700 ? ev.key : typeAhead+ev.key; typedAt=Date.now();

@@ -128,3 +128,39 @@ func TestDownloadStreamCancellation(t *testing.T) {
 		t.Fatal("cancelled download remained blocked reading the pipe")
 	}
 }
+
+func TestDownloadStreamHEADDoesNotRead(t *testing.T) {
+	s, _ := fixture(t, true)
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	defer writer.Close() // Keep the empty pipe open: any read would block.
+	s.backend = downloadBackend{open: func() (*os.File, fsx.Entry, error) {
+		return reader, fsx.Entry{Type: "file"}, nil
+	}}
+	req := httptest.NewRequest(http.MethodHead, "/?path=/stream", nil)
+	req.Header.Set("Range", "bytes=1-3")
+	w := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.download(w, req, &session{})
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		_ = writer.Close()
+		<-done
+		t.Fatal("HEAD tried to consume the stream")
+	}
+	if w.Code != 200 || w.Body.Len() != 0 || w.Header().Get("Content-Type") != "application/octet-stream" || !strings.HasPrefix(w.Header().Get("Content-Disposition"), "attachment;") {
+		t.Fatalf("HEAD response: %d %v %s", w.Code, w.Header(), w.Body)
+	}
+	for _, header := range []string{"Content-Length", "Content-Range", "Accept-Ranges"} {
+		if w.Header().Get(header) != "" {
+			t.Fatalf("stream HEAD advertised %s", header)
+		}
+	}
+}

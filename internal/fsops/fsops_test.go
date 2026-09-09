@@ -826,6 +826,46 @@ func TestLinkPartsKeepsTheTargetComponentsInOrder(t *testing.T) {
 	}
 }
 
+// TestAnAbsoluteTargetClimbingOutOfTheJailIsRefused: under -jail the base is an
+// ordinary directory with a real parent, so a link target of "<base>/../report"
+// names the host's /report — outside the jail, and to be refused. Staying at the
+// base instead, the way "/.." stays at "/", quietly substituted <base>/report:
+// a different file, which the UI would then have downloaded under the name of
+// the one that should have been refused.
+func TestAnAbsoluteTargetClimbingOutOfTheJailIsRefused(t *testing.T) {
+	requireSymlinks(t)
+	requirePOSIXLinks(t)
+	outer := tempDir(t)
+	mkdir(t, outer, "jail")
+	base := filepath.Join(outer, "jail")
+	write(t, outer, "report", "the host's report")
+	write(t, base, "report", "the jail's report")
+	sep := string(filepath.Separator)
+	if err := os.Symlink(base+sep+".."+sep+"report", filepath.Join(base, "ptr")); err != nil {
+		t.Fatal(err)
+	}
+	r := newRoot(t, base)
+	ctx := context.Background()
+
+	if e, err := StatFollow(ctx, r, nil, "/ptr"); !errors.Is(err, fsx.ErrOutsideRoot) {
+		t.Fatalf("entry %+v, err = %v, want ErrOutsideRoot", e, err)
+	}
+	// The link itself is still describable, and resolves to nothing.
+	e, err := Stat(ctx, r, nil, "/ptr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !e.IsSymlink || e.LinkResolved != "" {
+		t.Errorf("entry = %+v, want a symlink with no resolved path", e)
+	}
+	// The refusal is the jail's, not a new rule about "..": unjailed, the base
+	// is the filesystem root, which really is its own parent, and the walk stays
+	// where it is exactly as the kernel does for "/..".
+	if r.Jailed() != true {
+		t.Fatal("the fixture must be jailed for this to mean anything")
+	}
+}
+
 // TestDotDotAfterAnUntraversableComponentIsRefused: ".." is applied to wherever
 // the components before it landed, and a component that landed nowhere is not
 // something to climb out of. The kernel answers "/nowhere/../b.txt" with ENOENT

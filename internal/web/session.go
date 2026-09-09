@@ -30,6 +30,7 @@ type session struct {
 	who                     backend.Principal
 	admin, partial          bool
 	dead                    atomic.Bool
+	authRequests            atomic.Int32
 	// Index metadata is immutable after insertion; list links require Server.mu.
 	user             string
 	order, userOrder *list.Element
@@ -160,12 +161,20 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (*session,
 	old := s.lookupSessionLocked(id, binding)
 	s.mu.Unlock()
 	if old != nil {
-		return s.authenticateSession(w, r, old, cred, hasCred)
-	}
-	if s.pinned == nil {
-		if err := s.authFailures.allow(ClientIP(r), s.now()); err != nil {
-			return nil, err
+		// Reserve before the shared gate: queued admission also counts against
+		// this session's allowance (one validator plus eight followers).
+		n := old.authRequests.Add(1)
+		defer old.authRequests.Add(-1)
+		if n > maxSessionAuthWaiters+1 {
+			return nil, qtsauth.ErrOverloaded
 		}
+	}
+	if err := s.authAdmission.enter(r.Context()); err != nil {
+		return nil, err
+	}
+	defer s.authAdmission.leave()
+	if old != nil {
+		return s.authenticateSession(w, r, old, cred, hasCred)
 	}
 	if s.pinned == nil && !hasCred {
 		return nil, nil
@@ -229,6 +238,14 @@ func (s *Server) authenticateSession(w http.ResponseWriter, r *http.Request, old
 			if ctxErr := r.Context().Err(); ctxErr != nil {
 				old.mu.Unlock()
 				return nil, ctxErr
+			}
+			if errors.Is(err, errAuthRateLimited) {
+				// Rate limiting here represents a verified failure, not temporary
+				// admission pressure. Revoke the session even when reporting 429.
+				old.mu.Unlock()
+				s.destroy(old.id)
+				s.cookie(w, r, "", -1)
+				return nil, err
 			}
 			if errors.Is(err, qtsauth.ErrOverloaded) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				old.mu.Unlock()

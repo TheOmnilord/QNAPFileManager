@@ -173,7 +173,7 @@ type Pool struct {
 
 	mu       sync.Mutex
 	workers  map[string]*client
-	spawning map[string]chan struct{}
+	spawning map[string]*startup
 	// retiring holds the workers that have left p.workers but whose process is
 	// not gone yet: one superseded by a credential change and still finishing
 	// the calls it accepted, one evicted to make room, one reaped as idle, one
@@ -194,6 +194,20 @@ type Pool struct {
 type budget struct {
 	times        []time.Time
 	blockedUntil time.Time
+}
+
+// startup is one worker coming up: the channel every other caller for that uid
+// waits on, and the handle Shutdown needs to stop waiting for the NAS.
+//
+// The cancel is the point. A startup runs on the context of whichever request
+// asked for the worker, so a shutdown had nothing to pull on: it collected the
+// workers it could see, reported success, and closed the jail root while a
+// process it had never heard of was still finishing its handshake — and that
+// process was then registered for termination by a goroutine running after the
+// pool was supposed to be gone.
+type startup struct {
+	done   chan struct{}
+	cancel context.CancelFunc
 }
 
 // New builds the pool the daemon runs with. plat and ids may be nil; the
@@ -239,7 +253,7 @@ func NewWithOptions(o Options) *Pool {
 	p := &Pool{
 		opts:        o.normalise(),
 		workers:     map[string]*client{},
-		spawning:    map[string]chan struct{}{},
+		spawning:    map[string]*startup{},
 		retiring:    map[*client]struct{}{},
 		budgets:     map[string]*budget{},
 		stopJanitor: make(chan struct{}),
@@ -307,18 +321,60 @@ func (p *Pool) reapIdle() {
 // terminate time instead — which is where the accounting used to end — let the
 // replacement start while the old process was still alive, so an operator's
 // Max was quietly a ceiling on registered workers rather than on processes.
+//
+// It waits for exited however long that takes. A worker parked in
+// uninterruptible filesystem I/O — a wedged NFS mount, a disk that stopped
+// answering — survives SIGKILL until the kernel lets go of it, and it is still a
+// process holding a user's credentials, its memory and the jail's descriptor
+// while it does. Handing its slot to a replacement anyway put the pool over the
+// Max an operator set on a 1 GB NAS and, worse, lost the last reference to it:
+// Shutdown could then find nothing to wait for. So the slot stays reserved and
+// the fact is logged, loudly and repeatedly, which is the honest report of a
+// machine that has a real problem.
 func (p *Pool) stopRetired(c *client) {
 	p.terminate(c)
-	select {
-	case <-c.exited:
-	case <-time.After(termGrace + termGrace):
-		// The signal ladder has already run. Holding the slot for ever over a
-		// process that will not die would take the pool down with it.
-		p.opts.Logger.Printf("workerpool: the retired worker for %s (pid %d) has not exited; releasing its slot anyway", c.key, c.pid)
-	}
+	p.awaitExit(c)
 	p.mu.Lock()
 	delete(p.retiring, c)
 	p.mu.Unlock()
+}
+
+// stuckWorkerReport is how often a worker that will not die is complained about.
+const stuckWorkerReport = termGrace + termGrace
+
+// awaitExit waits for a terminated worker's process to be gone, complaining
+// once per stuckWorkerReport until it is.
+func (p *Pool) awaitExit(c *client) {
+	t := time.NewTicker(stuckWorkerReport)
+	defer t.Stop()
+	for {
+		select {
+		case <-c.exited:
+			return
+		case <-t.C:
+			p.opts.Logger.Printf("workerpool: the retired worker for %s (pid %d) has not exited after the full signal ladder — it is probably stuck in uninterruptible I/O. Its slot stays reserved until the kernel releases it.", c.key, c.pid)
+		}
+	}
+}
+
+// stopRetiredWait stops a retired worker and waits for it, but not for ever:
+// the callers are requests, and a request must not hang on a process that will
+// not die. Only the wait is bounded. The slot is released by stopRetired and by
+// nothing else, so giving up here leaves the worker counted — which is what
+// makes the next makeRoomLocked refuse rather than exceed Max.
+func (p *Pool) stopRetiredWait(ctx context.Context, c *client) {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		p.stopRetired(c)
+	}()
+	t := time.NewTimer(stuckWorkerReport)
+	defer t.Stop()
+	select {
+	case <-done:
+	case <-ctx.Done():
+	case <-t.C:
+	}
 }
 
 // Shutdown stops every worker: bye first, then the signals. It is safe to call
@@ -330,6 +386,35 @@ func (p *Pool) Shutdown(ctx context.Context) error {
 		return nil
 	}
 	p.closed = true
+	// A worker that is still coming up is a process (or, in-process, a
+	// goroutine) that nothing else in this function can see: it is not in
+	// p.workers until its hello has been answered. Cancelling the startups and
+	// waiting for them is what turns them into workers this can collect —
+	// without it, Shutdown returned success and closed the jail root while a
+	// handshake was still running, and the process it produced was registered
+	// for termination afterwards, by a goroutine belonging to a pool that was
+	// supposed to be gone.
+	starting := make([]*startup, 0, len(p.spawning))
+	for _, s := range p.spawning {
+		starting = append(starting, s)
+	}
+	p.mu.Unlock()
+
+	close(p.stopJanitor)
+	<-p.janitorGone
+
+	for _, s := range starting {
+		s.cancel()
+	}
+	for _, s := range starting {
+		select {
+		case <-s.done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	p.mu.Lock()
 	all := make([]*client, 0, len(p.workers)+len(p.retiring))
 	for key, c := range p.workers {
 		all = append(all, c)
@@ -338,14 +423,13 @@ func (p *Pool) Shutdown(ctx context.Context) error {
 	// A worker that is on its way out is still a process holding a user's
 	// credentials and still holding the jail's descriptor. Collecting only
 	// p.workers left those behind, and Shutdown reported success over them.
+	// The startups awaited above land here too: p.closed was already set when
+	// they finished, so each one went straight into p.retiring.
 	for c := range p.retiring {
 		all = append(all, c)
 		delete(p.retiring, c)
 	}
 	p.mu.Unlock()
-
-	close(p.stopJanitor)
-	<-p.janitorGone
 
 	done := make(chan struct{})
 	go func() {
@@ -607,7 +691,7 @@ func (p *Pool) get(ctx context.Context, who backend.Principal) (c *client, fresh
 						// before the retry rather than beside it, because the
 						// slot it still holds is the one the replacement is
 						// about to ask for.
-						p.stopRetired(stale)
+						p.stopRetiredWait(ctx, stale)
 					}
 					continue
 				}
@@ -625,12 +709,12 @@ func (p *Pool) get(ctx context.Context, who backend.Principal) (c *client, fresh
 			go p.stopRetired(corpse)
 			continue
 		}
-		if wait, ok := p.spawning[key]; ok {
+		if s, ok := p.spawning[key]; ok {
 			// Single-flight: ten parallel requests from one page load spawn
 			// one worker, not ten.
 			p.mu.Unlock()
 			select {
-			case <-wait:
+			case <-s.done:
 			case <-ctx.Done():
 				return nil, false, 0, ctx.Err()
 			}
@@ -653,14 +737,18 @@ func (p *Pool) get(ctx context.Context, who backend.Principal) (c *client, fresh
 			// take, so it is not handed over until its process has actually
 			// gone. Starting the replacement beside it was how Max became a
 			// count of map entries rather than of processes.
-			p.stopRetired(victim)
+			p.stopRetiredWait(ctx, victim)
 			continue
 		}
-		wait := make(chan struct{})
-		p.spawning[key] = wait
+		// The startup runs on a context of its own, derived from the caller's,
+		// so that Shutdown can end a handshake nobody else can reach.
+		sctx, scancel := context.WithCancel(ctx)
+		s := &startup{done: make(chan struct{}), cancel: scancel}
+		p.spawning[key] = s
 		p.mu.Unlock()
 
-		nc, err := p.spawn(ctx, who)
+		nc, err := p.spawn(sctx, who)
+		scancel()
 
 		p.mu.Lock()
 		delete(p.spawning, key)
@@ -698,7 +786,11 @@ func (p *Pool) get(ctx context.Context, who backend.Principal) (c *client, fresh
 			p.retiring[nc] = struct{}{}
 		}
 		p.mu.Unlock()
-		close(wait)
+		// Closing this is what releases both the other callers for this uid and
+		// a Shutdown waiting for the startup. Everything the two of them need to
+		// see — p.workers on success, p.retiring on failure — is already in
+		// place above, under the lock.
+		close(s.done)
 
 		if err != nil {
 			if nc != nil {
@@ -790,7 +882,7 @@ func (p *Pool) retire(c *client, cause error) {
 	p.retiring[c] = struct{}{}
 	p.mu.Unlock()
 	c.fail(cause)
-	p.stopRetired(c)
+	p.stopRetiredWait(context.Background(), c)
 }
 
 // spawn creates one worker and completes the hello handshake, so a worker that

@@ -17,5 +17,18 @@ func openFinal(rt *os.Root, rel string) (*os.File, error) {
 	return rt.OpenFile(rel, os.O_RDONLY, 0)
 }
 
+// checkTraversable off Linux asks the same question with the only tool there
+// is: open the directory through the root and let the host's own access rules
+// answer. There is no O_PATH to ask for a handle without asking for the
+// contents, so this is stricter than the Linux version — which is the safe
+// direction, and this platform is the dev loop rather than the NAS.
+func checkTraversable(rt *os.Root, dir string) error {
+	d, err := rt.Open(dir)
+	if err != nil {
+		return err
+	}
+	return d.Close()
+}
+
 // clearNonblock has nothing to undo where the open was blocking to begin with.
 func clearNonblock(*os.File) error { return nil }

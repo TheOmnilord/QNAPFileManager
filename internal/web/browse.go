@@ -198,7 +198,7 @@ func (s *Server) download(w http.ResponseWriter, r *http.Request, sess *session)
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", `attachment; filename="`+ascii+`"; filename*=UTF-8''`+strings.ReplaceAll(url.QueryEscape(strings.ToValidUTF8(name, "_")), "+", "%20"))
 	// procfs/sysfs may report zero or misleading lengths, or reject SEEK_END.
-	stream := e.Size == 0
+	stream := pseudoFilesystem(f) || e.Size == 0
 	if !stream {
 		size, seekErr := f.Seek(0, io.SeekEnd)
 		stream = seekErr != nil || size != e.Size
@@ -210,14 +210,17 @@ func (s *Server) download(w http.ResponseWriter, r *http.Request, sess *session)
 		}
 	}
 	if stream {
-		// Closing the descriptor also interrupts a blocked pipe/pseudo-file read.
-		stop := context.AfterFunc(r.Context(), func() { _ = f.Close() })
-		defer stop()
 		w.WriteHeader(http.StatusOK) // Ignore Range for streams of unknown length.
 		// Flush headers so net/http cannot infer Content-Length for a short body.
 		if flusher, ok := w.(http.Flusher); ok {
 			flusher.Flush()
 		}
+		if r.Method == http.MethodHead {
+			return
+		}
+		// Closing interrupts pipe reads; kernel pseudo-file reads may not cancel.
+		stop := context.AfterFunc(r.Context(), func() { _ = f.Close() })
+		defer stop()
 		_, _ = io.Copy(w, downloadReader{ctx: r.Context(), reader: f})
 		return
 	}

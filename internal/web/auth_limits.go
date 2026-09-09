@@ -11,17 +11,17 @@ import (
 )
 
 const (
-	defaultAuthTimeout = 10 * time.Second
-	authFailureBurst   = 20
-	authFailureWindow  = time.Minute
-	maxFailureClients  = 4096
+	defaultAuthTimeout    = 10 * time.Second
+	authFailureBurst      = 20
+	authFailureWindow     = time.Minute
+	maxFailureClients     = 4096
+	maxSessionAuthWaiters = 8
 )
 
 var errAuthRateLimited = errors.New("authentication failure rate exceeded")
 
 type failureBucket struct {
-	tokens                float64
-	updated, blockedUntil time.Time
+	credentials map[string]time.Time
 }
 
 type failureLimiter struct {
@@ -36,59 +36,47 @@ func (s *Server) now() time.Time {
 	return time.Now()
 }
 
-func (b *failureBucket) refill(now time.Time) {
-	if now.After(b.updated) {
-		b.tokens = min(authFailureBurst, b.tokens+now.Sub(b.updated).Seconds()*authFailureBurst/authFailureWindow.Seconds())
-		b.updated = now
+func (b *failureBucket) prune(now time.Time) {
+	for key, expires := range b.credentials {
+		if !now.Before(expires) {
+			delete(b.credentials, key)
+		}
 	}
 }
 
-func (l *failureLimiter) allow(ip string, now time.Time) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if b := l.clients[ip]; b != nil {
-		if now.Before(b.blockedUntil) {
-			return errAuthRateLimited
-		}
-		return nil
-	}
-	// Keep the limiter itself bounded without evicting a live client's ban.
-	if len(l.clients) >= maxFailureClients {
-		for key, b := range l.clients {
-			b.refill(now)
-			if !now.Before(b.blockedUntil) && b.tokens >= authFailureBurst {
-				delete(l.clients, key)
-			}
-		}
-		if len(l.clients) >= maxFailureClients {
-			return qtsauth.ErrOverloaded
-		}
-	}
-	return nil
-}
-
-func (l *failureLimiter) failed(ip string, now time.Time) {
+// Account only verified failures: an IP budget must never reject a valid
+// credential. QTS's negative cache throttles repeated work for the same key.
+func (l *failureLimiter) failed(ip, key string, now time.Time) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.clients == nil {
 		l.clients = make(map[string]*failureBucket)
 	}
 	b := l.clients[ip]
-	if b == nil {
-		if len(l.clients) >= maxFailureClients {
-			return
+	if b == nil && len(l.clients) >= maxFailureClients {
+		for key, b := range l.clients {
+			b.prune(now)
+			if len(b.credentials) == 0 {
+				delete(l.clients, key)
+			}
 		}
-		b = &failureBucket{tokens: authFailureBurst, updated: now}
+		if len(l.clients) >= maxFailureClients {
+			return errAuthRateLimited
+		}
+	}
+	if b == nil {
+		b = &failureBucket{credentials: make(map[string]time.Time)}
 		l.clients[ip] = b
 	}
-	if now.Before(b.blockedUntil) {
-		return // Completions already in flight must not extend the ban.
+	b.prune(now)
+	if _, exists := b.credentials[key]; exists {
+		return nil // Repeats neither consume capacity nor extend the window.
 	}
-	b.refill(now)
-	b.tokens--
-	if b.tokens < 1 {
-		b.blockedUntil = now.Add(authFailureWindow)
+	if len(b.credentials) >= authFailureBurst {
+		return errAuthRateLimited
 	}
+	b.credentials[key] = now.Add(authFailureWindow)
+	return nil
 }
 
 func (s *Server) verifyCredential(r *http.Request, cred qtsauth.Cred) (qtsauth.Session, error) {
@@ -97,10 +85,46 @@ func (s *Server) verifyCredential(r *http.Request, cred qtsauth.Cred) (qtsauth.S
 		return qtsauth.Session{}, ctxErr
 	}
 	if err != nil && !errors.Is(err, qtsauth.ErrOverloaded) && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-		s.authFailures.failed(ClientIP(r), s.now())
+		if limitErr := s.authFailures.failed(ClientIP(r), qtsauth.CacheKey(cred), s.now()); limitErr != nil {
+			return qtsauth.Session{}, limitErr
+		}
 	}
 	return verified, err
 }
+
+// Shared by new credentials and existing sessions, including lock and identity
+// resolution waits. The verifier independently bounds actual CGI work.
+type authAdmission struct {
+	once    sync.Once
+	slots   chan struct{}
+	waiters chan struct{}
+}
+
+func (a *authAdmission) enter(ctx context.Context) error {
+	a.once.Do(func() {
+		a.slots = make(chan struct{}, qtsauth.DefaultMaxConcurrentValidations)
+		a.waiters = make(chan struct{}, qtsauth.DefaultMaxValidationWaiters)
+	})
+	select {
+	case a.slots <- struct{}{}:
+		return nil
+	default:
+	}
+	select {
+	case a.waiters <- struct{}{}:
+		defer func() { <-a.waiters }()
+	default:
+		return qtsauth.ErrOverloaded
+	}
+	select {
+	case a.slots <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (a *authAdmission) leave() { <-a.slots }
 
 // A session's validation lock must not hold its followers beyond their deadline.
 func lockSession(ctx context.Context, sess *session) error {

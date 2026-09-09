@@ -366,6 +366,19 @@ func (p *Pool) call(ctx context.Context, c *client, op wproto.Op, body any) (wpr
 		// is something to send a second frame down: the transport goes.
 		_ = c.tr.Close()
 		c.fail(gone)
+		// And the process goes with it. Marking the client failed only settles
+		// this end of the conversation: the worker on the other side is still
+		// running, still holding a user's credentials and still counted against
+		// Max, and nothing else was scheduled to end it — it survived until the
+		// next acquire happened to notice or the janitor's idle sweep came
+		// round, which for a worker wedged mid-handler could be never.
+		//
+		// The bye of a shutdown is the exception: terminate is already stopping
+		// that worker and owns the rest of the ladder.
+		if op != wproto.OpBye {
+			p.opts.Logger.Printf("workerpool: %s did not take a %s frame (%v); retiring it", c.key, op, err)
+			go p.retire(c, gone)
+		}
 		return wproto.Frame{}, nil, gone
 	}
 

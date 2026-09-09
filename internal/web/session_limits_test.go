@@ -37,8 +37,9 @@ func TestCookielessSessionReuseAndUserLimit(t *testing.T) {
 		}
 		return w.Result().Cookies()[0].Value
 	}
-	// Concurrent first requests must converge on one id and CSRF secret too.
-	ids := make(chan string, 64)
+	// Concurrent first requests within the per-session admission budget must
+	// converge on one id and CSRF secret too. Larger bursts may return 503.
+	ids := make(chan string, maxSessionAuthWaiters+1)
 	var wg sync.WaitGroup
 	for i := 0; i < cap(ids); i++ {
 		wg.Add(1)

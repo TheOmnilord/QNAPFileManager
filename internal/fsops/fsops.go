@@ -124,13 +124,31 @@ func resolve(r fsx.Root, apiPath string, followFinal bool) (jailPath, error) {
 			if blocked != nil {
 				return jailPath{}, blocked
 			}
+			if len(done) == 0 {
+				// Unjailed this is "/..", which the kernel answers with "/", so
+				// the walk stays where it is. Under -jail it is not: the base is
+				// an ordinary directory with a real parent, and "/jail/../report"
+				// names the host's /report. Staying at the base instead silently
+				// substituted /jail/report — a different file, served under the
+				// name of one that should have been refused.
+				if r.Jailed() {
+					return jailPath{}, fmt.Errorf("%q climbs above the jail root: %w", apiPath, fsx.ErrOutsideRoot)
+				}
+				continue
+			}
 			// Everything in done is already resolved — every symlink among
 			// them has been followed to where it points — so ".." is
-			// unambiguous here in a way it never is on an unresolved path. At
-			// the base it is the base, exactly as "/.." is "/".
-			if len(done) > 0 {
-				done = done[:len(done)-1]
+			// unambiguous here in a way it never is on an unresolved path. It
+			// is still the kernel's to allow: ".." is resolved *inside* the
+			// directory it is written in and needs search permission on it,
+			// which an Lstat of that directory from outside never tested. So
+			// the permission is asked for before the component is popped, and
+			// "locked/../report" fails for a user who cannot traverse "locked"
+			// exactly as it would in the shell (INV-2).
+			if err := checkTraversable(rt, relOf(done)); err != nil {
+				return jailPath{}, err
 			}
+			done = done[:len(done)-1]
 			continue
 		}
 		if len(rest) == 0 && !followFinal {

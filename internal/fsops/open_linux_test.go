@@ -79,6 +79,42 @@ func TestOpenReadClearsNonblock(t *testing.T) {
 	}
 }
 
+// TestOpenFinalRefusesASymlinkAsTheFinalComponent: os.Root.OpenFile puts
+// O_NOFOLLOW on its openat and then follows the link anyway when it stays
+// inside the root, so the caller's no-follow contract was enforced only by an
+// lstat and an os.SameFile check — which an inode swap between the two can
+// satisfy. openFinal opens the parent through the root and the final component
+// relative to that descriptor, where the kernel honours the flag and says
+// ELOOP.
+func TestOpenFinalRefusesASymlinkAsTheFinalComponent(t *testing.T) {
+	requireSymlinks(t)
+	r, base := fixture(t)
+	if err := os.Symlink("one.txt", filepath.Join(base, "a", "link")); err != nil {
+		t.Fatal(err)
+	}
+	rt, err := r.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := openFinal(rt, "a/link")
+	if err == nil {
+		f.Close()
+		t.Fatal("a symlink as the final component must be refused by the kernel, not followed")
+	}
+	if !errors.Is(err, syscall.ELOOP) {
+		t.Fatalf("err = %v, want ELOOP", err)
+	}
+	if code := fsx.Code(err); code != "bad_request" {
+		t.Errorf("code = %q, want bad_request", code)
+	}
+	// The regular file beside it still opens, through the same path.
+	ok, err := openFinal(rt, "a/one.txt")
+	if err != nil {
+		t.Fatalf("opening a regular file through openFinal: %v", err)
+	}
+	ok.Close()
+}
+
 func fileStatusFlags(t *testing.T, f *os.File) int {
 	t.Helper()
 	rc, err := f.SyscallConn()

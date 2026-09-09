@@ -358,9 +358,13 @@ func (p *Pool) call(ctx context.Context, c *client, op wproto.Op, body any) (wpr
 	c.calls++
 	c.mu.Unlock()
 
-	if err := c.tr.Write(req, nil); err != nil {
+	if err := p.writeFrame(ctx, c, req); err != nil {
 		c.abandon(id, pend)
 		gone := workerGone(c.key, err)
+		// A write that failed part-way has desynchronised the framing, and a
+		// write that timed out has left a worker that is not reading. Neither
+		// is something to send a second frame down: the transport goes.
+		_ = c.tr.Close()
 		c.fail(gone)
 		return wproto.Frame{}, nil, gone
 	}
@@ -384,9 +388,40 @@ func (p *Pool) call(ctx context.Context, c *client, op wproto.Op, body any) (wpr
 		// the caller only frees this end, and the operation on the other end
 		// would go on holding a worker slot — and, for a fifo or a directory on
 		// a wedged mount, a blocked syscall — long after the browser has gone.
-		p.cancelRemote(c, id)
+		//
+		// A goodbye is the exception. There is no handler to stop, the worker
+		// is about to be signalled anyway, and sending one used to hang the
+		// whole shutdown: the worker had already stopped reading to wait out
+		// its handlers, so the cancellation went into a pipe nobody was
+		// draining and terminate never reached the kill.
+		if op != wproto.OpBye {
+			p.cancelRemote(c, id)
+		}
 		return wproto.Frame{}, nil, ctx.Err()
 	}
+}
+
+// writeTimeout bounds a single frame's journey into the transport. It is not a
+// call timeout — the reply has its own — only a bound on how long the front-end
+// will wait for a worker to take the bytes.
+const writeTimeout = 10 * time.Second
+
+// writeFrame puts one frame on a worker's transport without ever blocking
+// indefinitely on a worker that has stopped reading.
+func (p *Pool) writeFrame(ctx context.Context, c *client, f wproto.Frame) error {
+	d := writeTimeout
+	if dl, ok := ctx.Deadline(); ok {
+		if left := time.Until(dl); left < d {
+			d = left
+		}
+	}
+	if d <= 0 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return context.DeadlineExceeded
+	}
+	return c.tr.WriteWithin(d, f, nil)
 }
 
 // abandon takes one request out of the pending table on behalf of a caller that
@@ -417,9 +452,20 @@ func (c *client) abandon(id uint64, p *pending) {
 	}
 }
 
+// cancelTimeout bounds the cancellation write. The caller it is sent on behalf
+// of has already given up, so this must never become a second wait of its own.
+const cancelTimeout = 2 * time.Second
+
 // cancelRemote tells a worker that a request it is still running is no longer
 // wanted. It is best effort and never waits for the acknowledgement: the caller
 // has already gone, and there is nobody left to report a failure to.
+//
+// The write is bounded, and it has to be. It runs after the caller's context
+// has already expired, so there is no deadline left to inherit; without one, a
+// worker that had stopped reading would turn a cancellation into a permanent
+// hang in the root front-end. A cancellation that cannot be delivered means the
+// worker is no longer listening at all, so the transport is closed and the
+// worker retired — which cancels the request far more thoroughly anyway.
 func (p *Pool) cancelRemote(c *client, id uint64) {
 	cid := p.nextID.Add(1)
 	req, err := wproto.NewReq(cid, wproto.OpCancel, wproto.CancelReq{ReqID: id})
@@ -437,8 +483,11 @@ func (p *Pool) cancelRemote(c *client, id uint64) {
 	ack := &pending{ch: make(chan result, 1)}
 	c.pending[cid] = ack
 	c.mu.Unlock()
-	if err := c.tr.Write(req, nil); err != nil {
+	if err := c.tr.WriteWithin(cancelTimeout, req, nil); err != nil {
 		c.abandon(cid, ack)
+		p.opts.Logger.Printf("workerpool: %s did not take the cancellation of request %d (%v); retiring it", c.key, id, err)
+		_ = c.tr.Close()
+		go p.retire(c, workerGone(c.key, err))
 	}
 }
 
@@ -501,6 +550,8 @@ func (e *RemoteError) Unwrap() error {
 		return fsx.ErrConfirmRequired
 	case "queue_full":
 		return fsx.ErrQueueFull
+	case "worker_gone":
+		return fsx.ErrWorkerGone
 	case "cancelled":
 		return context.Canceled
 	}

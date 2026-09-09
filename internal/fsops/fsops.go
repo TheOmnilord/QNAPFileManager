@@ -107,6 +107,13 @@ func resolve(r fsx.Root, apiPath string, followFinal bool) (jailPath, error) {
 	done := make([]string, 0, 8)
 	rest := splitRel(rel)
 	hops := 0
+	// blocked is the failure of the first component the walk could not traverse
+	// — missing, unreadable, or not a directory. Resolution carries on past it
+	// so the caller's own syscall reports the honest errno for a path that only
+	// names something that is not there yet, but a ".." after it cannot be
+	// applied: the kernel resolves "/missing/../x" to ENOENT, and popping the
+	// component here instead would quietly turn it into "/x".
+	var blocked error
 	for len(rest) > 0 {
 		part := rest[0]
 		rest = rest[1:]
@@ -114,9 +121,13 @@ func resolve(r fsx.Root, apiPath string, followFinal bool) (jailPath, error) {
 		case "", ".":
 			continue
 		case "..":
-			// Everything in done is already resolved, so ".." is unambiguous
-			// here in a way it never is on an unresolved path. At the base it
-			// is the base, exactly as "/.." is "/".
+			if blocked != nil {
+				return jailPath{}, blocked
+			}
+			// Everything in done is already resolved — every symlink among
+			// them has been followed to where it points — so ".." is
+			// unambiguous here in a way it never is on an unresolved path. At
+			// the base it is the base, exactly as "/.." is "/".
 			if len(done) > 0 {
 				done = done[:len(done)-1]
 			}
@@ -128,8 +139,19 @@ func resolve(r fsx.Root, apiPath string, followFinal bool) (jailPath, error) {
 		}
 		cand := relJoin(relOf(done), part)
 		fi, err := rt.Lstat(cand)
-		if err != nil || fi.Mode()&fs.ModeSymlink == 0 {
-			// Not a link, or not there at all: keep it and move on.
+		if err != nil {
+			// Not there at all, or not readable: keep the component as written
+			// so the caller's syscall reports it, and remember why.
+			if blocked == nil && len(rest) > 0 {
+				blocked = err
+			}
+			done = append(done, part)
+			continue
+		}
+		if fi.Mode()&fs.ModeSymlink == 0 {
+			if blocked == nil && len(rest) > 0 && !fi.IsDir() {
+				blocked = fmt.Errorf("%q is not a directory: %w", "/"+cand, fsx.ErrBadName)
+			}
 			done = append(done, part)
 			continue
 		}
@@ -159,6 +181,15 @@ func resolve(r fsx.Root, apiPath string, followFinal bool) (jailPath, error) {
 // An absolute target names a host path, which is how the kernel would read it
 // too. Under -jail it therefore has to land inside the base or the link is an
 // escape and is refused; unjailed, everything is inside by definition.
+//
+// The target is deliberately not cleaned first. filepath.Clean is a lexical
+// rewrite, and a symlink target is not a lexical object: with
+// /share/A/link → /share/B/dir, the kernel reads "/share/A/link/../report" as
+// /share/B/report, because it follows link before it applies "..". Cleaning
+// removes the "link/.." pair and lands on /share/A/report — a different file,
+// which the UI would then happily download under the name of the one that was
+// asked for. So the components go back into the walk as written and ".." is
+// applied to whatever they resolve to, exactly as in the kernel.
 func linkParts(r fsx.Root, apiPath, link string) (parts []string, absolute bool, err error) {
 	if link == "" {
 		return nil, false, fmt.Errorf("%q is a symlink with an empty target: %w", apiPath, fsx.ErrBadName)
@@ -166,16 +197,51 @@ func linkParts(r fsx.Root, apiPath, link string) (parts []string, absolute bool,
 	if !isAbsLink(link) {
 		return splitRel(filepath.ToSlash(link)), false, nil
 	}
-	osTarget := filepath.Clean(filepath.FromSlash(link))
-	base, ok := baseFor(r, osTarget)
+	osTarget := filepath.FromSlash(link)
+	comps := splitOSPath(osTarget)
+	// Containment is decided on the literal head of the target — everything up
+	// to its first ".." — because that is the deepest point whose location is
+	// known without resolving anything. Everything from the first ".." on is
+	// walked inside the root, where it cannot address anything outside the jail
+	// whatever it says.
+	head := comps
+	for i, c := range comps {
+		if c == ".." {
+			head = comps[:i]
+			break
+		}
+	}
+	vol := filepath.VolumeName(osTarget)
+	osHead := filepath.Join(append([]string{vol + string(filepath.Separator)}, head...)...)
+	base, ok := baseFor(r, osHead)
 	if !ok {
 		return nil, false, fmt.Errorf("%q leaves the jail root through a symlink: %w", apiPath, fsx.ErrOutsideRoot)
 	}
-	api, err := base.API(osTarget)
+	api, err := base.API(osHead)
 	if err != nil {
 		return nil, false, err
 	}
-	return splitRel(strings.TrimPrefix(api, "/")), true, nil
+	parts = splitRel(strings.TrimPrefix(api, "/"))
+	return append(parts, comps[len(head):]...), true, nil
+}
+
+// splitOSPath breaks an absolute OS path into its components, volume name
+// dropped and empty components (a doubled separator, a trailing one) with it.
+// Both separators count on Windows, where a symlink target may be written
+// either way; "." and ".." are kept, because the walk is what decides what they
+// mean.
+func splitOSPath(p string) []string {
+	p = p[len(filepath.VolumeName(p)):]
+	fields := strings.FieldsFunc(p, func(c rune) bool {
+		return c == '/' || (runtime.GOOS == "windows" && c == '\\')
+	})
+	out := make([]string, 0, len(fields))
+	for _, f := range fields {
+		if f != "." {
+			out = append(out, f)
+		}
+	}
+	return out
 }
 
 // isAbsLink reports whether a symlink target is absolute on this host. On
@@ -474,13 +540,15 @@ func Readlink(ctx context.Context, r fsx.Root, p string) (string, error) {
 // point: the descriptor that comes back can only be something the user was
 // allowed to open, so the root front-end may safely stream from it.
 //
-// The final component is never followed. os.Root follows a symlink that stays
-// inside the tree and gives the caller's O_NOFOLLOW no say in it, so the link
-// is refused here instead: an lstat classifies the name, and the descriptor
-// that comes back is then checked against that lstat with os.SameFile, so a
-// component swapped for a symlink between the two is caught rather than
-// followed. That closes the race the flag was there to close, on every platform
-// rather than only on Linux.
+// The final component is never followed, and on Linux that is the kernel's
+// answer rather than this package's: openFinal opens the parent directory
+// through the root and then the last component relative to that descriptor with
+// O_NOFOLLOW, which openat really does honour. os.Root.OpenFile cannot be used
+// for it — it follows a symlink that stays inside the tree and gives the
+// caller's O_NOFOLLOW no say. An lstat still classifies the name first, so the
+// refusal is a plain "that is a symlink" rather than an ELOOP, and the
+// descriptor is checked back against that lstat with os.SameFile, which is what
+// covers the platforms with no openat.
 //
 // Directories, devices, fifos and sockets are refused with fsx.ErrUnsupported:
 // a download is bytes, and opening a fifo would block the worker forever.
@@ -521,7 +589,7 @@ func OpenRead(ctx context.Context, r fsx.Root, p string) (*os.File, fsx.Entry, e
 		return nil, fsx.Entry{}, fmt.Errorf("%q is a %s, not a regular file: %w",
 			clean, fsx.TypeString(before.Mode()), fsx.ErrUnsupported)
 	}
-	f, err := tg.rt.OpenFile(tg.rel, openReadFlags(), 0)
+	f, err := openFinal(tg.rt, tg.rel)
 	if err != nil {
 		return nil, fsx.Entry{}, err
 	}

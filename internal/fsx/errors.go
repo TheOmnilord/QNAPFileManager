@@ -73,9 +73,11 @@ func Code(err error) string {
 		return "no_space"
 	case errors.Is(err, ErrNotAbsolute), errors.Is(err, ErrBadName), errors.Is(err, ErrOutsideRoot):
 		return "bad_request"
-	// A dead worker is our bug or a crash, not something the caller did.
+	// A dead worker is our bug or a crash, not something the caller did, but
+	// it needs its own code: the pool reconstructs remote errors from the
+	// code alone, and callers must still recognise the ErrWorkerGone sentinel.
 	case errors.Is(err, ErrWorkerGone):
-		return "internal"
+		return "worker_gone"
 
 	case errors.Is(err, context.Canceled):
 		return "cancelled"

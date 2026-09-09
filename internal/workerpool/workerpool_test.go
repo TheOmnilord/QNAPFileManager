@@ -7,6 +7,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -799,6 +800,11 @@ func (t *fakeTransport) Write(f wproto.Frame, files []*os.File) error {
 	return nil
 }
 
+// WriteWithin never has to wait here: the recorder always takes the frame.
+func (t *fakeTransport) WriteWithin(_ time.Duration, f wproto.Frame, files []*os.File) error {
+	return t.Write(f, files)
+}
+
 func (t *fakeTransport) PassesFDs() bool { return true }
 
 func (t *fakeTransport) Close() error {
@@ -942,6 +948,237 @@ func TestACancelledCallerTellsTheWorkerToStop(t *testing.T) {
 	}
 	if got.ReqID != id {
 		t.Errorf("the cancel names request %d, want %d", got.ReqID, id)
+	}
+}
+
+// liveForTest counts everything the pool is holding a process for: registered
+// workers, reservations for one being started, and the ones on their way out.
+func (p *Pool) liveForTest() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.workers) + len(p.spawning) + len(p.retiring)
+}
+
+// TestARetiringWorkerStillCountsAgainstMax: a worker superseded by a credential
+// change leaves p.workers immediately but keeps running until the calls it had
+// already accepted are done. Untracked, that slot was handed straight to the
+// replacement — so with Max=1 a credential change during a request produced two
+// live workers, and repeating it accumulated processes past the ceiling an
+// operator had set on a 1 GB ARM NAS.
+func TestARetiringWorkerStillCountsAgainstMax(t *testing.T) {
+	p, _ := testPool(t, func(o *Options) { o.Max = 1 })
+	ctx := context.Background()
+	who := alice()
+
+	held, err := p.acquire(ctx, who)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := p.liveForTest(); n != 1 {
+		t.Fatalf("%d live workers, want 1", n)
+	}
+
+	changed := who
+	changed.Groups = []int{7}
+	if err := p.Ping(ctx, changed); !errors.Is(err, ErrWorkerBusy) {
+		t.Fatalf("err = %v, want ErrWorkerBusy: the only slot is still held by the worker being retired", err)
+	}
+	if n := p.liveForTest(); n != 1 {
+		t.Fatalf("%d live workers after the credential change, want 1", n)
+	}
+	if held.isDead() {
+		t.Fatal("a worker with a call in flight was killed under its caller")
+	}
+
+	// Once the retiring process is really gone the slot comes back.
+	p.release(held)
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		err := p.Ping(ctx, changed)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, ErrWorkerBusy) {
+			t.Fatalf("ping: %v", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the retiring worker's slot was never released")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case <-held.gone:
+	default:
+		t.Error("the slot came back while the superseded worker was still running")
+	}
+	if n := p.liveForTest(); n != 1 {
+		t.Fatalf("%d live workers, want 1", n)
+	}
+}
+
+// TestShutdownStopsARetiringWorker: Shutdown used to collect p.workers only, so
+// a superseded worker — a whole process holding a user's credentials and the
+// jail's descriptor — was left running and Shutdown reported success over it.
+func TestShutdownStopsARetiringWorker(t *testing.T) {
+	root, _ := testTree(t)
+	p := NewWithOptions(Options{
+		Root:      root,
+		InProcess: true,
+		Logger:    log.New(io.Discard, "", 0),
+	})
+	ctx := context.Background()
+	who := alice()
+
+	held, err := p.acquire(ctx, who)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed := who
+	changed.Groups = []int{7}
+	if err := p.Ping(ctx, changed); err != nil {
+		t.Fatal(err)
+	}
+	p.mu.Lock()
+	_, tracked := p.retiring[held]
+	p.mu.Unlock()
+	if !tracked {
+		t.Fatal("a superseded worker with a call in flight must stay tracked until its process is gone")
+	}
+
+	sctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	if err := p.Shutdown(sctx); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+	select {
+	case <-held.exited:
+	default:
+		t.Fatal("shutdown returned while the retiring worker was still running")
+	}
+}
+
+// TestGoodbyeNeverHangsOnAWorkerThatStoppedReading is the shutdown deadlock the
+// in-process pipe made concrete: a worker that has taken the goodbye stops
+// reading while it waits for its handlers, the goodbye's own timeout then tried
+// to write a cancellation into that pipe — synchronously and with no deadline —
+// and terminate never reached the transport close or the kill.
+func TestGoodbyeNeverHangsOnAWorkerThatStoppedReading(t *testing.T) {
+	p := NewWithOptions(Options{InProcess: true, CallTimeout: time.Minute, Logger: log.New(io.Discard, "", 0)})
+	t.Cleanup(func() { _ = p.Shutdown(context.Background()) })
+
+	ours, theirs := net.Pipe()
+	c := newClient(alice())
+	c.tr = wproto.NewTransport(ours)
+	c.kill = func(context.Context) { _ = theirs.Close(); close(c.exited) }
+	go c.readLoop(nil)
+
+	peer := wproto.NewTransport(theirs)
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		for {
+			f, files, err := peer.Read()
+			closeAll(files)
+			if err != nil {
+				return
+			}
+			if f.Op == wproto.OpBye {
+				// Exactly what the worker does: take the goodbye, then stop
+				// reading until the handlers it is waiting for have finished.
+				return
+			}
+		}
+	}()
+
+	done := make(chan struct{})
+	go func() { defer close(done); p.terminate(c) }()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("terminate never returned: the goodbye's cancellation blocked on a worker that had stopped reading")
+	}
+	<-stopped
+	select {
+	case <-c.exited:
+	default:
+		t.Error("terminate returned without reaching the kill")
+	}
+}
+
+// TestAWriteToAWorkerThatNeverReadsTimesOut: every write the pool makes is
+// bounded. A socket's send buffer fills and a net.Pipe has no buffer at all, so
+// an unbounded write is a wait on a worker's goodwill — in the root front-end,
+// on the goroutine serving a user's request.
+func TestAWriteToAWorkerThatNeverReadsTimesOut(t *testing.T) {
+	p := NewWithOptions(Options{InProcess: true, CallTimeout: 500 * time.Millisecond, Logger: log.New(io.Discard, "", 0)})
+	t.Cleanup(func() { _ = p.Shutdown(context.Background()) })
+
+	ours, theirs := net.Pipe()
+	t.Cleanup(func() { _ = theirs.Close() })
+	c := newClient(alice())
+	c.tr = wproto.NewTransport(ours)
+	go c.readLoop(nil)
+
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := p.call(context.Background(), c, wproto.OpPing, nil)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("the write must fail rather than succeed against a peer that never read")
+		}
+		if !errors.Is(err, fsx.ErrWorkerGone) {
+			t.Fatalf("err = %v, want ErrWorkerGone", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("a write to a worker that never reads blocked the caller indefinitely")
+	}
+}
+
+// TestACancelledStartupStillChargesTheRestartBudget: the charge used to be
+// skipped whenever the caller's context had been cancelled, so an authenticated
+// user who disconnected after the process had been forked and before hello
+// completed could have replacement processes started for ever without ever
+// spending the budget that exists to stop exactly that.
+func TestACancelledStartupStillChargesTheRestartBudget(t *testing.T) {
+	var spawns atomic.Int64
+	p, _ := testPool(t, func(o *Options) {
+		o.Max = 8
+		o.RestartBudget = 2
+		o.RestartWindow = time.Minute
+		o.RestartCooldown = time.Minute
+		o.newWorker = func(who backend.Principal) (*client, error) {
+			// The process starts, and then never answers hello.
+			spawns.Add(1)
+			c := newClient(who)
+			tr := newFakeTransport()
+			c.tr = tr
+			c.kill = func(context.Context) { _ = tr.Close(); close(c.exited) }
+			return c, nil
+		}
+	})
+	ctx := context.Background()
+	who := alice()
+
+	for i := 0; i < 3; i++ {
+		cctx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+		err := p.Ping(cctx, who)
+		cancel()
+		if err == nil {
+			t.Fatalf("ping %d succeeded against a worker that never answered hello", i)
+		}
+	}
+	if n := spawns.Load(); n != 3 {
+		t.Fatalf("%d processes were started, want 3", n)
+	}
+	// The budget is spent, and it was spent by cancelled callers.
+	if err := p.Ping(ctx, who); !errors.Is(err, ErrWorkerUnavailable) {
+		t.Fatalf("err = %v, want ErrWorkerUnavailable", err)
+	}
+	if n := spawns.Load(); n != 3 {
+		t.Fatalf("%d processes were started once the budget was spent, want 3", n)
 	}
 }
 

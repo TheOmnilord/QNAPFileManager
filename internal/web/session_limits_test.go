@@ -83,8 +83,8 @@ func TestSessionTotalLimitAndEviction(t *testing.T) {
 		id := fmt.Sprint(i)
 		s.insertSession(indexedTestSession(id, id))
 	}
-	if len(s.sessions) != DefaultMaxSessions || !first.dead.Load() || s.sessions[first.id] != nil || s.byCredential[first.binding] != nil || s.byUser[first.user] != nil {
-		t.Fatal("total bound did not evict oldest session and all its indexes")
+	if len(s.sessions) != DefaultMaxSessions || first.dead.Load() || s.sessions[first.id] != first || s.byCredential[first.binding] != first || s.byUser[first.user] == nil {
+		t.Fatal("total bound invalidated another user's live session")
 	}
 	if s.sessionOrder.Len() != DefaultMaxSessions {
 		t.Fatal("eviction queue was not bounded")
@@ -92,7 +92,7 @@ func TestSessionTotalLimitAndEviction(t *testing.T) {
 	// Removal remains safe when a request that was already running is denied.
 	s.destroy(first.id)
 	s.destroy("1")
-	if len(s.sessions) != DefaultMaxSessions-1 {
+	if len(s.sessions) != DefaultMaxSessions-2 {
 		t.Fatal("logout did not remove session")
 	}
 
@@ -105,9 +105,35 @@ func TestSessionTotalLimitAndEviction(t *testing.T) {
 	if len(s2.sessions) != 3 || !a.dead.Load() || s2.byUser["alice"].Len() != 2 {
 		t.Fatal("configured per-user limit did not evict oldest")
 	}
-	s2.insertSession(indexedTestSession("e", "eve"))
-	if len(s2.sessions) != 3 || s2.sessions["b"] != nil {
-		t.Fatal("configured total limit did not evict oldest")
+	if got := s2.insertSession(indexedTestSession("e", "eve")); got != nil || len(s2.sessions) != 3 || s2.sessions["b"] == nil {
+		t.Fatal("configured total limit did not refuse a new identity")
+	}
+}
+
+func TestSessionExpiredReclaimedBeforeOwnEviction(t *testing.T) {
+	s, _ := fixture(t, true)
+	s.MaxSessions = 2
+	a := s.insertSession(indexedTestSession("a", "alice"))
+	expired := s.insertSession(indexedTestSession("expired", "bob"))
+	expired.expires = time.Now().Add(-time.Second)
+	// Even an expired session busy with validation can be reclaimed without
+	// acquiring its network-held lock or blocking unrelated users.
+	expired.mu.Lock()
+	defer expired.mu.Unlock()
+	if got := s.insertSession(indexedTestSession("b", "alice")); got == nil || a.dead.Load() || !expired.dead.Load() {
+		t.Fatal("expired session was not reclaimed before own live session")
+	}
+	if s.byCredential["expired"] != nil || s.byUser["bob"] != nil || s.sessionOrder.Len() != 2 {
+		t.Fatal("expired session indexes retained")
+	}
+	// Under total pressure, the requesting identity replaces only its own oldest.
+	if got := s.insertSession(indexedTestSession("c", "alice")); got == nil || !a.dead.Load() || len(s.sessions) != 2 {
+		t.Fatal("requester did not replace its own oldest session")
+	}
+	// A newcomer can use an expired entry belonging to another user.
+	s.sessions["b"].expires = time.Now().Add(-time.Second)
+	if got := s.insertSession(indexedTestSession("d", "dave")); got == nil || s.sessions["c"].dead.Load() {
+		t.Fatal("new identity could not reclaim an expired entry")
 	}
 }
 

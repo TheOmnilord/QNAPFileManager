@@ -18,6 +18,7 @@ const (
 	DefaultNegativeTTL              = 10 * time.Second
 	DefaultMaxCacheEntries          = 4096
 	DefaultMaxConcurrentValidations = 8
+	DefaultMaxValidationWaiters     = 64
 	cachePruneInterval              = 64
 )
 
@@ -79,6 +80,9 @@ type Verifier struct {
 	// MaxConcurrentValidations bounds CGI calls across distinct credentials.
 	// Set before first use; nonpositive values use 8.
 	MaxConcurrentValidations int
+	// MaxValidationWaiters bounds both slot and single-flight waiters.
+	// Set before first use; nonpositive values use 64.
+	MaxValidationWaiters int
 
 	// Now is the clock, for tests. nil means time.Now.
 	Now func() time.Time
@@ -89,6 +93,7 @@ type Verifier struct {
 	inserts         uint64
 	inflight        map[string]*flight
 	validationSlots chan struct{}
+	waiters         int // guarded by mu
 }
 
 type cacheEntry struct {
@@ -150,6 +155,9 @@ func CacheKey(c Cred) string {
 // decision 3 requires unconditional revalidation before any mutation, so that a
 // QTS sign-out takes effect immediately.
 func (v *Verifier) Verify(ctx context.Context, cred Cred) (Session, error) {
+	if err := ctx.Err(); err != nil {
+		return Session{}, err
+	}
 	key := CacheKey(cred)
 	var slots chan struct{}
 	acquired := false
@@ -173,7 +181,16 @@ func (v *Verifier) Verify(ctx context.Context, cred Cred) (Session, error) {
 			return e.sess, e.err
 		}
 		if f, ok := v.inflight[key]; ok {
+			if acquired {
+				<-slots
+				acquired = false
+			}
+			if !v.addWaiterLocked() {
+				v.mu.Unlock()
+				return Session{}, ErrOverloaded
+			}
 			v.mu.Unlock()
+			defer v.removeWaiter()
 			select {
 			case <-f.done:
 				return f.sess, f.err
@@ -190,13 +207,26 @@ func (v *Verifier) Verify(ctx context.Context, cred Cred) (Session, error) {
 				v.validationSlots = make(chan struct{}, limit)
 			}
 			slots = v.validationSlots
+			select {
+			case slots <- struct{}{}:
+				acquired = true
+				v.mu.Unlock()
+				continue
+			default:
+			}
+			if !v.addWaiterLocked() {
+				v.mu.Unlock()
+				return Session{}, ErrOverloaded
+			}
 			v.mu.Unlock()
 			select {
 			case slots <- struct{}{}:
+				v.removeWaiter()
 				acquired = true
 				// Recheck the cache and single-flight after waiting for capacity.
 				continue
 			case <-ctx.Done():
+				v.removeWaiter()
 				return Session{}, fmt.Errorf("qtsauth: verify cancelled: %w", ctx.Err())
 			}
 		}
@@ -206,7 +236,14 @@ func (v *Verifier) Verify(ctx context.Context, cred Cred) (Session, error) {
 		break
 	}
 
-	sess, err := v.validate(ctx, cred)
+	var sess Session
+	err := ctx.Err()
+	if err == nil {
+		sess, err = v.validate(ctx, cred)
+	}
+	if ctx.Err() != nil {
+		err = ctx.Err()
+	}
 
 	ttl := v.positiveTTL()
 	if err != nil {
@@ -222,8 +259,11 @@ func (v *Verifier) Verify(ctx context.Context, cred Cred) (Session, error) {
 			}
 		}
 	}
-	v.removeCached(key)
-	v.cache[key] = cacheEntry{sess: sess, err: err, expires: now.Add(ttl), order: v.order.PushBack(key)}
+	// A caller's deadline is not evidence about the credential. Never cache it.
+	if ctx.Err() == nil {
+		v.removeCached(key)
+		v.cache[key] = cacheEntry{sess: sess, err: err, expires: now.Add(ttl), order: v.order.PushBack(key)}
+	}
 	maxEntries := v.MaxCacheEntries
 	if maxEntries <= 0 {
 		maxEntries = DefaultMaxCacheEntries
@@ -237,6 +277,24 @@ func (v *Verifier) Verify(ctx context.Context, cred Cred) (Session, error) {
 	f.sess, f.err = sess, err
 	close(f.done)
 	return sess, err
+}
+
+func (v *Verifier) addWaiterLocked() bool {
+	limit := v.MaxValidationWaiters
+	if limit <= 0 {
+		limit = DefaultMaxValidationWaiters
+	}
+	if v.waiters >= limit {
+		return false
+	}
+	v.waiters++
+	return true
+}
+
+func (v *Verifier) removeWaiter() {
+	v.mu.Lock()
+	v.waiters--
+	v.mu.Unlock()
 }
 
 // removeCached requires mu. Eviction never changes an in-flight verification.

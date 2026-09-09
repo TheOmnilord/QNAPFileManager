@@ -2,6 +2,7 @@ package qtsauth
 
 import (
 	"net/http"
+	"net/url"
 	"strings"
 
 	"qnapfilemanager/internal/idmap"
@@ -66,21 +67,22 @@ func FromRequest(r *http.Request) (Cred, bool) {
 		return Cred{}, false
 	}
 
+	cookies := qtsCookies(r)
 	user := ""
-	if c, err := r.Cookie(CookieUser); err == nil {
-		user = strings.TrimSpace(c.Value)
+	if value, ok := cookies[CookieUser]; ok {
+		user = value
 		if user != "" && !ValidUserName(user) {
 			return Cred{}, false
 		}
 	}
 
-	if c, err := r.Cookie(CookieQToken); err == nil && user != "" {
-		if tok := strings.TrimSpace(c.Value); validToken(tok) {
+	if value, ok := cookies[CookieQToken]; ok && user != "" {
+		if tok := value; validToken(tok) {
 			return Cred{Kind: KindQToken, User: user, Token: tok}, true
 		}
 	}
-	if c, err := r.Cookie(CookieSID); err == nil {
-		if tok := strings.TrimSpace(c.Value); validToken(tok) {
+	if value, ok := cookies[CookieSID]; ok {
+		if tok := value; validToken(tok) {
 			return Cred{Kind: KindSID, User: user, Token: tok}, true
 		}
 	}
@@ -93,6 +95,33 @@ func FromRequest(r *http.Request) (Cred, bool) {
 		return Cred{Kind: KindSID, User: user, Token: tok}, true
 	}
 	return Cred{}, false
+}
+
+// qtsCookies accepts literal domain backslashes rejected by net/http.Cookie.
+// VERIFY ON NAS: exact QTS cookie encoding (raw versus percent-encoded).
+// Decode once, preserving literal '+'; validate the decoded bytes at extraction.
+// Only the three QTS names use this parser; application cookies stay strict.
+func qtsCookies(r *http.Request) map[string]string {
+	out := make(map[string]string, 3)
+	for _, header := range r.Header.Values("Cookie") {
+		for _, pair := range strings.Split(header, ";") {
+			name, value, ok := strings.Cut(strings.TrimLeft(pair, " \t"), "=")
+			if !ok || (name != CookieUser && name != CookieQToken && name != CookieSID) {
+				continue
+			}
+			if _, seen := out[name]; seen {
+				continue // Match net/http's first-cookie precedence.
+			}
+			if len(value) >= 2 && value[0] == '"' && value[len(value)-1] == '"' {
+				value = value[1 : len(value)-1]
+			}
+			if decoded, err := url.PathUnescape(value); err == nil {
+				value = decoded
+			}
+			out[name] = value
+		}
+	}
+	return out
 }
 
 // validToken rejects empty, over-long and control-character-bearing tokens

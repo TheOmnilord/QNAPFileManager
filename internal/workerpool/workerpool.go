@@ -174,6 +174,13 @@ type Pool struct {
 	mu       sync.Mutex
 	workers  map[string]*client
 	spawning map[string]chan struct{}
+	// retiring holds the workers that have left p.workers but whose process is
+	// not gone yet: one superseded by a credential change and still finishing
+	// the calls it accepted, one evicted to make room, one reaped as idle, one
+	// that crashed. They are still processes on the NAS holding a user's
+	// credentials, so they count against Max and Shutdown waits for them. An
+	// entry lives until the client's exited channel closes.
+	retiring map[*client]struct{}
 	budgets  map[string]*budget
 	closed   bool
 
@@ -233,6 +240,7 @@ func NewWithOptions(o Options) *Pool {
 		opts:        o.normalise(),
 		workers:     map[string]*client{},
 		spawning:    map[string]chan struct{}{},
+		retiring:    map[*client]struct{}{},
 		budgets:     map[string]*budget{},
 		stopJanitor: make(chan struct{}),
 		janitorGone: make(chan struct{}),
@@ -284,13 +292,33 @@ func (p *Pool) reapIdle() {
 			continue
 		}
 		delete(p.workers, key)
+		p.retiring[c] = struct{}{}
 		dead = append(dead, c)
 	}
 	p.mu.Unlock()
 	for _, c := range dead {
 		p.opts.Logger.Printf("workerpool: reaping the idle worker for %s (pid %d)", c.key, c.pid)
-		go p.terminate(c)
+		go p.stopRetired(c)
 	}
+}
+
+// stopRetired terminates a worker that is being tracked in p.retiring and gives
+// its slot back only once the process is really gone. Releasing the slot at
+// terminate time instead — which is where the accounting used to end — let the
+// replacement start while the old process was still alive, so an operator's
+// Max was quietly a ceiling on registered workers rather than on processes.
+func (p *Pool) stopRetired(c *client) {
+	p.terminate(c)
+	select {
+	case <-c.exited:
+	case <-time.After(termGrace + termGrace):
+		// The signal ladder has already run. Holding the slot for ever over a
+		// process that will not die would take the pool down with it.
+		p.opts.Logger.Printf("workerpool: the retired worker for %s (pid %d) has not exited; releasing its slot anyway", c.key, c.pid)
+	}
+	p.mu.Lock()
+	delete(p.retiring, c)
+	p.mu.Unlock()
 }
 
 // Shutdown stops every worker: bye first, then the signals. It is safe to call
@@ -302,10 +330,17 @@ func (p *Pool) Shutdown(ctx context.Context) error {
 		return nil
 	}
 	p.closed = true
-	all := make([]*client, 0, len(p.workers))
+	all := make([]*client, 0, len(p.workers)+len(p.retiring))
 	for key, c := range p.workers {
 		all = append(all, c)
 		delete(p.workers, key)
+	}
+	// A worker that is on its way out is still a process holding a user's
+	// credentials and still holding the jail's descriptor. Collecting only
+	// p.workers left those behind, and Shutdown reported success over them.
+	for c := range p.retiring {
+		all = append(all, c)
+		delete(p.retiring, c)
 	}
 	p.mu.Unlock()
 
@@ -318,7 +353,18 @@ func (p *Pool) Shutdown(ctx context.Context) error {
 		var wg sync.WaitGroup
 		for _, c := range all {
 			wg.Add(1)
-			go func(c *client) { defer wg.Done(); p.terminate(c) }(c)
+			go func(c *client) {
+				defer wg.Done()
+				p.terminate(c)
+				// terminate returns straight away for a worker somebody else
+				// is already stopping, so the exit is waited for here rather
+				// than assumed: Shutdown's promise is that nothing of this
+				// pool is still running when it returns.
+				select {
+				case <-c.exited:
+				case <-ctx.Done():
+				}
+			}(c)
 		}
 		wg.Wait()
 	}()
@@ -514,7 +560,7 @@ func (p *Pool) acquire(ctx context.Context, who backend.Principal) (*client, err
 func (p *Pool) release(c *client) {
 	if c.done(p.now()) {
 		p.opts.Logger.Printf("workerpool: stopping the superseded worker for %s (pid %d) now that its calls have finished", c.key, c.pid)
-		go p.terminate(c)
+		go p.stopRetired(c)
 	}
 }
 
@@ -543,13 +589,25 @@ func (p *Pool) get(ctx context.Context, who backend.Principal) (c *client, fresh
 					// for as long as it lived. It is dropped from the map
 					// here, which makes the next pass spawn a fresh one, and
 					// stopped as soon as its in-flight calls are done.
+					//
+					// It stays counted against Max until its process is gone.
+					// Dropping it from the accounting the moment it left the
+					// map meant that with Max: 1 a credential change during a
+					// request immediately allowed a second live worker, and
+					// repeating the change accumulated processes outside the
+					// limit an operator had set.
 					delete(p.workers, key)
+					p.retiring[c] = struct{}{}
 					stale := c
 					p.mu.Unlock()
 					p.opts.Logger.Printf("workerpool: retiring the worker for %s: credentials changed from %s to %s",
 						key, stale.cred, want)
 					if stale.markRetired() {
-						go p.terminate(stale)
+						// Nothing is in flight, so it can go now — and it goes
+						// before the retry rather than beside it, because the
+						// slot it still holds is the one the replacement is
+						// about to ask for.
+						p.stopRetired(stale)
 					}
 					continue
 				}
@@ -560,10 +618,11 @@ func (p *Pool) get(ctx context.Context, who backend.Principal) (c *client, fresh
 			// It crashed. Remove it, charge the restart budget, and fall
 			// through to a respawn.
 			delete(p.workers, key)
+			p.retiring[c] = struct{}{}
 			p.noteRestartLocked(key, now)
 			corpse := c
 			p.mu.Unlock()
-			go p.terminate(corpse)
+			go p.stopRetired(corpse)
 			continue
 		}
 		if wait, ok := p.spawning[key]; ok {
@@ -583,9 +642,19 @@ func (p *Pool) get(ctx context.Context, who backend.Principal) (c *client, fresh
 			return nil, false, 0, fmt.Errorf("%s stopped %d times in %s, not restarting it for another %s: %w",
 				key, len(b.times), p.opts.RestartWindow, left, ErrWorkerUnavailable)
 		}
-		if err := p.makeRoomLocked(now); err != nil {
+		victim, err := p.makeRoomLocked(now)
+		if err != nil {
 			p.mu.Unlock()
 			return nil, false, 0, err
+		}
+		if victim != nil {
+			p.mu.Unlock()
+			// The evicted worker's slot is the one this request is about to
+			// take, so it is not handed over until its process has actually
+			// gone. Starting the replacement beside it was how Max became a
+			// count of map entries rather than of processes.
+			p.stopRetired(victim)
+			continue
 		}
 		wait := make(chan struct{})
 		p.spawning[key] = wait
@@ -604,10 +673,17 @@ func (p *Pool) get(ctx context.Context, who backend.Principal) (c *client, fresh
 			// — a bad binary, an impossible credential, a hung handshake —
 			// could be respawned on every request forever.
 			//
-			// A caller who gave up while the spawn was running is not evidence
-			// of anything being broken, so a cancelled request is not charged:
-			// six abandoned page loads must not lock a user out for a minute.
-			if ctx.Err() == nil {
+			// What is charged is the cost that was actually paid: nc is
+			// non-nil exactly when a process (or, in-process, a goroutine) was
+			// started, and starting one is the expensive part whether or not
+			// the caller is still there to receive it. Making that conditional
+			// on the caller's context was a way through the budget: an
+			// authenticated user who disconnected after the fork and before
+			// hello could have replacement processes started for ever without
+			// spending anything. A spawn that never got that far, on the other
+			// hand, is not charged to a caller who simply gave up — six
+			// abandoned page loads must not lock a user out for a minute.
+			if nc != nil || ctx.Err() == nil {
 				blocked = p.noteRestartLocked(key, p.now())
 			}
 		case p.closed:
@@ -616,12 +692,17 @@ func (p *Pool) get(ctx context.Context, who backend.Principal) (c *client, fresh
 			p.workers[key] = nc
 			nc.hold(p.now())
 		}
+		if err != nil && nc != nil {
+			// It never reached p.workers, but it is a live process all the
+			// same until it has been reaped, so it counts against Max.
+			p.retiring[nc] = struct{}{}
+		}
 		p.mu.Unlock()
 		close(wait)
 
 		if err != nil {
 			if nc != nil {
-				go p.terminate(nc)
+				go p.stopRetired(nc)
 			}
 			if blocked {
 				err = fmt.Errorf("%s failed to start (%v), not restarting it for another %s: %w",
@@ -642,9 +723,16 @@ func (p *Pool) get(ctx context.Context, who backend.Principal) (c *client, fresh
 // pass this check before any of their workers has finished coming up, and
 // counting only p.workers let them all through — twenty-two processes with
 // Max: 1, and the memory ceiling an operator set on a 1 GB ARM NAS gone.
-func (p *Pool) makeRoomLocked(now time.Time) error {
-	if len(p.workers)+len(p.spawning) < p.opts.Max {
-		return nil
+//
+// A worker on its way out counts for the same reason and for as long as its
+// process is alive. Max is a bound on processes on the NAS, not on entries in a
+// map, and a worker being evicted or superseded is still holding its memory,
+// its descriptors and a user's credentials until the kernel says otherwise.
+// It returns the worker it evicted, if any. Stopping it is the caller's job,
+// with the pool lock released and before the replacement is reserved.
+func (p *Pool) makeRoomLocked(now time.Time) (*client, error) {
+	if len(p.workers)+len(p.spawning)+len(p.retiring) < p.opts.Max {
+		return nil, nil
 	}
 	var (
 		victimKey string
@@ -659,13 +747,13 @@ func (p *Pool) makeRoomLocked(now time.Time) error {
 		}
 	}
 	if victim == nil {
-		return fmt.Errorf("%d workers are running (%d more are starting) and none of them is idle: %w",
-			len(p.workers), len(p.spawning), ErrWorkerBusy)
+		return nil, fmt.Errorf("%d workers are running (%d more are starting, %d are stopping) and none of them is idle: %w",
+			len(p.workers), len(p.spawning), len(p.retiring), ErrWorkerBusy)
 	}
 	delete(p.workers, victimKey)
+	p.retiring[victim] = struct{}{}
 	p.opts.Logger.Printf("workerpool: evicting the least recently used idle worker %s (pid %d)", victimKey, victim.pid)
-	go p.terminate(victim)
-	return nil
+	return victim, nil
 }
 
 // noteRestartLocked charges one crash to a uid and blocks further restarts
@@ -699,9 +787,10 @@ func (p *Pool) retire(c *client, cause error) {
 		delete(p.workers, c.key)
 		_ = p.noteRestartLocked(c.key, p.now())
 	}
+	p.retiring[c] = struct{}{}
 	p.mu.Unlock()
 	c.fail(cause)
-	go p.terminate(c)
+	p.stopRetired(c)
 }
 
 // spawn creates one worker and completes the hello handshake, so a worker that

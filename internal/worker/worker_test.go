@@ -360,6 +360,105 @@ func TestTheConnectionEndingStopsRunningHandlers(t *testing.T) {
 	}
 }
 
+// TestTheWorkerKeepsReadingWhileSayingGoodbye is the worker half of the
+// shutdown deadlock. The goodbye waits for the handlers that are already
+// running — but the front-end bounds its goodbye by its own timeout and then
+// tells the worker to cancel what it is still doing, and a worker that had
+// stopped reading to wait made that cancellation block for ever on the
+// unbuffered in-process pipe. The handler never finished, the goodbye never
+// completed, and the process was never signalled.
+func TestTheWorkerKeepsReadingWhileSayingGoodbye(t *testing.T) {
+	base := fixture(t)
+	started := make(chan struct{})
+	tr, done := dialWith(t, base, Options{
+		dispatch: func(ctx context.Context, f wproto.Frame) (any, error) {
+			close(started)
+			<-ctx.Done() // only a cancellation ends this handler
+			return nil, ctx.Err()
+		},
+	})
+	if f := req(t, tr, 1, wproto.OpHello, wproto.HelloReq{JailRoot: base}); f.Kind != wproto.KindOK {
+		t.Fatalf("hello = %+v", f)
+	}
+
+	// From here on one goroutine does the reading: the worker's replies must
+	// have somewhere to go, or its handler could never finish either.
+	frames := make(chan wproto.Frame, 8)
+	go func() {
+		defer close(frames)
+		for {
+			f, files, err := tr.Read()
+			for _, file := range files {
+				file.Close()
+			}
+			if err != nil {
+				return
+			}
+			frames <- f
+		}
+	}()
+
+	build := func(id uint64, op wproto.Op, body any) wproto.Frame {
+		t.Helper()
+		f, err := wproto.NewReq(id, op, body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return f
+	}
+
+	if err := tr.Write(build(2, wproto.OpList, wproto.ListReq{Dir: []byte("/")}), nil); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the handler never started")
+	}
+	if err := tr.Write(build(3, wproto.OpBye, nil), nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// This is the write that used to hang: the worker was waiting for the very
+	// handler this frame is there to stop.
+	cancelFrame := build(4, wproto.OpCancel, wproto.CancelReq{ReqID: 2})
+	sent := make(chan error, 1)
+	go func() { sent <- tr.Write(cancelFrame, nil) }()
+	select {
+	case err := <-sent:
+		if err != nil {
+			t.Fatalf("sending the cancellation: %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("the worker stopped reading while it waited for its handlers, so the cancellation never reached it")
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("the goodbye must end the loop cleanly, got %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("the goodbye never completed")
+	}
+
+	var sawCancelled, sawBye bool
+	for f := range frames {
+		switch f.ID {
+		case 2:
+			sawCancelled = f.Kind == wproto.KindErr && f.Err != nil && f.Err.Code == "cancelled"
+		case 3:
+			sawBye = f.Kind == wproto.KindOK
+		}
+	}
+	if !sawCancelled {
+		t.Error("the running request was never cancelled")
+	}
+	if !sawBye {
+		t.Error("the goodbye was never acknowledged")
+	}
+}
+
 // TestAFailedWriteEndsTheWorker: a write that fails part-way leaves a frame the
 // peer can never finish reading, and every reply after it would be read as the
 // remainder of that one. The worker used to log the failure and carry on

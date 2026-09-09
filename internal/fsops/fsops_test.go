@@ -28,6 +28,18 @@ func requireSymlinks(t *testing.T) {
 	}
 }
 
+// requirePOSIXLinks skips a test whose subject is how the kernel resolves a
+// symlink target containing "..". Windows is not that kernel: it normalises the
+// target when the link is created, so "…/link/../report" is already stored as
+// "…/report" and there is nothing left for a resolver to get right or wrong
+// (INV-2 — never simulate the kernel). These run on the Linux CI jobs.
+func requirePOSIXLinks(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows normalises a symlink target at creation time, so this rule cannot be observed here")
+	}
+}
+
 // fixture builds a small tree and returns its Root.
 //
 //	/a/                 dir
@@ -726,6 +738,118 @@ func TestRelativeSymlinkEscapesAreRefused(t *testing.T) {
 	}
 	if !e.IsSymlink || e.LinkResolved != "" {
 		t.Errorf("entry = %+v, want a symlink with no resolved path", e)
+	}
+}
+
+// TestAnAbsoluteLinkTargetResolvesInKernelOrder: with /share/A/link pointing at
+// /share/B/dir, the kernel reads the target "/share/A/link/../report" as
+// /share/B/report — it follows link and only then applies "..". Cleaning the
+// target first removes the "link/.." pair and lands on /share/A/report, a
+// different file, which the UI's target actions would then download under the
+// name of the one that was asked for.
+func TestAnAbsoluteLinkTargetResolvesInKernelOrder(t *testing.T) {
+	requireSymlinks(t)
+	requirePOSIXLinks(t)
+	base := tempDir(t)
+	mkdir(t, base, "share/A")
+	mkdir(t, base, "share/B/dir")
+	write(t, base, "share/B/report", "the right report")
+	write(t, base, "share/A/report", "x")
+
+	link := filepath.Join(base, "share", "A", "link")
+	if err := os.Symlink(filepath.Join(base, "share", "B", "dir"), link); err != nil {
+		t.Fatal(err)
+	}
+	sep := string(filepath.Separator)
+	if err := os.Symlink(link+sep+".."+sep+"report", filepath.Join(base, "share", "ptr")); err != nil {
+		t.Fatal(err)
+	}
+	r := newRoot(t, base)
+	ctx := context.Background()
+
+	e, err := Stat(ctx, r, nil, "/share/ptr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.LinkResolved != "/share/B/report" {
+		t.Fatalf("resolved = %q, want /share/B/report", e.LinkResolved)
+	}
+	if e.TargetType != "file" {
+		t.Errorf("target type = %q, want file", e.TargetType)
+	}
+	// The sizes differ, so this is the file itself answering rather than the
+	// path arithmetic agreeing with itself.
+	st, err := StatFollow(ctx, r, nil, "/share/ptr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Size != int64(len("the right report")) {
+		t.Fatalf("size = %d, want %d: the link resolved to the wrong file", st.Size, len("the right report"))
+	}
+}
+
+// TestLinkPartsKeepsTheTargetComponentsInOrder is the same rule tested where
+// the host's own symlink semantics cannot get in the way: whatever the kernel
+// underneath, the components of an absolute target must reach the walk as
+// written, with the ".." still in them, and be checked for containment on the
+// literal head that precedes it.
+func TestLinkPartsKeepsTheTargetComponentsInOrder(t *testing.T) {
+	base := tempDir(t)
+	r := newRoot(t, base)
+	sep := string(filepath.Separator)
+
+	parts, absolute, err := linkParts(r, "/share/ptr", filepath.Join(base, "share", "A", "link")+sep+".."+sep+"report")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !absolute {
+		t.Fatal("an absolute target restarts the walk from the jail base")
+	}
+	want := []string{"share", "A", "link", "..", "report"}
+	if strings.Join(parts, "/") != strings.Join(want, "/") {
+		t.Fatalf("parts = %v, want %v: the \"link/..\" pair was collapsed before link was followed", parts, want)
+	}
+
+	// A relative target keeps its components too, and stays relative.
+	parts, absolute, err = linkParts(r, "/share/ptr", "sub"+sep+".."+sep+"report")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if absolute || strings.Join(parts, "/") != "sub/../report" {
+		t.Fatalf("relative target = %v absolute=%v", parts, absolute)
+	}
+
+	// Containment is still enforced, on the head that precedes the first "..".
+	outside := filepath.Join(filepath.Dir(base), "elsewhere", "x")
+	if _, _, err := linkParts(r, "/share/ptr", outside); !errors.Is(err, fsx.ErrOutsideRoot) {
+		t.Fatalf("err = %v, want ErrOutsideRoot for %q", err, outside)
+	}
+}
+
+// TestDotDotAfterAnUntraversableComponentIsRefused: ".." is applied to wherever
+// the components before it landed, and a component that landed nowhere is not
+// something to climb out of. The kernel answers "/nowhere/../b.txt" with ENOENT
+// and "/b.txt/../a/one.txt" with ENOTDIR; popping the failed component instead
+// quietly served a file nobody asked for.
+func TestDotDotAfterAnUntraversableComponentIsRefused(t *testing.T) {
+	requireSymlinks(t)
+	requirePOSIXLinks(t)
+	r, base := fixture(t)
+	sep := string(filepath.Separator)
+	if err := os.Symlink(filepath.Join(base, "nowhere")+sep+".."+sep+"b.txt", filepath.Join(base, "missing")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(base, "b.txt")+sep+".."+sep+"a"+sep+"one.txt", filepath.Join(base, "throughfile")); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if e, err := StatFollow(ctx, r, nil, "/missing"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("entry %+v, err = %v, want ErrNotExist", e, err)
+	}
+	if e, err := StatFollow(ctx, r, nil, "/throughfile"); err == nil {
+		t.Fatalf("climbing out of a regular file must fail, got %+v", e)
+	} else if code := fsx.Code(err); code != "bad_request" {
+		t.Errorf("code = %q, want bad_request (%v)", code, err)
 	}
 }
 

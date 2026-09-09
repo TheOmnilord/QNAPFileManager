@@ -155,3 +155,26 @@ func TestFromRequestNil(t *testing.T) {
 		t.Error("FromRequest(nil) = ok")
 	}
 }
+
+func TestRawQTSHeaders(t *testing.T) {
+	for _, tc := range []struct {
+		header string
+		want   Cred
+		ok     bool
+	}{
+		{`NAS_USER=DOMAIN\alice; NAS_SID="s%2Bid"`, Cred{Kind: KindSID, User: `DOMAIN\alice`, Token: "s+id"}, true},
+		{`NAS_USER=alice; qtoken=t+ok`, Cred{Kind: KindQToken, User: "alice", Token: "t+ok"}, true},
+		{`NAS_USER=alice; qtoken=t%ZZ`, Cred{Kind: KindQToken, User: "alice", Token: "t%ZZ"}, true},
+		{`NAS_USER=alice; qtoken="t=ok"`, Cred{Kind: KindQToken, User: "alice", Token: "t=ok"}, true},
+		{`NAS_USER=%00alice; NAS_USER=alice; qtoken=t`, Cred{}, false},
+		{`NAS_USER=alice; qtoken=t%0A`, Cred{}, false},
+		{`NAS_USER=alice; NAS_SID=t%00`, Cred{}, false},
+	} {
+		r := httptest.NewRequest("GET", "/", nil)
+		r.Header.Set("Cookie", tc.header)
+		got, ok := FromRequest(r)
+		if got != tc.want || ok != tc.ok {
+			t.Errorf("header %q: got %+v, %v; want %+v, %v", tc.header, got, ok, tc.want, tc.ok)
+		}
+	}
+}

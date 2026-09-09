@@ -74,3 +74,63 @@ func TestValidationConcurrencyBound(t *testing.T) {
 		})
 	}
 }
+
+func TestValidationWaitersIncludeSingleFlight(t *testing.T) {
+	for _, shared := range []bool{false, true} {
+		t.Run(fmt.Sprint(shared), func(t *testing.T) {
+			release := make(chan struct{})
+			var once sync.Once
+			unblock := func() { once.Do(func() { close(release) }) }
+			endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				<-release
+				fmt.Fprint(w, "<r><authPassed>0</authPassed></r>")
+			}))
+			defer endpoint.Close()
+			defer unblock()
+			v := newTestVerifier(endpoint)
+			results := make(chan error, 200)
+			for i := 0; i < 200; i++ {
+				go func(i int) {
+					token := fmt.Sprint(i)
+					if shared {
+						token = "same"
+					}
+					_, err := v.Verify(context.Background(), Cred{Kind: KindSID, Token: token})
+					results <- err
+				}(i)
+			}
+			active := DefaultMaxConcurrentValidations
+			if shared {
+				active = 1
+			}
+			admitted := active + DefaultMaxValidationWaiters
+			for i := 0; i < 200-admitted; i++ {
+				select {
+				case err := <-results:
+					if !errors.Is(err, ErrOverloaded) {
+						t.Fatalf("excess waiter: %v", err)
+					}
+				case <-time.After(3 * time.Second):
+					t.Fatal("excess waiter blocked")
+				}
+			}
+			v.mu.Lock()
+			waiting, flights := v.waiters, len(v.inflight)
+			v.mu.Unlock()
+			if waiting != DefaultMaxValidationWaiters || flights != active {
+				t.Fatalf("waiting=%d active=%d", waiting, flights)
+			}
+			unblock()
+			for i := 0; i < admitted; i++ {
+				if err := <-results; !errors.Is(err, ErrNotAuthenticated) {
+					t.Errorf("admitted request: %v", err)
+				}
+			}
+			v.mu.Lock()
+			defer v.mu.Unlock()
+			if v.waiters != 0 || len(v.validationSlots) != 0 || len(v.inflight) != 0 {
+				t.Fatal("admission capacity leaked")
+			}
+		})
+	}
+}

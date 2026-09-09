@@ -398,7 +398,7 @@ func TestStatusRootsDiagAndErrors(t *testing.T) {
 	if w := request(s, "GET", "/api/fs/stat?path=/missing", c, nil); w.Code != 404 {
 		t.Fatal(w.Body.String())
 	}
-	for code, want := range map[string]int{"bad_request": 400, "unauthorized": 401, "permission": 403, "protected": 403, "readonly": 403, "not_found": 404, "exists": 409, "not_empty": 409, "cross_device": 409, "conflict": 409, "too_large": 413, "unsupported": 415, "queue_full": 429, "internal": 500} {
+	for code, want := range map[string]int{"bad_request": 400, "unauthorized": 401, "permission": 403, "protected": 403, "readonly": 403, "not_found": 404, "exists": 409, "not_empty": 409, "cross_device": 409, "conflict": 409, "too_large": 413, "unsupported": 415, "queue_full": 429, "worker_gone": 503, "internal": 500} {
 		if got := statusCode(code); got != want {
 			t.Errorf("%s = %d", code, got)
 		}

@@ -271,6 +271,14 @@ func (s *session) hello() error {
 // serve is the read loop. It never returns while a handler is still running.
 func (s *session) serve(ctx context.Context) error {
 	defer s.wg.Wait()
+	// bye is non-nil once a goodbye has been accepted, and closes when the
+	// goroutine that waits out the running handlers has answered it.
+	var bye chan struct{}
+	defer func() {
+		if bye != nil {
+			<-bye
+		}
+	}()
 	for {
 		f, files, err := s.tr.Read()
 		if err != nil {
@@ -278,6 +286,11 @@ func (s *session) serve(ctx context.Context) error {
 			// However the connection ended, nothing a running handler produces
 			// can reach anyone now. Stop them before waiting for them.
 			s.cancelAll()
+			if bye != nil {
+				// This is the goodbye closing the transport under us, which is
+				// the orderly end of the session rather than a failure.
+				return nil
+			}
 			if ferr := s.fatalError(); ferr != nil {
 				// The read only failed because fatal closed the transport
 				// underneath it; report what actually went wrong.
@@ -298,16 +311,38 @@ func (s *session) serve(ctx context.Context) error {
 			s.reply(wproto.NewErr(f.ID, fmt.Errorf("%s frames are not requests: %w", f.Kind, wproto.ErrProtocol), nil))
 			continue
 		}
+		if bye != nil && f.Op != wproto.OpCancel {
+			// The goodbye has been accepted; only a cancellation for something
+			// still running is still useful.
+			s.reply(wproto.NewErr(f.ID, fmt.Errorf("this worker is shutting down: %w", fsx.ErrWorkerGone), nil))
+			continue
+		}
+
 		switch f.Op {
 		case wproto.OpBye:
 			// Finish what is in flight, then answer and stop. The reply is
 			// the front-end's signal that this exit was orderly rather than a
 			// crash.
-			s.wg.Wait()
-			if ok, err := wproto.NewOK(f.ID, nil); err == nil {
-				s.reply(ok)
-			}
-			return nil
+			//
+			// The wait happens on its own goroutine and this loop carries on
+			// reading. Waiting here instead used to deadlock the whole
+			// shutdown: the front-end bounds a request by its own deadline and
+			// then tells the worker to cancel it, and on the unbuffered
+			// in-process pipe that cancellation blocked forever against a
+			// worker that had stopped reading — so the handler never finished,
+			// the goodbye never completed, and the process was never signalled.
+			bye = make(chan struct{})
+			go func(id uint64, answered chan struct{}) {
+				defer close(answered)
+				s.wg.Wait()
+				if ok, err := wproto.NewOK(id, nil); err == nil {
+					s.reply(ok)
+				}
+				// Closing the transport is what ends the read loop, which is
+				// still draining frames on purpose.
+				_ = s.tr.Close()
+			}(f.ID, bye)
+			continue
 		case wproto.OpHello:
 			s.reply(wproto.NewErr(f.ID, fmt.Errorf("hello was already sent: %w", wproto.ErrProtocol), nil))
 			continue

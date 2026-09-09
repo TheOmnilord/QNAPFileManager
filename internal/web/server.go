@@ -6,6 +6,7 @@ import (
 	"container/list"
 	"context"
 	"embed"
+	"errors"
 	"io"
 	"io/fs"
 	"log"
@@ -41,6 +42,11 @@ type Server struct {
 	// Set before serving; nonpositive limits select the defaults.
 	MaxSessions, MaxSessionsPerUser int
 	sessionLookups                  uint64 // indexed lookups, guarded by mu
+	// AuthTimeout defaults to 10 seconds; config currently has no auth deadline.
+	// Set these before serving. Now is injectable for failure-limiter tests.
+	AuthTimeout  time.Duration
+	Now          func() time.Time
+	authFailures failureLimiter
 }
 
 func New(cfg config.Config, b backend.Backend, v *qtsauth.Verifier, ids *idmap.Map, p *platform.Platform, pinned *backend.Principal, version string, logger *log.Logger) *Server {
@@ -88,9 +94,31 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	if api || r.URL.Path == "/" || r.URL.Path == "/index.html" {
 		w.Header().Set("Cache-Control", "no-store")
 	}
-	sess, err := s.authenticate(w, r)
+	timeout := s.AuthTimeout
+	if timeout <= 0 {
+		timeout = defaultAuthTimeout
+	}
+	authCtx, authCancel := context.WithTimeout(r.Context(), timeout)
+	sess, err := s.authenticate(w, r.WithContext(authCtx))
+	if authCtx.Err() != nil {
+		err = authCtx.Err()
+	}
+	authCancel()
 	if err != nil {
-		s.fail(w, r, "unauthorized", "Sign in to QTS again to continue.", "", "")
+		switch {
+		case errors.Is(err, context.DeadlineExceeded):
+			writeError(w, 504, "auth_timeout", "Authentication timed out. Try again.", "", r.URL.Path, "")
+		case errors.Is(err, qtsauth.ErrOverloaded):
+			w.Header().Set("Retry-After", "2")
+			writeError(w, 503, "overloaded", "Authentication is busy. Try again shortly.", "", r.URL.Path, "")
+		case errors.Is(err, errAuthRateLimited):
+			w.Header().Set("Retry-After", "60")
+			writeError(w, 429, "rate_limited", "Too many failed authentication attempts. Try again in a minute.", "", r.URL.Path, "")
+		case errors.Is(err, errSessionStoreFull):
+			writeError(w, 503, "session_store_full", "The session store is full. Try again later.", "", r.URL.Path, "")
+		default:
+			s.fail(w, r, "unauthorized", "Sign in to QTS again to continue.", "", "")
+		}
 		return
 	}
 	if !safeMethod(r.Method) {

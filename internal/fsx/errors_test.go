@@ -31,7 +31,7 @@ func TestCode(t *testing.T) {
 		{"bad name", ErrBadName, "bad_request"},
 		{"outside root", ErrOutsideRoot, "bad_request"},
 		// A dead worker is our problem, not the caller's.
-		{"worker gone", ErrWorkerGone, "internal"},
+		{"worker gone", ErrWorkerGone, "worker_gone"},
 
 		{"cancelled", context.Canceled, "cancelled"},
 		// A deadline is not a cancellation and must not be mislabelled as one.

@@ -2,6 +2,7 @@ package web
 
 import (
 	"container/list"
+	"context"
 	"crypto/rand"
 	"errors"
 	"net/http"
@@ -21,6 +22,7 @@ const (
 )
 
 var errSession = errors.New("invalid session")
+var errSessionStoreFull = errors.New("session store full")
 
 type session struct {
 	mu                      sync.Mutex
@@ -33,7 +35,8 @@ type session struct {
 	order, userOrder *list.Element
 	note             string
 	cred             qtsauth.Cred
-	checked, expires time.Time
+	checked          time.Time
+	expires          time.Time // guarded by Server.mu after insertion
 }
 
 func (s *Server) cookie(w http.ResponseWriter, r *http.Request, value string, age int) {
@@ -86,7 +89,9 @@ func (s *Server) insertSession(sess *session) *session {
 	defer s.mu.Unlock()
 	if sess.binding != "" {
 		if old := s.byCredential[sess.binding]; old != nil {
-			return old
+			if !s.reclaimExpiredLocked(old, time.Now()) {
+				return old
+			}
 		}
 	}
 	if s.byCredential == nil {
@@ -101,13 +106,25 @@ func (s *Server) insertSession(sess *session) *session {
 		maxUser = DefaultMaxSessionsPerUser
 	}
 	sess.user = sess.who.User
+	// Sweep only under pressure, and never wait for a session doing network I/O.
+	users := s.byUser[sess.user]
+	if len(s.sessions) >= maxTotal || (users != nil && users.Len() >= maxUser) {
+		now := time.Now()
+		for _, old := range s.sessions {
+			s.reclaimExpiredLocked(old, now)
+		}
+	}
 	if users := s.byUser[sess.user]; users != nil && users.Len() >= maxUser {
 		s.removeSessionLocked(users.Front().Value.(*session))
 	}
 	for len(s.sessions) >= maxTotal {
-		s.removeSessionLocked(s.sessionOrder.Front().Value.(*session))
+		users := s.byUser[sess.user]
+		if users == nil || users.Len() == 0 {
+			return nil // Never invalidate another identity's live session.
+		}
+		s.removeSessionLocked(users.Front().Value.(*session))
 	}
-	users := s.byUser[sess.user]
+	users = s.byUser[sess.user]
 	if users == nil {
 		users = new(list.List)
 		s.byUser[sess.user] = users
@@ -119,6 +136,14 @@ func (s *Server) insertSession(sess *session) *session {
 		s.byCredential[sess.binding] = sess
 	}
 	return sess
+}
+
+func (s *Server) reclaimExpiredLocked(old *session, now time.Time) bool {
+	expired := !now.Before(old.expires)
+	if expired {
+		s.removeSessionLocked(old)
+	}
+	return expired
 }
 
 func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (*session, error) {
@@ -137,6 +162,11 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (*session,
 	if old != nil {
 		return s.authenticateSession(w, r, old, cred, hasCred)
 	}
+	if s.pinned == nil {
+		if err := s.authFailures.allow(ClientIP(r), s.now()); err != nil {
+			return nil, err
+		}
+	}
 	if s.pinned == nil && !hasCred {
 		return nil, nil
 	}
@@ -148,11 +178,14 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (*session,
 		if s.verifier == nil {
 			return nil, errSession
 		}
-		verified, err := s.verifier.Verify(r.Context(), cred)
+		verified, err := s.verifyCredential(r, cred)
 		if err != nil {
-			return nil, errSession
+			return nil, err
 		}
 		ident, err := s.ids.Resolve(r.Context(), verified.User)
+		if ctxErr := r.Context().Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		if err != nil {
 			return nil, errSession
 		}
@@ -164,13 +197,24 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (*session,
 			s.logger.Printf("admin disagreement user=%q ip=%q: %s", ident.Name, ClientIP(r), sess.note)
 		}
 	}
-	return s.authenticateSession(w, r, s.insertSession(sess), cred, hasCred)
+	if err := r.Context().Err(); err != nil {
+		return nil, err
+	}
+	stored := s.insertSession(sess)
+	if stored == nil {
+		return nil, errSessionStoreFull
+	}
+	return s.authenticateSession(w, r, stored, cred, hasCred)
 }
 
 func (s *Server) authenticateSession(w http.ResponseWriter, r *http.Request, old *session, cred qtsauth.Cred, hasCred bool) (*session, error) {
+	if err := lockSession(r.Context(), old); err != nil {
+		return nil, err
+	}
 	now := time.Now()
-	old.mu.Lock()
+	s.mu.Lock()
 	invalid := old.dead.Load() || !now.Before(old.expires)
+	s.mu.Unlock()
 	if s.pinned == nil && hasCred && qtsauth.CacheKey(cred) != old.binding {
 		invalid = true
 	}
@@ -181,11 +225,23 @@ func (s *Server) authenticateSession(w http.ResponseWriter, r *http.Request, old
 			if !safeMethod(r.Method) {
 				s.verifier.Invalidate(old.cred)
 			}
-			verified, err := s.verifier.Verify(r.Context(), old.cred)
+			verified, err := s.verifyCredential(r, old.cred)
+			if ctxErr := r.Context().Err(); ctxErr != nil {
+				old.mu.Unlock()
+				return nil, ctxErr
+			}
+			if errors.Is(err, qtsauth.ErrOverloaded) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				old.mu.Unlock()
+				return nil, err
+			}
 			if err != nil || verified.User != old.who.User {
 				invalid = true
 			} else {
 				ident, err := s.ids.Resolve(r.Context(), verified.User)
+				if ctxErr := r.Context().Err(); ctxErr != nil {
+					old.mu.Unlock()
+					return nil, ctxErr
+				}
 				if err != nil {
 					invalid = true
 				} else {
@@ -197,14 +253,17 @@ func (s *Server) authenticateSession(w http.ResponseWriter, r *http.Request, old
 			}
 		}
 	}
+	s.mu.Lock()
 	if !invalid && !old.dead.Load() {
 		old.expires = now.Add(sessionTTL)
+		s.mu.Unlock()
 		// Return an immutable request snapshot, not shared mutable session fields.
 		cp := snapshot(old)
 		old.mu.Unlock()
 		s.cookie(w, r, old.id, int(sessionTTL.Seconds()))
 		return cp, nil
 	}
+	s.mu.Unlock()
 	old.mu.Unlock()
 	s.destroy(old.id)
 	s.cookie(w, r, "", -1)

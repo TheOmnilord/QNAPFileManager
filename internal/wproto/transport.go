@@ -7,6 +7,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"time"
 
 	"qnapfilemanager/internal/fsx"
 )
@@ -30,10 +31,31 @@ type Transport interface {
 	// Write sends one frame. The caller keeps ownership of files: they are
 	// duplicated into the peer and the sender still closes its own copies.
 	Write(f Frame, files []*os.File) error
+	// WriteWithin is Write bounded by d.
+	//
+	// A stream socket's send buffer fills when the peer stops reading, and a
+	// net.Pipe has no buffer at all, so an unbounded Write is a wait on the
+	// peer's goodwill. That is fine inside a worker, which has nothing else to
+	// do; it is not fine in the root front-end, where one wedged worker would
+	// otherwise park the goroutine that was trying to shut it down.
+	//
+	// A frame that does not go out in time may have gone out in part, which
+	// desynchronises the framing for everything after it. There is no way to
+	// resynchronise, so a caller that gets an error here must close the
+	// transport and retire the worker rather than write to it again.
+	WriteWithin(d time.Duration, f Frame, files []*os.File) error
 	// PassesFDs reports whether this transport can carry descriptors at all,
 	// so a caller can fall back rather than fail.
 	PassesFDs() bool
 	Close() error
+}
+
+// deadlineWriter is the part of net.Conn that lets a write be bounded. Both
+// transports the daemon really uses have it: the socketpair is a *net.UnixConn,
+// and the in-process pipe is a net.Pipe, whose deadlines have been real since
+// Go 1.10. Anything else falls back to a goroutine and a timer.
+type deadlineWriter interface {
+	SetWriteDeadline(t time.Time) error
 }
 
 // NewTransport wraps rw. A *net.UnixConn on Linux gets the fd-passing
@@ -63,12 +85,28 @@ func (t *unixTransport) Read() (Frame, []*os.File, error) {
 }
 
 func (t *unixTransport) Write(f Frame, files []*os.File) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.writeLocked(f, files)
+}
+
+func (t *unixTransport) WriteWithin(d time.Duration, f Frame, files []*os.File) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if err := t.c.SetWriteDeadline(time.Now().Add(d)); err != nil {
+		return err
+	}
+	// The deadline is cleared again so an unbounded Write from another caller
+	// is not silently given this one's expiry.
+	defer func() { _ = t.c.SetWriteDeadline(time.Time{}) }()
+	return t.writeLocked(f, files)
+}
+
+func (t *unixTransport) writeLocked(f Frame, files []*os.File) error {
 	fds := make([]int, 0, len(files))
 	for _, file := range files {
 		fds = append(fds, int(file.Fd()))
 	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
 	return WriteFrame(t.c, f, fds)
 }
 
@@ -102,6 +140,40 @@ func (t *streamTransport) Write(f Frame, files []*os.File) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return Encode(t.rw, f)
+}
+
+func (t *streamTransport) WriteWithin(d time.Duration, f Frame, files []*os.File) error {
+	if len(files) > 0 {
+		return fmt.Errorf("passing file descriptors on this transport: %w", fsx.ErrUnsupported)
+	}
+	f.NFD = 0
+	if dw, ok := t.rw.(deadlineWriter); ok {
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		if err := dw.SetWriteDeadline(time.Now().Add(d)); err != nil {
+			return err
+		}
+		defer func() { _ = dw.SetWriteDeadline(time.Time{}) }()
+		return Encode(t.rw, f)
+	}
+	// Nothing to set a deadline on. The write goes on its own goroutine, which
+	// keeps the write lock until the peer takes the bytes or the transport is
+	// closed — and closing it is exactly what the caller has to do next, since
+	// a frame that timed out here may have gone out in part.
+	done := make(chan error, 1)
+	go func() {
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		done <- Encode(t.rw, f)
+	}()
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-timer.C:
+		return fmt.Errorf("the peer did not accept a %s frame within %s: %w", f.Kind, d, os.ErrDeadlineExceeded)
+	}
 }
 
 func (t *streamTransport) PassesFDs() bool { return false }

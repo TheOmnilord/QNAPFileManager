@@ -5,6 +5,9 @@ import "errors"
 // Sentinel errors. Callers should use errors.Is; every error returned by this
 // package wraps exactly one of these.
 var (
+	// ErrOverloaded means no validation waiter capacity remains; QTS was not called.
+	ErrOverloaded = errors.New("qtsauth: validation overloaded")
+
 	// ErrNotAuthenticated means QTS answered but rejected the credential
 	// (authPassed was absent or zero).
 	ErrNotAuthenticated = errors.New("qtsauth: not authenticated")

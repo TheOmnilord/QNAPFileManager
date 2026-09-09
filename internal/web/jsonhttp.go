@@ -29,6 +29,9 @@ func statusCode(code string) int {
 		return 415
 	case "queue_full":
 		return 429
+	case "worker_gone":
+		// The worker died mid-request; the pool respawns it, so retrying is right.
+		return 503
 	case "no_space":
 		return 507
 	case "confirm_required":

@@ -183,3 +183,37 @@ func TestRootTempDirRoundTrip(t *testing.T) {
 		t.Fatalf("an empty OS path must be rejected, got %v", err)
 	}
 }
+
+// TestRootDriveRootBase is the round-four finding: on Windows a jail of "C:\"
+// was trimmed to "C:", which names the drive's current directory, so the jail
+// silently pointed at the working directory. The mapping must keep the volume
+// root intact in both directions.
+func TestRootDriveRootBase(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("drive roots exist only on Windows")
+	}
+	r, err := NewRoot(`C:\`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := r.base; got != `C:\` {
+		t.Fatalf("base = %q, want C:\\", got)
+	}
+	osPath, err := r.OS("/Windows/notepad.exe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.EqualFold(osPath, `C:\Windows\notepad.exe`) {
+		t.Fatalf("OS() = %q", osPath)
+	}
+	api, err := r.API(`C:\Windows\notepad.exe`)
+	if err != nil || api != "/Windows/notepad.exe" {
+		t.Fatalf("API() = %q, %v", api, err)
+	}
+	if !r.Contains(`C:\Windows`) || r.Contains(`D:\Windows`) {
+		t.Fatal("Contains misjudged a drive-root jail")
+	}
+	if root, err := r.OS("/"); err != nil || root != `C:\` {
+		t.Fatalf("OS(\"/\") = %q, %v", root, err)
+	}
+}

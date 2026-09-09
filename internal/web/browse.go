@@ -29,6 +29,11 @@ func requestPath(r *http.Request) (string, error) {
 		}
 		p = string(raw)
 	}
+	for _, component := range strings.Split(p, "/") {
+		if component == "." || component == ".." {
+			return "", fmt.Errorf("path contains a dot component: %w", fsx.ErrBadName)
+		}
+	}
 	return fsx.Clean(p)
 }
 
@@ -210,6 +215,15 @@ func (s *Server) download(w http.ResponseWriter, r *http.Request, sess *session)
 		}
 	}
 	if stream {
+		if r.Method != http.MethodHead {
+			streamFile, err := prepareDownloadStream(f)
+			if err != nil {
+				s.backendError(w, r, p, err)
+				return
+			}
+			f = streamFile
+			defer f.Close()
+		}
 		w.WriteHeader(http.StatusOK) // Ignore Range for streams of unknown length.
 		// Flush headers so net/http cannot infer Content-Length for a short body.
 		if flusher, ok := w.(http.Flusher); ok {
@@ -218,10 +232,18 @@ func (s *Server) download(w http.ResponseWriter, r *http.Request, sess *session)
 		if r.Method == http.MethodHead {
 			return
 		}
-		// Closing interrupts pipe reads; kernel pseudo-file reads may not cancel.
-		stop := context.AfterFunc(r.Context(), func() { _ = f.Close() })
-		defer stop()
-		_, _ = io.Copy(w, downloadReader{ctx: r.Context(), reader: f})
+		ctx := r.Context()
+		copyDone := make(chan struct{})
+		defer close(copyDone)
+		go func() {
+			select {
+			case <-ctx.Done():
+				// Close wakes reads registered with the runtime poller.
+				_ = f.Close()
+			case <-copyDone:
+			}
+		}()
+		_, _ = io.Copy(w, downloadReader{ctx: ctx, reader: f})
 		return
 	}
 	http.ServeContent(w, r, name, e.MTime, f)

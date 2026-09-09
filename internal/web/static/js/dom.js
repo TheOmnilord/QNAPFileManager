@@ -18,6 +18,7 @@ export function parseRoute(hash) {
  if (hash.startsWith('b64/') && !pathB64 || pathB64 && !/^[A-Za-z0-9_-]+$/.test(pathB64)) throw new Error('Invalid byte path.');
  const path=pathB64 ? bytePath(rawPath({pathB64})).path : pathname.startsWith('/') ? decodeURIComponent(pathname) : '/share';
  if (!path.startsWith('/')) throw new Error('Use an absolute path.');
+ if (path.split('/').some(part => part==='.' || part==='..')) throw new Error('Path components "." and ".." are not allowed.');
  return {path,pathB64};
 }
 export function rawPath(entry) { return entry.pathB64 ? atob(entry.pathB64.replace(/-/g,'+').replace(/_/g,'/')) : String.fromCharCode(...new TextEncoder().encode(entry.path)); }

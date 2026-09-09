@@ -44,8 +44,7 @@ func (b *failureBucket) prune(now time.Time) {
 	}
 }
 
-// Account only verified failures: an IP budget must never reject a valid
-// credential. QTS's negative cache throttles repeated work for the same key.
+// Account only verified failures. Cache hits do not consume network capacity.
 func (l *failureLimiter) failed(ip, key string, now time.Time) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -80,42 +79,123 @@ func (l *failureLimiter) failed(ip, key string, now time.Time) error {
 }
 
 func (s *Server) verifyCredential(r *http.Request, cred qtsauth.Cred) (qtsauth.Session, error) {
-	verified, err := s.verifier.Verify(r.Context(), cred)
+	// The verifier exposes no cache-only lookup. Gate its transport so cached
+	// answers (including positives from other IPs) bypass the failure budget.
+	s.authTransportOnce.Do(func() {
+		if c := s.verifier.Client; c != nil {
+			client := c.HTTP
+			if client == nil {
+				client = qtsauth.NewHTTPClient(c.BaseURL, qtsauth.DefaultTimeout)
+			}
+			cp := *client
+			next := cp.Transport
+			if next == nil {
+				next = http.DefaultTransport
+			}
+			cp.Transport = authBudgetTransport{next: next}
+			c.HTTP = &cp
+		}
+	})
+	ctx, cancel := context.WithCancelCause(r.Context())
+	defer cancel(nil)
+	ctx = context.WithValue(ctx, authBudgetKey{}, &authBudget{s: s, ip: ClientIP(r), cancel: cancel})
+	verified, err := s.verifier.Verify(ctx, cred)
 	if ctxErr := r.Context().Err(); ctxErr != nil {
 		return qtsauth.Session{}, ctxErr
 	}
+	if errors.Is(context.Cause(ctx), errAuthRateLimited) {
+		return qtsauth.Session{}, errAuthRateLimited
+	}
 	if err != nil && !errors.Is(err, qtsauth.ErrOverloaded) && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-		if limitErr := s.authFailures.failed(ClientIP(r), qtsauth.CacheKey(cred), s.now()); limitErr != nil {
-			return qtsauth.Session{}, limitErr
-		}
+		// Already-running calls can finish after another failure fills the
+		// budget. Preserve their actual failure so sessions are revoked.
+		_ = s.authFailures.failed(ClientIP(r), qtsauth.CacheKey(cred), s.now())
 	}
 	return verified, err
 }
 
-// Shared by new credentials and existing sessions, including lock and identity
-// resolution waits. The verifier independently bounds actual CGI work.
+type authBudgetKey struct{}
+
+type authBudget struct {
+	s      *Server
+	ip     string
+	cancel context.CancelCauseFunc
+}
+
+type authBudgetTransport struct{ next http.RoundTripper }
+
+func (t authBudgetTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	if b, ok := r.Context().Value(authBudgetKey{}).(*authBudget); ok {
+		if err := b.s.authFailures.allow(b.ip, b.s.now()); err != nil {
+			// Admission pressure says nothing about credential validity. Cancel
+			// this verification so the verifier cannot negative-cache the refusal.
+			b.cancel(err)
+			return nil, err
+		}
+	}
+	return t.next.RoundTrip(r)
+}
+
+func (l *failureLimiter) allow(ip string, now time.Time) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if b := l.clients[ip]; b != nil {
+		b.prune(now)
+		if len(b.credentials) >= authFailureBurst {
+			return errAuthRateLimited
+		}
+		return nil
+	}
+	if len(l.clients) >= maxFailureClients {
+		for key, b := range l.clients {
+			b.prune(now)
+			if len(b.credentials) == 0 {
+				delete(l.clients, key)
+			}
+		}
+		if len(l.clients) >= maxFailureClients {
+			return errAuthRateLimited
+		}
+	}
+	return nil
+}
+
+// Shared by credential validation and identity resolution. Session followers
+// share the waiting bound but never occupy execution slots.
 type authAdmission struct {
 	once    sync.Once
 	slots   chan struct{}
 	waiters chan struct{}
 }
 
-func (a *authAdmission) enter(ctx context.Context) error {
+func (a *authAdmission) init() {
 	a.once.Do(func() {
 		a.slots = make(chan struct{}, qtsauth.DefaultMaxConcurrentValidations)
 		a.waiters = make(chan struct{}, qtsauth.DefaultMaxValidationWaiters)
 	})
+}
+
+func (a *authAdmission) wait() error {
+	a.init()
+	select {
+	case a.waiters <- struct{}{}:
+		return nil
+	default:
+		return qtsauth.ErrOverloaded
+	}
+}
+
+func (a *authAdmission) enter(ctx context.Context) error {
+	a.init()
 	select {
 	case a.slots <- struct{}{}:
 		return nil
 	default:
 	}
-	select {
-	case a.waiters <- struct{}{}:
-		defer func() { <-a.waiters }()
-	default:
-		return qtsauth.ErrOverloaded
+	if err := a.wait(); err != nil {
+		return err
 	}
+	defer func() { <-a.waiters }()
 	select {
 	case a.slots <- struct{}{}:
 		return nil
@@ -127,7 +207,18 @@ func (a *authAdmission) enter(ctx context.Context) error {
 func (a *authAdmission) leave() { <-a.slots }
 
 // A session's validation lock must not hold its followers beyond their deadline.
-func lockSession(ctx context.Context, sess *session) error {
+func (a *authAdmission) lockSession(ctx context.Context, sess *session) error {
+	if sess.mu.TryLock() {
+		if err := ctx.Err(); err != nil {
+			sess.mu.Unlock()
+			return err
+		}
+		return nil
+	}
+	if err := a.wait(); err != nil {
+		return err
+	}
+	defer func() { <-a.waiters }()
 	for !sess.mu.TryLock() {
 		timer := time.NewTimer(5 * time.Millisecond)
 		select {

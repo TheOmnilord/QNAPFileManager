@@ -44,10 +44,11 @@ type Server struct {
 	sessionLookups                  uint64 // indexed lookups, guarded by mu
 	// AuthTimeout defaults to 10 seconds; config currently has no auth deadline.
 	// Set these before serving. Now is injectable for failure-limiter tests.
-	AuthTimeout   time.Duration
-	Now           func() time.Time
-	authFailures  failureLimiter
-	authAdmission authAdmission
+	AuthTimeout       time.Duration
+	Now               func() time.Time
+	authFailures      failureLimiter
+	authAdmission     authAdmission
+	authTransportOnce sync.Once
 }
 
 func New(cfg config.Config, b backend.Backend, v *qtsauth.Verifier, ids *idmap.Map, p *platform.Platform, pinned *backend.Principal, version string, logger *log.Logger) *Server {

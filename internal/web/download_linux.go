@@ -5,6 +5,38 @@ import (
 	"syscall"
 )
 
+// prepareDownloadStream registers raw worker descriptors with the runtime
+// poller. SetNonblock alone cannot make an existing blocking os.NewFile pollable.
+func prepareDownloadStream(f *os.File) (*os.File, error) {
+	conn, err := f.SyscallConn()
+	if err != nil {
+		return nil, err
+	}
+	var dup uintptr
+	var setupErr error
+	err = conn.Control(func(fd uintptr) {
+		setupErr = syscall.SetNonblock(int(fd), true)
+		if setupErr != nil {
+			return
+		}
+		var errno syscall.Errno
+		dup, _, errno = syscall.Syscall(syscall.SYS_FCNTL, fd, syscall.F_DUPFD_CLOEXEC, 0)
+		if errno != 0 {
+			setupErr = errno
+		}
+	})
+	if err != nil {
+		return nil, err
+	}
+	if setupErr != nil {
+		return nil, os.NewSyscallError("prepare download stream", setupErr)
+	}
+	// A separate descriptor gives NewFile ownership without double-closing f's
+	// descriptor. NewFile observes O_NONBLOCK and registers pipes/FIFOs; regular
+	// files ignore O_NONBLOCK and continue to use ordinary file reads.
+	return os.NewFile(dup, f.Name()), nil
+}
+
 func pseudoFilesystem(f *os.File) bool {
 	return pseudoFilesystemWithStatfs(int(f.Fd()), syscall.Fstatfs)
 }

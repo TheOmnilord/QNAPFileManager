@@ -16,6 +16,11 @@ test('hash routes preserve authoritative bytes and accept text and legacy bookma
  assert.deepEqual(parseRoute(route(text)),{...text,pathB64:''});
  assert.deepEqual(parseRoute(''),{path:'/share',pathB64:''});
  for (const hash of ['#b64/','#b64/%%','#b64/'+bytePath('relative').pathB64]) assert.throws(() => parseRoute(hash));
+ for (const path of ['/dangling/../report','/locked/./report','/..','/.','/a//../b']) {
+  assert.throws(() => parseRoute(route({path})), /Path components/);
+  assert.throws(() => parseRoute(route(bytePath(path))), /Path components/);
+ }
+ assert.throws(() => parseRoute('#/dangling/%2e%2e/report'), /Path components/);
  // Parent navigation and breadcrumbs slice raw bytes, including invalid UTF-8.
  const parent=bytePath(rawPath(entry).slice(0,rawPath(entry).lastIndexOf('/')));
  assert.equal(rawPath(parseRoute(route(parent))),'/share/\xff');

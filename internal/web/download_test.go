@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -100,32 +101,76 @@ func TestDownloadSizing(t *testing.T) {
 }
 
 func TestDownloadStreamCancellation(t *testing.T) {
-	s, _ := fixture(t, true)
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows os.Pipe reads are synchronous and cannot reliably be interrupted by Close")
+	}
 	r, w, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
 	}
+	testDownloadStreamCancellation(t, r, w)
+}
+
+type downloadProgressRecorder struct {
+	*httptest.ResponseRecorder
+	wrote chan struct{}
+}
+
+func (w downloadProgressRecorder) Write(p []byte) (int, error) {
+	n, err := w.ResponseRecorder.Write(p)
+	select {
+	case w.wrote <- struct{}{}:
+	default:
+	}
+	return n, err
+}
+
+func testDownloadStreamCancellation(t *testing.T, r, w *os.File) {
+	t.Helper()
 	defer r.Close()
 	defer w.Close()
-	opened := make(chan struct{})
+	s, _ := fixture(t, true)
 	s.backend = downloadBackend{open: func() (*os.File, fsx.Entry, error) {
-		close(opened)
 		return r, fsx.Entry{Type: "file"}, nil
 	}}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	req := httptest.NewRequest(http.MethodGet, "/?path=/meminfo", nil).WithContext(ctx)
 	done := make(chan struct{})
+	recorder := downloadProgressRecorder{httptest.NewRecorder(), make(chan struct{}, 1)}
 	go func() {
 		defer close(done)
-		s.download(httptest.NewRecorder(), req, &session{})
+		s.download(recorder, req, &session{})
 	}()
-	<-opened
+	go func() { _, _ = io.WriteString(w, "stream started\n") }()
+	select {
+	case <-recorder.wrote:
+	case <-done:
+		t.Fatal("download returned before reading the pipe")
+	case <-time.After(10 * time.Second):
+		t.Fatal("download did not start reading the pipe")
+	}
+	// Keep the writer open and give the copy time to block on its next read.
+	// This also detects an unregistered non-blocking descriptor returning EAGAIN.
+	select {
+	case <-done:
+		t.Fatal("download returned before cancellation or pipe EOF")
+	case <-time.After(100 * time.Millisecond):
+	}
 	cancel()
 	select {
 	case <-done:
-	case <-time.After(5 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("cancelled download remained blocked reading the pipe")
+	}
+}
+
+func TestDownloadReaderAlreadyCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	reader := downloadReader{ctx: ctx, reader: strings.NewReader("must not be copied")}
+	if n, err := io.Copy(io.Discard, reader); n != 0 || err != context.Canceled {
+		t.Fatalf("cancelled copy = (%d, %v), want (0, context.Canceled)", n, err)
 	}
 }
 

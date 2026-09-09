@@ -71,7 +71,25 @@ func (p *Pool) spawnProcess(who backend.Principal) (*client, error) {
 	if who.Root {
 		uid = 0
 	}
-	cmd := exec.Command(exe, "-worker", "-uid", strconv.Itoa(uid))
+	// The pool's context, not the requesting user's: a worker outlives the
+	// request that spawned it. What it buys is the end of the shutdown, where a
+	// process forked by a startup nothing had a handle for yet — one whose
+	// cmd.Start returned after the shutdown had finished sweeping — would
+	// otherwise be left running with a user's credentials and the front-end's
+	// descriptors, with nobody left to signal it.
+	cmd := exec.CommandContext(p.shutdownCtx, exe, "-worker", "-uid", strconv.Itoa(uid))
+	// The cancellation aims at the process group, the way the signal ladder
+	// does, so anything the worker started dies with it rather than being
+	// reparented; os/exec's default would signal the leader alone. WaitDelay
+	// bounds the copy of the worker's stdout and stderr into the log after the
+	// process is gone: without it a grandchild holding the pipe open keeps
+	// cmd.Wait — and therefore the client's exited channel, and therefore a
+	// shutdown waiting on it — running for as long as it likes.
+	cmd.Cancel = func() error {
+		signalGroup(cmd.Process.Pid, syscall.SIGKILL)
+		return nil
+	}
+	cmd.WaitDelay = termGrace
 	// Never hold a working directory on a volume: it would block an unmount.
 	cmd.Dir = "/"
 	cmd.Env = workerEnv(who)

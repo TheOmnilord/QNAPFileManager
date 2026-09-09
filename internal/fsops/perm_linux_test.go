@@ -102,3 +102,70 @@ func TestOpenReadThroughASearchOnlyDirectory(t *testing.T) {
 		t.Errorf("listing a directory with no read bit = %v, want a permission error", err)
 	}
 }
+
+// TestMetadataThroughNestedSearchOnlyDirectories is the same rule for every
+// operation that only needs to *reach* a name rather than to enumerate one, and
+// for more than one directory deep — because the walk os.Root does is the same
+// walk whether the read permission is missing on the first component or the
+// fourth. Stat, StatFollow, Readlink and OpenRead all take the O_PATH walk now;
+// this is what says so.
+func TestMetadataThroughNestedSearchOnlyDirectories(t *testing.T) {
+	requireSymlinks(t)
+	requireUnprivileged(t)
+	base := tempDir(t)
+	mkdir(t, base, "outer/inner")
+	write(t, base, "outer/inner/leaf.txt", "reachable")
+	if err := os.Symlink("leaf.txt", filepath.Join(base, "outer", "inner", "ptr")); err != nil {
+		t.Fatal(err)
+	}
+	outer := filepath.Join(base, "outer")
+	inner := filepath.Join(outer, "inner")
+	// Restored innermost first, which is the order t.Cleanup runs them in and
+	// the only order that works: chmod on the inner directory needs the search
+	// bit on the outer one, which 0111 still grants.
+	chmodBack(t, outer, 0o755)
+	chmodBack(t, inner, 0o755)
+	for _, dir := range []string{outer, inner} {
+		if err := os.Chmod(dir, 0o111); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := os.ReadDir(outer); err == nil {
+		t.Skip("this filesystem does not enforce the directory read bit")
+	}
+	r := newRoot(t, base)
+	ctx := context.Background()
+
+	// The directories themselves are still nameable.
+	if e, err := Stat(ctx, r, nil, "/outer/inner"); err != nil {
+		t.Fatalf("stat of a search-only directory two deep: %v", err)
+	} else if e.Type != "dir" {
+		t.Errorf("type = %q, want dir", e.Type)
+	}
+	if e, err := Stat(ctx, r, nil, "/outer/inner/leaf.txt"); err != nil {
+		t.Fatalf("stat through two search-only directories: %v", err)
+	} else if e.Size != int64(len("reachable")) {
+		t.Errorf("size = %d, want %d", e.Size, len("reachable"))
+	}
+	if target, err := Readlink(ctx, r, "/outer/inner/ptr"); err != nil {
+		t.Fatalf("readlink through two search-only directories: %v", err)
+	} else if target != "leaf.txt" {
+		t.Errorf("target = %q, want leaf.txt", target)
+	}
+	if e, err := StatFollow(ctx, r, nil, "/outer/inner/ptr"); err != nil {
+		t.Fatalf("stat through the link: %v", err)
+	} else if e.Size != int64(len("reachable")) {
+		t.Errorf("size through the link = %d, want %d", e.Size, len("reachable"))
+	}
+	f, _, err := OpenRead(ctx, r, "/outer/inner/leaf.txt")
+	if err != nil {
+		t.Fatalf("downloading through two search-only directories: %v", err)
+	}
+	f.Close()
+
+	// And a name that is not there is still ENOENT rather than EACCES: the walk
+	// must not turn "you may not look" into the answer for "it is not here".
+	if _, err := Stat(ctx, r, nil, "/outer/inner/missing.txt"); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("stat of a missing name = %v, want a not-exist error", err)
+	}
+}

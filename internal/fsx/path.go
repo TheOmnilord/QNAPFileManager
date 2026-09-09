@@ -6,19 +6,31 @@ import (
 	"strings"
 )
 
-// Clean normalises an API path: absolute, slash-separated, no "." or ".."
-// elements left in it. API paths are always Linux-shaped, even when the
-// process is running on Windows against a -jail directory; the conversion to
-// an OS path happens in exactly one place, Root.OS.
+// Clean checks and tidies an API path: absolute, slash-separated, with no "."
+// or ".." component anywhere in it. API paths are always Linux-shaped, even
+// when the process is running on Windows against a -jail directory; the
+// conversion to an OS path happens in exactly one place, Root.OS.
 //
 // It rejects the empty string, a relative path, an embedded NUL (which the
-// kernel would truncate at), and a leading "//" — path.Clean would collapse
-// that to a plain absolute path, but on a UNC-aware host it names a server,
-// so it must not be silently accepted here and re-expanded later.
+// kernel would truncate at), and a leading "//" — collapsing that to a plain
+// absolute path would be wrong on a UNC-aware host, where it names a server,
+// so it must not be silently accepted here and re-expanded later. Duplicate
+// slashes elsewhere and a trailing slash are collapsed, because those name the
+// same file to the kernel.
 //
-// A "..", once the path is absolute, cannot escape: path.Clean resolves
-// "/a/../../b" to "/b". Note this is purely lexical, so callers doing a write
-// must still resolve the parent's symlinks before trusting the result.
+// A "." or a ".." is refused rather than normalised, and that is the whole
+// point of this function. path.Clean is pure lexical arithmetic and the kernel
+// is not: it resolves each component in turn, so "/dangling/../report" is
+// ENOENT and "/locked/../report" is EACCES for a user who cannot search
+// "locked", while a lexical clean turns both into "/report" and answers about a
+// different file — one the request never named and the user may not be entitled
+// to. Cleaning also cancels a symlink against the "..'" that follows it, which
+// the kernel resolves the other way round.
+//
+// Nothing legitimate loses by this: the UI only ever sends canonical absolute
+// paths (it builds them from the entries the worker returned), so a "." or ".."
+// arriving here is a hand-made request, and the honest answer to it is
+// bad_request rather than a guess at what the caller meant.
 func Clean(p string) (string, error) {
 	if p == "" {
 		return "", fmt.Errorf("empty path: %w", ErrNotAbsolute)
@@ -32,15 +44,23 @@ func Clean(p string) (string, error) {
 	if !strings.HasPrefix(p, "/") {
 		return "", fmt.Errorf("%q is not absolute: %w", p, ErrNotAbsolute)
 	}
-	c := path.Clean(p)
-	// Belt and braces: unreachable for an absolute path today, but the check
-	// costs nothing and is the invariant the guard depends on.
-	for _, el := range strings.Split(c, "/") {
-		if el == ".." {
-			return "", fmt.Errorf("%q escapes the root: %w", p, ErrBadName)
+	var b strings.Builder
+	b.Grow(len(p))
+	for _, el := range strings.Split(p, "/") {
+		switch el {
+		case "":
+			// A duplicate or trailing slash: the kernel ignores it, so do we.
+			continue
+		case ".", "..":
+			return "", fmt.Errorf("%q contains a %q component, which only the kernel may resolve: %w", p, el, ErrBadName)
 		}
+		b.WriteByte('/')
+		b.WriteString(el)
 	}
-	return c, nil
+	if b.Len() == 0 {
+		return "/", nil
+	}
+	return b.String(), nil
 }
 
 // Join appends elements to an already-clean API path. Names coming from a

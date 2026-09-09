@@ -161,19 +161,6 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (*session,
 	old := s.lookupSessionLocked(id, binding)
 	s.mu.Unlock()
 	if old != nil {
-		// Reserve before the shared gate: queued admission also counts against
-		// this session's allowance (one validator plus eight followers).
-		n := old.authRequests.Add(1)
-		defer old.authRequests.Add(-1)
-		if n > maxSessionAuthWaiters+1 {
-			return nil, qtsauth.ErrOverloaded
-		}
-	}
-	if err := s.authAdmission.enter(r.Context()); err != nil {
-		return nil, err
-	}
-	defer s.authAdmission.leave()
-	if old != nil {
 		return s.authenticateSession(w, r, old, cred, hasCred)
 	}
 	if s.pinned == nil && !hasCred {
@@ -184,26 +171,8 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (*session,
 		sess.who = *s.pinned
 		sess.admin = idmap.IsLocalAdmin(idmap.Ident{Name: s.pinned.User, UID: s.pinned.UID, GID: s.pinned.GID, Groups: s.pinned.Groups}, s.ids)
 	} else {
-		if s.verifier == nil {
-			return nil, errSession
-		}
-		verified, err := s.verifyCredential(r, cred)
-		if err != nil {
+		if err := s.authenticateCredential(r, sess, cred); err != nil {
 			return nil, err
-		}
-		ident, err := s.ids.Resolve(r.Context(), verified.User)
-		if ctxErr := r.Context().Err(); ctxErr != nil {
-			return nil, ctxErr
-		}
-		if err != nil {
-			return nil, errSession
-		}
-		sess.who = principal(ident)
-		sess.admin, sess.note = idmap.DecideAdmin(verified.IsAdmin(), ident, s.ids, s.cfg.Auth.AdminRequiresBoth)
-		sess.partial = ident.Partial
-		sess.binding, sess.kind, sess.cred, sess.checked = binding, cred.Kind, cred, verified.ValidatedAt
-		if sess.note != "" {
-			s.logger.Printf("admin disagreement user=%q ip=%q: %s", ident.Name, ClientIP(r), sess.note)
 		}
 	}
 	if err := r.Context().Err(); err != nil {
@@ -216,8 +185,43 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (*session,
 	return s.authenticateSession(w, r, stored, cred, hasCred)
 }
 
+func (s *Server) authenticateCredential(r *http.Request, sess *session, cred qtsauth.Cred) error {
+	if s.verifier == nil {
+		return errSession
+	}
+	if err := s.authAdmission.enter(r.Context()); err != nil {
+		return err
+	}
+	defer s.authAdmission.leave()
+	verified, err := s.verifyCredential(r, cred)
+	if err != nil {
+		return err
+	}
+	ident, err := s.ids.Resolve(r.Context(), verified.User)
+	if ctxErr := r.Context().Err(); ctxErr != nil {
+		return ctxErr
+	}
+	if err != nil {
+		return errSession
+	}
+	sess.who = principal(ident)
+	sess.admin, sess.note = idmap.DecideAdmin(verified.IsAdmin(), ident, s.ids, s.cfg.Auth.AdminRequiresBoth)
+	sess.partial = ident.Partial
+	sess.binding, sess.kind, sess.cred, sess.checked = qtsauth.CacheKey(cred), cred.Kind, cred, verified.ValidatedAt
+	if sess.note != "" {
+		s.logger.Printf("admin disagreement user=%q ip=%q: %s", ident.Name, ClientIP(r), sess.note)
+	}
+	return nil
+}
+
 func (s *Server) authenticateSession(w http.ResponseWriter, r *http.Request, old *session, cred qtsauth.Cred, hasCred bool) (*session, error) {
-	if err := lockSession(r.Context(), old); err != nil {
+	// Include requests that converged on this session during insertion too.
+	n := old.authRequests.Add(1)
+	defer old.authRequests.Add(-1)
+	if n > maxSessionAuthWaiters+1 {
+		return nil, qtsauth.ErrOverloaded
+	}
+	if err := s.authAdmission.lockSession(r.Context(), old); err != nil {
 		return nil, err
 	}
 	now := time.Now()
@@ -231,6 +235,11 @@ func (s *Server) authenticateSession(w http.ResponseWriter, r *http.Request, old
 		if s.verifier == nil {
 			invalid = true
 		} else {
+			if err := s.authAdmission.enter(r.Context()); err != nil {
+				old.mu.Unlock()
+				return nil, err
+			}
+			defer s.authAdmission.leave()
 			if !safeMethod(r.Method) {
 				s.verifier.Invalidate(old.cred)
 			}
@@ -239,15 +248,7 @@ func (s *Server) authenticateSession(w http.ResponseWriter, r *http.Request, old
 				old.mu.Unlock()
 				return nil, ctxErr
 			}
-			if errors.Is(err, errAuthRateLimited) {
-				// Rate limiting here represents a verified failure, not temporary
-				// admission pressure. Revoke the session even when reporting 429.
-				old.mu.Unlock()
-				s.destroy(old.id)
-				s.cookie(w, r, "", -1)
-				return nil, err
-			}
-			if errors.Is(err, qtsauth.ErrOverloaded) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			if errors.Is(err, errAuthRateLimited) || errors.Is(err, qtsauth.ErrOverloaded) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				old.mu.Unlock()
 				return nil, err
 			}

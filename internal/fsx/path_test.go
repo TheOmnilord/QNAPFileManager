@@ -16,10 +16,22 @@ func TestClean(t *testing.T) {
 		{"plain", "/etc/passwd", "/etc/passwd", nil},
 		{"trailing slash", "/share/Public/", "/share/Public", nil},
 		{"double slash inside", "/share//Public", "/share/Public", nil},
-		{"dot element", "/share/./Public", "/share/Public", nil},
-		{"dotdot resolved", "/share/Public/../Multimedia", "/share/Multimedia", nil},
-		{"dotdot past root", "/../../etc", "/etc", nil},
+		{"repeated slashes", "/share///a//b/", "/share/a/b", nil},
 		{"backslash is a real character", "/share/a\\b", "/share/a\\b", nil},
+		// A "." or a ".." is refused, never resolved: the kernel walks
+		// "/dangling/../report" into ENOENT and "/locked/../report" into EACCES,
+		// where a lexical clean would answer about "/report" — a file the request
+		// never named.
+		{"dot element", "/share/./Public", "", ErrBadName},
+		{"dotdot inside", "/share/Public/../Multimedia", "", ErrBadName},
+		{"dotdot past root", "/../../etc", "", ErrBadName},
+		{"trailing dotdot", "/share/Public/..", "", ErrBadName},
+		{"trailing dot", "/share/Public/.", "", ErrBadName},
+		{"dot-only path", "/.", "", ErrBadName},
+		// Only a whole component counts; these are ordinary filenames.
+		{"leading dots in a name", "/share/...", "/share/...", nil},
+		{"dotfile", "/share/.hidden", "/share/.hidden", nil},
+		{"name ending in dots", "/share/a..b", "/share/a..b", nil},
 		{"space and hash", "/share/a #b.txt", "/share/a #b.txt", nil},
 		{"empty", "", "", ErrNotAbsolute},
 		{"relative", "etc/passwd", "", ErrNotAbsolute},

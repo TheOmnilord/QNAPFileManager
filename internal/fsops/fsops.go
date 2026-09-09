@@ -9,7 +9,11 @@
 // arrives in M1 and the recursive walks (TreeSize, copy, delete) in M2.
 //
 // Paths in and out are API paths — absolute, slash-separated, already the shape
-// fsx.Clean produces. Every syscall goes through the *os.Root that fsx.Root.Open
+// fsx.Clean produces. Every entry point here passes what it was given through
+// fsx.Clean, which refuses a "." or a ".." component rather than resolving it:
+// only the kernel may resolve those, one component at a time, against the
+// symlinks and the search permissions that are actually there.
+// Every syscall goes through the *os.Root that fsx.Root.Open
 // holds: the kernel resolves each component against that directory's descriptor
 // and refuses one that would leave it, so the jail is enforced by openat rather
 // than by string comparison. The unjailed production case is the same code path
@@ -156,7 +160,7 @@ func resolve(r fsx.Root, apiPath string, followFinal bool) (jailPath, error) {
 			continue
 		}
 		cand := relJoin(relOf(done), part)
-		fi, err := rt.Lstat(cand)
+		fi, err := statAt(rt, cand, false)
 		if err != nil {
 			// Not there at all, or not readable: keep the component as written
 			// so the caller's syscall reports it, and remember why.
@@ -177,7 +181,7 @@ func resolve(r fsx.Root, apiPath string, followFinal bool) (jailPath, error) {
 		if hops > maxLinkHops {
 			return jailPath{}, fmt.Errorf("%q: too many levels of symbolic links: %w", apiPath, fsx.ErrUnsupported)
 		}
-		link, err := rt.Readlink(cand)
+		link, err := readlinkAt(rt, cand)
 		if err != nil {
 			return jailPath{}, err
 		}
@@ -374,7 +378,7 @@ func List(ctx context.Context, r fsx.Root, plat *platform.Platform, dir string, 
 		// API vocabulary spells bad_request. An lstat tells that apart from a
 		// genuine failure without depending on an errno that differs per
 		// platform.
-		if fi, serr := tg.rt.Lstat(tg.rel); serr == nil && !fi.IsDir() {
+		if fi, serr := statAt(tg.rt, tg.rel, false); serr == nil && !fi.IsDir() {
 			return fsx.Listing{}, fmt.Errorf("%q is not a directory: %w", clean, fsx.ErrBadName)
 		}
 		// A directory we cannot read is an error, not a partial listing: a
@@ -507,9 +511,9 @@ func statPath(ctx context.Context, r fsx.Root, plat *platform.Platform, p string
 	}
 	var fi os.FileInfo
 	if follow {
-		fi, err = tg.rt.Stat(tg.rel)
+		fi, err = statAt(tg.rt, tg.rel, true)
 	} else {
-		fi, err = tg.rt.Lstat(tg.rel)
+		fi, err = statAt(tg.rt, tg.rel, false)
 	}
 	if err != nil {
 		return fsx.Entry{}, err
@@ -549,7 +553,7 @@ func Readlink(ctx context.Context, r fsx.Root, p string) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	return tg.rt.Readlink(tg.rel)
+	return readlinkAt(tg.rt, tg.rel)
 }
 
 // OpenRead opens a regular file for reading as this process's identity — which
@@ -592,7 +596,7 @@ func OpenRead(ctx context.Context, r fsx.Root, p string) (*os.File, fsx.Entry, e
 	if err := ctx.Err(); err != nil {
 		return nil, fsx.Entry{}, err
 	}
-	before, err := tg.rt.Lstat(tg.rel)
+	before, err := statAt(tg.rt, tg.rel, false)
 	if err != nil {
 		return nil, fsx.Entry{}, err
 	}
@@ -667,7 +671,7 @@ func newEntry(apiPath string, name []byte, fi os.FileInfo, ids *idmap.Map) fsx.E
 // the link itself stays fully visible, because hiding it would be lying about
 // the directory, but where it points is not this daemon's to disclose.
 func resolveLink(e *fsx.Entry, r fsx.Root, rt *os.Root, rel, apiPath string, wantType, wantResolved bool) {
-	if t, err := rt.Readlink(rel); err == nil {
+	if t, err := readlinkAt(rt, rel); err == nil {
 		e.SetLinkTarget([]byte(t))
 	}
 	if !wantType {
@@ -679,7 +683,7 @@ func resolveLink(e *fsx.Entry, r fsx.Root, rt *os.Root, rel, apiPath string, wan
 	}
 	// The path is fully resolved by now, so lstat is the target's own metadata
 	// and needs no second pass through the link.
-	st, err := tg.rt.Lstat(tg.rel)
+	st, err := statAt(tg.rt, tg.rel, false)
 	if err != nil {
 		return // dangling or unreadable; TargetType stays empty, as documented
 	}

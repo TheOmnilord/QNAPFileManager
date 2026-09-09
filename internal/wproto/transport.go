@@ -135,7 +135,7 @@ func (t *unixTransport) Read() (Frame, []*os.File, error) {
 	}
 	files := make([]*os.File, 0, len(fds))
 	for i, fd := range fds {
-		files = append(files, os.NewFile(uintptr(fd), fmt.Sprintf("wproto-fd-%d-%d", f.ID, i)))
+		files = append(files, receivedFile(fd, fmt.Sprintf("wproto-fd-%d-%d", f.ID, i)))
 	}
 	return f, files, err
 }

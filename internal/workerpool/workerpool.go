@@ -188,6 +188,23 @@ type Pool struct {
 
 	stopJanitor chan struct{}
 	janitorGone chan struct{}
+
+	// There is exactly one shutdown operation, however many callers ask for
+	// one. shutdownOnce starts it, shutdownDone is closed when it has finished
+	// and shutdownErr is its result; every caller waits on shutdownDone with a
+	// context of its own, so a caller that gives up early gives up on the wait
+	// and not on the work. A second call after a timeout therefore waits again
+	// rather than reporting a success that never happened.
+	shutdownOnce sync.Once
+	shutdownDone chan struct{}
+	shutdownErr  error
+	// shutdownCtx is the context every worker process is started against. It is
+	// cancelled when the shutdown has finished with everything it could see, so
+	// a process whose fork returned after the last sweep — the one nothing in
+	// the pool has a handle for yet — is still killed by os/exec rather than
+	// outliving the pool that spawned it.
+	shutdownCtx context.Context
+	endWorkers  context.CancelFunc
 }
 
 // budget is one uid's restart history.
@@ -251,14 +268,16 @@ func New(cfg config.Config, root fsx.Root, plat *platform.Platform, ids *idmap.M
 // NewWithOptions builds a pool from an explicit Options.
 func NewWithOptions(o Options) *Pool {
 	p := &Pool{
-		opts:        o.normalise(),
-		workers:     map[string]*client{},
-		spawning:    map[string]*startup{},
-		retiring:    map[*client]struct{}{},
-		budgets:     map[string]*budget{},
-		stopJanitor: make(chan struct{}),
-		janitorGone: make(chan struct{}),
+		opts:         o.normalise(),
+		workers:      map[string]*client{},
+		spawning:     map[string]*startup{},
+		retiring:     map[*client]struct{}{},
+		budgets:      map[string]*budget{},
+		stopJanitor:  make(chan struct{}),
+		janitorGone:  make(chan struct{}),
+		shutdownDone: make(chan struct{}),
 	}
+	p.shutdownCtx, p.endWorkers = context.WithCancel(context.Background())
 	go p.janitor()
 	return p
 }
@@ -378,91 +397,121 @@ func (p *Pool) stopRetiredWait(ctx context.Context, c *client) {
 }
 
 // Shutdown stops every worker: bye first, then the signals. It is safe to call
-// twice and it never blocks longer than ctx allows.
+// from several goroutines and safe to call again, and it never blocks longer
+// than ctx allows.
+//
+// The work itself runs once, in the background, and every caller waits on that
+// one operation. Doing it on the caller's goroutine meant a caller whose
+// deadline expired took the shutdown with it: it returned while workers it had
+// not reached yet were still running, and because `closed` was already set the
+// next call reported an immediate success over them. A caller that gives up
+// here gives up only on the waiting; the termination carries on, and a second
+// call waits for it to finish rather than pretending it has.
 func (p *Pool) Shutdown(ctx context.Context) error {
-	p.mu.Lock()
-	if p.closed {
+	p.shutdownOnce.Do(func() {
+		// Set under the lock and before anything else, so that from the moment
+		// the first caller returns — whatever it returns — no further worker can
+		// be spawned: get checks this while holding the same lock it registers
+		// a startup under.
+		p.mu.Lock()
+		p.closed = true
 		p.mu.Unlock()
-		return nil
+		go p.runShutdown()
+	})
+	select {
+	case <-p.shutdownDone:
+		return p.shutdownErr
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	p.closed = true
-	// A worker that is still coming up is a process (or, in-process, a
-	// goroutine) that nothing else in this function can see: it is not in
-	// p.workers until its hello has been answered. Cancelling the startups and
-	// waiting for them is what turns them into workers this can collect —
-	// without it, Shutdown returned success and closed the jail root while a
-	// handshake was still running, and the process it produced was registered
-	// for termination afterwards, by a goroutine belonging to a pool that was
-	// supposed to be gone.
-	starting := make([]*startup, 0, len(p.spawning))
-	for _, s := range p.spawning {
-		starting = append(starting, s)
-	}
-	p.mu.Unlock()
+}
+
+// runShutdown is the single shutdown operation. It terminates everything the
+// pool is holding a process for and closes the jail root, and it does not stop
+// for anybody's deadline: the callers have their own contexts to give up on.
+func (p *Pool) runShutdown() {
+	defer close(p.shutdownDone)
 
 	close(p.stopJanitor)
 	<-p.janitorGone
 
-	for _, s := range starting {
-		s.cancel()
-	}
-	for _, s := range starting {
-		select {
-		case <-s.done:
-		case <-ctx.Done():
-			return ctx.Err()
+	var wg sync.WaitGroup
+	for {
+		// A worker that is still coming up is a process (or, in-process, a
+		// goroutine) that is in p.spawning and nowhere else: it is not in
+		// p.workers until its hello has been answered. Cancelling those startups
+		// turns them into workers this can collect — without it, Shutdown
+		// reported success and closed the jail root while a handshake was still
+		// running, and the process it produced was registered for termination
+		// afterwards, by a goroutine belonging to a pool that was supposed to be
+		// gone.
+		//
+		// The workers that already exist are collected in the same breath and
+		// terminated beside the cancellation, not after it. Waiting for the
+		// startups first was the defect: a spawn that cannot be cancelled — one
+		// parked in fork(2) or in a blocked cmd.Start — spent the whole deadline
+		// on its own, and the workers that were running and killable at the top
+		// of the function were still running when the deadline expired.
+		p.mu.Lock()
+		starting := make([]*startup, 0, len(p.spawning))
+		for _, s := range p.spawning {
+			starting = append(starting, s)
 		}
-	}
+		all := make([]*client, 0, len(p.workers)+len(p.retiring))
+		for key, c := range p.workers {
+			all = append(all, c)
+			delete(p.workers, key)
+		}
+		// A worker that is on its way out is still a process holding a user's
+		// credentials and still holding the jail's descriptor. Collecting only
+		// p.workers left those behind, and Shutdown reported success over them.
+		// A startup that finishes late lands here too: p.closed is set by now,
+		// so whatever it produced goes straight into p.retiring — which is why
+		// this sweep repeats until it finds nothing left.
+		for c := range p.retiring {
+			all = append(all, c)
+			delete(p.retiring, c)
+		}
+		p.mu.Unlock()
 
-	p.mu.Lock()
-	all := make([]*client, 0, len(p.workers)+len(p.retiring))
-	for key, c := range p.workers {
-		all = append(all, c)
-		delete(p.workers, key)
-	}
-	// A worker that is on its way out is still a process holding a user's
-	// credentials and still holding the jail's descriptor. Collecting only
-	// p.workers left those behind, and Shutdown reported success over them.
-	// The startups awaited above land here too: p.closed was already set when
-	// they finished, so each one went straight into p.retiring.
-	for c := range p.retiring {
-		all = append(all, c)
-		delete(p.retiring, c)
-	}
-	p.mu.Unlock()
-
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		var wg sync.WaitGroup
+		if len(starting) == 0 && len(all) == 0 {
+			break
+		}
 		for _, c := range all {
 			wg.Add(1)
 			go func(c *client) {
 				defer wg.Done()
 				p.terminate(c)
-				// terminate returns straight away for a worker somebody else
-				// is already stopping, so the exit is waited for here rather
-				// than assumed: Shutdown's promise is that nothing of this
-				// pool is still running when it returns.
-				select {
-				case <-c.exited:
-				case <-ctx.Done():
-				}
+				// terminate returns straight away for a worker somebody else is
+				// already stopping, so the exit is waited for rather than
+				// assumed: the promise is that nothing of this pool is still
+				// running when the operation completes. It is an unbounded wait
+				// by design — a worker wedged in uninterruptible I/O is a process
+				// that still exists, and saying otherwise would be a lie. The
+				// caller's context is what bounds the caller.
+				<-c.exited
 			}(c)
 		}
-		wg.Wait()
-	}()
-	select {
-	case <-done:
-	case <-ctx.Done():
-		return ctx.Err()
+		for _, s := range starting {
+			s.cancel()
+		}
+		for _, s := range starting {
+			<-s.done
+		}
 	}
+	wg.Wait()
+
+	// Everything this pool knows about is gone. Cancelling the workers' context
+	// is the backstop for what it might not know about: a fork that returned
+	// after the last sweep looked.
+	p.endWorkers()
+
 	// The jail's descriptor is the pool's to release: every worker resolved its
 	// paths through it, and they are all stopped by now.
 	if err := p.opts.Root.Close(); err != nil {
 		p.opts.Logger.Printf("workerpool: closing the jail root: %v", err)
+		p.shutdownErr = err
 	}
-	return nil
 }
 
 // Stats is one worker's line in /api/diag.
@@ -939,7 +988,10 @@ func (p *Pool) spawnInProcess(who backend.Principal) (*client, error) {
 	c.tr = wproto.NewTransport(ours)
 	c.pid = os.Getpid()
 
-	ctx, cancel := context.WithCancel(context.Background())
+	// Derived from the pool's context for the same reason the process mode's
+	// exec.CommandContext is: a worker loop whose startup finished after the
+	// shutdown had swept must not be left reading the filesystem.
+	ctx, cancel := context.WithCancel(p.shutdownCtx)
 	c.kill = func(kctx context.Context) {
 		cancel()
 		_ = theirs.Close()

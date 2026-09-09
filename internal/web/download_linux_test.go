@@ -2,9 +2,21 @@ package web
 
 import (
 	"fmt"
+	"os"
 	"syscall"
 	"testing"
 )
+
+func TestDownloadRawDescriptorCancellation(t *testing.T) {
+	var fds [2]int
+	if err := syscall.Pipe2(fds[:], syscall.O_CLOEXEC); err != nil {
+		t.Fatal(err)
+	}
+	// Match a blocking descriptor received from the worker via SCM_RIGHTS.
+	r := os.NewFile(uintptr(fds[0]), "raw pipe reader")
+	w := os.NewFile(uintptr(fds[1]), "raw pipe writer")
+	testDownloadStreamCancellation(t, r, w)
+}
 
 func TestPseudoFilesystemClassifier(t *testing.T) {
 	for _, tc := range []struct {

@@ -102,14 +102,44 @@ func testPool(t *testing.T, tweak func(*Options)) (*Pool, *clock) {
 		tweak(&o)
 	}
 	p := NewWithOptions(o)
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := p.Shutdown(ctx); err != nil {
-			t.Errorf("shutdown: %v", err)
-		}
-	})
+	t.Cleanup(func() { shutdownForTest(t, p) })
 	return p, c
+}
+
+// testWait is the longest anything in this package's tests may wait for
+// anything. Shutdown waits for a worker's process however long that takes —
+// which is right in production and fatal in a test, because a fixture whose
+// exit never comes turns a cleanup into a hang, and a hang is reported by the
+// runner as the whole package timing out ten minutes later with no failing
+// assertion to read. Every wait here is bounded by this, and a wait that
+// expires fails the test that owns it and says what it was waiting for.
+const testWait = 30 * time.Second
+
+// shutdownForTest stops a pool inside testWait and reports what it found. It
+// is what every cleanup uses: an unbounded Shutdown in a t.Cleanup is the one
+// call in this file that can hang without ever naming a test.
+func shutdownForTest(t *testing.T, p *Pool) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), testWait)
+	defer cancel()
+	if err := p.Shutdown(ctx); err != nil {
+		t.Errorf("shutdown: %v", err)
+	}
+}
+
+// stopForTest is shutdownForTest for the fixtures that are deliberately left
+// broken — a worker with no process behind it, a transport that was closed
+// under the pool — where the shutdown's own complaint is expected and only the
+// hang is a failure.
+func stopForTest(t *testing.T, p *Pool) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), testWait)
+	defer cancel()
+	if err := p.Shutdown(ctx); errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("shutdown did not finish within %s: something is waiting for an exit that never comes", testWait)
+	} else if err != nil {
+		t.Logf("shutdown: %v", err)
+	}
 }
 
 // workerForTest is the current worker for a key, read under the pool lock.
@@ -126,6 +156,31 @@ func (p *Pool) workerForTest(t *testing.T, key string) *client {
 
 func alice() backend.Principal {
 	return backend.Principal{User: "alice", UID: 1001, GID: 1001, Groups: []int{1001, 100}}
+}
+
+// terminates gives a hand-made client the one thing every real one has: a
+// termination that actually ends it. A fixture without it is a worker that can
+// never exit, and the moment anything registers it — a failed write now retires
+// the client that made it — a shutdown waits on that impossible exit for as long
+// as the test runner allows. It closes the transports it was given, closes
+// exited, and does both exactly once, because terminate is not the only thing
+// that reaches for a kill.
+//
+// The returned channel is closed when the termination has run, so a test can
+// synchronise on a retirement instead of racing the goroutine that starts it.
+func terminates(c *client, closers ...io.Closer) <-chan struct{} {
+	killed := make(chan struct{})
+	var once sync.Once
+	c.kill = func(context.Context) {
+		once.Do(func() {
+			for _, cl := range closers {
+				_ = cl.Close()
+			}
+			close(c.exited)
+			close(killed)
+		})
+	}
+	return killed
 }
 
 func TestRoundTrips(t *testing.T) {
@@ -509,7 +564,7 @@ func TestProcessModeIsLinuxOnly(t *testing.T) {
 	}
 	root, _ := testTree(t)
 	p := NewWithOptions(Options{Root: root, Mode: ModeProcess, Logger: log.New(io.Discard, "", 0)})
-	t.Cleanup(func() { _ = p.Shutdown(context.Background()) })
+	t.Cleanup(func() { stopForTest(t, p) })
 	err := p.Ping(context.Background(), alice())
 	if !errors.Is(err, fsx.ErrUnsupported) {
 		t.Fatalf("err = %v, want ErrUnsupported", err)
@@ -896,11 +951,12 @@ func TestACancelledCallNeverAbandonsADescriptor(t *testing.T) {
 // worker would otherwise keep the slot for a reply nobody will read.
 func TestACancelledCallerTellsTheWorkerToStop(t *testing.T) {
 	p := NewWithOptions(Options{InProcess: true, CallTimeout: time.Minute, Logger: log.New(io.Discard, "", 0)})
-	t.Cleanup(func() { _ = p.Shutdown(context.Background()) })
+	t.Cleanup(func() { stopForTest(t, p) })
 
 	c := newClient(alice())
 	tr := newFakeTransport()
 	c.tr = tr
+	terminates(c, tr)
 	t.Cleanup(func() { _ = tr.Close() })
 	go c.readLoop(nil)
 
@@ -1064,12 +1120,12 @@ func TestShutdownStopsARetiringWorker(t *testing.T) {
 // and terminate never reached the transport close or the kill.
 func TestGoodbyeNeverHangsOnAWorkerThatStoppedReading(t *testing.T) {
 	p := NewWithOptions(Options{InProcess: true, CallTimeout: time.Minute, Logger: log.New(io.Discard, "", 0)})
-	t.Cleanup(func() { _ = p.Shutdown(context.Background()) })
+	t.Cleanup(func() { stopForTest(t, p) })
 
 	ours, theirs := net.Pipe()
 	c := newClient(alice())
 	c.tr = wproto.NewTransport(ours)
-	c.kill = func(context.Context) { _ = theirs.Close(); close(c.exited) }
+	terminates(c, theirs)
 	go c.readLoop(nil)
 
 	peer := wproto.NewTransport(theirs)
@@ -1111,12 +1167,17 @@ func TestGoodbyeNeverHangsOnAWorkerThatStoppedReading(t *testing.T) {
 // on the goroutine serving a user's request.
 func TestAWriteToAWorkerThatNeverReadsTimesOut(t *testing.T) {
 	p := NewWithOptions(Options{InProcess: true, CallTimeout: 500 * time.Millisecond, Logger: log.New(io.Discard, "", 0)})
-	t.Cleanup(func() { _ = p.Shutdown(context.Background()) })
+	t.Cleanup(func() { stopForTest(t, p) })
 
 	ours, theirs := net.Pipe()
 	t.Cleanup(func() { _ = theirs.Close() })
 	c := newClient(alice())
 	c.tr = wproto.NewTransport(ours)
+	// The failed write retires this client, which puts it in the pool's
+	// accounting — so it needs a termination that ends it, or the shutdown in
+	// the cleanup below waits for an exit that can never happen and the test
+	// hangs until the runner's timeout.
+	killed := terminates(c, theirs)
 	go c.readLoop(nil)
 
 	done := make(chan error, 1)
@@ -1134,6 +1195,14 @@ func TestAWriteToAWorkerThatNeverReadsTimesOut(t *testing.T) {
 		}
 	case <-time.After(20 * time.Second):
 		t.Fatal("a write to a worker that never reads blocked the caller indefinitely")
+	}
+	// The retirement runs on a goroutine of its own. Waiting for it here is what
+	// keeps the cleanup from racing it, and proves the write failure really did
+	// end the worker rather than only the call.
+	select {
+	case <-killed:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the worker that never read was never terminated")
 	}
 }
 
@@ -1155,7 +1224,7 @@ func TestACancelledStartupStillChargesTheRestartBudget(t *testing.T) {
 			c := newClient(who)
 			tr := newFakeTransport()
 			c.tr = tr
-			c.kill = func(context.Context) { _ = tr.Close(); close(c.exited) }
+			terminates(c, tr)
 			return c, nil
 		}
 	})
@@ -1199,6 +1268,12 @@ func TestUnknownOpIsUnsupported(t *testing.T) {
 // closes the pipe and returns, and exited stays open — which is what a process
 // parked in uninterruptible filesystem I/O looks like from here. Signals do not
 // reach it, and no amount of waiting makes it go.
+//
+// It is the deliberate exception to the rule terminates enforces everywhere
+// else, and the release is what keeps it honest: it is registered as a cleanup
+// here, which runs before the pool's own shutdown cleanup (they run last in,
+// first out), so the shutdown at the end of the test has something that can
+// actually exit to wait for.
 //
 // The returned release ends the pretence, so the test can watch the slot come
 // back and so nothing is left blocked when the test is over.
@@ -1327,7 +1402,7 @@ func TestShutdownCancelsAndAwaitsAPendingStartup(t *testing.T) {
 			c := newClient(who)
 			tr := newFakeTransport()
 			c.tr = tr
-			c.kill = func(context.Context) { _ = tr.Close(); close(c.exited) }
+			terminates(c, tr)
 			started <- c
 			return c, nil
 		},
@@ -1367,6 +1442,103 @@ func TestShutdownCancelsAndAwaitsAPendingStartup(t *testing.T) {
 	}
 }
 
+// TestShutdownStopsRunningWorkersWhileAStartupIsStuck: a startup that cannot be
+// cancelled — one parked in fork(2), or in a cmd.Start that had no context to
+// interrupt it — used to spend the whole shutdown deadline on its own. The
+// workers that were running, registered and perfectly killable were collected
+// only afterwards, so Shutdown returned the deadline error with every one of
+// them still alive; and because the pool was already marked closed, the next
+// call returned an immediate success over them.
+func TestShutdownStopsRunningWorkersWhileAStartupIsStuck(t *testing.T) {
+	root, _ := testTree(t)
+	var (
+		gate      = make(chan struct{})
+		gateOnce  sync.Once
+		open      = func() { gateOnce.Do(func() { close(gate) }) }
+		stuck     = make(chan struct{})
+		stuckOnce sync.Once
+		p         *Pool
+	)
+	// However this test ends, the spawn must be let go of: the pool's shutdown
+	// waits for it, and so would the runner.
+	defer open()
+
+	p = NewWithOptions(Options{
+		Root:      root,
+		InProcess: true,
+		Max:       4,
+		Logger:    log.New(io.Discard, "", 0),
+		newWorker: func(who backend.Principal) (*client, error) {
+			if who.UID == alice().UID {
+				return p.spawnInProcess(who)
+			}
+			// The second spawn is stuck where nothing can reach it: there is no
+			// client yet, so there is no transport to close and no process to
+			// signal, and the startup's cancellation has nothing to act on.
+			stuckOnce.Do(func() { close(stuck) })
+			<-gate
+			return nil, errors.New("the fork never came back")
+		},
+	})
+
+	ctx := context.Background()
+	if err := p.Ping(ctx, alice()); err != nil {
+		t.Fatal(err)
+	}
+	running := p.workerForTest(t, alice().Key())
+
+	bob := backend.Principal{User: "bob", UID: 1002, GID: 1002}
+	pinged := make(chan error, 1)
+	go func() { pinged <- p.Ping(ctx, bob) }()
+	select {
+	case <-stuck:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the second startup never began")
+	}
+
+	// The deadline is spent on the startup nothing can cancel...
+	sctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	if err := p.Shutdown(sctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("shutdown = %v, want the deadline error while a startup is stuck", err)
+	}
+	// ...and the worker that was running has still been stopped, inside it.
+	select {
+	case <-running.exited:
+	case <-time.After(2 * time.Second):
+		t.Fatal("shutdown spent its deadline waiting for a startup and left a running worker alive")
+	}
+
+	// A second call waits for the same operation. Returning nil here — which is
+	// what a pool that only remembers "closed" does — would be a report that
+	// everything had stopped while a spawn was still running.
+	sctx2, cancel2 := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel2()
+	begin := time.Now()
+	if err := p.Shutdown(sctx2); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("the second shutdown = %v, want the deadline error: the startup has not finished", err)
+	}
+	if el := time.Since(begin); el < 400*time.Millisecond {
+		t.Fatalf("the second shutdown returned after %s: it did not wait for the first", el)
+	}
+
+	// Once the spawn finally comes back, the operation completes and says so.
+	open()
+	fctx, fcancel := context.WithTimeout(ctx, 30*time.Second)
+	defer fcancel()
+	if err := p.Shutdown(fctx); err != nil {
+		t.Fatalf("the shutdown after the startup returned: %v", err)
+	}
+	if n := p.liveForTest(); n != 0 {
+		t.Fatalf("%d workers left behind by shutdown, want 0", n)
+	}
+	select {
+	case <-pinged:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the request whose worker was starting never returned")
+	}
+}
+
 // TestAFailedWriteRetiresTheWorker: a write that fails or times out leaves the
 // framing desynchronised and the worker on the other end still running its
 // handler. Failing the client settles only this end of the conversation; the
@@ -1374,14 +1546,13 @@ func TestShutdownCancelsAndAwaitsAPendingStartup(t *testing.T) {
 // a worker wedged mid-handler could be never.
 func TestAFailedWriteRetiresTheWorker(t *testing.T) {
 	p := NewWithOptions(Options{InProcess: true, CallTimeout: 500 * time.Millisecond, Logger: log.New(io.Discard, "", 0)})
-	t.Cleanup(func() { _ = p.Shutdown(context.Background()) })
+	t.Cleanup(func() { stopForTest(t, p) })
 
 	ours, theirs := net.Pipe()
 	t.Cleanup(func() { _ = theirs.Close() })
 	c := newClient(alice())
 	c.tr = wproto.NewTransport(ours)
-	killed := make(chan struct{})
-	c.kill = func(context.Context) { close(killed); close(c.exited) }
+	killed := terminates(c)
 	go c.readLoop(nil)
 
 	// Registered the way a completed spawn would leave it, so the retirement is

@@ -76,10 +76,12 @@ func NewRoot(base string) (Root, error) {
 		return Root{}, fmt.Errorf("jail root %q: %w", base, err)
 	}
 	abs = filepath.Clean(abs)
-	// Trim a trailing separator so the prefix arithmetic in API is uniform,
-	// but never down to the empty string ("/" on Linux, "C:\" on Windows both
-	// survive as something usable).
-	for len(abs) > 1 && isPathSeparator(abs[len(abs)-1]) {
+	// Trim a trailing separator so the prefix arithmetic is uniform, but never
+	// below the volume root: "C:\" must stay "C:\", because "C:" on Windows
+	// names the drive's current directory, not its root (a -jail C:\ once
+	// listed the repository instead of the drive).
+	vol := filepath.VolumeName(abs)
+	for len(abs) > len(vol)+1 && isPathSeparator(abs[len(abs)-1]) {
 		abs = abs[:len(abs)-1]
 	}
 	return Root{base: abs, h: &handle{dir: abs}}, nil
@@ -190,8 +192,12 @@ func (r Root) Contains(osPath string) bool {
 	if pathEqual(p, b) {
 		return true
 	}
-	// A drive root such as "C:\" keeps its separator after NewRoot's trim, so
-	// "C:\x" against base "C:" is handled here too.
+	// A drive root such as "C:\" keeps its separator, so the element boundary
+	// is either the separator the base already ends with or the one that
+	// must follow it.
+	if isPathSeparator(b[len(b)-1]) {
+		return len(p) > len(b) && pathEqual(p[:len(b)], b)
+	}
 	return len(p) > len(b) && isPathSeparator(p[len(b)]) && pathEqual(p[:len(b)], b)
 }
 
@@ -211,7 +217,8 @@ func (r Root) API(osPath string) (string, error) {
 		return "/", nil
 	}
 	if r.Contains(p) {
-		return path.Clean("/" + filepath.ToSlash(p[len(b)+1:])), nil
+		rest := strings.TrimLeft(p[len(b):], string(filepath.Separator))
+		return path.Clean("/" + filepath.ToSlash(rest)), nil
 	}
 	return "", fmt.Errorf("%q is outside the jail root %q: %w", osPath, b, ErrOutsideRoot)
 }

@@ -79,7 +79,8 @@ func TestAuthenticationBurstBound(t *testing.T) {
 			t.Fatal("admitted request did not finish")
 		}
 	}
-	if calls.Load() != 72 || peak.Load() > 8 {
+	// Calls already in flight when the last failure is recorded may finish.
+	if calls.Load() < authFailureBurst || calls.Load() > authFailureBurst+7 || peak.Load() > 8 {
 		t.Fatalf("calls=%d peak=%d", calls.Load(), peak.Load())
 	}
 }
@@ -147,10 +148,12 @@ func TestExistingSessionAuthenticationBurstBound(t *testing.T) {
 	var once sync.Once
 	unblock := func() { once.Do(func() { close(release) }) }
 	endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		close(started)
-		select {
-		case <-release:
-		case <-r.Context().Done():
+		if r.URL.Query().Get("sid") == "stuck" {
+			close(started)
+			select {
+			case <-release:
+			case <-r.Context().Done():
+			}
 		}
 		fmt.Fprint(w, "<r><authPassed>1</authPassed><username>dev</username></r>")
 	}))
@@ -192,6 +195,34 @@ func TestExistingSessionAuthenticationBurstBound(t *testing.T) {
 	if n := old.authRequests.Load(); n != 9 {
 		t.Fatalf("retained %d requests; want one validator and eight followers", n)
 	}
+	// All eight followers must have reached the waiting gate before checking
+	// fairness; merely launching goroutines would miss the original defect.
+	until := time.Now().Add(time.Second)
+	for len(s.authAdmission.waiters) != maxSessionAuthWaiters && time.Now().Before(until) {
+		time.Sleep(time.Millisecond)
+	}
+	if len(s.authAdmission.waiters) != maxSessionAuthWaiters || len(s.authAdmission.slots) != 1 {
+		t.Fatalf("followers hold execution slots: active=%d waiting=%d", len(s.authAdmission.slots), len(s.authAdmission.waiters))
+	}
+	for _, stale := range []bool{false, true} {
+		fast := indexedTestSession(fmt.Sprintf("fast-%v", stale), "dev")
+		fast.cred = qtsauth.Cred{Kind: qtsauth.KindSID, Token: fast.id}
+		fast.binding = qtsauth.CacheKey(fast.cred)
+		if stale {
+			fast.checked = time.Now().Add(-time.Minute)
+		}
+		s.insertSession(fast)
+		done := make(chan *httptest.ResponseRecorder, 1)
+		go func() { done <- request(s, "GET", "/api/session", &http.Cookie{Name: "qfm_sid", Value: fast.id}, nil) }()
+		select {
+		case w := <-done:
+			if w.Code != 200 {
+				t.Fatalf("other session (stale=%v): %d %s", stale, w.Code, w.Body)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("other session (stale=%v) blocked behind followers", stale)
+		}
+	}
 	unblock()
 	for i := 0; i < 9; i++ {
 		select {
@@ -229,6 +260,10 @@ func TestAuthenticationFailureLimiter(t *testing.T) {
 	now := time.Unix(1700000000, 0)
 	s.Now = func() time.Time { return now }
 	s.verifier.Now = s.Now
+	// Prime only the verifier cache: no web session may bypass verification.
+	if _, err := s.verifier.Verify(context.Background(), qtsauth.Cred{Kind: qtsauth.KindSID, Token: "valid"}); err != nil {
+		t.Fatal(err)
+	}
 	attempt := func(ip, token string) *httptest.ResponseRecorder {
 		r := httptest.NewRequest("GET", "/api/session?sid="+token, nil)
 		r.RemoteAddr = "127.0.0.1:1234"
@@ -243,10 +278,12 @@ func TestAuthenticationFailureLimiter(t *testing.T) {
 	for i := 0; i < 30; i++ {
 		assertAuthError(t, attempt("192.0.2.1", "0"), 401, "unauthorized", "")
 	}
-	if calls.Load() != 20 {
+	if calls.Load() != 21 {
 		t.Fatalf("repeated credential bypassed negative cache: %d", calls.Load())
 	}
-	assertAuthError(t, attempt("192.0.2.1", "blocked"), 429, "rate_limited", "60")
+	for i := 0; i < 30; i++ {
+		assertAuthError(t, attempt("192.0.2.1", fmt.Sprintf("blocked-%d", i)), 429, "rate_limited", "60")
+	}
 	if w := attempt("192.0.2.1", "valid"); w.Code != 200 || !strings.Contains(w.Body.String(), `"user":"dev"`) {
 		t.Fatalf("valid NAT peer blocked: %d %s", w.Code, w.Body)
 	}
@@ -256,19 +293,79 @@ func TestAuthenticationFailureLimiter(t *testing.T) {
 	old.checked = time.Now().Add(-time.Minute)
 	s.insertSession(old)
 	assertAuthError(t, attempt("192.0.2.1", "revoked"), 429, "rate_limited", "60")
-	if !old.dead.Load() || s.sessions[old.id] != nil {
-		t.Fatal("rate-limited verification failure preserved a revoked session")
+	if old.dead.Load() || s.sessions[old.id] == nil {
+		t.Fatal("admission refusal destroyed an unverified session")
 	}
 	now = now.Add(59 * time.Second)
 	assertAuthError(t, attempt("192.0.2.1", "still-blocked"), 429, "rate_limited", "60")
-	if calls.Load() != 24 {
-		t.Fatalf("distinct credentials were not validated: %d", calls.Load())
+	assertAuthError(t, attempt("192.0.2.1", "0"), 429, "rate_limited", "60")
+	if calls.Load() != 21 {
+		t.Fatalf("exhausted budget contacted QTS: %d", calls.Load())
 	}
-	assertAuthError(t, attempt("192.0.2.2", "other-ip"), 401, "unauthorized", "")
+	// A refusal must not poison the verifier's cache for another IP.
+	assertAuthError(t, attempt("192.0.2.2", "blocked-0"), 401, "unauthorized", "")
 	now = now.Add(time.Second)
 	assertAuthError(t, attempt("192.0.2.1", "recovered"), 401, "unauthorized", "")
-	if calls.Load() != 26 {
+	if calls.Load() != 23 {
 		t.Fatalf("recovery did not contact QTS: %d", calls.Load())
+	}
+}
+
+func TestSessionFollowersShareTotalWaitingBound(t *testing.T) {
+	s, _ := fixture(t, false)
+	s.AuthTimeout = 3 * time.Second
+	// Occupy every execution slot, independently of session-lock followers.
+	for i := 0; i < qtsauth.DefaultMaxConcurrentValidations; i++ {
+		if err := s.authAdmission.enter(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		defer s.authAdmission.leave()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	var followers sync.WaitGroup
+	defer func() { cancel(); followers.Wait() }()
+	for i := 0; i < qtsauth.DefaultMaxValidationWaiters/maxSessionAuthWaiters; i++ {
+		old := s.insertSession(indexedTestSession(fmt.Sprintf("locked-%d", i), "dev"))
+		old.mu.Lock()
+		defer old.mu.Unlock()
+		for j := 0; j < maxSessionAuthWaiters; j++ {
+			followers.Add(1)
+			go func() {
+				defer followers.Done()
+				r := httptest.NewRequest("GET", "/api/session", nil).WithContext(ctx)
+				r.AddCookie(&http.Cookie{Name: "qfm_sid", Value: old.id})
+				s.Handler().ServeHTTP(httptest.NewRecorder(), r)
+			}()
+		}
+	}
+	until := time.Now().Add(2 * time.Second)
+	for len(s.authAdmission.waiters) != qtsauth.DefaultMaxValidationWaiters && time.Now().Before(until) {
+		time.Sleep(time.Millisecond)
+	}
+	if n := len(s.authAdmission.waiters); n != qtsauth.DefaultMaxValidationWaiters {
+		t.Fatalf("followers retained %d waiting positions; want 64", n)
+	}
+	busy := s.insertSession(indexedTestSession("overflow", "dev"))
+	busy.mu.Lock()
+	defer busy.mu.Unlock()
+	w := request(s, "GET", "/api/session", &http.Cookie{Name: "qfm_sid", Value: busy.id}, nil)
+	assertAuthError(t, w, 503, "overloaded", "2")
+	// An already-validated session needs neither waiting nor execution capacity.
+	s.insertSession(indexedTestSession("ready", "dev"))
+	readyRequest := httptest.NewRequest("GET", "/api/session", nil)
+	readyCtx, readyCancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer readyCancel()
+	readyRequest = readyRequest.WithContext(readyCtx)
+	readyRequest.AddCookie(&http.Cookie{Name: "qfm_sid", Value: "ready"})
+	w = httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, readyRequest)
+	if w.Code != 200 {
+		t.Fatalf("fresh session queued behind validation: %d %s", w.Code, w.Body)
+	}
+	cancel()
+	followers.Wait()
+	if len(s.authAdmission.waiters) != 0 {
+		t.Fatal("cancelled followers leaked waiting capacity")
 	}
 }
 
@@ -287,6 +384,9 @@ func TestFailureBucketWindowAndBound(t *testing.T) {
 	}
 	if len(l.clients) != maxFailureClients || l.failed("new", "key", now) != errAuthRateLimited {
 		t.Fatal("failure table is not bounded")
+	}
+	if err := l.allow("new", now); err != errAuthRateLimited {
+		t.Fatal("full failure table admitted an uncached validation", err)
 	}
 	if err := l.failed("new", "key", now.Add(time.Minute)); err != nil {
 		t.Fatal("inactive failure entries were not reclaimed", err)

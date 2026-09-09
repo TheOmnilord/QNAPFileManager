@@ -9,6 +9,24 @@ import "os"
 // Nothing but the dev loop runs here, and it has no fifos to be parked on.
 func openDirFlags() int { return os.O_RDONLY }
 
+// statAt off Linux is os.Root's own stat. There is no O_PATH to walk the
+// intermediate directories with, so the walk is os.Root's — which asks for read
+// permission on every directory on the way, where Linux now asks only for
+// search. That is stricter than the kernel rather than looser, and this
+// platform is the Windows dev box, whose ACLs do not have a "search but not
+// read" shape to get wrong in the first place.
+func statAt(rt *os.Root, rel string, follow bool) (os.FileInfo, error) {
+	if follow {
+		return rt.Stat(rel)
+	}
+	return rt.Lstat(rel)
+}
+
+// readlinkAt off Linux is os.Root's own readlink, for the same reason.
+func readlinkAt(rt *os.Root, rel string) (string, error) {
+	return rt.Readlink(rel)
+}
+
 // openFinal off Linux is a plain read-only open through the root: there is no
 // O_NOFOLLOW to ask for and no openat to ask it of. The no-follow rule itself
 // is not lost — OpenRead classifies the name with lstat and verifies the

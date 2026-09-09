@@ -1,10 +1,12 @@
 # QNAPFileManager
 
-A root-capable web file manager for QNAP NAS (QTS / QuTS hero), delivered as a QPKG. Unlike File Station it can
-browse and manage the **whole** filesystem (`/`, `/etc`, `/root`, `.qpkg` directories, raw volume mounts), edit
-permissions and ownership, and it never needs SSH or Telnet.
+A file manager app for the QNAP QTS / QuTS hero desktop, installed from App Center as a QPKG and opened as a window in the
+QTS desktop with the user's QTS login, exactly like File Station. Unlike File Station it can browse and manage the **whole**
+filesystem (`/`, `/etc`, `/root`, `.qpkg` directories, raw volume mounts), edit permissions and ownership, and it never
+needs SSH or Telnet. Every operation runs with the signed-in user's own Linux identity; administrators can switch to a
+root mode for system paths.
 
-Status: **planning**. Nothing is built yet. Start with [PLAN.md](PLAN.md).
+Status: **M0 in progress**. Start with [PLAN.md](PLAN.md).
 
 ## Why
 

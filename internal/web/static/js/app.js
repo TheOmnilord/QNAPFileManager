@@ -1,6 +1,6 @@
 import {$,el,error,openDialog,route,parseRoute,rawPath,bytePath} from './dom.js';
 import {api,signInNotice} from './api.js';
-import {state,update} from './state.js';
+import {state,update,sessionGuard} from './state.js';
 import {initList,loadList} from './list.js';
 import {loadTree} from './tree.js';
 import {initViewer} from './viewer.js';
@@ -27,16 +27,22 @@ function navigate() {
 }
 
 async function connect() {
+ const valid=sessionGuard();
  try {
   const session=await api('api/session');
+  if (!valid()) return;
   if (!session.authenticated) { signInNotice(); return; }
+  showSession(session);
+ } catch(err) { if (valid()) error(err); }
+}
+function showSession(session) {
+  if (state.session) signInNotice();
   update({session}); $('#signin').hidden=true;
   $('#identity').textContent=`${session.user} · ${session.admin ? 'Administrator' : 'User'}`;
   $('#sessionDetails').textContent=`${session.user} · uid ${session.uid}, gid ${session.gid} · ${session.viaQTS ? 'QTS session' : 'Pinned development identity'} · root mode off${session.groupsIncomplete ? ' · Warning: groups incomplete' : ''}`;
   $('#chipReadonly').textContent='Read-only browse';
   if (session.groupsIncomplete) $('#announce').textContent='Warning: supplementary groups are incomplete.';
-  navigate(); await loadTree();
- } catch(err) { error(err); }
+  navigate(); loadTree();
 }
 initList(); initViewer();
 $('.skip').addEventListener('click',ev => { ev.preventDefault(); $('#list').focus(); });
@@ -52,7 +58,13 @@ function hidden() { update({hidden:$('#chkHidden').checked}); loadList(); loadTr
 $('#chkHidden').addEventListener('change',hidden);
 $('#btnSettings').addEventListener('click',() => openDialog('#dlgSettings')); $('#userMenu').addEventListener('click',() => openDialog('#dlgSession')); $('#btnShortcuts').addEventListener('click',() => openDialog('#dlgShortcuts'));
 for (const button of document.querySelectorAll('[data-close]')) button.addEventListener('click',() => button.closest('dialog').close());
-$('#btnLogout').addEventListener('click',async () => { try { await api('api/logout',{}, {method:'POST'}); signInNotice(); } catch(err) { error(err); } });
+$('#btnLogout').addEventListener('click',async () => {
+ // Start with the current CSRF token, then invalidate pending reads immediately.
+ const request=api('api/logout',{}, {method:'POST'});
+ signInNotice();
+ const valid=sessionGuard();
+ try { await request; } catch(err) { if (valid()) error(err); }
+});
 document.addEventListener('keydown',ev => {
  const editing=ev.target.matches('input,textarea,select'),ctrl=ev.ctrlKey || ev.metaKey;
  if (document.querySelector('dialog[open]')) return;
@@ -70,5 +82,14 @@ document.addEventListener('keydown',ev => {
 });
 for (const event of ['dragover','drop']) document.addEventListener(event,ev => { ev.preventDefault(); ev.stopPropagation(); });
 // Polling couples visible state to QTS expiry even while the user is idle.
-setInterval(async () => { if (!state.session) return; try { const session=await api('api/session'); if (!session.authenticated) signInNotice(); else update({session}); } catch(err) { error(err); } },60000);
+setInterval(async () => {
+ if (!state.session) return;
+ const valid=sessionGuard();
+ try {
+  const session=await api('api/session');
+  if (!valid()) return;
+  if (!session.authenticated) signInNotice();
+  else if (JSON.stringify(session)!==JSON.stringify(state.session)) showSession(session);
+ } catch(err) { if (valid()) error(err); }
+},60000);
 connect();

@@ -1,6 +1,6 @@
 import {api} from './api.js';
 import {$,el,error,pathArgs,route,heightRule,announce} from './dom.js';
-import {state,update,selected,countSelected,subscribe} from './state.js';
+import {state,update,selected,countSelected,subscribe,sessionGuard} from './state.js';
 import {nameCell,isDirectory,isReadable,isSymlink,hasTarget,fileTarget,actionHint,directoryNotice} from './badges.js';
 import {view,download,properties} from './viewer.js';
 const DEFAULT_PAGE = 500;
@@ -15,12 +15,13 @@ const navigable = e => e && !(e.volumeRoot && state.path==='/share') && (!state.
 function query(offset) { return {...pathArgs(state),offset,limit:pageSize,sort:state.sort,desc:state.desc,hidden:state.hidden,volumes:false}; }
 
 async function page(number,generation) {
+ const valid=sessionGuard();
  if (state.pages.has(number)) return;
- const key = `${generation}:${number}`;
+ const key = `${state.sessionGeneration}:${generation}:${number}`;
  if (pending.has(key)) return pending.get(key);
  const request = (async () => {
   const data = await api('api/fs/list',query(number*pageSize));
-  if (generation !== state.generation || !state.session) return;
+  if (!valid() || generation !== state.generation || !state.session) return;
   if (!Number.isInteger(data.limit) || data.limit < 1) throw new Error('Invalid listing page size.');
   if (number === 0) pageSize = data.limit;
   else if (data.limit !== pageSize) throw new Error('Listing page size changed. Refresh to continue.');
@@ -30,20 +31,22 @@ async function page(number,generation) {
   render();
  })();
  pending.set(key,request);
- try { await request; } finally { pending.delete(key); }
+ try { await request; } catch(err) { if (valid() && generation===state.generation) throw err; } finally { pending.delete(key); }
 }
 
 export async function loadList() {
+ if (!state.session) return;
+ const valid=sessionGuard();
  const generation = state.generation+1;
  pageSize = DEFAULT_PAGE;
  update({generation,pages:new Map(),total:0,selection:new Set(),exclude:false,focus:0,anchor:0,loading:true});
  $('#listViewport').scrollTop = 0; $('#status').textContent = 'Loading…'; render();
  try {
   await page(0,generation);
-  if (generation !== state.generation) return;
-  if (state.total <= 2000) for (let n=1;generation===state.generation && n<Math.ceil(state.total/pageSize);n++) await page(n,generation);
-  render();
- } catch(err) { if (generation === state.generation) { update({loading:false}); error(err); } }
+  if (!valid() || generation !== state.generation) return;
+  if (state.total <= 2000) for (let n=1;valid() && generation===state.generation && n<Math.ceil(state.total/pageSize);n++) await page(n,generation);
+  if (valid() && generation===state.generation) render();
+ } catch(err) { if (valid() && generation === state.generation) { update({loading:false}); error(err); } }
 }
 
 function select(index,event={}) {
@@ -104,7 +107,8 @@ export function render() {
  $('#listEmpty').hidden = state.loading || state.total !== 0;
  if (hadFocus) focusRow();
  if (!state.loading && state.session) status();
- for (const n of needed) page(n,state.generation).catch(error);
+ const valid=sessionGuard(),generation=state.generation;
+ for (const n of needed) page(n,generation).catch(err => { if (valid() && generation===state.generation) error(err); });
 }
 
 function focusRow() { document.getElementById(`row-${state.focus}`)?.focus({preventScroll:true}); }
@@ -114,6 +118,7 @@ export function open(e) {
  else view(e);
 }
 async function move(index,event) {
+ const valid=sessionGuard(),generation=state.generation;
  index = Math.max(0,Math.min(state.total-1,index));
  if (state.total === 0) return;
  const direction = index < state.focus ? -1 : 1;
@@ -125,7 +130,9 @@ async function move(index,event) {
  const v = $('#listViewport'),h = rowHeight();
  if (index*h < v.scrollTop) v.scrollTop = index*h;
  if ((index+1)*h > v.scrollTop+v.clientHeight) v.scrollTop = (index+1)*h-v.clientHeight;
- await page(Math.floor(index/pageSize),state.generation); render(); focusRow();
+ try { await page(Math.floor(index/pageSize),generation); }
+ catch(err) { if (valid() && generation===state.generation) error(err); return; }
+ if (valid() && generation===state.generation) { render(); focusRow(); }
 }
 
 export function contextMenu(e) {

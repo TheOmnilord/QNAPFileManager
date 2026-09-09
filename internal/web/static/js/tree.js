@@ -1,6 +1,6 @@
 import {api} from './api.js';
 import {$,el,error,pathArgs,route} from './dom.js';
-import {state} from './state.js';
+import {state,sessionGuard} from './state.js';
 import {isDirectory,volumeGroup} from './badges.js';
 let typeAhead='',typedAt=0;
 function node(entry,level) {
@@ -9,6 +9,7 @@ function node(entry,level) {
  line.append(toggle,label); item.append(line);
  let loaded=false;
  item.expand = async () => {
+  const valid=sessionGuard();
   if (item.getAttribute('aria-expanded')==='true') { item.setAttribute('aria-expanded','false'); item.lastElementChild.hidden=true; toggle.textContent='▸'; return; }
   if (!loaded) {
    toggle.disabled=true;
@@ -16,13 +17,14 @@ function node(entry,level) {
     const group=el('div',{role:'group'});
     for (let offset=0;;) {
      const page=await api('api/fs/list',{...pathArgs(entry),offset,limit:500,sort:'name',hidden:state.hidden,volumes:false});
-     if (!item.isConnected || !state.session) return;
+     if (!valid() || !item.isConnected || !state.session) return;
      for (const child of page.entries.filter(e => isDirectory(e) && !e.volumeRoot)) group.append(node(child,level+1));
      offset+=page.entries.length;
      if (!page.entries.length || offset>=page.total) break;
     }
     item.append(group); loaded=true;
-   } finally { toggle.disabled=false; }
+   } catch(err) { if (valid() && item.isConnected) error(err); return; }
+   finally { if (valid() && item.isConnected) toggle.disabled=false; }
   }
   item.setAttribute('aria-expanded','true'); item.lastElementChild.hidden=false; toggle.textContent='▾';
  };
@@ -52,14 +54,18 @@ function node(entry,level) {
 }
 
 export async function loadTree() {
+ if (!state.session) return;
+ const valid=sessionGuard();
  const tree=$('#tree'); tree.replaceChildren();
  const root=node({name:'/',path:'/',type:'dir'},1); root.tabIndex=0; tree.append(root);
  try {
   await root.expand();
+  if (!valid() || !root.isConnected) return;
   const share=[...root.querySelectorAll('[role=treeitem]')].find(n => n.querySelector('.treeLabel').textContent==='share');
   if (share) await share.expand();
+  if (!valid() || !root.isConnected) return;
   const roots=await api('api/fs/roots');
-  if (!state.session) return;
+  if (!valid() || !root.isConnected || !state.session) return;
   volumeGroup(roots);
- } catch(err) { error(err); }
+ } catch(err) { if (valid() && root.isConnected) error(err); }
 }

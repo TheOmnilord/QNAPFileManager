@@ -49,8 +49,18 @@ type Entry struct {
 	IsSymlink bool `json:"isSymlink,omitempty"`
 	// LinkTarget is the raw readlink(2) text.
 	LinkTarget string `json:"linkTarget,omitempty"`
+	// LinkTargetB64 carries the same bytes base64url-encoded, and is set only
+	// when they are not valid UTF-8 — exactly like NameB64. A symlink target is
+	// an arbitrary byte string on Linux, so a target that JSON would rewrite
+	// into U+FFFD has to travel beside the display string. The UI must send
+	// this value (as pathB64) rather than linkTarget whenever it is present.
+	LinkTargetB64 string `json:"linkTargetB64,omitempty"`
 	// LinkResolved is the fully evaluated target, empty when dangling or looping.
 	LinkResolved string `json:"linkResolved,omitempty"`
+	// LinkResolvedB64 is LinkResolved's raw-bytes counterpart, set on the same
+	// rule. "Go to symlink target" must navigate with this when it is present:
+	// the string form of a non-UTF-8 path names a different file, or none.
+	LinkResolvedB64 string `json:"linkResolvedB64,omitempty"`
 	// TargetType is the Type of the resolved target, empty when dangling.
 	TargetType string `json:"targetType,omitempty"`
 
@@ -84,6 +94,29 @@ func (e *Entry) SetPath(raw []byte) {
 		return
 	}
 	e.PathB64 = base64.RawURLEncoding.EncodeToString(raw)
+}
+
+// SetLinkTarget fills LinkTarget and, only for bytes that are not valid UTF-8,
+// LinkTargetB64. readlink(2) returns whatever bytes were stored, so the same
+// rule that protects a filename has to protect a link target.
+func (e *Entry) SetLinkTarget(raw []byte) {
+	e.LinkTarget = string(raw)
+	if utf8.Valid(raw) {
+		e.LinkTargetB64 = ""
+		return
+	}
+	e.LinkTargetB64 = base64.RawURLEncoding.EncodeToString(raw)
+}
+
+// SetLinkResolved is SetLinkTarget's counterpart for the fully evaluated
+// target, which is the value the UI navigates to.
+func (e *Entry) SetLinkResolved(raw []byte) {
+	e.LinkResolved = string(raw)
+	if utf8.Valid(raw) {
+		e.LinkResolvedB64 = ""
+		return
+	}
+	e.LinkResolvedB64 = base64.RawURLEncoding.EncodeToString(raw)
 }
 
 // SortKey values accepted by ListOptions.Sort. They are untyped string

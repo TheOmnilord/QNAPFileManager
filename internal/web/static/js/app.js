@@ -1,4 +1,4 @@
-import {$,el,error,openDialog,route,rawPath,bytePath} from './dom.js';
+import {$,el,error,openDialog,route,parseRoute,rawPath,bytePath} from './dom.js';
 import {api,signInNotice} from './api.js';
 import {state,update} from './state.js';
 import {initList,loadList} from './list.js';
@@ -17,12 +17,7 @@ $('#theme').addEventListener('change',ev => theme(ev.target.value));
 function navigate() {
  let path='/share',pathB64='';
  try {
-  const hash=location.hash.slice(1);
-  const split=hash.indexOf('?'),pathname=split<0 ? hash : hash.slice(0,split);
-  pathB64=split<0 ? '' : new URLSearchParams(hash.slice(split+1)).get('pathB64') || '';
-  if (pathB64) path=bytePath(rawPath({pathB64})).path;
-  else if (pathname.startsWith('/')) path=decodeURIComponent(pathname);
-  if (!path.startsWith('/')) throw new Error('Use an absolute path.');
+  ({path,pathB64}=parseRoute(location.hash));
  } catch(err) { error(err); return; }
  update({path,pathB64}); $('#pathEdit').value=path;
  const crumbs=$('#crumbs'); crumbs.replaceChildren(el('a',{href:'#/'},'/'));

@@ -11,6 +11,42 @@ import (
 	"unicode/utf8"
 )
 
+// A symlink target is an arbitrary byte string too, and "go to symlink target"
+// navigates with it — so the same U+FFFD substitution that would hide a file
+// behind a wrong name would send the UI to a wrong path, or to none.
+func TestSetLinkTargetAndResolved(t *testing.T) {
+	bad := []byte("../Bilder\xff/orig.txt")
+	var e Entry
+	e.SetLinkTarget([]byte("../Public/orig.txt"))
+	e.SetLinkResolved([]byte("/share/Public/orig.txt"))
+	if e.LinkTargetB64 != "" || e.LinkResolvedB64 != "" {
+		t.Fatalf("valid UTF-8 must not carry base64: %+v", e)
+	}
+	e.SetLinkTarget(bad)
+	e.SetLinkResolved(bad)
+	if e.LinkTarget != string(bad) {
+		t.Errorf("LinkTarget = %q", e.LinkTarget)
+	}
+	for name, got := range map[string]string{"LinkTargetB64": e.LinkTargetB64, "LinkResolvedB64": e.LinkResolvedB64} {
+		if got == "" {
+			t.Fatalf("%s must be set for a non-UTF-8 target", name)
+		}
+		raw, err := base64.RawURLEncoding.DecodeString(got)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if string(raw) != string(bad) {
+			t.Errorf("%s decoded to %q, want %q", name, raw, bad)
+		}
+	}
+	// And setting a valid target afterwards clears them again.
+	e.SetLinkTarget([]byte("ok"))
+	e.SetLinkResolved([]byte("/ok"))
+	if e.LinkTargetB64 != "" || e.LinkResolvedB64 != "" {
+		t.Errorf("a valid target must clear the base64 fields: %+v", e)
+	}
+}
+
 func TestSetNameAndPath(t *testing.T) {
 	// The legacy-share case: a name that is not valid UTF-8. encoding/json
 	// would silently replace the bytes with U+FFFD, so the raw form has to

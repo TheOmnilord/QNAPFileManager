@@ -1,7 +1,7 @@
 import {api} from './api.js';
 import {$,el,error,pathArgs,route,heightRule,announce} from './dom.js';
 import {state,update,selected,countSelected,subscribe} from './state.js';
-import {nameCell,isDirectory,isReadable,isSymlink,actionHint,directoryNotice} from './badges.js';
+import {nameCell,isDirectory,isReadable,isSymlink,hasTarget,fileTarget,actionHint,directoryNotice} from './badges.js';
 import {view,download,properties} from './viewer.js';
 const DEFAULT_PAGE = 500;
 let pageSize = DEFAULT_PAGE;
@@ -132,8 +132,8 @@ export function contextMenu(e) {
  if (!e) return;
  const menu = $('#ctxMenu'); menu.replaceChildren();
  const actions = [['Open',() => open(e),!isDirectory(e) && !isReadable(e)],['Properties',() => properties(e)],['Copy full path',async () => { try { await navigator.clipboard.writeText(e.path); announce('Path copied.'); } catch { error(new Error('Could not copy the path. Use the path field to copy it.')); } }]];
- if (isReadable(e) || isSymlink(e) && !e.linkResolved) actions.splice(1,0,['View text',() => view(e),!isReadable(e)],['Download',() => download(e),!isReadable(e)]);
- if (isSymlink(e) && (e.targetType === 'dir' || !e.linkResolved)) actions.push(['Go to target',() => { location.hash = route({path:e.linkResolved}); },!e.linkResolved]);
+ if (isReadable(e) || isSymlink(e) && !hasTarget(e)) actions.splice(1,0,['View text',() => view(e),!isReadable(e)],['Download',() => download(e),!isReadable(e)]);
+ if (isSymlink(e) && (e.targetType === 'dir' || !hasTarget(e))) actions.push(['Go to target',() => { location.hash = route(fileTarget(e)); },!hasTarget(e)]);
  for (const [label,action,disabled] of actions) { const b = el('button',{role:'menuitem',tabindex:'-1'},label); b.disabled=!!disabled; if (disabled) b.title=actionHint(e); b.addEventListener('click',() => { menu.hidden=true; action(); }); menu.append(b); }
  menu.hidden=false; const first=menu.querySelector('button:not(:disabled)'); first.tabIndex=0; first.focus();
 }

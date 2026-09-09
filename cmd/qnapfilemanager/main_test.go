@@ -9,10 +9,13 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 
 	"qnapfilemanager/internal/config"
 	"qnapfilemanager/internal/fsx"
+	"qnapfilemanager/internal/idmap"
 )
 
 // The -worker switch has to be recognised before anything else runs: a worker
@@ -182,6 +185,80 @@ func TestParseServeFlags(t *testing.T) {
 	}
 	if _, err := parseServeFlags([]string{"extra"}, io.Discard); err == nil {
 		t.Error("a positional argument must be an error")
+	}
+}
+
+// TestIdentityFilesAreHostOnlyOutsideDevMode is the round-one finding: the
+// daemon read /etc/passwd and /etc/group from inside -jail even when it was
+// about to fork real workers with the credentials it found there. A writable
+// jail could then map an authenticated QTS name to uid 0.
+func TestIdentityFilesAreHostOnlyOutsideDevMode(t *testing.T) {
+	jail, err := fsx.NewRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = jail.Close() })
+	var none fsx.Root
+
+	cases := []struct {
+		name      string
+		root      fsx.Root
+		inProcess bool
+		wantHost  bool
+	}{
+		{"jailed process mode", jail, false, true},
+		{"jailed in-process mode", jail, true, false},
+		{"unjailed process mode", none, false, true},
+		{"unjailed in-process mode", none, true, true},
+	}
+	for _, c := range cases {
+		passwd, group, err := identityFiles(c.root, c.inProcess)
+		if err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		host := passwd == idmap.DefaultPasswdPath && group == idmap.DefaultGroupPath
+		if host != c.wantHost {
+			t.Errorf("%s: passwd=%q group=%q; host-only = %v, want %v", c.name, passwd, group, host, c.wantHost)
+		}
+		if !c.wantHost && !strings.HasPrefix(passwd, jail.Base()) {
+			t.Errorf("%s: the fixture files must come from inside the jail, got %q", c.name, passwd)
+		}
+	}
+}
+
+// Real worker processes and jailed identities are mutually exclusive, and -dev
+// is the only thing that turns the process ones off on Linux.
+func TestInProcessWorkersFollowsDev(t *testing.T) {
+	if !inProcessWorkers(true) {
+		t.Error("-dev must run the workers in this process")
+	}
+	if got, want := inProcessWorkers(false), runtime.GOOS != "linux"; got != want {
+		t.Errorf("without -dev, inProcess = %v on %s, want %v", got, runtime.GOOS, want)
+	}
+}
+
+func TestImpersonateRequiresDev(t *testing.T) {
+	err := runServe([]string{"-impersonate", "alice", "-addr", "127.0.0.1:0"}, io.Discard)
+	if err == nil {
+		t.Fatal("-impersonate without -dev must be refused")
+	}
+	for _, want := range []string{"-impersonate", "-dev"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal must mention %s: %v", want, err)
+		}
+	}
+	// And the flag itself parses, so -dev is what changes the outcome.
+	o, err := parseServeFlags([]string{"-dev", "-impersonate", "alice"}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !o.dev || o.impersonate != "alice" {
+		t.Fatalf("options = %+v", o)
+	}
+	if o2, err := parseServeFlags([]string{"-impersonate", "alice"}, io.Discard); err != nil {
+		t.Fatal(err)
+	} else if o2.dev {
+		t.Fatal("-dev must default to off")
 	}
 }
 

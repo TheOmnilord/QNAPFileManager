@@ -2,6 +2,7 @@ package fsops
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -44,11 +45,21 @@ func fixture(t *testing.T) (fsx.Root, string) {
 	write(t, base, "a/sub/two.txt", "twotwo")
 	write(t, base, "a/.hidden", "h")
 	write(t, base, "b.txt", "bb")
+	return newRoot(t, base), base
+}
+
+// newRoot builds a jailed Root and releases its descriptor when the test ends.
+// Every operation now runs against an open handle on the jail directory, and on
+// Windows a directory with an open handle cannot be removed — so without this,
+// t.TempDir's own cleanup fails.
+func newRoot(t *testing.T, base string) fsx.Root {
+	t.Helper()
 	r, err := fsx.NewRoot(base)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return r, base
+	t.Cleanup(func() { _ = r.Close() })
+	return r
 }
 
 // tempDir is t.TempDir with the symlinks and the Windows 8.3 short names
@@ -201,11 +212,7 @@ func bigDir(t *testing.T, n int) (fsx.Root, string) {
 			t.Fatal(err)
 		}
 	}
-	r, err := fsx.NewRoot(base)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return r, dir
+	return newRoot(t, base), dir
 }
 
 // TestListPagingInvariants is the property the UI depends on: for every sort
@@ -410,6 +417,10 @@ func TestListSymlinks(t *testing.T) {
 	if e, _ := find(l, "todir"); e.TargetType != "dir" || e.LinkResolved != "/a/sub" {
 		t.Errorf("todir resolved = %q, targetType = %q", e.LinkResolved, e.TargetType)
 	}
+	// A target that is valid UTF-8 carries no base64 twin.
+	if e, _ := find(l, "todir"); e.LinkTargetB64 != "" || e.LinkResolvedB64 != "" {
+		t.Errorf("todir = %+v, want no base64 fields for a UTF-8 target", e)
+	}
 	if e, _ := find(l, "tofile"); e.TargetType != "file" {
 		t.Errorf("tofile targetType = %q", e.TargetType)
 	}
@@ -471,10 +482,7 @@ func TestListShareClassification(t *testing.T) {
 		filepath.Join(base, "share", "notashare")); err != nil {
 		t.Fatal(err)
 	}
-	r, err := fsx.NewRoot(base)
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := newRoot(t, base)
 	plat, err := platform.FromMountinfo(strings.NewReader(shareMountinfo))
 	if err != nil {
 		t.Fatal(err)
@@ -543,10 +551,7 @@ func TestListNonUTF8Name(t *testing.T) {
 		t.Skipf("the OS rewrote the name to %q; nothing to test", des[0].Name())
 	}
 
-	r, err := fsx.NewRoot(base)
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := newRoot(t, base)
 	l, err := List(context.Background(), r, nil, "/", fsx.ListOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -563,6 +568,44 @@ func TestListNonUTF8Name(t *testing.T) {
 	}
 	if e.Path != "/"+raw {
 		t.Errorf("path = %q", e.Path)
+	}
+}
+
+// TestNonUTF8LinkTargetKeepsItsBytes: the target of a symlink is raw bytes,
+// and JSON rewrites invalid UTF-8 as U+FFFD. Without the base64 twin the UI's
+// "go to symlink target" navigates to a path that names a different file, or
+// none at all.
+func TestNonUTF8LinkTargetKeepsItsBytes(t *testing.T) {
+	requireSymlinks(t)
+	base := tempDir(t)
+	raw := "we\xffird.txt"
+	if err := os.WriteFile(filepath.Join(base, raw), []byte("x"), 0o644); err != nil {
+		t.Skipf("this filesystem refuses a non-UTF-8 name: %v", err)
+	}
+	des, err := os.ReadDir(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(des) != 1 || des[0].Name() != raw {
+		t.Skipf("the OS rewrote the name to %q; nothing to test", des[0].Name())
+	}
+	if err := os.Symlink(raw, filepath.Join(base, "link")); err != nil {
+		t.Fatal(err)
+	}
+	r := newRoot(t, base)
+
+	e, err := Stat(context.Background(), r, nil, "/link")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := base64.RawURLEncoding.EncodeToString([]byte(raw)); e.LinkTargetB64 != want {
+		t.Errorf("linkTargetB64 = %q, want %q", e.LinkTargetB64, want)
+	}
+	if want := base64.RawURLEncoding.EncodeToString([]byte("/" + raw)); e.LinkResolvedB64 != want {
+		t.Errorf("linkResolvedB64 = %q, want %q (resolved %q)", e.LinkResolvedB64, want, e.LinkResolved)
+	}
+	if e.TargetType != "file" {
+		t.Errorf("targetType = %q", e.TargetType)
 	}
 }
 
@@ -626,18 +669,78 @@ func TestOpenRead(t *testing.T) {
 	}
 }
 
-func TestOpenReadRefusesASymlinkOnLinux(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("O_NOFOLLOW exists only on Linux")
-	}
+// TestOpenReadNeverFollowsTheFinalComponent: os.Root follows a symlink that
+// stays inside the tree and ignores the caller's O_NOFOLLOW while doing it, so
+// the rule is enforced by lstat here — which also makes it the same rule on
+// every platform rather than a Linux-only one.
+func TestOpenReadNeverFollowsTheFinalComponent(t *testing.T) {
 	requireSymlinks(t)
 	r, base := fixture(t)
 	if err := os.Symlink(filepath.Join(base, "a", "one.txt"), filepath.Join(base, "link.txt")); err != nil {
 		t.Fatal(err)
 	}
-	if f, _, err := OpenRead(context.Background(), r, "/link.txt"); err == nil {
+	f, _, err := OpenRead(context.Background(), r, "/link.txt")
+	if err == nil {
 		f.Close()
-		t.Fatal("O_NOFOLLOW must refuse a symlink as the final component")
+		t.Fatal("a symlink as the final component must be refused, not followed")
+	}
+	if !errors.Is(err, fsx.ErrUnsupported) {
+		t.Errorf("err = %v, want ErrUnsupported", err)
+	}
+	// A link in an earlier component is still followed: that is how /share works.
+	if err := os.Symlink(filepath.Join(base, "a"), filepath.Join(base, "adir")); err != nil {
+		t.Fatal(err)
+	}
+	f, _, err = OpenRead(context.Background(), r, "/adir/one.txt")
+	if err != nil {
+		t.Fatalf("reading through a directory symlink: %v", err)
+	}
+	f.Close()
+}
+
+// A relative symlink can climb out of the jail with "..", which no lexical
+// check of the link text would catch. os.Root resolves it against the base's
+// own descriptor, so the escape is refused by the kernel.
+func TestRelativeSymlinkEscapesAreRefused(t *testing.T) {
+	requireSymlinks(t)
+	r, base := fixture(t)
+	up := filepath.Join(strings.Repeat(".."+string(filepath.Separator), 12), "Windows")
+	if runtime.GOOS != "windows" {
+		up = "../../../../../../../../../../../../etc"
+	}
+	if err := os.Symlink(up, filepath.Join(base, "climb")); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if l, err := List(ctx, r, nil, "/climb", fsx.ListOptions{}); err == nil {
+		t.Fatalf("listing through %q escaped the jail: %v", up, names(l))
+	}
+	if _, _, err := OpenRead(ctx, r, "/climb/passwd"); err == nil {
+		t.Fatal("reading through a relative escape must fail")
+	}
+	// The link itself is still describable, and points nowhere this daemon
+	// will admit to.
+	e, err := Stat(ctx, r, nil, "/climb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !e.IsSymlink || e.LinkResolved != "" {
+		t.Errorf("entry = %+v, want a symlink with no resolved path", e)
+	}
+}
+
+// A symlink loop must end, and end as an error rather than as a hung worker.
+func TestSymlinkLoopsAreRefused(t *testing.T) {
+	requireSymlinks(t)
+	r, base := fixture(t)
+	if err := os.Symlink(filepath.Join(base, "loopb"), filepath.Join(base, "loopa")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(base, "loopa"), filepath.Join(base, "loopb")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := StatFollow(context.Background(), r, nil, "/loopa"); err == nil {
+		t.Fatal("a symlink loop must be an error")
 	}
 }
 

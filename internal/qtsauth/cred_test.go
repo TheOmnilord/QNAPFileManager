@@ -5,6 +5,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"qnapfilemanager/internal/idmap"
 )
 
 func req(cookies map[string]string, target string, headers map[string]string) *http.Request {
@@ -123,16 +125,27 @@ func TestFromRequestRejectsHostileToken(t *testing.T) {
 }
 
 func TestValidUserName(t *testing.T) {
-	good := []string{"admin", "sveinung", "user.name", "user_x", "a-b", "DOMAIN@corp", "a", strings.Repeat("a", 64)}
-	bad := []string{"", "a b", "a/b", "a\\b", "a;b", "a\tb", "a\nb", strings.Repeat("a", 65), "üser", "a\x00"}
+	good := []string{"alice", `DOMAIN\alice`, "alice@example.com", "a.b-c_d", "admin", "sveinung", "user.name", "user_x", "a-b", "DOMAIN@corp", "a", strings.Repeat("a", 64)}
+	bad := []string{"", "-x", "bob;rm", "a b", "a/b", "a;b", "a\tb", "a\nb", strings.Repeat("a", 65), "üser", "a\x00"}
 	for _, s := range good {
-		if !ValidUserName(s) {
+		if !ValidUserName(s) || ValidUserName(s) != idmap.ValidName(s) {
 			t.Errorf("ValidUserName(%q) = false, want true", s)
 		}
 	}
 	for _, s := range bad {
-		if ValidUserName(s) {
+		if ValidUserName(s) || ValidUserName(s) != idmap.ValidName(s) {
 			t.Errorf("ValidUserName(%q) = true, want false", s)
+		}
+	}
+}
+
+func TestDomainResponseBinding(t *testing.T) {
+	for _, name := range []string{`DOMAIN\alice`, "alice@example.com"} {
+		for _, kind := range []string{KindSID, KindQToken} {
+			got, err := bindUser(Cred{Kind: kind, User: name, Token: "token"}, Result{Username: name}, false)
+			if err != nil || got != name {
+				t.Errorf("bindUser(%q, %q) = %q, %v", kind, name, got, err)
+			}
 		}
 	}
 }

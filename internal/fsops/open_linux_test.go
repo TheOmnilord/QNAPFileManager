@@ -40,6 +40,29 @@ func TestOpenReadDoesNotBlockOnAFifo(t *testing.T) {
 	}
 }
 
+// TestListDoesNotBlockOnAFifo is the same trap on the listing side, which
+// O_DIRECTORY closes: the kernel refuses a non-directory in may_open, before
+// the fifo machinery gets a chance to park the caller inside open(2).
+func TestListDoesNotBlockOnAFifo(t *testing.T) {
+	r, base := fixture(t)
+	if err := syscall.Mkfifo(filepath.Join(base, "pipe"), 0o644); err != nil {
+		t.Skipf("mkfifo is not available here: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := List(context.Background(), r, nil, "/pipe", fsx.ListOptions{})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, fsx.ErrBadName) {
+			t.Fatalf("listing a fifo = %v, want ErrBadName", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("List blocked in open(2) on a fifo with no writer")
+	}
+}
+
 // A regular file must come back in blocking mode all the same: O_NONBLOCK is
 // only there to survive the open, and a descriptor that leaves this package
 // still carrying it would behave differently from every other file in the

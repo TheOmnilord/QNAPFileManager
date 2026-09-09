@@ -766,6 +766,185 @@ func TestFailedStartupChargesTheRestartBudget(t *testing.T) {
 	}
 }
 
+// fakeTransport is a worker that never was: every frame written to it is
+// recorded, and the test decides what comes back and when. It claims to pass
+// descriptors so the ownership rules around them can be exercised without a
+// Unix socket, which the dev box does not have.
+type fakeTransport struct {
+	mu     sync.Mutex
+	writes []wproto.Frame
+	in     chan result
+	closed chan struct{}
+	once   sync.Once
+}
+
+func newFakeTransport() *fakeTransport {
+	return &fakeTransport{in: make(chan result, 4), closed: make(chan struct{})}
+}
+
+func (t *fakeTransport) Read() (wproto.Frame, []*os.File, error) {
+	select {
+	case r := <-t.in:
+		return r.f, r.files, nil
+	case <-t.closed:
+		return wproto.Frame{}, nil, io.EOF
+	}
+}
+
+func (t *fakeTransport) Write(f wproto.Frame, files []*os.File) error {
+	t.mu.Lock()
+	t.writes = append(t.writes, f)
+	t.mu.Unlock()
+	closeAll(files)
+	return nil
+}
+
+func (t *fakeTransport) PassesFDs() bool { return true }
+
+func (t *fakeTransport) Close() error {
+	t.once.Do(func() { close(t.closed) })
+	return nil
+}
+
+func (t *fakeTransport) written() []wproto.Frame {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return append([]wproto.Frame(nil), t.writes...)
+}
+
+// isClosed reports whether a descriptor has been released, by closing it again:
+// a second Close is the one answer that is os.ErrClosed on every platform,
+// where File.Stat on Windows just passes a stale handle to the kernel. It is
+// destructive, so a test asks once and at the end.
+func isClosed(f *os.File) bool {
+	return errors.Is(f.Close(), os.ErrClosed)
+}
+
+func tempFile(t *testing.T, name string) *os.File {
+	t.Helper()
+	f, err := os.Create(filepath.Join(t.TempDir(), name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+	return f
+}
+
+// TestACancelledCallNeverAbandonsADescriptor: deliver used to take the pending
+// entry out of the map and then send on its channel with the lock released. A
+// caller that cancelled in that window left the download's descriptor sitting
+// in a buffered channel nobody would ever read — a file held open in the root
+// front-end until the daemon restarted. Both orders now close it exactly once.
+func TestACancelledCallNeverAbandonsADescriptor(t *testing.T) {
+	c := newClient(alice())
+	c.tr = newFakeTransport()
+
+	deliverFD := func(id uint64, f *os.File) wproto.Frame {
+		ok, err := wproto.NewOK(id, wproto.OpenReadResp{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ok.NFD = 1
+		return ok
+	}
+
+	register := func(id uint64) *pending {
+		p := &pending{ch: make(chan result, 1)}
+		c.mu.Lock()
+		c.pending[id] = p
+		c.mu.Unlock()
+		return p
+	}
+
+	// The reply lands first — taking the id out of the table with it — and the
+	// caller gives up a moment later. This is the order that leaked.
+	first := tempFile(t, "delivered")
+	pend7 := register(7)
+	c.deliver(deliverFD(7, first), []*os.File{first}, true, nil)
+	c.abandon(7, pend7)
+	if !isClosed(first) {
+		t.Error("a descriptor delivered just before the caller gave up was left open")
+	}
+
+	// The caller gives up first and the reply lands afterwards.
+	second := tempFile(t, "late")
+	pend8 := register(8)
+	c.abandon(8, pend8)
+	c.deliver(deliverFD(8, second), []*os.File{second}, true, nil)
+	if !isClosed(second) {
+		t.Error("a descriptor that arrived after the cancellation was left open")
+	}
+
+	// A live caller still gets its descriptor, open.
+	third := tempFile(t, "wanted")
+	pend9 := register(9)
+	c.deliver(deliverFD(9, third), []*os.File{third}, true, nil)
+	r := <-pend9.ch
+	if len(r.files) != 1 || isClosed(r.files[0]) {
+		t.Fatalf("the caller must receive its descriptor open: %+v", r.files)
+	}
+}
+
+// TestACancelledCallerTellsTheWorkerToStop is the front-end half of
+// cancellation propagation: dropping the caller frees this end only, and the
+// worker would otherwise keep the slot for a reply nobody will read.
+func TestACancelledCallerTellsTheWorkerToStop(t *testing.T) {
+	p := NewWithOptions(Options{InProcess: true, CallTimeout: time.Minute, Logger: log.New(io.Discard, "", 0)})
+	t.Cleanup(func() { _ = p.Shutdown(context.Background()) })
+
+	c := newClient(alice())
+	tr := newFakeTransport()
+	c.tr = tr
+	t.Cleanup(func() { _ = tr.Close() })
+	go c.readLoop(nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errc := make(chan error, 1)
+	go func() {
+		_, _, err := p.call(ctx, c, wproto.OpList, wproto.ListReq{Dir: []byte("/")})
+		errc <- err
+	}()
+
+	var id uint64
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		for _, f := range tr.written() {
+			if f.Op == wproto.OpList {
+				id = f.ID
+			}
+		}
+		if id != 0 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if id == 0 {
+		t.Fatal("the request was never sent")
+	}
+
+	cancel()
+	if err := <-errc; !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+
+	var got *wproto.CancelReq
+	for _, f := range tr.written() {
+		if f.Op != wproto.OpCancel {
+			continue
+		}
+		var req wproto.CancelReq
+		if err := f.Unmarshal(&req); err != nil {
+			t.Fatal(err)
+		}
+		got = &req
+	}
+	if got == nil {
+		t.Fatal("a cancelled caller must send an OpCancel frame")
+	}
+	if got.ReqID != id {
+		t.Errorf("the cancel names request %d, want %d", got.ReqID, id)
+	}
+}
+
 func TestUnknownOpIsUnsupported(t *testing.T) {
 	p, _ := testPool(t, nil)
 	c, err := p.acquire(context.Background(), alice())

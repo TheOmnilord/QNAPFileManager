@@ -8,9 +8,12 @@
 // M0 covers the read side only: List, Stat, Readlink and OpenRead. Mutation
 // arrives in M1 and the recursive walks (TreeSize, copy, delete) in M2.
 //
-// Paths in and out are API paths — absolute, slash-separated, already the
-// shape fsx.Clean produces. The single conversion to an OS path is fsx.Root.OS
-// and it happens here, once per syscall.
+// Paths in and out are API paths — absolute, slash-separated, already the shape
+// fsx.Clean produces. Every syscall goes through the *os.Root that fsx.Root.Open
+// holds: the kernel resolves each component against that directory's descriptor
+// and refuses one that would leave it, so the jail is enforced by openat rather
+// than by string comparison. The unjailed production case is the same code path
+// with the filesystem root as its base.
 package fsops
 
 import (
@@ -22,6 +25,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -36,6 +40,11 @@ import (
 // with a million entries notices a disconnected client within one chunk.
 const readChunk = 256
 
+// maxLinkHops bounds symlink following in resolve. It is deliberately the
+// kernel's own SYMLOOP_MAX, so a cycle inside the jail ends the same way a
+// cycle outside it would rather than spinning in this process.
+const maxLinkHops = 40
+
 // idMap is the uid/gid → name resolver. It is a process-wide value rather than
 // a parameter because it is a property of the machine, not of a request: the
 // worker sets it once at hello time, before it serves anything, and every
@@ -49,90 +58,191 @@ func SetIDMap(m *idmap.Map) { idMap.Store(m) }
 // IDMap returns the installed resolver, or nil.
 func IDMap() *idmap.Map { return idMap.Load() }
 
-// resolveWithin maps an API path to its OS path and, when a jail is
-// configured, refuses one that leaves the jail through a symlink.
-//
-// fsx.Root.OS is lexical: it cannot see that a directory inside the jail is a
-// symlink to /etc, and open(2) and ReadDir follow such a link happily — which
-// is how a jailed daemon used to enumerate and download the whole host
-// filesystem. Every component is therefore resolved with filepath.EvalSymlinks
-// and the result must still be under the base. A path that does not exist is
-// let through so the caller's own syscall reports the honest ENOENT, after the
-// deepest ancestor that does exist has been checked.
-//
-// Accepted TOCTOU window: this is a check, not a lock. Between EvalSymlinks
-// here and the syscall the caller makes next, a component could be replaced by
-// a symlink pointing out of the jail, and the operation would follow it. The
-// window is accepted for M0 and documented in
-// docs/design/backend-packaging-plan.md §2.0: the jail is defence in depth
-// behind the kernel's own permission check — the worker already runs as the
-// signed-in user — rather than the only thing between a request and the host.
-// The race-free version (openat2 with RESOLVE_IN_ROOT, or an O_PATH walk) is
-// M1 work, when the mutating operations arrive and the stakes change.
-func resolveWithin(r fsx.Root, apiPath string) (string, error) {
-	osPath, err := r.OS(apiPath)
-	if err != nil {
-		return "", err
-	}
-	if !r.Jailed() {
-		return osPath, nil
-	}
-	resolved, err := filepath.EvalSymlinks(osPath)
-	if err != nil {
-		parent := filepath.Dir(osPath)
-		if parent == osPath {
-			return osPath, nil
-		}
-		if resolved, err = filepath.EvalSymlinks(parent); err != nil {
-			// Nothing along the path resolves, so there is nothing to reach
-			// through it either; the caller's syscall will say so.
-			return osPath, nil
-		}
-	}
-	if !insideBase(r, resolved) {
-		return "", fmt.Errorf("%q leaves the jail root through a symlink: %w", apiPath, fsx.ErrOutsideRoot)
-	}
-	return osPath, nil
+// jailPath is one API path resolved against the jail: the open root every
+// syscall goes through, the name to hand its methods, and the API path that
+// names the result.
+type jailPath struct {
+	rt  *os.Root
+	rel string // slash-separated and relative to rt, "." for the base itself
+	api string // the API path rel corresponds to
 }
 
-// resolveParentWithin is resolveWithin for an operation that must not follow
-// the final component itself: Stat and Readlink describe the link, not its
-// target, so a symlink pointing out of the jail is a legitimate thing to
-// report on. The directories leading to it still have to stay inside.
-func resolveParentWithin(r fsx.Root, apiPath string) (string, error) {
-	osPath, err := r.OS(apiPath)
+// resolve walks an API path inside the jail's *os.Root, one component at a
+// time, and returns what to operate on.
+//
+// os.Root would happily do the walk itself — but it refuses an absolute symlink
+// target outright, and QTS is built out of them (/share/Public pointing at
+// /share/CACHEDEV1_DATA/Public is the whole share layout). So the links are
+// followed here: a relative target is spliced into the remaining components and
+// resolution continues inside the root, and an absolute one is read as the host
+// path it is, checked against the jail base, and re-entered from the top of the
+// root. Every individual lookup is still an openat against the root's
+// descriptor, so no step of this can address anything outside the jail.
+//
+// followFinal says whether the last component is followed. Stat, Readlink and
+// OpenRead describe the link itself, so they pass false: a symlink pointing out
+// of the jail is a legitimate thing to report on, as long as nothing reaches
+// through it. A component that does not exist is kept as written, so the
+// caller's own syscall reports the honest ENOENT.
+//
+// Accepted TOCTOU window: this is a resolution, not a lock. Between the lstat
+// that classifies a component here and the operation the caller makes next, a
+// component could be replaced. What that can no longer do is escape — the
+// operation is still an openat inside the root — so the worst case is that the
+// caller reads a different file inside the jail than the one that was resolved,
+// which is the same race any two-syscall sequence has against a concurrent
+// rename. Removing it entirely (openat2 with RESOLVE_IN_ROOT, or an O_PATH walk
+// that hands the operation a descriptor rather than a name) is M1 work, when
+// the mutating operations arrive and the stakes change.
+func resolve(r fsx.Root, apiPath string, followFinal bool) (jailPath, error) {
+	rt, err := r.Open()
 	if err != nil {
-		return "", err
+		return jailPath{}, err
 	}
-	if !r.Jailed() {
-		return osPath, nil
+	rel, err := r.Rel(apiPath)
+	if err != nil {
+		return jailPath{}, err
 	}
-	if parent := fsx.Parent(apiPath); parent != apiPath {
-		if _, err := resolveWithin(r, parent); err != nil {
-			return "", err
+
+	done := make([]string, 0, 8)
+	rest := splitRel(rel)
+	hops := 0
+	for len(rest) > 0 {
+		part := rest[0]
+		rest = rest[1:]
+		switch part {
+		case "", ".":
+			continue
+		case "..":
+			// Everything in done is already resolved, so ".." is unambiguous
+			// here in a way it never is on an unresolved path. At the base it
+			// is the base, exactly as "/.." is "/".
+			if len(done) > 0 {
+				done = done[:len(done)-1]
+			}
+			continue
 		}
+		if len(rest) == 0 && !followFinal {
+			done = append(done, part)
+			continue
+		}
+		cand := relJoin(relOf(done), part)
+		fi, err := rt.Lstat(cand)
+		if err != nil || fi.Mode()&fs.ModeSymlink == 0 {
+			// Not a link, or not there at all: keep it and move on.
+			done = append(done, part)
+			continue
+		}
+		hops++
+		if hops > maxLinkHops {
+			return jailPath{}, fmt.Errorf("%q: too many levels of symbolic links: %w", apiPath, fsx.ErrUnsupported)
+		}
+		link, err := rt.Readlink(cand)
+		if err != nil {
+			return jailPath{}, err
+		}
+		parts, absolute, err := linkParts(r, apiPath, link)
+		if err != nil {
+			return jailPath{}, err
+		}
+		if absolute {
+			done = done[:0]
+		}
+		rest = append(parts, rest...)
 	}
-	return osPath, nil
+	return jailPath{rt: rt, rel: relOf(done), api: apiOf(done)}, nil
 }
 
-// insideBase reports whether a symlink-resolved OS path is still under the
-// jail. The base is resolved too when the direct comparison fails: a jail
-// reached through a symlink (/tmp on a Mac) or spelled as a Windows 8.3 short
-// name resolves to a different string than the one the operator configured,
-// and refusing the entire jail over a spelling would be worse than useless.
-func insideBase(r fsx.Root, osPath string) bool {
-	if r.Contains(osPath) {
+// linkParts turns one readlink(2) result into the components resolution should
+// continue with, and says whether they start again from the jail base.
+//
+// An absolute target names a host path, which is how the kernel would read it
+// too. Under -jail it therefore has to land inside the base or the link is an
+// escape and is refused; unjailed, everything is inside by definition.
+func linkParts(r fsx.Root, apiPath, link string) (parts []string, absolute bool, err error) {
+	if link == "" {
+		return nil, false, fmt.Errorf("%q is a symlink with an empty target: %w", apiPath, fsx.ErrBadName)
+	}
+	if !isAbsLink(link) {
+		return splitRel(filepath.ToSlash(link)), false, nil
+	}
+	osTarget := filepath.Clean(filepath.FromSlash(link))
+	base, ok := baseFor(r, osTarget)
+	if !ok {
+		return nil, false, fmt.Errorf("%q leaves the jail root through a symlink: %w", apiPath, fsx.ErrOutsideRoot)
+	}
+	api, err := base.API(osTarget)
+	if err != nil {
+		return nil, false, err
+	}
+	return splitRel(strings.TrimPrefix(api, "/")), true, nil
+}
+
+// isAbsLink reports whether a symlink target is absolute on this host. On
+// Windows that includes both "C:\x" and the volume-relative "\x", either of
+// which filepath.Join would treat as leaving the current directory.
+func isAbsLink(link string) bool {
+	if link == "" {
+		return false
+	}
+	if link[0] == '/' {
 		return true
+	}
+	return runtime.GOOS == "windows" && (filepath.IsAbs(link) || link[0] == '\\')
+}
+
+// baseFor returns the Root an absolute symlink target should be mapped through,
+// or false when the target is outside the jail altogether. The jail base is
+// re-resolved when the direct comparison fails: a jail reached through a symlink
+// (/tmp on a Mac) or spelled as a Windows 8.3 short name resolves to a
+// different string than the one the operator configured, and refusing the
+// entire jail over a spelling would be worse than useless.
+func baseFor(r fsx.Root, osPath string) (fsx.Root, bool) {
+	if r.Contains(osPath) {
+		return r, true
 	}
 	real, err := filepath.EvalSymlinks(r.Base())
 	if err != nil {
-		return false
+		return r, false
 	}
 	rr, err := fsx.NewRoot(real)
 	if err != nil {
-		return false
+		return r, false
 	}
-	return rr.Contains(osPath)
+	return rr, rr.Contains(osPath)
+}
+
+// splitRel splits a root-relative path into components. "." and "" are no
+// components at all, which is how the base itself is spelled.
+func splitRel(rel string) []string {
+	if rel == "" || rel == "." {
+		return nil
+	}
+	return strings.Split(strings.Trim(rel, "/"), "/")
+}
+
+// relOf renders resolved components as the name an os.Root method takes.
+func relOf(parts []string) string {
+	if len(parts) == 0 {
+		return "."
+	}
+	return strings.Join(parts, "/")
+}
+
+// relJoin names a child of a root-relative directory.
+func relJoin(dir, name string) string {
+	if dir == "" || dir == "." {
+		return name
+	}
+	return dir + "/" + name
+}
+
+// apiOf renders resolved components as an API path.
+func apiOf(parts []string) string {
+	if len(parts) == 0 {
+		return "/"
+	}
+	return "/" + strings.Join(parts, "/")
 }
 
 // List returns one page of a directory listing (backend plan §2.1).
@@ -141,9 +251,14 @@ func insideBase(r fsx.Root, osPath string) bool {
 // DirEntry.Info is the data getdents already returned, so this is a single
 // syscall per chunk, not an Lstat per file. A symlink's own metadata is never
 // followed: Size is the length of the link text and Mode is the link's mode,
-// exactly as ls -l reports them. os.Stat is called for a symlink only when
-// opts.ResolveLinks asks for the target's type, or at /share where the
-// share/volume-root classification depends on it.
+// exactly as ls -l reports them. The target is stat'ed for a symlink only when
+// opts.ResolveLinks asks for its type, or at /share where the share/volume-root
+// classification depends on it.
+//
+// The directory is opened with O_DIRECTORY where the platform has it, so a fifo
+// named in the request is refused by the kernel before open(2) can block on it:
+// a readable fifo with no writer would otherwise hold a worker slot until the
+// process died, and sixty-four of them would take the whole worker.
 //
 // opts.ShowHidden is the one filter applied here, because hiding entries after
 // the fact would break paging. opts.ShowVolumeRoots is deliberately *not* a
@@ -162,12 +277,22 @@ func List(ctx context.Context, r fsx.Root, plat *platform.Platform, dir string, 
 		return fsx.Listing{}, err
 	}
 
-	osDir, err := resolveWithin(r, clean)
+	tg, err := resolve(r, clean, true)
 	if err != nil {
 		return fsx.Listing{}, err
 	}
-	f, err := os.Open(osDir)
+	if err := ctx.Err(); err != nil {
+		return fsx.Listing{}, err
+	}
+	f, err := tg.rt.OpenFile(tg.rel, openDirFlags(), 0)
 	if err != nil {
+		// O_DIRECTORY reports "this is not a directory" as ENOTDIR, which the
+		// API vocabulary spells bad_request. An lstat tells that apart from a
+		// genuine failure without depending on an errno that differs per
+		// platform.
+		if fi, serr := tg.rt.Lstat(tg.rel); serr == nil && !fi.IsDir() {
+			return fsx.Listing{}, fmt.Errorf("%q is not a directory: %w", clean, fsx.ErrBadName)
+		}
 		// A directory we cannot read is an error, not a partial listing: a
 		// half-shown /proc/<pid> that silently dropped what it could not read
 		// would be worse than saying so.
@@ -177,11 +302,14 @@ func List(ctx context.Context, r fsx.Root, plat *platform.Platform, dir string, 
 	if fi, err := f.Stat(); err != nil {
 		return fsx.Listing{}, err
 	} else if !fi.IsDir() {
+		// The platforms without O_DIRECTORY get the same answer, one syscall
+		// later.
 		return fsx.Listing{}, fmt.Errorf("%q is not a directory: %w", clean, fsx.ErrBadName)
 	}
 
 	shareDir := clean == "/share"
 	volRoots := volumeRootNames(plat, shareDir)
+	osDir, _ := r.OS(tg.api) // for the mount table only; never for a syscall
 	mounts := childMountPoints(plat, osDir)
 	ids := IDMap()
 
@@ -211,11 +339,9 @@ func List(ctx context.Context, r fsx.Root, plat *platform.Platform, dir string, 
 				e.MountPoint = true
 			}
 			if e.IsSymlink {
-				// A name this host cannot express as a path (a backslash on
-				// Windows) is still listed; only its target stays unresolved.
-				if childOS, err := r.OS(child); err == nil {
-					resolveLink(&e, r, childOS, o.ResolveLinks || shareDir, o.ResolveLinks)
-				}
+				// The parent is already resolved, so the link is addressed
+				// directly beneath it rather than resolved again per entry.
+				resolveLink(&e, r, tg.rt, relJoin(tg.rel, name), child, o.ResolveLinks || shareDir, o.ResolveLinks)
 			}
 			if shareDir {
 				// §2.2: at /share we return everything and label it. The
@@ -286,31 +412,29 @@ func statPath(ctx context.Context, r fsx.Root, plat *platform.Platform, p string
 	if err := ctx.Err(); err != nil {
 		return fsx.Entry{}, err
 	}
-	var osPath string
-	if follow {
-		// The follow variant reaches the target, so the target has to be
-		// inside the jail; the plain one only describes the link itself.
-		osPath, err = resolveWithin(r, clean)
-	} else {
-		osPath, err = resolveParentWithin(r, clean)
-	}
+	// The follow variant reaches the target, so the target has to be inside the
+	// jail; the plain one only describes the link itself.
+	tg, err := resolve(r, clean, follow)
 	if err != nil {
+		return fsx.Entry{}, err
+	}
+	if err := ctx.Err(); err != nil {
 		return fsx.Entry{}, err
 	}
 	var fi os.FileInfo
 	if follow {
-		fi, err = os.Stat(osPath)
+		fi, err = tg.rt.Stat(tg.rel)
 	} else {
-		fi, err = os.Lstat(osPath)
+		fi, err = tg.rt.Lstat(tg.rel)
 	}
 	if err != nil {
 		return fsx.Entry{}, err
 	}
 	e := newEntry(clean, []byte(fsx.Base(clean)), fi, IDMap())
 	if e.IsSymlink {
-		resolveLink(&e, r, osPath, true, true)
+		resolveLink(&e, r, tg.rt, tg.rel, clean, true, true)
 	}
-	if plat != nil && plat.IsMountPoint(osPath) {
+	if osPath, err := r.OS(tg.api); err == nil && plat != nil && plat.IsMountPoint(osPath) {
 		e.MountPoint = true
 	}
 	if fsx.Parent(clean) == "/share" {
@@ -334,11 +458,14 @@ func Readlink(ctx context.Context, r fsx.Root, p string) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	osPath, err := resolveParentWithin(r, clean)
+	tg, err := resolve(r, clean, false)
 	if err != nil {
 		return "", err
 	}
-	return os.Readlink(osPath)
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	return tg.rt.Readlink(tg.rel)
 }
 
 // OpenRead opens a regular file for reading as this process's identity — which
@@ -347,21 +474,23 @@ func Readlink(ctx context.Context, r fsx.Root, p string) (string, error) {
 // point: the descriptor that comes back can only be something the user was
 // allowed to open, so the root front-end may safely stream from it.
 //
-// On Linux the open carries O_NOFOLLOW, so a symlink as the final component is
-// refused (ELOOP) rather than followed. Off Linux that flag does not exist and
-// the final component is followed; the dev loop is the only place that
-// happens, and it never runs as root over real user data.
+// The final component is never followed. os.Root follows a symlink that stays
+// inside the tree and gives the caller's O_NOFOLLOW no say in it, so the link
+// is refused here instead: an lstat classifies the name, and the descriptor
+// that comes back is then checked against that lstat with os.SameFile, so a
+// component swapped for a symlink between the two is caught rather than
+// followed. That closes the race the flag was there to close, on every platform
+// rather than only on Linux.
 //
 // Directories, devices, fifos and sockets are refused with fsx.ErrUnsupported:
 // a download is bytes, and opening a fifo would block the worker forever.
-//
-// "Would block forever" is not hypothetical, which is why the Linux open also
-// carries O_NONBLOCK: open(2) on a fifo with no writer blocks inside the
-// syscall, where neither the HTTP deadline nor the pool's call timeout can
-// reach it, and 64 such requests would take every worker slot in the daemon.
-// The descriptor is put back into blocking mode only once fstat has proved it
-// is a regular file — the check has to be on the descriptor, since checking
-// the name first would just be a race.
+// "Would block forever" is not hypothetical — open(2) on a fifo with no writer
+// blocks inside the syscall, where neither the HTTP deadline nor the pool's
+// call timeout can reach it, and 64 such requests would take every worker slot
+// in the daemon. The lstat refuses one before the open; O_NONBLOCK on Linux is
+// the backstop for the case where the name became a fifo in between. The
+// descriptor is put back into blocking mode once fstat has confirmed it is a
+// regular file after all.
 func OpenRead(ctx context.Context, r fsx.Root, p string) (*os.File, fsx.Entry, error) {
 	clean, err := fsx.Clean(p)
 	if err != nil {
@@ -370,11 +499,29 @@ func OpenRead(ctx context.Context, r fsx.Root, p string) (*os.File, fsx.Entry, e
 	if err := ctx.Err(); err != nil {
 		return nil, fsx.Entry{}, err
 	}
-	osPath, err := resolveWithin(r, clean)
+	tg, err := resolve(r, clean, false)
 	if err != nil {
 		return nil, fsx.Entry{}, err
 	}
-	f, err := os.OpenFile(osPath, openReadFlags(), 0)
+	if err := ctx.Err(); err != nil {
+		return nil, fsx.Entry{}, err
+	}
+	before, err := tg.rt.Lstat(tg.rel)
+	if err != nil {
+		return nil, fsx.Entry{}, err
+	}
+	if before.Mode()&fs.ModeSymlink != 0 {
+		return nil, fsx.Entry{}, fmt.Errorf("%q is a symlink and the last component of a download is never followed: %w",
+			clean, fsx.ErrUnsupported)
+	}
+	if !before.Mode().IsRegular() {
+		// Refused before the open rather than after it: opening a device or a
+		// fifo has effects of its own, and there is no reason to have them for
+		// something that was never going to be downloaded.
+		return nil, fsx.Entry{}, fmt.Errorf("%q is a %s, not a regular file: %w",
+			clean, fsx.TypeString(before.Mode()), fsx.ErrUnsupported)
+	}
+	f, err := tg.rt.OpenFile(tg.rel, openReadFlags(), 0)
 	if err != nil {
 		return nil, fsx.Entry{}, err
 	}
@@ -384,9 +531,15 @@ func OpenRead(ctx context.Context, r fsx.Root, p string) (*os.File, fsx.Entry, e
 		return nil, fsx.Entry{}, err
 	}
 	if !fi.Mode().IsRegular() {
+		// The same answer from the descriptor itself, which is the one that
+		// counts if the name was swapped after the lstat above.
 		f.Close()
 		return nil, fsx.Entry{}, fmt.Errorf("%q is a %s, not a regular file: %w",
 			clean, fsx.TypeString(fi.Mode()), fsx.ErrUnsupported)
+	}
+	if !os.SameFile(before, fi) {
+		f.Close()
+		return nil, fsx.Entry{}, fmt.Errorf("%q was replaced between the check and the open: %w", clean, fsx.ErrUnsupported)
 	}
 	if err := clearNonblock(f); err != nil {
 		f.Close()
@@ -419,32 +572,36 @@ func newEntry(apiPath string, name []byte, fi os.FileInfo, ids *idmap.Map) fsx.E
 	return e
 }
 
-// resolveLink fills the three symlink fields. target says whether to spend an
-// os.Stat learning the target's type; resolved says whether to spend the full
-// EvalSymlinks walk on top of that. A target outside the jail leaves
-// LinkResolved empty rather than leaking a host path.
-func resolveLink(e *fsx.Entry, r fsx.Root, osPath string, target, resolved bool) {
-	if t, err := os.Readlink(osPath); err == nil {
-		e.LinkTarget = t
+// resolveLink fills the symlink fields of an entry whose own lstat data is
+// already in place. rel names the link inside rt; apiPath is the same link as
+// the API sees it. wantType says whether to spend the walk that learns the
+// target's type, wantResolved whether to report where it lands.
+//
+// A target outside the jail leaves both empty rather than leaking a host path:
+// the link itself stays fully visible, because hiding it would be lying about
+// the directory, but where it points is not this daemon's to disclose.
+func resolveLink(e *fsx.Entry, r fsx.Root, rt *os.Root, rel, apiPath string, wantType, wantResolved bool) {
+	if t, err := rt.Readlink(rel); err == nil {
+		e.SetLinkTarget([]byte(t))
 	}
-	if !target {
+	if !wantType {
 		return
 	}
-	st, err := os.Stat(osPath)
+	tg, err := resolve(r, apiPath, true)
+	if err != nil {
+		return // out of the jail, or a loop
+	}
+	// The path is fully resolved by now, so lstat is the target's own metadata
+	// and needs no second pass through the link.
+	st, err := tg.rt.Lstat(tg.rel)
 	if err != nil {
 		return // dangling or unreadable; TargetType stays empty, as documented
 	}
 	e.TargetType = fsx.TypeString(st.Mode())
-	if !resolved {
+	if !wantResolved {
 		return
 	}
-	rp, err := filepath.EvalSymlinks(osPath)
-	if err != nil {
-		return
-	}
-	if api, err := r.API(rp); err == nil {
-		e.LinkResolved = api
-	}
+	e.SetLinkResolved([]byte(tg.api))
 }
 
 // typeRank orders the "type" sort so a directory listing reads the way a file

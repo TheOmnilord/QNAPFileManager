@@ -84,7 +84,11 @@ serve flags:
   -jail <dir>           reroot every filesystem path under <dir> (dev loop)
   -proxy-prefix <path>  serve the mux at <path> as well as / (QTS proxy)
   -readonly[=false]     override readOnly
+  -dev                  development mode: run the workers inside this process,
+                        read identities from inside -jail, and allow
+                        -impersonate. Never use it on a NAS.
   -impersonate <user>   run every operation as <user>, without a QTS session
+                        (requires -dev)
 `, version)
 }
 
@@ -151,10 +155,43 @@ type serveOptions struct {
 	proxyPrefix string
 	readOnly    bool
 	impersonate string
+	dev         bool
 	// set records which flags the operator actually gave, so an unset
 	// -readonly leaves the config's value alone instead of overwriting it
 	// with the flag's default.
 	set map[string]bool
+}
+
+// inProcessWorkers reports whether this run serves requests from goroutines in
+// the front-end rather than from real, credential-carrying worker processes.
+// That is the case on any host without Unix credentials, and on Linux only when
+// the operator asked for it with -dev.
+func inProcessWorkers(dev bool) bool { return dev || runtime.GOOS != "linux" }
+
+// identityFiles picks where uid/gid names and group memberships are read from.
+//
+// In production — a Linux host spawning real worker processes — they always
+// come from the host's own /etc/passwd and /etc/group, whatever -jail says. The
+// jail is a path mapping for user data; it is not a source of identities.
+// Reading them from inside it was a privilege escalation: with a writable jail
+// such as "-jail /share/Public", anyone who could create etc/passwd there could
+// map their own authenticated QTS name to uid 0, and a worker forked with
+// Credential{Uid: 0} is root whether or not Principal.Root was ever set.
+//
+// Fixture identity files are read out of the jail only where no worker process
+// is spawned at all and there is therefore no credential to forge: the Windows
+// dev box, or an explicit -dev.
+func identityFiles(root fsx.Root, inProcess bool) (passwd, group string, err error) {
+	if !inProcess || !root.Jailed() {
+		return idmap.DefaultPasswdPath, idmap.DefaultGroupPath, nil
+	}
+	if passwd, err = root.OS("/etc/passwd"); err != nil {
+		return "", "", err
+	}
+	if group, err = root.OS("/etc/group"); err != nil {
+		return "", "", err
+	}
+	return passwd, group, nil
 }
 
 func parseServeFlags(args []string, stderr io.Writer) (serveOptions, error) {
@@ -167,7 +204,8 @@ func parseServeFlags(args []string, stderr io.Writer) (serveOptions, error) {
 	fs.StringVar(&o.jail, "jail", "", "reroot every filesystem path under this directory")
 	fs.StringVar(&o.proxyPrefix, "proxy-prefix", "", "also serve the mux under this path")
 	fs.BoolVar(&o.readOnly, "readonly", true, "override readOnly")
-	fs.StringVar(&o.impersonate, "impersonate", "", "run every operation as this user, without a QTS session")
+	fs.BoolVar(&o.dev, "dev", false, "development mode: in-process workers, identities read from inside -jail, -impersonate allowed")
+	fs.StringVar(&o.impersonate, "impersonate", "", "run every operation as this user, without a QTS session (requires -dev)")
 	if err := fs.Parse(args); err != nil {
 		return o, err
 	}
@@ -203,6 +241,14 @@ func runServe(args []string, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	// -impersonate serves every request as one user with no QTS session at all.
+	// That is the dev loop's whole point and a total authentication bypass
+	// anywhere else, so it is gated on the flag that says "this is a
+	// development run" rather than on nobody noticing.
+	if o.impersonate != "" && !o.dev {
+		return fmt.Errorf("-impersonate %s runs every request as that user with no QTS session and is refused outside development mode; add -dev if that is really what you want", o.impersonate)
+	}
+	inProcess := inProcessWorkers(o.dev)
 	cfg := config.Default()
 	if o.configPath != "" {
 		// A missing file is the first-run state and Load returns the defaults
@@ -242,13 +288,12 @@ func runServe(args []string, stderr io.Writer) error {
 	}
 	logger := log.New(logw, "", log.LstdFlags|log.LUTC)
 
-	passwdPath, err := root.OS("/etc/passwd")
+	passwdPath, groupPath, err := identityFiles(root, inProcess)
 	if err != nil {
 		return err
 	}
-	groupPath, err := root.OS("/etc/group")
-	if err != nil {
-		return err
+	if o.dev {
+		logger.Printf("development mode: workers run inside this process, identities come from %s, and -impersonate is allowed. This is not a production configuration.", passwdPath)
 	}
 	ids := idmap.Open(passwdPath, groupPath)
 	var pinned *backend.Principal
@@ -274,7 +319,7 @@ func runServe(args []string, stderr io.Writer) error {
 		verifier = qtsauth.NewVerifier(client)
 	}
 	plat := platform.Detect()
-	b := workerpool.New(cfg, root, plat, ids, logger)
+	b := workerpool.New(cfg, root, plat, ids, logger, inProcess)
 	defer func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
@@ -283,6 +328,7 @@ func runServe(args []string, stderr io.Writer) error {
 		}
 	}()
 	srv := newServer(cfg, root, logger)
+	srv.dev = o.dev
 	srv.frontend = web.New(cfg, poolBackend{b}, verifier, ids, plat, pinned, version, logger).Handler()
 	return srv.run(context.Background())
 }
@@ -291,6 +337,7 @@ func runServe(args []string, stderr io.Writer) error {
 type server struct {
 	cfg      config.Config
 	root     fsx.Root
+	dev      bool
 	logger   *log.Logger
 	frontend http.Handler
 }
@@ -331,8 +378,8 @@ func (s *server) run(ctx context.Context) error {
 	if s.root.Jailed() {
 		jail = s.root.Base()
 	}
-	s.logger.Printf("qnapfilemanager %s listening on %s (readOnly=%v, jail=%s, proxyPrefix=%q)",
-		version, ln.Addr(), s.cfg.ReadOnly, jail, s.cfg.Web.ProxyPrefix)
+	s.logger.Printf("qnapfilemanager %s listening on %s (readOnly=%v, jail=%s, proxyPrefix=%q, dev=%v)",
+		version, ln.Addr(), s.cfg.ReadOnly, jail, s.cfg.Web.ProxyPrefix, s.dev)
 
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()

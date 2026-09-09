@@ -58,6 +58,10 @@ func TestBusyVerificationDoesNotBlockOtherSessions(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("unrelated session blocked on QTS verification")
 	}
+	// Expiration is checked on indexed lookup; unrelated requests no longer sweep.
+	if w := request(s, "GET", "/api/session", &http.Cookie{Name: "qfm_sid", Value: "expired"}, nil); w.Code != http.StatusUnauthorized {
+		t.Fatalf("expired session: %d", w.Code)
+	}
 	s.mu.Lock()
 	_, retained := s.sessions["expired"]
 	s.mu.Unlock()

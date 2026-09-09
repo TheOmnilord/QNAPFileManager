@@ -3,6 +3,7 @@
 package web
 
 import (
+	"container/list"
 	"context"
 	"embed"
 	"io"
@@ -24,16 +25,22 @@ import (
 var assets embed.FS
 
 type Server struct {
-	cfg      config.Config
-	backend  backend.Backend
-	verifier *qtsauth.Verifier
-	ids      *idmap.Map
-	platform *platform.Platform
-	pinned   *backend.Principal
-	version  string
-	logger   *log.Logger
-	mu       sync.Mutex
-	sessions map[string]*session
+	cfg          config.Config
+	backend      backend.Backend
+	verifier     *qtsauth.Verifier
+	ids          *idmap.Map
+	platform     *platform.Platform
+	pinned       *backend.Principal
+	version      string
+	logger       *log.Logger
+	mu           sync.Mutex
+	sessions     map[string]*session
+	byCredential map[string]*session
+	byUser       map[string]*list.List
+	sessionOrder list.List
+	// Set before serving; nonpositive limits select the defaults.
+	MaxSessions, MaxSessionsPerUser int
+	sessionLookups                  uint64 // indexed lookups, guarded by mu
 }
 
 func New(cfg config.Config, b backend.Backend, v *qtsauth.Verifier, ids *idmap.Map, p *platform.Platform, pinned *backend.Principal, version string, logger *log.Logger) *Server {

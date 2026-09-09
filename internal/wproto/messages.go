@@ -171,9 +171,16 @@ type JobReq struct {
 }
 
 // CancelReq is a separate, immediate RPC on its own ID; the worker looks the
-// job up in its own map[string]context.CancelFunc.
+// work up in its own tables and cancels the context it runs under.
 type CancelReq struct {
-	JobID string `json:"j"`
+	// JobID cancels a long-running job (M2).
+	JobID string `json:"j,omitempty"`
+	// ReqID cancels one in-flight request by the frame ID it was sent with.
+	// The front-end sends this the moment a caller's context is done, because
+	// unregistering the caller stops nobody: a worker whose request context was
+	// never cancelled keeps its slot — and, for a fifo or a directory on a
+	// wedged mount, its blocked syscall — long after the browser has gone.
+	ReqID uint64 `json:"r,omitempty"`
 }
 
 // CopyOptions are the per-job knobs shared by copy and move. They live here

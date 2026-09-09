@@ -2,8 +2,9 @@ package qtsauth
 
 import (
 	"net/http"
-	"regexp"
 	"strings"
+
+	"qnapfilemanager/internal/idmap"
 )
 
 // Credential kinds.
@@ -29,13 +30,9 @@ const (
 // maxTokenLen bounds a credential we are willing to forward to the CGI.
 const maxTokenLen = 512
 
-// userNameRe is the accepted syntax for a QTS user name. The name reaches an
-// argv (idmap's `id -G <user>` fallback) and a query string, so it is filtered
-// before either. Same expression as identity-and-hero-plan.md §1.1.
-var userNameRe = regexp.MustCompile(`^[A-Za-z0-9._@\-]{1,64}$`)
-
 // ValidUserName reports whether name is acceptable as a QTS user name.
-func ValidUserName(name string) bool { return userNameRe.MatchString(name) }
+// Share NSS's grammar, including domain names and rejection of leading '-'.
+func ValidUserName(name string) bool { return idmap.ValidName(name) }
 
 // Cred is a QTS credential taken from a request.
 type Cred struct {

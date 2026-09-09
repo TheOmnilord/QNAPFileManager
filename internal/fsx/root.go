@@ -2,10 +2,12 @@ package fsx
 
 import (
 	"fmt"
+	"os"
 	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 )
 
 // Root is the -jail mapping between API paths (always absolute and
@@ -13,13 +15,53 @@ import (
 // The zero Root is the identity used in production: "/etc/passwd" maps to
 // "/etc/passwd".
 //
-// Every syscall in the filesystem layer goes through Root.OS; nothing else in
-// the codebase constructs an OS path. That is what lets the whole daemon run
+// Root is the API↔OS path mapper and the owner of the one *os.Root every
+// filesystem syscall goes through (see Open). Nothing else in the codebase
+// constructs an OS path or opens a jail. That is what lets the whole daemon run
 // on Windows against testdata\fakeroot, gives every test a sandbox for free
 // with NewRoot(t.TempDir()), and makes "-jail /share/CACHEDEV1_DATA" a real
 // defence-in-depth option for a cautious operator.
+//
+// A Root is copied by value all over the tree; the descriptor behind Open is
+// shared by every copy, so copying is free and closing is done once.
 type Root struct {
 	base string // "" means identity; otherwise a cleaned absolute OS path
+	h    *handle
+}
+
+// identityDir is the directory an unjailed Root operates in: the filesystem
+// root. On Windows that is the root of the current drive, which is the same
+// thing the identity mapping has always produced ("/etc/passwd" → "\etc\passwd").
+const identityDir = "/"
+
+// identityRoot is the shared *os.Root of the unjailed mapping. It is a package
+// singleton because there is only ever one of it, it costs a single descriptor
+// for the life of the process, and the zero Root — which production uses and
+// which no constructor ever touched — has to be usable as it stands.
+var identityRoot = sync.OnceValues(func() (*os.Root, error) { return os.OpenRoot(identityDir) })
+
+// handle is the lazily opened *os.Root behind a jailed Root, held by pointer so
+// that every copy of the Root shares one descriptor.
+type handle struct {
+	dir  string
+	once sync.Once
+	r    *os.Root
+	err  error
+}
+
+func (h *handle) open() (*os.Root, error) {
+	h.once.Do(func() { h.r, h.err = os.OpenRoot(h.dir) })
+	return h.r, h.err
+}
+
+// close releases the descriptor, and makes a later open fail rather than hand
+// out a fresh one: after shutdown there is nothing left to serve.
+func (h *handle) close() error {
+	h.once.Do(func() { h.err = fmt.Errorf("the jail root %q is closed: %w", h.dir, os.ErrClosed) })
+	if h.r == nil {
+		return nil
+	}
+	return h.r.Close()
 }
 
 // NewRoot builds a Root from a jail directory. An empty base — and "/", which
@@ -40,7 +82,68 @@ func NewRoot(base string) (Root, error) {
 	for len(abs) > 1 && isPathSeparator(abs[len(abs)-1]) {
 		abs = abs[:len(abs)-1]
 	}
-	return Root{base: abs}, nil
+	return Root{base: abs, h: &handle{dir: abs}}, nil
+}
+
+// Open returns the *os.Root that every filesystem operation is performed
+// against: the jail directory, or the filesystem root when unjailed. It is
+// opened once and shared, so callers must not close what it returns — Close
+// does that, once, when the pool shuts down.
+//
+// The point of the type is that os.Root resolves each path component relative
+// to a directory descriptor it holds, refusing any component that would leave
+// the tree. That is what makes the jail a real one rather than a lexical
+// check: a symlink inside it can no longer point the operation at /etc, and
+// there is no window between checking a path and using it in which a component
+// could be swapped for one. The unjailed production case goes through the same
+// call so there is exactly one code path.
+func (r Root) Open() (*os.Root, error) {
+	if r.h != nil {
+		return r.h.open()
+	}
+	return identityRoot()
+}
+
+// Close releases the jail's descriptor. Closing an unjailed Root is a no-op:
+// the identity root is shared by the whole process.
+func (r Root) Close() error {
+	if r.h == nil {
+		return nil
+	}
+	return r.h.close()
+}
+
+// Rel maps an API path to the name to hand a method of the *os.Root from Open:
+// slash-separated, relative to the base, and "." for the base itself. It
+// applies the same defensive cleaning and the same Windows backslash refusal as
+// OS, so a path can never climb out of the tree even before os.Root looks at it.
+func (r Root) Rel(apiPath string) (string, error) {
+	c, err := r.cleanAPI(apiPath)
+	if err != nil {
+		return "", err
+	}
+	rel := strings.TrimPrefix(c, "/")
+	if rel == "" {
+		return ".", nil
+	}
+	return rel, nil
+}
+
+// cleanAPI is the shared front half of OS and Rel: clean the path to an
+// absolute API path and refuse what this host would misread.
+//
+// The refusal is not belt and braces on Windows. fsx.Clean is a POSIX cleaner,
+// so a backslash is an ordinary filename character to it — but filepath.Join
+// then treats it as a separator, which turned "/..\..\PLAN.md" into a path
+// above the jail. A backslash in an API path is therefore refused on Windows
+// and left legal on Linux, where QNAP shares written from Windows clients
+// really do contain one.
+func (r Root) cleanAPI(apiPath string) (string, error) {
+	c := path.Clean("/" + strings.TrimPrefix(apiPath, "/"))
+	if runtime.GOOS == "windows" && strings.ContainsRune(c, '\\') {
+		return "", fmt.Errorf("%q contains a backslash, which this host would read as a path separator: %w", apiPath, ErrOutsideRoot)
+	}
+	return c, nil
 }
 
 // Jailed reports whether this Root rewrites paths at all.
@@ -49,21 +152,18 @@ func (r Root) Jailed() bool { return r.base != "" }
 // Base is the OS directory the jail is rooted at, empty when not jailed.
 func (r Root) Base() string { return r.base }
 
-// OS maps an API path to the OS path to hand to a syscall. The argument is
-// cleaned defensively and the result is verified: OS never returns a path
-// outside the jail, whatever it is given, and says ErrOutsideRoot instead.
+// OS maps an API path to the OS path it names. The argument is cleaned
+// defensively and the result is verified: OS never returns a path outside the
+// jail, whatever it is given, and says ErrOutsideRoot instead.
 //
-// The verification is not belt and braces on Windows. fsx.Clean is a POSIX
-// cleaner, so a backslash is an ordinary filename character to it — but
-// filepath.Join then treats it as a separator, which turned "/..\..\PLAN.md"
-// into a path above the jail. A backslash in an API path is therefore refused
-// on Windows and left legal on Linux, where QNAP shares written from Windows
-// clients really do contain one; the containment check below is the second
-// line, catching anything the character check did not think of.
+// This is a name, not a handle. Syscalls go through Open and Rel, which the
+// kernel resolves against the jail's descriptor; OS is for the things that
+// need to talk about a path rather than open it — the mount table, the log
+// line, the identity files an operator configured.
 func (r Root) OS(apiPath string) (string, error) {
-	c := path.Clean("/" + strings.TrimPrefix(apiPath, "/"))
-	if runtime.GOOS == "windows" && strings.ContainsRune(c, '\\') {
-		return "", fmt.Errorf("%q contains a backslash, which this host would read as a path separator: %w", apiPath, ErrOutsideRoot)
+	c, err := r.cleanAPI(apiPath)
+	if err != nil {
+		return "", err
 	}
 	if !r.Jailed() {
 		return filepath.FromSlash(c), nil

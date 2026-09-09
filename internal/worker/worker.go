@@ -28,6 +28,7 @@ import (
 	"os"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 
 	"qnapfilemanager/internal/fsops"
 	"qnapfilemanager/internal/fsx"
@@ -64,6 +65,12 @@ type Options struct {
 	// the GC target — because in that mode this "worker" is a goroutine
 	// inside the front-end and must not reconfigure it.
 	InProcess bool
+
+	// dispatch replaces every operation handler with one function. It is
+	// unexported, so only a test in this package can set it, and it exists for
+	// the one thing no real filesystem call can be relied on to do: run until
+	// its request context is cancelled and not a moment before.
+	dispatch func(ctx context.Context, f wproto.Frame) (any, error)
 }
 
 func (o Options) normalise() Options {
@@ -77,8 +84,9 @@ func (o Options) normalise() Options {
 }
 
 // Run serves one connection until the peer goes away, sends bye, or the
-// framing breaks. It does not close rw: the process exit (or, in-process, the
-// pool) owns that.
+// framing breaks. In the ordinary case it does not close rw — the process exit
+// (or, in-process, the pool) owns that — but an unrecoverable write does close
+// it; see session.fatal.
 //
 // The first frame must be a hello request. Anything else is a protocol error
 // and ends the connection, because a worker that started serving before it
@@ -86,9 +94,10 @@ func (o Options) normalise() Options {
 func Run(ctx context.Context, rw io.ReadWriter, o Options) error {
 	o = o.normalise()
 	s := &session{
-		tr:   wproto.NewTransport(rw),
-		opts: o,
-		sem:  make(chan struct{}, o.MaxConcurrent),
+		tr:       wproto.NewTransport(rw),
+		opts:     o,
+		sem:      make(chan struct{}, o.MaxConcurrent),
+		inflight: map[uint64]context.CancelFunc{},
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -96,6 +105,9 @@ func Run(ctx context.Context, rw io.ReadWriter, o Options) error {
 	if err := s.hello(); err != nil {
 		return err
 	}
+	// The jail's descriptor is this worker's; nothing outlives the loop that
+	// could still resolve a path through it.
+	defer func() { _ = s.root.Close() }()
 	return s.serve(ctx)
 }
 
@@ -109,6 +121,87 @@ type session struct {
 
 	sem chan struct{}
 	wg  sync.WaitGroup
+
+	// inflight holds one cancel function per running request, so an OpCancel
+	// frame can stop the handler rather than only unregistering the caller at
+	// the other end (§2.8). It is guarded by inflightMu, which is never held
+	// across a handler or a write.
+	inflightMu sync.Mutex
+	inflight   map[uint64]context.CancelFunc
+
+	// fatalOnce/fatalErr record the first unrecoverable transport failure.
+	fatalOnce sync.Once
+	fatalErr  atomic.Pointer[error]
+}
+
+// fatal ends the connection on an unrecoverable framing or write failure.
+//
+// A frame that was only half written desynchronises the stream: every reply
+// after it is read as a continuation of this one, so the front-end hands a user
+// the wrong listing, or waits forever for a remainder that never comes. There
+// is nothing to carry on with and nothing to apologise with either, since the
+// apology would go down the same broken stream. The transport is closed, which
+// makes the read loop return and this worker exit; the parent sees the socket
+// close, reports worker_gone, and spawns a replacement.
+func (s *session) fatal(err error) {
+	s.fatalOnce.Do(func() {
+		s.fatalErr.Store(&err)
+		s.opts.Log.Printf("worker: %v; closing the connection", err)
+		_ = s.tr.Close()
+		s.cancelAll()
+	})
+}
+
+func (s *session) fatalError() error {
+	if p := s.fatalErr.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
+// begin registers a request's cancel function and returns the context its
+// handler runs under. end must be called for every begin.
+func (s *session) begin(ctx context.Context, id uint64) (context.Context, context.CancelFunc) {
+	rctx, cancel := context.WithCancel(ctx)
+	s.inflightMu.Lock()
+	s.inflight[id] = cancel
+	s.inflightMu.Unlock()
+	return rctx, cancel
+}
+
+func (s *session) end(id uint64, cancel context.CancelFunc) {
+	s.inflightMu.Lock()
+	delete(s.inflight, id)
+	s.inflightMu.Unlock()
+	cancel()
+}
+
+// cancelRequest stops one running handler. An id that is not running is not an
+// error: the reply and the cancellation race by nature, and the front-end
+// sending one for a request that has just finished is the ordinary case.
+func (s *session) cancelRequest(id uint64) {
+	s.inflightMu.Lock()
+	cancel := s.inflight[id]
+	s.inflightMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// cancelAll stops every running handler, for the case where the connection
+// itself has ended. Nothing they produce can be delivered any more, and serve
+// waits for them before it returns — so without this, a worker whose front-end
+// had gone would sit out a listing of a million files on behalf of nobody.
+func (s *session) cancelAll() {
+	s.inflightMu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(s.inflight))
+	for _, cancel := range s.inflight {
+		cancels = append(cancels, cancel)
+	}
+	s.inflightMu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
 }
 
 // hello reads the first frame, applies everything it carries, and answers with
@@ -182,6 +275,14 @@ func (s *session) serve(ctx context.Context) error {
 		f, files, err := s.tr.Read()
 		if err != nil {
 			closeAll(files)
+			// However the connection ended, nothing a running handler produces
+			// can reach anyone now. Stop them before waiting for them.
+			s.cancelAll()
+			if ferr := s.fatalError(); ferr != nil {
+				// The read only failed because fatal closed the transport
+				// underneath it; report what actually went wrong.
+				return ferr
+			}
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				// The front-end is gone. Nothing here is worth reporting as a
 				// failure: this is the expected end of every worker's life.
@@ -210,6 +311,12 @@ func (s *session) serve(ctx context.Context) error {
 		case wproto.OpHello:
 			s.reply(wproto.NewErr(f.ID, fmt.Errorf("hello was already sent: %w", wproto.ErrProtocol), nil))
 			continue
+		case wproto.OpCancel:
+			// Answered on the read loop rather than through the semaphore: a
+			// cancellation that queued behind the very requests it is meant to
+			// stop would be no cancellation at all.
+			s.cancel(f)
+			continue
 		}
 
 		select {
@@ -218,18 +325,33 @@ func (s *session) serve(ctx context.Context) error {
 			s.reply(wproto.NewErr(f.ID, fmt.Errorf("%d requests are already running: %w", cap(s.sem), fsx.ErrQueueFull), nil))
 			continue
 		}
+		rctx, cancel := s.begin(ctx, f.ID)
 		s.wg.Add(1)
 		go func(f wproto.Frame) {
 			defer s.wg.Done()
 			defer func() { <-s.sem }()
-			s.dispatch(ctx, f)
+			defer s.end(f.ID, cancel)
+			s.dispatch(rctx, f)
 		}(f)
 	}
 }
 
+// cancel stops the handler an OpCancel frame names and acknowledges it.
+func (s *session) cancel(f wproto.Frame) {
+	var req wproto.CancelReq
+	if err := f.Unmarshal(&req); err != nil {
+		s.replyErr(f.ID, err, nil)
+		return
+	}
+	if req.ReqID != 0 {
+		s.cancelRequest(req.ReqID)
+	}
+	s.replyOK(f.ID, nil)
+}
+
 func (s *session) reply(f wproto.Frame) {
 	if err := s.tr.Write(f, nil); err != nil {
-		s.opts.Log.Printf("worker: writing a reply to request %d: %v", f.ID, err)
+		s.fatal(fmt.Errorf("writing the reply to request %d: %w", f.ID, err))
 	}
 }
 
@@ -249,6 +371,15 @@ func (s *session) replyOK(id uint64, v any) {
 }
 
 func (s *session) dispatch(ctx context.Context, f wproto.Frame) {
+	if s.opts.dispatch != nil {
+		v, err := s.opts.dispatch(ctx, f)
+		if err != nil {
+			s.replyErr(f.ID, err, nil)
+			return
+		}
+		s.replyOK(f.ID, v)
+		return
+	}
 	switch f.Op {
 	case wproto.OpPing:
 		s.replyOK(f.ID, nil)
@@ -351,7 +482,10 @@ func (s *session) openRead(ctx context.Context, f wproto.Frame) {
 	}
 	ok.NFD = 1
 	if err := s.tr.Write(ok, []*os.File{file}); err != nil {
-		s.opts.Log.Printf("worker: passing the descriptor for request %d: %v", f.ID, err)
+		// The descriptor may or may not have reached the front-end, and the
+		// frame that says how many arrived may be half written. Neither side
+		// can tell any more, so the connection goes.
+		s.fatal(fmt.Errorf("passing the descriptor for request %d: %w", f.ID, err))
 	}
 }
 

@@ -46,7 +46,7 @@ type client struct {
 	kill func(context.Context)
 
 	mu          sync.Mutex
-	pending     map[uint64]chan result
+	pending     map[uint64]*pending
 	dead        bool
 	deadErr     error
 	inflight    int
@@ -100,6 +100,18 @@ type result struct {
 	files []*os.File
 }
 
+// pending is one registered request id. Delivery and cancellation both take
+// c.mu and both act on this struct, which is what makes the handover of a
+// received descriptor atomic: either the deliverer puts it in the channel for a
+// caller that is still there, or it closes it because the entry is already
+// abandoned. There is no third outcome in which nobody owns it.
+type pending struct {
+	ch chan result
+	// abandoned marks an entry whose caller has given up. Anything that arrives
+	// for it afterwards is the deliverer's to close.
+	abandoned bool
+}
+
 func newClient(who backend.Principal) *client {
 	return &client{
 		key:     who.Key(),
@@ -107,7 +119,7 @@ func newClient(who backend.Principal) *client {
 		cred:    credsOf(who),
 		exited:  make(chan struct{}),
 		gone:    make(chan struct{}),
-		pending: map[uint64]chan result{},
+		pending: map[uint64]*pending{},
 		started: time.Now(),
 	}
 }
@@ -227,18 +239,21 @@ func (c *client) fail(cause error) {
 	}
 	c.dead = true
 	c.deadErr = cause
-	waiting := make([]chan result, 0, len(c.pending))
+	waiting := make([]*pending, 0, len(c.pending))
 	ids := make([]uint64, 0, len(c.pending))
-	for id, ch := range c.pending {
-		waiting = append(waiting, ch)
+	for id, p := range c.pending {
+		waiting = append(waiting, p)
 		ids = append(ids, id)
 	}
-	c.pending = map[uint64]chan result{}
+	c.pending = map[uint64]*pending{}
 	c.mu.Unlock()
 
-	for i, ch := range waiting {
+	for i, p := range waiting {
+		if p.abandoned {
+			continue
+		}
 		select {
-		case ch <- result{f: wproto.NewErr(ids[i], cause, nil)}:
+		case p.ch <- result{f: wproto.NewErr(ids[i], cause, nil)}:
 		default:
 		}
 	}
@@ -265,27 +280,38 @@ func (c *client) readLoop(logger *log.Logger) {
 	}
 }
 
+// deliver hands one frame to the call that is waiting for it, or closes what it
+// carries.
+//
+// The send happens under c.mu, together with the lookup. That is the whole
+// point: with the lock released in between, a caller could cancel after the
+// deliverer had taken the channel and before it used it, and the descriptor of
+// a cancelled download would sit in a buffered channel nobody would ever read
+// again — a file the root front-end holds open until the daemon restarts.
+// Under the lock, a cancellation either happens before the send and is seen
+// here, or after it and finds the result in the channel to close (see abandon).
 func (c *client) deliver(f wproto.Frame, files []*os.File, terminal bool, logger *log.Logger) {
 	c.mu.Lock()
-	ch, ok := c.pending[f.ID]
+	p, ok := c.pending[f.ID]
 	if ok && terminal {
 		delete(c.pending, f.ID)
 	}
-	c.mu.Unlock()
-	if !ok {
-		// A reply to a call that has already given up (its context expired).
-		// The descriptor it carries is ours to close, or it leaks in the root
-		// front-end for as long as the daemon runs.
-		closeAll(files)
-		if logger != nil {
-			logger.Printf("workerpool: %s sent a reply for the unknown request %d", c.key, f.ID)
+	if ok && !p.abandoned {
+		select {
+		case p.ch <- result{f: f, files: files}:
+			c.mu.Unlock()
+			return
+		default:
+			// The caller is not reading (a job's progress frames outran it).
 		}
-		return
 	}
-	select {
-	case ch <- result{f: f, files: files}:
-	default:
-		closeAll(files)
+	c.mu.Unlock()
+
+	// Nobody owns what arrived. The descriptor it carries is ours to close, or
+	// it leaks in the root front-end for as long as the daemon runs.
+	closeAll(files)
+	if !ok && logger != nil {
+		logger.Printf("workerpool: %s sent a reply for the unknown request %d", c.key, f.ID)
 	}
 }
 
@@ -315,7 +341,7 @@ func (p *Pool) call(ctx context.Context, c *client, op wproto.Op, body any) (wpr
 	if err != nil {
 		return wproto.Frame{}, nil, err
 	}
-	ch := make(chan result, 1)
+	pend := &pending{ch: make(chan result, 1)}
 
 	c.mu.Lock()
 	if c.dead {
@@ -326,40 +352,92 @@ func (p *Pool) call(ctx context.Context, c *client, op wproto.Op, body any) (wpr
 		}
 		return wproto.Frame{}, nil, err
 	}
-	c.pending[id] = ch
+	c.pending[id] = pend
 	c.calls++
 	c.mu.Unlock()
 
 	if err := c.tr.Write(req, nil); err != nil {
-		c.unregister(id)
+		c.abandon(id, pend)
 		gone := workerGone(c.key, err)
 		c.fail(gone)
 		return wproto.Frame{}, nil, gone
 	}
 
 	select {
-	case r := <-ch:
+	case r := <-pend.ch:
 		if r.f.Kind == wproto.KindErr {
 			closeAll(r.files)
 			return wproto.Frame{}, nil, remoteError(r.f.Err)
 		}
 		return r.f, r.files, nil
 	case <-c.gone:
-		c.unregister(id)
+		c.abandon(id, pend)
 		if err := c.deadError(); err != nil {
 			return wproto.Frame{}, nil, err
 		}
 		return wproto.Frame{}, nil, workerGone(c.key, nil)
 	case <-ctx.Done():
-		c.unregister(id)
+		c.abandon(id, pend)
+		// The worker is still running this request. Tell it to stop: dropping
+		// the caller only frees this end, and the operation on the other end
+		// would go on holding a worker slot — and, for a fifo or a directory on
+		// a wedged mount, a blocked syscall — long after the browser has gone.
+		p.cancelRemote(c, id)
 		return wproto.Frame{}, nil, ctx.Err()
 	}
 }
 
-func (c *client) unregister(id uint64) {
+// abandon takes one request out of the pending table on behalf of a caller that
+// has given up, and closes anything the worker had already delivered for it.
+// Together with the send inside deliver's critical section this makes ownership
+// of a received descriptor total: it is either handed to a live caller or
+// closed, never left in a channel with nobody to read it.
+//
+// The entry is passed in rather than looked up, because the case that leaks is
+// exactly the one where the lookup would fail: a terminal reply has already
+// been delivered — taking the id out of the table on its way past — and the
+// caller's select happened to pick its cancellation instead of the result now
+// sitting in the channel.
+func (c *client) abandon(id uint64, p *pending) {
 	c.mu.Lock()
-	delete(c.pending, id)
+	if cur, ok := c.pending[id]; ok && cur == p {
+		delete(c.pending, id)
+	}
+	p.abandoned = true
 	c.mu.Unlock()
+	for {
+		select {
+		case r := <-p.ch:
+			closeAll(r.files)
+		default:
+			return
+		}
+	}
+}
+
+// cancelRemote tells a worker that a request it is still running is no longer
+// wanted. It is best effort and never waits for the acknowledgement: the caller
+// has already gone, and there is nobody left to report a failure to.
+func (p *Pool) cancelRemote(c *client, id uint64) {
+	cid := p.nextID.Add(1)
+	req, err := wproto.NewReq(cid, wproto.OpCancel, wproto.CancelReq{ReqID: id})
+	if err != nil {
+		return
+	}
+	c.mu.Lock()
+	if c.dead {
+		// Nothing to cancel: the worker is gone and took the work with it.
+		c.mu.Unlock()
+		return
+	}
+	// The acknowledgement is registered so the reader drops it quietly instead
+	// of logging a reply to an unknown request; deliver removes the entry.
+	ack := &pending{ch: make(chan result, 1)}
+	c.pending[cid] = ack
+	c.mu.Unlock()
+	if err := c.tr.Write(req, nil); err != nil {
+		c.abandon(cid, ack)
+	}
 }
 
 func (c *client) deadError() error {

@@ -14,10 +14,11 @@ import (
 // Cache lifetimes. PLAN.md decision 3: "60 s cache with single-flight;
 // unconditional revalidation before any write".
 const (
-	DefaultPositiveTTL     = 60 * time.Second
-	DefaultNegativeTTL     = 10 * time.Second
-	DefaultMaxCacheEntries = 4096
-	cachePruneInterval     = 64
+	DefaultPositiveTTL              = 60 * time.Second
+	DefaultNegativeTTL              = 10 * time.Second
+	DefaultMaxCacheEntries          = 4096
+	DefaultMaxConcurrentValidations = 8
+	cachePruneInterval              = 64
 )
 
 // Session is the outcome of a successful verification. It carries only what
@@ -75,15 +76,19 @@ type Verifier struct {
 	NegativeTTL time.Duration
 	// MaxCacheEntries bounds cached answers; nonpositive values use 4096.
 	MaxCacheEntries int
+	// MaxConcurrentValidations bounds CGI calls across distinct credentials.
+	// Set before first use; nonpositive values use 8.
+	MaxConcurrentValidations int
 
 	// Now is the clock, for tests. nil means time.Now.
 	Now func() time.Time
 
-	mu       sync.Mutex
-	cache    map[string]cacheEntry
-	order    list.List // oldest insertion first; independent of in-flight calls
-	inserts  uint64
-	inflight map[string]*flight
+	mu              sync.Mutex
+	cache           map[string]cacheEntry
+	order           list.List // oldest insertion first; independent of in-flight calls
+	inserts         uint64
+	inflight        map[string]*flight
+	validationSlots chan struct{}
 }
 
 type cacheEntry struct {
@@ -146,30 +151,60 @@ func CacheKey(c Cred) string {
 // QTS sign-out takes effect immediately.
 func (v *Verifier) Verify(ctx context.Context, cred Cred) (Session, error) {
 	key := CacheKey(cred)
-
-	v.mu.Lock()
-	if v.cache == nil {
-		v.cache = map[string]cacheEntry{}
-	}
-	if v.inflight == nil {
-		v.inflight = map[string]*flight{}
-	}
-	if e, ok := v.cache[key]; ok && v.now().Before(e.expires) {
-		v.mu.Unlock()
-		return e.sess, e.err
-	}
-	if f, ok := v.inflight[key]; ok {
-		v.mu.Unlock()
-		select {
-		case <-f.done:
-			return f.sess, f.err
-		case <-ctx.Done():
-			return Session{}, fmt.Errorf("qtsauth: verify cancelled: %w", ctx.Err())
+	var slots chan struct{}
+	acquired := false
+	defer func() {
+		if acquired {
+			<-slots
 		}
+	}()
+	var f *flight
+
+	for {
+		v.mu.Lock()
+		if v.cache == nil {
+			v.cache = map[string]cacheEntry{}
+		}
+		if v.inflight == nil {
+			v.inflight = map[string]*flight{}
+		}
+		if e, ok := v.cache[key]; ok && v.now().Before(e.expires) {
+			v.mu.Unlock()
+			return e.sess, e.err
+		}
+		if f, ok := v.inflight[key]; ok {
+			v.mu.Unlock()
+			select {
+			case <-f.done:
+				return f.sess, f.err
+			case <-ctx.Done():
+				return Session{}, fmt.Errorf("qtsauth: verify cancelled: %w", ctx.Err())
+			}
+		}
+		if !acquired {
+			if v.validationSlots == nil {
+				limit := v.MaxConcurrentValidations
+				if limit <= 0 {
+					limit = DefaultMaxConcurrentValidations
+				}
+				v.validationSlots = make(chan struct{}, limit)
+			}
+			slots = v.validationSlots
+			v.mu.Unlock()
+			select {
+			case slots <- struct{}{}:
+				acquired = true
+				// Recheck the cache and single-flight after waiting for capacity.
+				continue
+			case <-ctx.Done():
+				return Session{}, fmt.Errorf("qtsauth: verify cancelled: %w", ctx.Err())
+			}
+		}
+		f = &flight{done: make(chan struct{})}
+		v.inflight[key] = f
+		v.mu.Unlock()
+		break
 	}
-	f := &flight{done: make(chan struct{})}
-	v.inflight[key] = f
-	v.mu.Unlock()
 
 	sess, err := v.validate(ctx, cred)
 

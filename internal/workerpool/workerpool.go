@@ -94,7 +94,10 @@ type Options struct {
 	// Mode is ModeProcess or ModeInProcess. Empty picks ModeProcess on Linux
 	// and ModeInProcess everywhere else.
 	Mode string
-	// InProcess forces ModeInProcess. -impersonate on the dev box sets it.
+	// InProcess forces ModeInProcess. The daemon's -dev flag sets it, and that
+	// flag is also what allows -impersonate and jailed identity files: nothing
+	// in this mode carries kernel credentials, so nothing in it can be trusted
+	// to establish an identity either.
 	InProcess bool
 
 	Max         int
@@ -189,12 +192,17 @@ type budget struct {
 // New builds the pool the daemon runs with. plat and ids may be nil; the
 // worker then detects the mount table itself and reports numeric ownership.
 //
+// inProcess is the daemon's -dev switch (and is implied off Linux). It picks
+// ModeInProcess, where the "workers" are goroutines in this process and nobody
+// is impersonated — which is why the caller must also refuse to trust anything
+// identity-shaped that only exists in that mode.
+//
 // logger is the daemon's own logger and must be passed: a worker's stdout and
 // stderr, its panic stacks and every lifecycle event are written through it,
 // and normalise would otherwise substitute io.Discard and throw away exactly
 // the diagnostics an operator who started the daemon with -log came for. A nil
 // logger is still tolerated, for a caller that genuinely wants silence.
-func New(cfg config.Config, root fsx.Root, plat *platform.Platform, ids *idmap.Map, logger *log.Logger) *Pool {
+func New(cfg config.Config, root fsx.Root, plat *platform.Platform, ids *idmap.Map, logger *log.Logger, inProcess bool) *Pool {
 	idle, err := cfg.Worker.IdleTimeoutDuration()
 	if err != nil {
 		idle = 0 // Validate rejects this at startup; be harmless if it slips through.
@@ -207,6 +215,7 @@ func New(cfg config.Config, root fsx.Root, plat *platform.Platform, ids *idmap.M
 		Root:        root,
 		Platform:    plat,
 		IDs:         ids,
+		InProcess:   inProcess,
 		Max:         cfg.Worker.Max,
 		IdleTimeout: idle,
 		Umask:       umask,
@@ -315,10 +324,15 @@ func (p *Pool) Shutdown(ctx context.Context) error {
 	}()
 	select {
 	case <-done:
-		return nil
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+	// The jail's descriptor is the pool's to release: every worker resolved its
+	// paths through it, and they are all stopped by now.
+	if err := p.opts.Root.Close(); err != nil {
+		p.opts.Logger.Printf("workerpool: closing the jail root: %v", err)
+	}
+	return nil
 }
 
 // Stats is one worker's line in /api/diag.
@@ -745,9 +759,18 @@ func (p *Pool) spawnInProcess(who backend.Principal) (*client, error) {
 	c.pid = os.Getpid()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	c.kill = func(context.Context) {
+	c.kill = func(kctx context.Context) {
 		cancel()
 		_ = theirs.Close()
+		// Wait for the loop to actually stop, the way the signal ladder does in
+		// process mode. Until it returns it still holds the jail's descriptor,
+		// and a Shutdown that reported success while a goroutine was still
+		// reading the filesystem would be reporting the wrong thing.
+		select {
+		case <-c.exited:
+		case <-kctx.Done():
+		case <-time.After(termGrace):
+		}
 	}
 	go func() {
 		defer close(c.exited)

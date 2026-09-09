@@ -1,0 +1,10 @@
+17 25 0:16 / /proc rw,relatime shared:5 - proc none rw
+18 25 0:17 / /sys rw,relatime shared:6 - sysfs sysfs rw
+19 25 0:6 / /dev rw,relatime shared:7 - devtmpfs devtmpfs rw,size=2013132k,nr_inodes=503283,mode=755
+25 1 8:2 / / rw,relatime - ext4 /dev/sda2 rw,data=ordered
+26 25 0:19 / /tmp rw,relatime - tmpfs tmpfs rw,size=64000k
+30 25 0:23 / /share rw,relatime - tmpfs tmpfs rw,size=16k
+31 30 9:1 / /share/CACHEDEV1_DATA rw,relatime - ext4 /dev/md1 rw,data=ordered,jqfmt=vfsv1,usrjquota=aquota.user
+32 30 8:33 / /share/external/DEV3301_1 rw,relatime,nosuid,nodev - ext4 /dev/sdc1 rw,data=ordered
+33 30 0:45 / /share/remote rw,relatime - nfs4 192.168.1.5:/export/media rw,vers=4.1,addr=192.168.1.5
+34 31 9:1 /Public /share/CACHEDEV1_DATA/Public\040Files rw,relatime - ext4 /dev/md1 rw,data=ordered

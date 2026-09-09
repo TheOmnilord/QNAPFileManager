@@ -1,0 +1,225 @@
+package wproto
+
+import (
+	"encoding/json"
+
+	"qnapfilemanager/internal/fsx"
+)
+
+// Limits are the front-end's caps, handed to the worker at hello time so the
+// worker can refuse oversized work itself rather than trusting each request.
+type Limits struct {
+	ListMax      int   `json:"listMax"`
+	MaxTextBytes int64 `json:"maxTextBytes"`
+}
+
+// HelloReq is the first frame on a new worker connection.
+type HelloReq struct {
+	// JailRoot is the -jail directory, empty in production. It is applied
+	// inside the worker, so nothing above it can address a path outside.
+	JailRoot string `json:"jailRoot,omitempty"`
+	// Umask is applied by the worker to itself; QTS's default is 0022.
+	Umask  uint32 `json:"umask"`
+	Limits Limits `json:"limits"`
+}
+
+// HelloResp lets the parent confirm it got the identity it asked for. The
+// worker reports what the kernel actually gave it, not what it was told.
+type HelloResp struct {
+	UID     int    `json:"uid"`
+	GID     int    `json:"gid"`
+	Groups  []int  `json:"groups,omitempty"`
+	PID     int    `json:"pid"`
+	Version string `json:"version,omitempty"`
+}
+
+type ListReq struct {
+	Dir  []byte          `json:"d"`
+	Opts fsx.ListOptions `json:"o"`
+}
+
+type ListResp struct {
+	Listing fsx.Listing `json:"l"`
+}
+
+type StatReq struct {
+	Path []byte `json:"p"`
+	// Follow stats the target of a symlink instead of the link itself.
+	Follow bool `json:"f,omitempty"`
+}
+
+type StatResp struct {
+	Entry fsx.Entry `json:"e"`
+}
+
+type MkdirReq struct {
+	Dir  []byte `json:"d"`
+	Name []byte `json:"n"`
+	Mode uint32 `json:"m"`
+	// Parents creates missing intermediate directories.
+	Parents bool `json:"p,omitempty"`
+}
+
+type RenameReq struct {
+	From      []byte `json:"f"`
+	To        []byte `json:"t"`
+	Overwrite bool   `json:"o,omitempty"`
+}
+
+type ChmodReq struct {
+	Path []byte `json:"p"`
+	Mode uint32 `json:"m"`
+	// Follow chmods the target of a symlink. A symlink's own mode is
+	// meaningless on Linux, so the default is to refuse rather than to
+	// silently change the target.
+	Follow bool `json:"f,omitempty"`
+}
+
+// ChownReq changes ownership. -1 leaves that half alone, matching chown(2).
+type ChownReq struct {
+	Path []byte `json:"p"`
+	UID  int    `json:"u"`
+	GID  int    `json:"g"`
+	// Follow chowns through a symlink; the default is lchown.
+	Follow bool `json:"f,omitempty"`
+}
+
+// ChownReq/ChmodReq reply with the post-call Entry so the front-end can diff
+// what was asked against what the kernel did (INV-2, and the partial-success
+// reporting in PLAN.md decision 12).
+type ModeResp struct {
+	Entry fsx.Entry `json:"e"`
+}
+
+type ReadlinkReq struct {
+	Path []byte `json:"p"`
+}
+
+type ReadlinkResp struct {
+	Target []byte `json:"t"`
+	// Resolved is the fully evaluated target, empty when dangling or looping.
+	Resolved []byte `json:"r,omitempty"`
+}
+
+// OpenReadReq asks the worker to open a file as the user. The reply carries
+// the fd on the frame (NFD:1) plus the stat the front-end needs for
+// http.ServeContent. The kernel checks permission at open(2) time; the root
+// front-end holding the resulting fd afterwards is intentional and safe,
+// because that fd can only be what the user was allowed to open.
+type OpenReadReq struct {
+	Path []byte `json:"p"`
+}
+
+type OpenReadResp struct {
+	Entry fsx.Entry `json:"e"`
+}
+
+// OpenWriteReq creates <dir>/.qfm-upload-<hex>.part with
+// O_WRONLY|O_CREAT|O_EXCL and mode 0600, owned by the worker's uid, and
+// returns its fd. The front-end streams the request body into it and never
+// creates a file itself.
+type OpenWriteReq struct {
+	Dir  []byte `json:"d"`
+	Name []byte `json:"n"`
+	Mode uint32 `json:"m"`
+}
+
+type OpenWriteResp struct {
+	Tmp []byte `json:"t"`
+}
+
+// FinalizeReq publishes (or discards) an upload the front-end has finished
+// streaming.
+type FinalizeReq struct {
+	Tmp       []byte `json:"t"`
+	Final     []byte `json:"f"`
+	Mode      uint32 `json:"m"`
+	MTimeUnix int64  `json:"mt,omitempty"`
+	Conflict  string `json:"c,omitempty"`
+	// Discard aborts: unlink the .part and report nothing else.
+	Discard bool `json:"x,omitempty"`
+}
+
+type FinalizeResp struct {
+	Entry fsx.Entry `json:"e"`
+	// Path is where the file actually landed, which differs from Final when
+	// Conflict was "rename".
+	Path []byte `json:"p"`
+}
+
+// TextReq reads or writes a small text file whole. Size is bounded by
+// Limits.MaxTextBytes on both sides.
+type TextReq struct {
+	Path  []byte `json:"p"`
+	Write bool   `json:"w,omitempty"`
+	Data  []byte `json:"d,omitempty"`
+}
+
+type TextResp struct {
+	Data []byte `json:"d,omitempty"`
+	// Truncated is set when the file was longer than the limit.
+	Truncated bool      `json:"t,omitempty"`
+	Entry     fsx.Entry `json:"e"`
+}
+
+// JobReq starts one long-lived RPC. Progress and per-item warnings come back
+// on the same request ID until a terminal ok or err frame closes it.
+type JobReq struct {
+	JobID string          `json:"j"`
+	Kind  string          `json:"k"`
+	Body  json.RawMessage `json:"b"`
+}
+
+// CancelReq is a separate, immediate RPC on its own ID; the worker looks the
+// job up in its own map[string]context.CancelFunc.
+type CancelReq struct {
+	JobID string `json:"j"`
+}
+
+// CopyOptions are the per-job knobs shared by copy and move. They live here
+// rather than in fsx because fsx carries no mutation code; internal/fsops will
+// consume this type as given.
+type CopyOptions struct {
+	Conflict       string `json:"conflict,omitempty"`
+	PreserveMode   bool   `json:"preserveMode,omitempty"`
+	PreserveTimes  bool   `json:"preserveTimes,omitempty"`
+	FollowSymlinks bool   `json:"followSymlinks,omitempty"`
+	// CrossMounts allows the walk to descend into mounts of the same storage
+	// domain — "include mounted sub-folders" in the UI. It never permits
+	// /proc, /sys, /dev, tmpfs, USB disks, other pools or network mounts.
+	CrossMounts bool `json:"crossMounts,omitempty"`
+}
+
+type CopyReq struct {
+	Src    [][]byte    `json:"s"`
+	DstDir []byte      `json:"d"`
+	Opts   CopyOptions `json:"o"`
+}
+
+type DeleteReq struct {
+	Paths     [][]byte `json:"p"`
+	Recursive bool     `json:"r,omitempty"`
+	// Trash renames into the nearest .@qfm_trash instead of unlinking.
+	Trash bool `json:"t,omitempty"`
+}
+
+// Prog is a progress update on a running job. The worker coalesces these to
+// at most 10 a second or one per 8 MiB, whichever comes first, so a
+// million-file delete does not flood the socket.
+type Prog struct {
+	Files      int64  `json:"f,omitempty"`
+	FilesTotal int64  `json:"ft,omitempty"`
+	Bytes      int64  `json:"b,omitempty"`
+	BytesTotal int64  `json:"bt,omitempty"`
+	Current    []byte `json:"c,omitempty"`
+	Phase      string `json:"p,omitempty"`
+}
+
+// Warn is a per-item failure inside a job: it does not end the job, it is
+// collected and reported alongside the result.
+type Warn struct {
+	Path    []byte `json:"p"`
+	Code    string `json:"c"`
+	Message string `json:"m"`
+	Errno   int    `json:"n,omitempty"`
+}

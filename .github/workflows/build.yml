@@ -1,0 +1,190 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+# Read-only by default; only the packaging job may create a release.
+permissions:
+  contents: read
+
+env:
+  # Pinned to the exact patch: govulncheck gates stdlib advisories against
+  # whatever toolchain built the tree, so a floating minor means a Go security
+  # release reddens CI until the runner image catches up.
+  GO_VERSION: '1.26.5'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Nothing here pushes over git — the release step authenticates gh
+          # through GH_TOKEN — so leaving the token in .git/config only widens
+          # what a compromised build step could read.
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - run: go vet ./...
+      # A module file that is not tidy means the invariant is unwatched, so a
+      # genuinely missing or unused requirement would go unnoticed too, until a
+      # build broke somewhere unrelated.
+      - run: go mod tidy -diff
+      # -race needs cgo, which is why it cannot run on the Windows dev box and
+      # runs here instead — on linux/amd64, the platform half the NAS ships.
+      # Do not set CGO_ENABLED: the runner's default of 1 is what it needs, and
+      # the package job sets 0 inline where it matters.
+      - run: go test -race ./...
+      # The three-GOOS sweep is mandatory, not belt and braces. Development
+      # happens on Windows, where `go vet ./...` never compiles the _linux.go
+      # files at all — including, in the sibling project, a type error that
+      # reached a release that way.
+      - run: GOOS=windows go vet ./...
+      # arm_64 is half of every release and nothing else vets it: the package
+      # job only builds it.
+      - run: GOOS=linux GOARCH=arm64 go vet ./...
+      - run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      # go vet is clean on this repo and stays clean; the dead-store family
+      # (SA4006) is staticcheck's. Pinned so a new release cannot redden CI on
+      # an unrelated push.
+      - run: go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
+      - run: staticcheck ./...
+      # This daemon runs as root, terminates TLS on the break-glass listener
+      # and holds a session cookie, so an advisory in crypto/tls or net/http
+      # matters to it.
+      - name: Vulnerability scan
+        run: |
+          # Pinned for the same reason staticcheck is: a broken tool release
+          # must not redden CI on an unrelated push. The vulnerability DB is
+          # fetched live regardless of the scanner's version.
+          go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+          govulncheck ./...
+
+  # The _windows.go and _other.go half of every platform split is skipped
+  # entirely by a Linux build — including its tests, which cannot fail if they
+  # are never compiled. Development happens on Windows, so this job is
+  # essential rather than optional.
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - run: go vet ./...
+      - run: go test ./...
+
+  package:
+    needs: [test, test-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # attaching the QPKGs to a release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Build the binaries
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="0.0.${GITHUB_RUN_NUMBER}"
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          # CGO_ENABLED=0 is what makes these run on QTS's bare userland.
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath \
+              -ldflags "-s -w -X main.version=$VERSION" \
+              -o "dist/$arch/bin/qnapfilemanager" ./cmd/qnapfilemanager
+          done
+
+      - name: Assemble the QPKG trees
+        run: |
+          sed -i "s/^QPKG_VER=.*/QPKG_VER=\"$VERSION\"/" qpkg/qpkg.cfg
+          mkdir -p qpkg/x86_64 qpkg/arm_64
+          cp -r dist/amd64/. qpkg/x86_64/
+          cp -r dist/arm64/. qpkg/arm_64/
+          cp config.example.json qpkg/shared/
+          chmod -R a+rx qpkg/x86_64 qpkg/arm_64
+
+      # Registers binfmt handlers so the arm_64 tree's binaries execute
+      # directly in the smoke test below.
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+
+      - name: Smoke-test the assembled trees
+        run: |
+          # Execute the tree, don't just list it: a wrong-arch or accidentally
+          # dynamically linked binary still stats fine while dying on QTS, and
+          # a broken route table looks identical to a working one from here.
+          set -e
+          mkdir -p /tmp/fakeroot/etc
+          cp /etc/passwd /etc/group /tmp/fakeroot/etc/
+          for arch in x86_64 arm_64; do
+            tree="qpkg/$arch"
+            [ "$("$tree/bin/qnapfilemanager" version)" = "$VERSION" ]
+            "$tree/bin/qnapfilemanager" serve -addr 127.0.0.1:18770 \
+              -jail /tmp/fakeroot -readonly &
+            pid=$!
+            ok=
+            for i in $(seq 20); do
+              if curl -sf localhost:18770/api/session >/dev/null; then ok=1; break; fi
+              sleep 0.5
+            done
+            [ -n "$ok" ] || { echo "$arch: the daemon never answered"; kill $pid; exit 1; }
+            # readOnly is the switch that must survive every refactor of the
+            # startup path, so the smoke test asserts on it by value.
+            curl -sf localhost:18770/api/session | grep -q '"readOnly":true'
+            [ "$(curl -s -o /dev/null -w '%{http_code}' localhost:18770/api/nope)" = 404 ]
+            kill $pid
+            wait $pid 2>/dev/null || true
+            echo "$arch ok: qnapfilemanager $VERSION"
+          done
+
+      - name: Install QDK
+        env:
+          # Pinned by commit, not by tag. This installer runs as root in the
+          # one job holding a release-write token, and a tag is a name its
+          # owner can move — so "pinned to v2.5.3" was a wish, not a pin. This
+          # is v2.5.3 as it stood when it was reviewed.
+          QDK_SHA: 955d98c9913989561142f9a9ac994ec0091559d6
+        run: |
+          git init /tmp/QDK && cd /tmp/QDK
+          git remote add origin https://github.com/qnap-dev/QDK.git
+          git fetch --depth 1 origin "$QDK_SHA"
+          git checkout --detach FETCH_HEAD
+          sudo ./InstallToUbuntu.sh install
+
+      - name: Build the QPKG
+        run: |
+          cd qpkg
+          PATH="$PATH:/usr/share/QDK/bin" qbuild
+          ls -l build/
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: qpkg
+          path: qpkg/build/*.qpkg
+          # Not the 90-day default: the sibling project's account-wide artifact
+          # quota has blocked releases twice. Releases hold the durable copies.
+          retention-days: 7
+
+      - name: Release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # A checksum file beside the artifacts, so a download can be verified
+          # on the NAS before installing an unsigned package.
+          (cd qpkg/build && sha256sum *.qpkg) > SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" qpkg/build/*.qpkg SHA256SUMS --generate-notes

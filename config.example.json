@@ -1,0 +1,33 @@
+{
+  "web": {
+    "listen": "127.0.0.1:8770",
+    "proxyPrefix": "/qnapfilemanager",
+    "breakGlass": {
+      "enabled": true,
+      "addr": "0.0.0.0:8771"
+    }
+  },
+  "auth": {
+    "mode": "qts",
+    "adminRequiresBoth": true,
+    "qtsPort": 0
+  },
+  "readOnly": true,
+  "trash": {
+    "enabled": true,
+    "days": 30
+  },
+  "worker": {
+    "max": 8,
+    "idleTimeout": "10m",
+    "umask": "0022"
+  },
+  "limits": {
+    "listMax": 5000,
+    "maxTextBytes": 2097152
+  },
+  "logging": {
+    "maxSizeMB": 8,
+    "quLog": true
+  }
+}

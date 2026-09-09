@@ -1,0 +1,234 @@
+// Package fsx holds the read-only path, type and error vocabulary shared by
+// the root front-end and the per-user worker. Nothing in this package mutates
+// the filesystem: mutation lives in internal/fsops, which only the worker
+// imports (INV-1).
+package fsx
+
+import (
+	"encoding/base64"
+	"io/fs"
+	"strconv"
+	"time"
+	"unicode/utf8"
+)
+
+// Entry describes one directory entry. The shape is fixed by
+// docs/design/backend-packaging-plan.md §2.1 and is what the HTTP API returns
+// verbatim.
+//
+// Linux filenames are arbitrary byte strings, but encoding/json replaces
+// invalid UTF-8 with U+FFFD, so such a name cannot round-trip through Name.
+// NameB64/PathB64 carry the raw bytes in that case and every endpoint that
+// accepts a path also accepts pathB64.
+type Entry struct {
+	Name    string `json:"name"`
+	NameB64 string `json:"nameB64,omitempty"`
+	Path    string `json:"path"`
+	PathB64 string `json:"pathB64,omitempty"`
+
+	// Type is "dir", "file", "symlink", "fifo", "socket", "device" or "other".
+	Type string `json:"type"`
+	// Size is st_size; for a symlink that is the length of the link text, not
+	// the size of its target.
+	Size int64 `json:"size"`
+	// Mode is octal and includes setuid/setgid/sticky, e.g. "0755".
+	Mode string `json:"mode"`
+	// ModeStr is the ls -l rendering, e.g. "drwxr-sr-x".
+	ModeStr string `json:"modeStr"`
+
+	UID int `json:"uid"`
+	GID int `json:"gid"`
+	// User and Group are empty when the id does not resolve; the UI then shows
+	// the number.
+	User  string `json:"user,omitempty"`
+	Group string `json:"group,omitempty"`
+
+	MTime time.Time `json:"mtime"`
+	Nlink uint64    `json:"nlink"`
+
+	IsSymlink bool `json:"isSymlink,omitempty"`
+	// LinkTarget is the raw readlink(2) text.
+	LinkTarget string `json:"linkTarget,omitempty"`
+	// LinkResolved is the fully evaluated target, empty when dangling or looping.
+	LinkResolved string `json:"linkResolved,omitempty"`
+	// TargetType is the Type of the resolved target, empty when dangling.
+	TargetType string `json:"targetType,omitempty"`
+
+	Hidden     bool `json:"hidden,omitempty"`
+	HasACL     bool `json:"hasAcl,omitempty"`
+	MountPoint bool `json:"mountPoint,omitempty"`
+
+	// Class is the guard classification: "normal", "warn" or "protected".
+	Class string `json:"class,omitempty"`
+	// ShareLink and VolumeRoot tag the two kinds of entry found at /share.
+	ShareLink  bool `json:"shareLink,omitempty"`
+	VolumeRoot bool `json:"volumeRoot,omitempty"`
+}
+
+// SetName fills Name and, only when the raw bytes are not valid UTF-8,
+// NameB64. Callers pass the bytes exactly as the kernel returned them.
+func (e *Entry) SetName(raw []byte) {
+	e.Name = string(raw)
+	if utf8.Valid(raw) {
+		e.NameB64 = ""
+		return
+	}
+	e.NameB64 = base64.RawURLEncoding.EncodeToString(raw)
+}
+
+// SetPath is SetName's counterpart for the Path/PathB64 pair.
+func (e *Entry) SetPath(raw []byte) {
+	e.Path = string(raw)
+	if utf8.Valid(raw) {
+		e.PathB64 = ""
+		return
+	}
+	e.PathB64 = base64.RawURLEncoding.EncodeToString(raw)
+}
+
+// SortKey values accepted by ListOptions.Sort. They are untyped string
+// constants so the field can stay a plain string in JSON.
+const (
+	SortName  = "name"
+	SortSize  = "size"
+	SortMTime = "mtime"
+	SortType  = "type"
+)
+
+// DefaultListLimit and MaxListLimit bound a single listing. A directory with
+// more entries than the cap comes back with Listing.Truncated set rather than
+// as a multi-megabyte response.
+const (
+	DefaultListLimit = 5000
+	MaxListLimit     = 50000
+)
+
+// ValidSortKey reports whether s names a sort order List understands. The
+// empty string means "the default", so it is valid.
+func ValidSortKey(s string) bool {
+	switch s {
+	case "", SortName, SortSize, SortMTime, SortType:
+		return true
+	}
+	return false
+}
+
+// ListOptions are the knobs on a single directory listing.
+type ListOptions struct {
+	// ShowHidden includes dotfiles.
+	ShowHidden bool `json:"showHidden,omitempty"`
+	// ShowVolumeRoots reveals the raw volume mounts at /share (§2.2).
+	ShowVolumeRoots bool `json:"showVolumeRoots,omitempty"`
+	// ResolveLinks stats each symlink to learn its target type. Costly on
+	// /share; defaults to true at the API layer.
+	ResolveLinks bool   `json:"resolveLinks,omitempty"`
+	Sort         string `json:"sort,omitempty"`
+	Desc         bool   `json:"desc,omitempty"`
+	Offset       int    `json:"offset,omitempty"`
+	// Limit defaults to DefaultListLimit and is capped at MaxListLimit.
+	Limit int `json:"limit,omitempty"`
+}
+
+// Listing is one page of a directory.
+type Listing struct {
+	Path      string  `json:"path"`
+	Parent    string  `json:"parent"`
+	Entries   []Entry `json:"entries"`
+	Total     int     `json:"total"`
+	Truncated bool    `json:"truncated,omitempty"`
+	// Notes are human-readable remarks about the directory itself, e.g.
+	// "on the QTS RAM disk" or "mount point".
+	Notes []string `json:"notes,omitempty"`
+	// Class is the guard classification of the directory itself.
+	Class string `json:"class,omitempty"`
+}
+
+// TypeString maps a mode to the Entry.Type vocabulary.
+func TypeString(m fs.FileMode) string {
+	switch {
+	case m&fs.ModeSymlink != 0:
+		return "symlink"
+	case m.IsDir():
+		return "dir"
+	case m&fs.ModeNamedPipe != 0:
+		return "fifo"
+	case m&fs.ModeSocket != 0:
+		return "socket"
+	case m&fs.ModeDevice != 0:
+		return "device"
+	case m.IsRegular():
+		return "file"
+	}
+	return "other"
+}
+
+// ModeOctal renders the permission bits plus setuid/setgid/sticky the way
+// chmod states them, e.g. "0755" or "1777".
+func ModeOctal(m fs.FileMode) string {
+	v := uint32(m.Perm())
+	if m&fs.ModeSetuid != 0 {
+		v |= 0o4000
+	}
+	if m&fs.ModeSetgid != 0 {
+		v |= 0o2000
+	}
+	if m&fs.ModeSticky != 0 {
+		v |= 0o1000
+	}
+	s := strconv.FormatUint(uint64(v), 8)
+	for len(s) < 4 {
+		s = "0" + s
+	}
+	return s
+}
+
+// ModeString renders a mode the way ls -l does, e.g. "drwxr-sr-x". This is
+// deliberately not fs.FileMode.String: Go prints setuid/setgid/sticky as
+// extra leading letters ("ug t"), which no NAS operator reads fluently.
+func ModeString(m fs.FileMode) string {
+	buf := make([]byte, 0, 10)
+	switch {
+	case m&fs.ModeSymlink != 0:
+		buf = append(buf, 'l')
+	case m.IsDir():
+		buf = append(buf, 'd')
+	case m&fs.ModeCharDevice != 0:
+		buf = append(buf, 'c')
+	case m&fs.ModeDevice != 0:
+		buf = append(buf, 'b')
+	case m&fs.ModeNamedPipe != 0:
+		buf = append(buf, 'p')
+	case m&fs.ModeSocket != 0:
+		buf = append(buf, 's')
+	default:
+		buf = append(buf, '-')
+	}
+	perm := m.Perm()
+	const rwx = "rwxrwxrwx"
+	for i := 0; i < 9; i++ {
+		if perm&(1<<uint(8-i)) != 0 {
+			buf = append(buf, rwx[i])
+		} else {
+			buf = append(buf, '-')
+		}
+	}
+	// The execute column of each triple doubles as the setuid/setgid/sticky
+	// flag; upper case when the underlying execute bit is clear.
+	set := func(i int, lower, upper byte) {
+		if buf[i] == 'x' {
+			buf[i] = lower
+		} else {
+			buf[i] = upper
+		}
+	}
+	if m&fs.ModeSetuid != 0 {
+		set(3, 's', 'S')
+	}
+	if m&fs.ModeSetgid != 0 {
+		set(6, 's', 'S')
+	}
+	if m&fs.ModeSticky != 0 {
+		set(9, 't', 'T')
+	}
+	return string(buf)
+}

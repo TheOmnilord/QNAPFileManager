@@ -1,0 +1,22 @@
+# QDK package routines for QNAPFileManager.
+# Variables such as SYS_QPKG_DIR are provided by the QDK install framework.
+
+pkg_post_install(){
+    mkdir -p "$SYS_QPKG_DIR/config" "$SYS_QPKG_DIR/logs"
+    # Deliberately no seeded config: an absent config is what opens the
+    # first-run claim window, and seeding one would have to invent a password.
+    # The daemon starts on its defaults — read-only, loopback only.
+    #
+    # The config holds the break-glass password hash and the audit log holds
+    # every path this app has touched. Admin-only, both of them.
+    chmod 700 "$SYS_QPKG_DIR/config" "$SYS_QPKG_DIR/logs"
+    [ -f "$SYS_QPKG_DIR/config/config.json" ] && chmod 600 "$SYS_QPKG_DIR/config/config.json"
+    :
+}
+
+pkg_post_remove(){
+    # The per-volume .@qfm_trash directories are deliberately left in place:
+    # they hold files a user deleted and may still want back, and removing an
+    # app is not a decision to destroy them.
+    :
+}

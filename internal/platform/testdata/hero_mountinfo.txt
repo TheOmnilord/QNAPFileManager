@@ -1,0 +1,13 @@
+17 25 0:16 / /proc rw,relatime shared:5 - proc none rw
+18 25 0:17 / /sys rw,relatime shared:6 - sysfs sysfs rw
+19 25 0:6 / /dev rw,relatime shared:7 - devtmpfs devtmpfs rw,size=4013132k,mode=755
+25 1 8:2 / / rw,relatime - ext4 /dev/sda2 rw,data=ordered
+30 25 0:23 / /share rw,relatime - tmpfs tmpfs rw,size=16k
+40 30 0:40 / /share/ZFS530_DATA rw,noatime,xattr,posixacl - zfs zpool1/zfs530_data rw,xattr,noacl
+41 40 0:41 / /share/ZFS530_DATA/Public rw,noatime,xattr - zfs zpool1/zfs530_data/Public rw,xattr,noacl
+42 40 0:42 / /share/ZFS530_DATA/Media rw,noatime,xattr - zfs zpool1/zfs530_data/Media rw,xattr,noacl
+43 40 0:43 / /share/ZFS530_DATA/Publication rw,noatime,xattr - zfs zpool1/zfs530_data/Publication rw,xattr,noacl
+44 40 0:44 / /share/ZFS530_DATA/Home\040Videos rw,noatime,xattr - zfs zpool1/zfs530_data/Home\040Videos rw,xattr,noacl
+45 30 0:45 / /share/ZFS531_DATA rw,noatime,xattr - zfs zpool2/zfs531_data rw,xattr,noacl
+46 45 0:46 / /share/ZFS531_DATA/Backup rw,noatime,xattr - zfs zpool2/zfs531_data/Backup rw,xattr,noacl
+47 30 0:47 / /share/remote rw,relatime - cifs //fileserver/share rw,vers=3.1.1

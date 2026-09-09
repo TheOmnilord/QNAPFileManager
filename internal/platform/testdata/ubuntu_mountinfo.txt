@@ -1,0 +1,9 @@
+23 28 0:22 / /sys rw,nosuid,nodev,noexec,relatime shared:2 - sysfs sysfs rw
+24 28 0:23 / /proc rw,nosuid,nodev,noexec,relatime shared:14 - proc proc rw
+25 28 0:5 / /dev rw,nosuid,relatime shared:8 - devtmpfs udev rw,size=3987684k,nr_inodes=996921,mode=755
+28 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw,errors=remount-ro
+29 28 0:25 / /run rw,nosuid,nodev,noexec,relatime shared:5 - tmpfs tmpfs rw,size=802616k,mode=755
+40 28 8:16 / /home rw,relatime shared:30 - xfs /dev/sdb1 rw,attr2,inode64,noquota
+41 28 8:2 / /boot/efi rw,relatime shared:31 - vfat /dev/sda2 rw,fmask=0077,dmask=0077
+55 29 0:44 / /run/user/1000/gvfs rw,nosuid,nodev,relatime - fuse.gvfsd-fuse gvfsd-fuse rw,user_id=1000
+60 28 8:49 / /media/usb\040stick rw,nosuid,nodev,relatime - ext4 /dev/sdd1 rw

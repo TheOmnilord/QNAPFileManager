@@ -1,0 +1,21 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "qnapfilemanager",
+      "runtimeExecutable": "go",
+      "runtimeArgs": [
+        "run",
+        "./cmd/qnapfilemanager",
+        "serve",
+        "-config",
+        "dev-config.json",
+        "-jail",
+        "testdata/fakeroot",
+        "-addr",
+        "127.0.0.1:8899"
+      ],
+      "port": 8899
+    }
+  ]
+}

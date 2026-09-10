@@ -275,3 +275,44 @@ func TestClassifyNormal(t *testing.T) {
 		t.Errorf("Classify(/etc) = %q, want protected (delete/rename denied)", got)
 	}
 }
+
+// TestCanonicalizeRootsSymlinkedProtectedRoot proves adv 1a's canonicalization:
+// when a protected root is itself a symlink (/etc/config -> /ordinary/config),
+// the resolved location is guarded too, while the lexical spelling keeps its
+// rule.
+func TestCanonicalizeRootsSymlinkedProtectedRoot(t *testing.T) {
+	g := New("", false)
+	g.CanonicalizeRoots(func(apiPath string) (string, bool) {
+		if apiPath == "/etc/config" {
+			return "/ordinary/config", true
+		}
+		return "", false // every other root resolves to itself: no duplicate
+	})
+	// The resolved location now carries the /etc/config warn rule.
+	if err := g.Check(OpWrite, "/ordinary/config/smb.conf"); !errors.Is(err, ErrConfirmRequired) {
+		t.Fatalf("resolved protected root not guarded: %v", err)
+	}
+	if err := g.Check(OpDelete, "/ordinary/config"); !errors.Is(err, ErrProtected) {
+		t.Fatalf("resolved protected root not denied for delete: %v", err)
+	}
+	// The lexical spelling keeps its protection.
+	if err := g.Check(OpWrite, "/etc/config/smb.conf"); !errors.Is(err, ErrConfirmRequired) {
+		t.Fatalf("lexical protected root lost protection: %v", err)
+	}
+	// An unrelated path is still normal.
+	if err := g.Check(OpWrite, "/ordinary/other/file"); err != nil {
+		t.Fatalf("unrelated path wrongly guarded: %v", err)
+	}
+}
+
+// TestCanonicalizeRootsNilAndIdentity proves a nil resolver and identity
+// resolutions add no rules (no accidental broadening).
+func TestCanonicalizeRootsNilAndIdentity(t *testing.T) {
+	g := New("", false)
+	before := len(g.rules)
+	g.CanonicalizeRoots(nil)
+	g.CanonicalizeRoots(func(p string) (string, bool) { return p, true })
+	if len(g.rules) != before {
+		t.Fatalf("rules changed: before %d after %d", before, len(g.rules))
+	}
+}

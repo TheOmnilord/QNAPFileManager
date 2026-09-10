@@ -339,6 +339,13 @@ func runServe(args []string, stderr io.Writer) error {
 	// decided from the path alone before any dispatch to a worker.
 	g := guard.New(guardInstallDir(o.configPath, root), shareIsRAM(plat))
 	g.SetMountPointChecker(plat.IsMountPointByTable)
+	// Canonicalize the protected roots so a protected root that is itself a
+	// symlink — /etc/config -> /ordinary/config — still matches once a caller
+	// reaches it by its resolved name (adv 1a). Uses the same front-end symlink
+	// resolution INV-1 permits, before any request is served.
+	g.CanonicalizeRoots(func(apiPath string) (string, bool) {
+		return web.ResolveAPIPath(root, apiPath)
+	})
 	g.SetReadOnly(cfg.ReadOnly)
 
 	// The audit log lives beside the app log (or config.logging.audit when set)

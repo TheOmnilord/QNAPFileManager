@@ -15,11 +15,28 @@ export const focused = () => entryAt(state.focus);
 // without list.js importing them, which would create a cycle. Each is
 // {label, run(entry), show?(entry), disabled?(entry)}.
 export const extraActions = [];
-// selectedEntries returns the explicitly selected entries in order, or null in
-// select-all (exclude) mode, which M1 mutations do not support.
-export function selectedEntries() {
+// selectionEntries resolves the explicit selection to its entries, in order,
+// fetching any pages that hold selected rows but were never loaded. A directory
+// larger than 2,000 entries loads lazily, so a Shift-range can select indices on
+// pages that are not in state.pages; the old synchronous selectedEntries silently
+// dropped those, so a delete of such a selection removed only the loaded subset
+// while reporting success (standard P2). This awaits the missing pages and
+// refuses — throwing a clear Error — rather than ever returning a truncated set.
+// It returns null in select-all (exclude) mode, which M1 mutations do not
+// support.
+export async function selectionEntries() {
  if (state.exclude) return null;
- return [...state.selection].sort((a,b) => a-b).map(entryAt).filter(Boolean);
+ const indices=[...state.selection].sort((a,b) => a-b);
+ const generation=state.generation;
+ const needed=new Set();
+ for (const i of indices) if (!entryAt(i)) needed.add(Math.floor(i/pageSize));
+ for (const n of needed) {
+  await page(n,generation);
+  if (generation!==state.generation || !state.session) throw new Error('The listing changed while preparing the selection. Try again.');
+ }
+ const entries=indices.map(entryAt);
+ if (entries.some(e => !e)) throw new Error('Some selected items are still loading. Scroll through the selection to load them, or select fewer items, then try again.');
+ return entries;
 }
 const navigable = e => e && !(e.volumeRoot && state.path==='/share') && (!state.filter || e.name.toLocaleLowerCase().includes(state.filter.toLocaleLowerCase()));
 function query(offset) { return {...pathArgs(state),offset,limit:pageSize,sort:state.sort,desc:state.desc,hidden:state.hidden,volumes:false}; }

@@ -38,6 +38,12 @@ const bufferDepth = 1024
 // written, so a sustained overflow does not itself flood the log.
 const dropReportInterval = 5 * time.Second
 
+// writeSyncTimeout bounds how long WriteSync waits for a durable line to reach
+// the sink before giving up and letting the request proceed. Long enough to
+// ride out a brief rotation or a slow disk, short enough that a wedged drain
+// cannot stall a mutation.
+const writeSyncTimeout = 2 * time.Second
+
 // bigDeleteFiles and bigDeleteBytes are the thresholds above which a delete is
 // a milestone worth mirroring to QuLog.
 const (
@@ -133,10 +139,9 @@ func Open(path string, qulog bool) (*Logger, error) {
 	return l, nil
 }
 
-// Write records ev. It never blocks: if the buffer is full the event is
-// dropped and the dropped counter incremented. A zero T is stamped now, and a
-// non-UTF-8 Path is moved to PathB64.
-func (l *Logger) Write(ev Event) {
+// prepare stamps a zero T and moves a non-UTF-8 Path to PathB64 so the event
+// survives JSON round-tripping. Shared by Write and WriteSync.
+func (l *Logger) prepare(ev Event) Event {
 	if ev.T.IsZero() {
 		ev.T = time.Now()
 	}
@@ -144,6 +149,14 @@ func (l *Logger) Write(ev Event) {
 		ev.PathB64 = base64.StdEncoding.EncodeToString([]byte(ev.Path))
 		ev.Path = ""
 	}
+	return ev
+}
+
+// Write records ev. It never blocks: if the buffer is full the event is
+// dropped and the dropped counter incremented. A zero T is stamped now, and a
+// non-UTF-8 Path is moved to PathB64.
+func (l *Logger) Write(ev Event) {
+	ev = l.prepare(ev)
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	if l.closed {
@@ -153,6 +166,36 @@ func (l *Logger) Write(ev Event) {
 	case l.ch <- ev:
 	default:
 		atomic.AddInt64(&l.dropped, 1)
+	}
+}
+
+// WriteSync writes ev straight to the sink, bypassing the drop-on-overflow
+// channel, and returns once it is persisted (or writeSyncTimeout elapses). It
+// is the durable path for the lines a crash must not lose: a mutation's INTENT
+// line, written before the work is dispatched, and every milestone (a denial, a
+// read-only toggle, a large delete). Ordinary result lines stay on the async
+// Write path. The write runs under drainMu, serialised with the drain
+// goroutine's own writes, so the two never interleave on the file. If the drain
+// is wedged the write is still queued to land when the lock frees; WriteSync
+// only stops waiting for it.
+func (l *Logger) WriteSync(ev Event) {
+	ev = l.prepare(ev)
+	l.mu.RLock()
+	closed := l.closed
+	l.mu.RUnlock()
+	if closed {
+		return
+	}
+	done := make(chan struct{})
+	go func() {
+		l.drainMu.Lock()
+		l.emit(ev)
+		l.drainMu.Unlock()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(writeSyncTimeout):
 	}
 }
 
@@ -307,7 +350,10 @@ func isMilestone(ev Event) bool {
 		return true
 	}
 	if ev.Result == "denied" {
-		return true
+		// A routine confirmation challenge (a token was demanded, none was
+		// presented yet) is recorded but is not a QuLog-worthy security event; an
+		// invalid presented token and every other denial are.
+		return ev.Code != "confirm_required"
 	}
 	switch ev.Op {
 	case "signin", "claim", "readonly", "chown":

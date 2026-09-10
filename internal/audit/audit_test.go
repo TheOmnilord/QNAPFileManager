@@ -291,3 +291,47 @@ func TestFileMode0600(t *testing.T) {
 		t.Fatalf("mode = %o, want 600", fi.Mode().Perm())
 	}
 }
+
+// TestWriteSyncDurable proves WriteSync persists an event to the sink before it
+// returns, without waiting for Close or the drain — the durability the intent
+// line and milestones rely on (adv 10). An ordinary async Write makes no such
+// promise; only the synchronous path is asserted here.
+func TestWriteSyncDurable(t *testing.T) {
+	l, rec := openTest(t, true)
+	defer l.Close()
+	l.WriteSync(Event{Actor: "alice", UID: 1000, Op: "delete", Path: "/x", Phase: "intent"})
+	// Readable immediately, with no Close in between.
+	evs, err := l.Tail(10)
+	if err != nil {
+		t.Fatalf("Tail: %v", err)
+	}
+	var found bool
+	for _, e := range evs {
+		if e.Op == "delete" && e.Phase == "intent" && e.Actor == "alice" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("WriteSync event not durable before Close: %d events", len(evs))
+	}
+	// A forced milestone written synchronously is mirrored to QuLog.
+	l.WriteSync(Event{Op: "readonly", Phase: "result", Result: "ok", ForceMilestone: true})
+	if rec.count() == 0 {
+		t.Fatal("WriteSync milestone not mirrored to QuLog")
+	}
+}
+
+// TestConfirmChallengeNotMilestone proves a routine confirmation challenge
+// (denied with code confirm_required) is recorded but is not a QuLog milestone,
+// while an invalid presented token (confirm_invalid) and other denials are.
+func TestConfirmChallengeNotMilestone(t *testing.T) {
+	if isMilestone(Event{Result: "denied", Code: "confirm_required"}) {
+		t.Fatal("a confirmation challenge must not be a milestone")
+	}
+	if !isMilestone(Event{Result: "denied", Code: "confirm_invalid"}) {
+		t.Fatal("an invalid confirmation token is a milestone")
+	}
+	if !isMilestone(Event{Result: "denied", Code: "protected"}) {
+		t.Fatal("a protected denial is a milestone")
+	}
+}

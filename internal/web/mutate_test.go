@@ -371,7 +371,21 @@ func TestBatchDeleteStopsOnReadOnly(t *testing.T) {
 	}
 	s.mutator = &flipReadOnlyOnDelete{fakeBackend: b, g: s.guard}
 	c, csrf := sessionCookie(t, s)
-	resp := post(s, "/api/fs/delete", c, csrf, `{"paths":[{"path":"/d1"},{"path":"/d2"},{"path":"/d3"}]}`)
+	// Every delete is permanent in M1, so the batch first demands a confirmation
+	// token (decision 10); redeem it, then the batch runs and the read-only toggle
+	// stops the later items.
+	first := post(s, "/api/fs/delete", c, csrf, `{"paths":[{"path":"/d1"},{"path":"/d2"},{"path":"/d3"}]}`)
+	if first.StatusCode != 409 {
+		t.Fatalf("first batch status %d, want 409 confirm_required", first.StatusCode)
+	}
+	var tok struct {
+		Confirm struct{ Token string }
+	}
+	json.NewDecoder(first.Body).Decode(&tok)
+	if tok.Confirm.Token == "" {
+		t.Fatal("no batch confirmation token issued")
+	}
+	resp := post(s, "/api/fs/delete", c, csrf, `{"paths":[{"path":"/d1"},{"path":"/d2"},{"path":"/d3"}],"confirm":"`+tok.Confirm.Token+`"}`)
 	if resp.StatusCode != 200 {
 		t.Fatalf("batch status %d", resp.StatusCode)
 	}

@@ -56,10 +56,5 @@ func (s *Server) fail(w http.ResponseWriter, r *http.Request, code, message, pat
 
 func (s *Server) backendError(w http.ResponseWriter, r *http.Request, p string, err error) {
 	code := fsx.Code(err)
-	messages := map[string]string{"permission": "Permission denied.", "not_found": "This path no longer exists.", "readonly": "This filesystem is read-only.", "unsupported": "This file cannot be opened here.", "internal": "The filesystem request failed."}
-	msg := messages[code]
-	if msg == "" {
-		msg = "The request could not be completed."
-	}
-	s.fail(w, r, code, msg, p, err.Error())
+	s.fail(w, r, code, backendMessage(code), p, err.Error())
 }

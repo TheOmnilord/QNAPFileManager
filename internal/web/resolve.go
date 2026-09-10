@@ -39,6 +39,15 @@ func resolveForGuard(r fsx.Root, apiPath string, resolveLeaf bool) string {
 	return apiPath
 }
 
+// ResolveAPIPath resolves every symlink in an API path through the jail mapping
+// and returns the canonical API path, or false when the path does not resolve
+// (absent, or escaping the jail). It exists so the guard can canonicalize its
+// protected roots at startup (guard.CanonicalizeRoots) using the same front-end
+// symlink resolution INV-1 permits, without importing internal/web internals.
+func ResolveAPIPath(r fsx.Root, apiPath string) (string, bool) {
+	return evalToAPI(r, apiPath)
+}
+
 // evalToAPI maps an API path to its OS spelling, resolves every symlink in it,
 // and maps the result back to an API path. It reports false when any step fails
 // — a path that does not exist, one that resolves outside the jail, or a host

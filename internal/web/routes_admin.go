@@ -77,9 +77,10 @@ func (s *Server) postSettings(w http.ResponseWriter, r *http.Request, sess *sess
 	}
 	s.cfgMu.Unlock()
 	if saveErr != nil {
-		// A failed safety-setting change is itself audit-worthy (adv 10).
+		// A failed safety-setting change is itself audit-worthy (adv 10) and a
+		// milestone, so write it durably rather than on the drop-on-overflow queue.
 		if s.auditor != nil {
-			s.auditor.Write(audit.Event{
+			s.auditor.WriteSync(audit.Event{
 				Actor: sess.who.User, UID: sess.who.UID, Admin: sess.admin, Root: sess.who.Root,
 				IP: ClientIP(r), Op: "readonly", Phase: "result", Result: "error", Code: "internal",
 				Detail: fmt.Sprintf("save failed: %v", saveErr), ForceMilestone: true,
@@ -89,7 +90,9 @@ func (s *Server) postSettings(w http.ResponseWriter, r *http.Request, sess *sess
 		return
 	}
 	if s.auditor != nil {
-		s.auditor.Write(audit.Event{
+		// The moment writes become possible on a root daemon is a milestone; write
+		// it durably (adv 10).
+		s.auditor.WriteSync(audit.Event{
 			Actor: sess.who.User, UID: sess.who.UID, Admin: sess.admin, Root: sess.who.Root,
 			IP: ClientIP(r), Op: "readonly", Phase: "result", Result: "ok",
 			Detail: fmt.Sprintf("readOnly=%v", newVal), ForceMilestone: true,

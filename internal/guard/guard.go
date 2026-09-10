@@ -123,6 +123,37 @@ func New(installDir string, shareIsRAM bool) *Guard {
 	return g
 }
 
+// CanonicalizeRoots duplicates every protected-path rule whose Prefix is itself
+// a symlink — /etc/config -> /ordinary/config — so the rule still governs the
+// location once a caller reaches it by its resolved name (adv 1a). resolve maps
+// a rule's prefix to its canonical API path, returning false when the prefix
+// does not resolve (absent, or escapes the jail); a prefix that resolves to a
+// different spelling gains a second rule under the canonical prefix. The route
+// layer already checks both the requested and the resolved spelling of an
+// operation's own path and takes the stricter verdict; this closes the gap where
+// only the resolved spelling of a *protected root* is ever presented. Call once
+// at startup, before serving. It never removes a rule, so the lexical spelling
+// keeps its protection too.
+func (g *Guard) CanonicalizeRoots(resolve func(apiPath string) (string, bool)) {
+	if resolve == nil {
+		return
+	}
+	// Startup-only, like New's own rule construction: Check reads g.rules
+	// without a lock, so this must complete before any request is served.
+	extra := make([]Rule, 0, len(g.rules))
+	for i := range g.rules {
+		r := g.rules[i]
+		canon, ok := resolve(r.Prefix)
+		if !ok || canon == "" || canon == r.Prefix {
+			continue
+		}
+		dup := r
+		dup.Prefix = canon
+		extra = append(extra, dup)
+	}
+	g.rules = append(g.rules, extra...)
+}
+
 // SetReadOnly turns global read-only mode on or off. When on, Check refuses
 // every mutating op regardless of path, so no route can forget the toggle.
 func (g *Guard) SetReadOnly(v bool) { g.readOnly.Store(v) }

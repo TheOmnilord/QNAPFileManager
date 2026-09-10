@@ -85,11 +85,13 @@ func Mkdir(ctx context.Context, r fsx.Root, dir, name string, mode os.FileMode, 
 //
 // os.Rename overwrites silently on Linux, which is the wrong default for a file
 // manager, so an existing destination is refused with fs.ErrExist unless
-// overwrite is set. The check is a separate lstat and the race is accepted
-// (PLAN.md §2.4): between the check and the renameat a third party could create
-// the destination, and overwrite:false could then still replace it — the same
-// unavoidable TOCTOU any check-then-act sequence has, and far less dangerous
-// than the containment races the O_PATH walk closes.
+// overwrite is set. On Linux this is enforced atomically by renameat2(2) with
+// RENAME_NOREPLACE, closing the check-then-act window (adv 2): the kernel itself
+// refuses the rename if the destination exists. Where the syscall is unavailable
+// (an old kernel, a filesystem that does not implement it, or a non-Linux host)
+// it falls back to a separate lstat pre-check, whose residual TOCTOU is accepted
+// (PLAN.md §2.4) — far less dangerous than the containment races the O_PATH walk
+// closes.
 //
 // A cross-filesystem rename — which on QuTS hero is any move between shares,
 // since every share is its own dataset — is reported as fsx.ErrCrossDevice so
@@ -125,14 +127,15 @@ func Rename(ctx context.Context, r fsx.Root, from, to string, overwrite bool) er
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if !overwrite {
-		if _, serr := statAt(toParent.jail, relJoin(toParent.rel, toName)); serr == nil {
-			return fmt.Errorf("%q already exists: %w", cleanTo, fs.ErrExist)
-		}
-	}
-	if err := renameAt(fromParent.jail, fromParent.rel, fromName, toParent.jail, toParent.rel, toName); err != nil {
+	// !overwrite is enforced inside renameAt: atomically on Linux (RENAME_NOREPLACE)
+	// and by an lstat pre-check where that is unavailable. An existing destination
+	// surfaces as fs.ErrExist either way.
+	if err := renameAt(fromParent.jail, fromParent.rel, fromName, toParent.jail, toParent.rel, toName, !overwrite); err != nil {
 		if errors.Is(err, syscall.EXDEV) {
 			return fmt.Errorf("cannot rename %q to %q, which is on a different filesystem: %w", cleanFrom, cleanTo, fsx.ErrCrossDevice)
+		}
+		if errors.Is(err, fs.ErrExist) {
+			return fmt.Errorf("%q already exists: %w", cleanTo, fs.ErrExist)
 		}
 		return err
 	}

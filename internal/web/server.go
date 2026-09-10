@@ -227,6 +227,11 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 				s.sessionInfo(w, r, nil)
 				return
 			}
+			// An unsafe request to a mutation route that never reached a valid
+			// session is a denial worth recording (adv 10).
+			if !safeMethod(r.Method) && isMutationRoute(r.URL.Path) {
+				s.auditUnauthenticated(r, "unauthorized", "no valid session on a mutation route")
+			}
 			s.fail(w, r, "unauthorized", "Sign in to QTS again to continue.", "", "")
 		}
 		return

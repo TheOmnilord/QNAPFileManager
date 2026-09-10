@@ -1,7 +1,7 @@
 import {api} from './api.js';
 import {$,el,error,announce,openDialog,pathArgs} from './dom.js';
 import {state,sessionGuard} from './state.js';
-import {loadList,focused,selectedEntries,extraActions} from './list.js';
+import {loadList,focused,selectionEntries,extraActions} from './list.js';
 import {loadTree} from './tree.js';
 
 // post sends a JSON body to a mutation route. api() attaches the CSRF header and
@@ -43,7 +43,7 @@ function promptDialog({title,label,value=''}) {
 
 // confirmDialog resolves to true only when confirmed. When phrase is set, the
 // OK button stays disabled until the typed text matches it exactly.
-function confirmDialog({title,body,why='',danger=false,phrase=''}) {
+export function confirmDialog({title,body,why='',danger=false,phrase=''}) {
  return new Promise(resolve => {
   const dlg=$('#dlgConfirm'),ok=$('#confirmOK'),input=$('#confirmPhrase'),phraseLabel=$('#confirmPhraseLabel');
   $('#confirmTitle').textContent=title; $('#confirmBody').textContent=body;
@@ -122,9 +122,16 @@ export async function deleteEntries(entries) {
  const body=entries.length===1 ? pathArgs(entries[0]) : {paths:entries.map(pathArgs)};
  const valid=sessionGuard();
  try {
-  // Grade 2: the server may still demand a confirmation token for a warn area.
-  const res=await runMutation('api/fs/delete',body,(confirm,message) =>
-   confirmDialog({title:'Confirm deletion',body:message||'This location needs confirmation.',why:(confirm.summary?.warnings||[]).join(' · '),danger:true}));
+  // Every delete is permanent in M1 (trash is M2), so the server now demands a
+  // confirmation token for ALL deletes and must be given the token round-trip
+  // (decision 10). A plain permanent delete carries no warnings, and the grade-1
+  // dialog above already covered it, so approve it silently; a warn-class area
+  // (server sends summary.warnings) still shows the detailed grade-2 dialog.
+  const res=await runMutation('api/fs/delete',body,(confirm,message) => {
+   const warnings=confirm.summary?.warnings||[];
+   if (!warnings.length) return true;
+   return confirmDialog({title:'Confirm deletion',body:message||'This location needs confirmation.',why:warnings.join(' · '),danger:true});
+  });
   if (!valid()) return;
   if (res===null) return;
   if (res.results) {
@@ -135,9 +142,16 @@ export async function deleteEntries(entries) {
  } catch(err) { if (valid()) actionError(err); }
 }
 
-// deleteSelection deletes the current explicit selection (toolbar/keyboard).
-export function deleteSelection() {
- const entries=selectedEntries();
+// deleteSelection deletes the current explicit selection (toolbar/keyboard). It
+// resolves the selection through selectionEntries, which fetches any selected
+// pages that were never loaded, so a Shift-range spanning unloaded pages is
+// deleted in full or not at all — never a silently truncated subset reported as
+// success (standard P2).
+export async function deleteSelection() {
+ let entries;
+ try {
+  entries=await selectionEntries();
+ } catch(err) { error(err); return; }
  if (entries===null) { error(new Error('Select items individually to delete them in this version.')); return; }
  deleteEntries(entries);
 }

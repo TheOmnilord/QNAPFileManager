@@ -3,6 +3,7 @@
 package fsops
 
 import (
+	"io/fs"
 	"os"
 
 	"qnapfilemanager/internal/fsx"
@@ -35,7 +36,17 @@ func mkdirAt(j fsx.Jail, parentRel, name string, mode os.FileMode, parents bool)
 // renameAt renames fromName under fromParentRel to toName under toParentRel.
 // Both parents belong to the same Root, so both jail handles are the same
 // os.Root and either serves; os.Root.Rename resolves both names against it.
-func renameAt(fromJail fsx.Jail, fromParentRel, fromName string, _ fsx.Jail, toParentRel, toName string) error {
+//
+// There is no RENAME_NOREPLACE here, so noReplace is enforced with the fallback
+// lstat pre-check (its residual TOCTOU is accepted, PLAN.md §2.4): an existing
+// destination is reported as fs.ErrExist rather than silently overwritten. This
+// is the Windows dev box and the in-process worker only (INV-2).
+func renameAt(fromJail fsx.Jail, fromParentRel, fromName string, _ fsx.Jail, toParentRel, toName string, noReplace bool) error {
+	if noReplace {
+		if _, err := statAt(fromJail, relJoin(toParentRel, toName)); err == nil {
+			return &fs.PathError{Op: "rename", Path: relJoin(toParentRel, toName), Err: fs.ErrExist}
+		}
+	}
 	return fromJail.Rename(relJoin(fromParentRel, fromName), relJoin(toParentRel, toName))
 }
 

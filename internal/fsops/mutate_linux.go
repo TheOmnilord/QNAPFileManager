@@ -40,11 +40,23 @@ func mkdirAt(j fsx.Jail, parentRel, name string, mode os.FileMode, parents bool)
 	return nil
 }
 
+// renameNoReplace is RENAME_NOREPLACE, the renameat2(2) flag that makes the
+// kernel refuse the rename (EEXIST) if the destination already exists, rather
+// than overwriting it. The value is stable across Linux architectures.
+const renameNoReplace = 0x1
+
 // renameAt renames fromName under fromParentRel to toName under toParentRel,
 // with renameat(2) relative to the two resolved parent descriptors. Neither
 // final component is followed: renameat operates on the name in the directory,
 // which for a symlink is the link itself.
-func renameAt(fromJail fsx.Jail, fromParentRel, fromName string, toJail fsx.Jail, toParentRel, toName string) error {
+//
+// When noReplace is set the no-overwrite guarantee is atomic: renameat2(2) with
+// RENAME_NOREPLACE lets the kernel reject an existing destination (EEXIST) in
+// the same syscall, closing the check-then-act window (adv 2). If renameat2 or
+// the flag is unavailable (ENOSYS/EINVAL — an old kernel or a filesystem that
+// does not implement it), it falls back to a best-effort lstat pre-check (its
+// residual TOCTOU is accepted, PLAN.md §2.4) and a plain renameat.
+func renameAt(fromJail fsx.Jail, fromParentRel, fromName string, toJail fsx.Jail, toParentRel, toName string, noReplace bool) error {
 	fromDir, err := walkOPath(fromJail, fromParentRel)
 	if err != nil {
 		return err
@@ -55,7 +67,16 @@ func renameAt(fromJail fsx.Jail, fromParentRel, fromName string, toJail fsx.Jail
 		return err
 	}
 	defer toDir.Close()
-	if err := renameatIn(fromDir, fromName, toDir, toName); err != nil {
+	err = renameatIn(fromDir, fromName, toDir, toName, noReplace)
+	if noReplace && (errors.Is(err, syscall.ENOSYS) || errors.Is(err, syscall.EINVAL)) {
+		// renameat2/RENAME_NOREPLACE unsupported here: fall back to a pre-check
+		// then a plain renameat.
+		if _, serr := statAt(toJail, relJoin(toParentRel, toName)); serr == nil {
+			return &fs.PathError{Op: "renameat", Path: relJoin(toParentRel, toName), Err: syscall.EEXIST}
+		}
+		err = renameatIn(fromDir, fromName, toDir, toName, false)
+	}
+	if err != nil {
 		return &fs.PathError{Op: "renameat", Path: relJoin(fromParentRel, fromName), Err: err}
 	}
 	return nil
@@ -189,8 +210,9 @@ func rawUnlinkat(dirfd int, name string, flags int) error {
 // renameatIn is renameat(2) between two open directories, retried over EINTR.
 // Both descriptors are held at once — the destination's Control nested inside
 // the source's — so neither is detached from the poller and the syscall sees
-// both live fds.
-func renameatIn(fromDir *os.File, fromName string, toDir *os.File, toName string) error {
+// both live fds. With noReplace it uses renameat2(2) with RENAME_NOREPLACE so
+// the kernel refuses an existing destination atomically.
+func renameatIn(fromDir *os.File, fromName string, toDir *os.File, toName string, noReplace bool) error {
 	fromRC, err := fromDir.SyscallConn()
 	if err != nil {
 		return err
@@ -203,7 +225,11 @@ func renameatIn(fromDir *os.File, fromName string, toDir *os.File, toName string
 	if cerr := fromRC.Control(func(fromFD uintptr) {
 		cerr2 = toRC.Control(func(toFD uintptr) {
 			for {
-				serr = syscall.Renameat(int(fromFD), fromName, int(toFD), toName)
+				if noReplace {
+					serr = renameat2(int(fromFD), fromName, int(toFD), toName, renameNoReplace)
+				} else {
+					serr = syscall.Renameat(int(fromFD), fromName, int(toFD), toName)
+				}
 				if serr != syscall.EINTR {
 					return
 				}
@@ -216,6 +242,36 @@ func renameatIn(fromDir *os.File, fromName string, toDir *os.File, toName string
 		return cerr2
 	}
 	return serr
+}
+
+// renameat2 is renameat2(2), which the syscall package does not export. The
+// unsafe shape is the one the vet rules sanction for a syscall call (a Pointer
+// converted to uintptr in the argument list); both names are kept alive across
+// the call rather than trusted to escape analysis.
+func renameat2(fromFD int, fromName string, toFD int, toName string, flags uint) error {
+	if sysRenameat2 == 0 {
+		// The syscall number is not compiled in for this architecture; behave as an
+		// old kernel would and let Rename take the lstat-pre-check fallback.
+		return syscall.ENOSYS
+	}
+	fromPtr, err := syscall.BytePtrFromString(fromName)
+	if err != nil {
+		return err
+	}
+	toPtr, err := syscall.BytePtrFromString(toName)
+	if err != nil {
+		return err
+	}
+	_, _, errno := syscall.Syscall6(sysRenameat2,
+		uintptr(fromFD), uintptr(unsafe.Pointer(fromPtr)),
+		uintptr(toFD), uintptr(unsafe.Pointer(toPtr)),
+		uintptr(flags), 0)
+	runtime.KeepAlive(fromPtr)
+	runtime.KeepAlive(toPtr)
+	if errno != 0 {
+		return errno
+	}
+	return nil
 }
 
 // syscallMode turns an fs.FileMode into the mode_t bits mkdirat expects: the

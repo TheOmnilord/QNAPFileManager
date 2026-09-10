@@ -49,7 +49,7 @@ func TestEnsureRootOwnedDirRejectsADecoy(t *testing.T) {
 		t.Skip("ensureRootOwnedDir creates root-owned directories; needs root")
 	}
 	parent := t.TempDir()
-	if err := os.Chmod(parent, 0o1777); err != nil { // root-owned + sticky
+	if err := os.Chmod(parent, 0o777|os.ModeSticky); err != nil { // root-owned + sticky
 		t.Fatal(err)
 	}
 	dir := filepath.Join(parent, ".qnapfilemanager")
@@ -81,7 +81,7 @@ func TestStageWorkerBinaryRootGated(t *testing.T) {
 		t.Skip("staging requires a root-owned sticky parent; needs root")
 	}
 	parent := t.TempDir()
-	if err := os.Chmod(parent, 0o1777); err != nil {
+	if err := os.Chmod(parent, 0o777|os.ModeSticky); err != nil {
 		t.Fatal(err)
 	}
 	src := filepath.Join(t.TempDir(), "qnapfilemanager")

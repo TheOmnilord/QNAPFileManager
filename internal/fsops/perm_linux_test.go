@@ -232,8 +232,11 @@ func TestADotComponentNeedsSearchPermissionOnTheDirectoryItNames(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The kernel has to be enforcing this for the test to mean anything: it is
-	// the "." lookup itself that needs the search bit here.
-	if _, err := os.Stat(filepath.Join(locked, ".")); !errors.Is(err, fs.ErrPermission) {
+	// the "." lookup itself that needs the search bit here. The dot is appended
+	// literally rather than through filepath.Join, which cleans it away — with
+	// the Join the precondition stat named locked itself, succeeded, and skipped
+	// the regression this test exists for.
+	if _, err := os.Stat(locked + string(filepath.Separator) + "."); !errors.Is(err, fs.ErrPermission) {
 		t.Skipf("this filesystem does not enforce the directory execute bit: %v", err)
 	}
 	if err := os.Symlink("locked/.", filepath.Join(base, "ptr")); err != nil {
@@ -253,6 +256,55 @@ func TestADotComponentNeedsSearchPermissionOnTheDirectoryItNames(t *testing.T) {
 	}
 	if e, err := StatFollow(ctx, r, nil, "/ptr"); err != nil {
 		t.Fatalf("a searchable directory named through \"locked/.\": %v", err)
+	} else if e.Type != "dir" {
+		t.Errorf("type = %q, want dir", e.Type)
+	}
+}
+
+// TestADotInAnAbsoluteLinkTargetNeedsTheSameSearchPermission is the same rule
+// for the shape QTS actually writes: /share/Public is an absolute symlink, and
+// so is everything under it that an operator points somewhere else by hand. An
+// absolute target used to be cleaned on its way through the containment mapping
+// — "<base>/locked/." became "<base>/locked" — so the "." lookup the kernel
+// performs inside locked was never asked for, and StatFollow described the
+// directory as a reachable target for a user the kernel answers with EACCES.
+// The relative form was already checked; this is the half that was still
+// answering for the kernel (INV-2).
+func TestADotInAnAbsoluteLinkTargetNeedsTheSameSearchPermission(t *testing.T) {
+	requireSymlinks(t)
+	requireUnprivileged(t)
+	r, base := fixture(t)
+	mkdir(t, base, "locked")
+	write(t, base, "locked/secret", "not yours")
+	locked := filepath.Join(base, "locked")
+	sep := string(filepath.Separator)
+	chmodBack(t, locked, 0o755)
+	if err := os.Chmod(locked, 0o644); err != nil { // readable, not searchable
+		t.Fatal(err)
+	}
+	// The kernel has to be enforcing this for the test to mean anything, and the
+	// dot has to still be there when it is asked: filepath.Join would clean it
+	// away and turn the precondition into a stat of locked itself.
+	if _, err := os.Stat(locked + sep + "."); !errors.Is(err, fs.ErrPermission) {
+		t.Skipf("this filesystem does not enforce the directory execute bit: %v", err)
+	}
+	if err := os.Symlink(locked+sep+".", filepath.Join(base, "ptr")); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	if e, err := StatFollow(ctx, r, nil, "/ptr"); !errors.Is(err, fs.ErrPermission) {
+		t.Fatalf("entry %+v, err = %v, want a permission error", e, err)
+	} else if code := fsx.Code(err); code != "permission" {
+		t.Errorf("code = %q, want permission", code)
+	}
+	// Restoring the bit makes the same link resolve, so what was refused was the
+	// missing permission and not the shape of the target.
+	if err := os.Chmod(locked, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if e, err := StatFollow(ctx, r, nil, "/ptr"); err != nil {
+		t.Fatalf("a searchable directory named through an absolute \"…/locked/.\": %v", err)
 	} else if e.Type != "dir" {
 		t.Errorf("type = %q, want dir", e.Type)
 	}

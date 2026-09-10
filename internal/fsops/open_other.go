@@ -23,7 +23,13 @@ func openDir(rt *os.Root, rel, _ string) (*os.File, error) {
 // (newUnixDirent in $GOROOT/src/os/file_unix.go takes the lstatat branch when
 // the parent was opened in a Root) — so the swap-the-directory-for-a-symlink
 // race the Linux version exists to close does not arise on this path either.
-func readDirInfos(f *os.File, n int) ([]dirEntryInfo, error) {
+//
+// The showHidden argument is Linux's alone: there the metadata costs three
+// syscalls this package makes itself and is worth not making for a name that
+// will be dropped, while here it is one DirEntry.Info on the dev box. The
+// entries handed back are the same either way, which is the point — the Linux
+// version skips the stat, not the entry.
+func readDirInfos(f *os.File, n int, _ bool) ([]dirEntryInfo, error) {
 	des, readErr := f.ReadDir(n)
 	out := make([]dirEntryInfo, 0, len(des))
 	for _, de := range des {

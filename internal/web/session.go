@@ -163,6 +163,11 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (*session,
 	if old != nil {
 		return s.authenticateSession(w, r, old, cred, hasCred)
 	}
+	// Bootstrap through a safe request before accepting any session mutation.
+	// An unsafe first request must not validate credentials or insert a session.
+	if !safeMethod(r.Method) {
+		return nil, errSession
+	}
 	if s.pinned == nil && !hasCred {
 		return nil, nil
 	}

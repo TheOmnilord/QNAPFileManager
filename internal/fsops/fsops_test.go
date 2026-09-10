@@ -824,6 +824,41 @@ func TestLinkPartsKeepsTheTargetComponentsInOrder(t *testing.T) {
 	if _, _, err := linkParts(r, "/share/ptr", outside); !errors.Is(err, fsx.ErrOutsideRoot) {
 		t.Fatalf("err = %v, want ErrOutsideRoot for %q", err, outside)
 	}
+
+	// A "." in an absolute target survives the containment mapping. The mapping
+	// used to clean it away — "<base>/locked/." came back as just "locked" — so
+	// the lookup the kernel makes inside locked was never asked for and a
+	// directory the kernel refuses could be reported as a reachable target.
+	parts, absolute, err = linkParts(r, "/share/ptr", filepath.Join(base, "locked")+sep+".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !absolute || strings.Join(parts, "/") != "locked/." {
+		t.Fatalf("parts = %v absolute=%v, want [locked .]: the \".\" was cleaned out of the target", parts, absolute)
+	}
+	// A "." written at the jail base keeps its place among the components below
+	// it: the base is a directory the walk really does stand on, so the lookup
+	// is one the kernel makes. The components of the base itself are still
+	// dropped, dots among them included — those name directories this walk never
+	// traverses.
+	parts, absolute, err = linkParts(r, "/share/ptr", base+sep+"."+sep+"a"+sep+"one.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !absolute || strings.Join(parts, "/") != "./a/one.txt" {
+		t.Fatalf("parts = %v absolute=%v, want [. a one.txt]", parts, absolute)
+	}
+
+	// A target that is nothing but "." is one component and not none: it names
+	// the directory the link lives in, by a lookup inside it that the kernel
+	// answers — splitRel spells the base itself ".", and a link target does not.
+	parts, absolute, err = linkParts(r, "/share/ptr", ".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if absolute || strings.Join(parts, "/") != "." {
+		t.Fatalf("parts = %v absolute=%v, want the single component \".\"", parts, absolute)
+	}
 }
 
 // TestAnAbsoluteTargetClimbingOutOfTheJailIsRefused: under -jail the base is an
@@ -930,6 +965,83 @@ func TestADotComponentInALinkTargetIsStillTheKernelsToCheck(t *testing.T) {
 	if e.Type != "dir" {
 		t.Errorf("entry = %+v, want the directory a described through the link", e)
 	}
+}
+
+// TestADotInAnAbsoluteLinkTargetIsCheckedToo: the same check for an absolute
+// target, which is the shape QTS writes for every share. The containment
+// mapping used to clean the target on its way through, so "<base>/b.txt/."
+// arrived at the walk as "<base>/b.txt" and StatFollow answered with the file —
+// where the kernel answers ENOTDIR, because "." is a lookup inside b.txt and
+// b.txt is not a directory (INV-2).
+func TestADotInAnAbsoluteLinkTargetIsCheckedToo(t *testing.T) {
+	requireSymlinks(t)
+	requirePOSIXLinks(t)
+	r, base := fixture(t)
+	sep := string(filepath.Separator)
+	if err := os.Symlink(filepath.Join(base, "b.txt")+sep+".", filepath.Join(base, "absfile")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(base, "a")+sep+".", filepath.Join(base, "absdir")); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	// The kernel has to be refusing it for the test to be measuring anything.
+	if _, err := os.Stat(filepath.Join(base, "absfile")); err == nil {
+		t.Skip("this host resolves a link target of \"file/.\" to the file itself")
+	}
+	if e, err := StatFollow(ctx, r, nil, "/absfile"); err == nil {
+		t.Fatalf("an absolute link target ending in \"b.txt/.\" must fail the way the kernel fails it, got %+v", e)
+	} else if code := fsx.Code(err); code != "bad_request" {
+		t.Errorf("code = %q, want bad_request (%v)", code, err)
+	}
+	// And on a real directory it still resolves, to the directory itself.
+	e, err := StatFollow(ctx, r, nil, "/absdir")
+	if err != nil {
+		t.Fatalf("an absolute link target ending in \"a/.\" names the directory a: %v", err)
+	}
+	if e.Type != "dir" {
+		t.Errorf("entry = %+v, want the directory a described through the link", e)
+	}
+	if e, err := Stat(ctx, r, nil, "/absdir"); err != nil {
+		t.Fatal(err)
+	} else if e.LinkResolved != "/a" {
+		t.Errorf("resolved = %q, want /a", e.LinkResolved)
+	}
+}
+
+// TestALinkTargetOfNothingButADotNamesTheDirectoryTheLinkIsIn: "." on its own
+// is a target like any other — it names the directory the link lives in, by a
+// lookup the kernel performs inside that directory. splitRel spells the jail
+// base itself "." and so dropped this target to no components at all, which
+// skipped the check and left the walk standing wherever it happened to be.
+func TestALinkTargetOfNothingButADotNamesTheDirectoryTheLinkIsIn(t *testing.T) {
+	requireSymlinks(t)
+	requirePOSIXLinks(t)
+	r, base := fixture(t)
+	if err := os.Symlink(".", filepath.Join(base, "a", "self")); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	e, err := StatFollow(ctx, r, nil, "/a/self")
+	if err != nil {
+		t.Fatalf("a link target of \".\" names the directory the link is in: %v", err)
+	}
+	if e.Type != "dir" {
+		t.Errorf("entry = %+v, want the directory a", e)
+	}
+	if e, err := Stat(ctx, r, nil, "/a/self"); err != nil {
+		t.Fatal(err)
+	} else if e.LinkResolved != "/a" {
+		t.Errorf("resolved = %q, want /a: the target names a, not the jail base", e.LinkResolved)
+	}
+	// Reaching through it works the way the kernel says it does.
+	f, _, err := OpenRead(ctx, r, "/a/self/one.txt")
+	if err != nil {
+		t.Fatalf("reading through a link whose target is \".\": %v", err)
+	}
+	f.Close()
 }
 
 // A symlink loop must end, and end as an error rather than as a hung worker.

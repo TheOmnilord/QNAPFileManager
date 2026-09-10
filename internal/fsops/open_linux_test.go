@@ -195,7 +195,7 @@ func TestListMetadataComesFromTheOpenedDirectory(t *testing.T) {
 		t.Fatalf("the swap did not take effect: size by path = %d", swapped.Size())
 	}
 
-	des, err := readDirInfos(f, readChunk)
+	des, err := readDirInfos(f, readChunk, true)
 	if err != nil && err != io.EOF {
 		t.Fatal(err)
 	}

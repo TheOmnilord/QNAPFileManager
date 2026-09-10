@@ -53,6 +53,11 @@ const maxLinkHops = 40
 // that describes it, or the error that says why there is none. It exists
 // because the two platforms obtain that metadata differently — see readDirInfos
 // in open_linux.go and open_other.go — and List should not have to care which.
+//
+// info and err are both nil for one case only: a dot-name in a listing that is
+// not showing hidden entries, whose metadata Linux does not spend the syscalls
+// to fetch. List drops those on the name alone, before it reads either field,
+// and that ordering is what makes the nil safe — see the filter in List.
 type dirEntryInfo struct {
 	name string
 	info fs.FileInfo
@@ -145,6 +150,9 @@ func resolve(r fsx.Root, apiPath string, followFinal bool) (jailPath, error) {
 			// name exactly what the walk is already standing on. Discarding it
 			// silently answered a question the kernel would have refused
 			// (INV-2), so the checks are made and their errors are the result.
+			// This holds for every shape of target: a relative "locked/.", an
+			// absolute "/share/locked/.", and a target that is nothing but "."
+			// all arrive here as a component (linkParts, splitLink).
 			if blocked != nil {
 				return jailPath{}, blocked
 			}
@@ -232,20 +240,23 @@ func resolve(r fsx.Root, apiPath string, followFinal bool) (jailPath, error) {
 // too. Under -jail it therefore has to land inside the base or the link is an
 // escape and is refused; unjailed, everything is inside by definition.
 //
-// The target is deliberately not cleaned first. filepath.Clean is a lexical
-// rewrite, and a symlink target is not a lexical object: with
-// /share/A/link → /share/B/dir, the kernel reads "/share/A/link/../report" as
-// /share/B/report, because it follows link before it applies "..". Cleaning
-// removes the "link/.." pair and lands on /share/A/report — a different file,
-// which the UI would then happily download under the name of the one that was
-// asked for. So the components go back into the walk as written and ".." is
-// applied to whatever they resolve to, exactly as in the kernel.
+// The target is deliberately not cleaned first — neither its ".." nor its ".".
+// filepath.Clean is a lexical rewrite, and a symlink target is not a lexical
+// object: with /share/A/link → /share/B/dir, the kernel reads
+// "/share/A/link/../report" as /share/B/report, because it follows link before
+// it applies "..". Cleaning removes the "link/.." pair and lands on
+// /share/A/report — a different file, which the UI would then happily download
+// under the name of the one that was asked for. A "." is the same mistake in a
+// quieter form: it is a lookup the kernel makes, inside the directory it is
+// written in, and "/share/locked/." is EACCES where "/share/locked" is not. So
+// the components go back into the walk as written and it is resolve() that asks
+// the kernel what they mean, exactly as the kernel would.
 func linkParts(r fsx.Root, apiPath, link string) (parts []string, absolute bool, err error) {
 	if link == "" {
 		return nil, false, fmt.Errorf("%q is a symlink with an empty target: %w", apiPath, fsx.ErrBadName)
 	}
 	if !isAbsLink(link) {
-		return splitRel(filepath.ToSlash(link)), false, nil
+		return splitLink(filepath.ToSlash(link)), false, nil
 	}
 	osTarget := filepath.FromSlash(link)
 	comps := splitOSPath(osTarget)
@@ -261,8 +272,20 @@ func linkParts(r fsx.Root, apiPath, link string) (parts []string, absolute bool,
 			break
 		}
 	}
+	// A "." in the head names the directory the walk has already reached rather
+	// than a new one, so it says nothing about *where* the head is and takes no
+	// part in the containment mapping. It still has to survive it: the mapping
+	// is where the dots used to be lost, and losing them let StatFollow answer
+	// for "/share/locked/." a user the kernel would have refused. So the head is
+	// located with the dots left out and handed back to the walk with them in.
+	located := make([]string, 0, len(head))
+	for _, c := range head {
+		if c != "." {
+			located = append(located, c)
+		}
+	}
 	vol := filepath.VolumeName(osTarget)
-	osHead := filepath.Join(append([]string{vol + string(filepath.Separator)}, head...)...)
+	osHead := filepath.Join(append([]string{vol + string(filepath.Separator)}, located...)...)
 	base, ok := baseFor(r, osHead)
 	if !ok {
 		return nil, false, fmt.Errorf("%q leaves the jail root through a symlink: %w", apiPath, fsx.ErrOutsideRoot)
@@ -271,7 +294,22 @@ func linkParts(r fsx.Root, apiPath, link string) (parts []string, absolute bool,
 	if err != nil {
 		return nil, false, err
 	}
-	parts = splitRel(strings.TrimPrefix(api, "/"))
+	// api names the located head as an API path, so the difference in length is
+	// exactly how many of the head's components the jail base itself accounts
+	// for. Those are dropped from the head as written, along with any "." among
+	// them: a dot at or above the base names a directory this walk did not
+	// traverse and has no business asking the kernel about. Everything below the
+	// base is kept with the spelling the link gave it.
+	skip := len(located) - len(splitRel(strings.TrimPrefix(api, "/")))
+	rest := head
+	for skip > 0 && len(rest) > 0 {
+		if rest[0] != "." {
+			skip--
+		}
+		rest = rest[1:]
+	}
+	parts = make([]string, 0, len(rest)+len(comps)-len(head))
+	parts = append(parts, rest...)
 	return append(parts, comps[len(head):]...), true, nil
 }
 
@@ -282,16 +320,9 @@ func linkParts(r fsx.Root, apiPath, link string) (parts []string, absolute bool,
 // mean.
 func splitOSPath(p string) []string {
 	p = p[len(filepath.VolumeName(p)):]
-	fields := strings.FieldsFunc(p, func(c rune) bool {
+	return strings.FieldsFunc(p, func(c rune) bool {
 		return c == '/' || (runtime.GOOS == "windows" && c == '\\')
 	})
-	out := make([]string, 0, len(fields))
-	for _, f := range fields {
-		if f != "." {
-			out = append(out, f)
-		}
-	}
-	return out
 }
 
 // isAbsLink reports whether a symlink target is absolute on this host. On
@@ -335,6 +366,23 @@ func splitRel(rel string) []string {
 		return nil
 	}
 	return strings.Split(strings.Trim(rel, "/"), "/")
+}
+
+// splitLink splits a relative symlink target into the components resolution
+// continues with. It is splitRel with one deliberate difference: a target of
+// "." is one component and not none.
+//
+// splitRel spells the jail base itself "."; a link target does not. "." there
+// is a lookup the kernel makes inside the directory the link lives in, and it
+// needs search permission on that directory like any other name — so the
+// component survives here and resolve() asks (INV-2). Everything else is the
+// same: separators collapse, and ".." is left for the walk to apply.
+func splitLink(link string) []string {
+	link = strings.Trim(link, "/")
+	if link == "" {
+		return nil
+	}
+	return strings.Split(link, "/")
 }
 
 // relOf renders resolved components as the name an os.Root method takes.
@@ -437,10 +485,14 @@ func List(ctx context.Context, r fsx.Root, plat *platform.Platform, dir string, 
 	entries := make([]fsx.Entry, 0, 64)
 	capped := false
 	for !capped {
-		des, readErr := readDirInfos(f, readChunk)
+		des, readErr := readDirInfos(f, readChunk, o.ShowHidden)
 		for _, de := range des {
 			name := de.name
 			hidden := strings.HasPrefix(name, ".")
+			// First, and it must stay first: when hidden entries are not being
+			// shown, Linux hands these back with no metadata at all rather than
+			// spending three syscalls per name on an entry that is about to be
+			// dropped. de.info and de.err are read only below this line.
 			if hidden && !o.ShowHidden {
 				continue
 			}

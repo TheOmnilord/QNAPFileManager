@@ -1,12 +1,14 @@
 import {$,el,error,openDialog,route,parseRoute,rawPath,bytePath} from './dom.js';
-import {api,signInNotice} from './api.js';
+import {api,signInNotice,connectionNotice} from './api.js';
 import {state,update,sessionGuard} from './state.js';
 import {initList,loadList} from './list.js';
 import {loadTree} from './tree.js';
 import {initViewer} from './viewer.js';
-import {sessionQuery,cleanSessionURL} from './bootstrap.js';
+import {sessionBootstrap,transientAuthError} from './bootstrap.js';
 
-let bootstrapQuery=sessionQuery(location.search);
+const bootstrap=sessionBootstrap(location.href,url => history.replaceState(history.state,'',url),
+ params => api('api/session',params,{signal:AbortSignal.timeout(15000)}));
+let connecting=false;
 
 function theme(value) {
  if (!['auto','light','dark'].includes(value)) value='auto';
@@ -30,16 +32,20 @@ function navigate() {
 }
 
 async function connect() {
+ if (connecting) return;
+ connecting=true;
  const valid=sessionGuard();
- const params=bootstrapQuery;
- bootstrapQuery={};
  try {
-  const session=await api('api/session',params);
-  if (!valid()) return;
+  const session=await bootstrap(valid);
+  if (!valid() || !session) return;
   if (!session.authenticated) { signInNotice(); return; }
-  history.replaceState(history.state,'',cleanSessionURL(location.href));
   showSession(session);
- } catch(err) { if (valid()) { if ('sid' in params) signInNotice(); error(err); } }
+ } catch(err) {
+  if (valid()) {
+   connectionNotice(transientAuthError(err) ? 'Connection temporarily unavailable' : 'Unable to connect',err.message);
+   error(err);
+  }
+ } finally { connecting=false; }
 }
 function showSession(session) {
   if (state.session) signInNotice();

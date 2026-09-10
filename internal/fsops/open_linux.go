@@ -343,7 +343,15 @@ func openDir(rt *os.Root, rel, osName string) (*os.File, error) {
 // A per-entry failure is reported per entry rather than for the listing: an
 // entry unlinked between getdents and the open is an ordinary race in a live
 // directory, and List drops it.
-func readDirInfos(f *os.File, n int) ([]dirEntryInfo, error) {
+//
+// showHidden is the one thing about the caller's filter that reaches down here,
+// and only to skip work: a dot-name in a listing that will not show it is handed
+// back with no metadata rather than costing an openat, an fstat and a close for
+// an entry List drops on the name alone. The chunk still holds every name the
+// directory read produced, in order, so it is the same chunk the non-Linux path
+// returns and List counts it the same way — the dropped entries were never
+// counted on either platform.
+func readDirInfos(f *os.File, n int, showHidden bool) ([]dirEntryInfo, error) {
 	names, readErr := f.Readdirnames(n)
 	if len(names) == 0 {
 		return nil, readErr
@@ -357,6 +365,10 @@ func readDirInfos(f *os.File, n int) ([]dirEntryInfo, error) {
 	// re-acquired per entry.
 	if cerr := rc.Control(func(pfd uintptr) {
 		for _, name := range names {
+			if !showHidden && strings.HasPrefix(name, ".") {
+				out = append(out, dirEntryInfo{name: name})
+				continue
+			}
 			fi, serr := lstatIn(int(pfd), name)
 			out = append(out, dirEntryInfo{name: name, info: fi, err: serr})
 		}

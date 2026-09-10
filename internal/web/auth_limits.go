@@ -17,13 +17,14 @@ const (
 	unattributedFailureBurst     = 200
 	authRecoveryInterval         = time.Second
 	unattributedRecoveryInterval = time.Second / 5
-	reservedRevalidationSlots    = 2
+	reservedAuthClassSlots       = 2
 	authFailureWindow            = time.Minute
 	maxFailureClients            = 4096
 	maxSessionAuthWaiters        = 8
 )
 
 var errAuthRateLimited = errors.New("authentication failure rate exceeded")
+var errAuthRetry = errors.New("authentication leader interrupted; retry")
 
 type failureBucket struct {
 	credentials map[string]time.Time
@@ -211,18 +212,20 @@ func (l *failureLimiter) allow(ip string, now time.Time) error {
 // Shared by credential validation and identity resolution. Session followers
 // and credential followers share the waiting bound but never occupy execution slots.
 type authAdmission struct {
-	once    sync.Once
-	slots   chan struct{}
-	logins  chan struct{}
-	mu      sync.Mutex
-	flights map[string]*credentialFlight
-	waiters chan struct{}
+	once          sync.Once
+	slots         chan struct{}
+	logins        chan struct{}
+	revalidations chan struct{}
+	mu            sync.Mutex
+	flights       map[string]*credentialFlight
+	waiters       chan struct{}
 }
 
 func (a *authAdmission) init() {
 	a.once.Do(func() {
 		a.slots = make(chan struct{}, qtsauth.DefaultMaxConcurrentValidations)
-		a.logins = make(chan struct{}, qtsauth.DefaultMaxConcurrentValidations-reservedRevalidationSlots)
+		a.logins = make(chan struct{}, qtsauth.DefaultMaxConcurrentValidations-reservedAuthClassSlots)
+		a.revalidations = make(chan struct{}, qtsauth.DefaultMaxConcurrentValidations-reservedAuthClassSlots)
 		a.waiters = make(chan struct{}, qtsauth.DefaultMaxValidationWaiters)
 	})
 }
@@ -267,15 +270,17 @@ func (a *authAdmission) enter(ctx context.Context, revalidation bool) error {
 			return ctx.Err()
 		}
 	}
-	if !revalidation {
-		if err := acquire(a.logins); err != nil {
-			return err
-		}
+	class := a.logins
+	if revalidation {
+		class = a.revalidations
+	}
+	// Acquire the class limit first so queued work cannot consume the other
+	// class's reserved execution capacity.
+	if err := acquire(class); err != nil {
+		return err
 	}
 	if err := acquire(a.slots); err != nil {
-		if !revalidation {
-			<-a.logins
-		}
+		<-class
 		return err
 	}
 	return nil
@@ -283,7 +288,9 @@ func (a *authAdmission) enter(ctx context.Context, revalidation bool) error {
 
 func (a *authAdmission) leave(revalidation bool) {
 	<-a.slots
-	if !revalidation {
+	if revalidation {
+		<-a.revalidations
+	} else {
 		<-a.logins
 	}
 }
@@ -309,6 +316,12 @@ func (a *authAdmission) credential(ctx context.Context, key string, create func(
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-f.done:
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			if errors.Is(f.err, context.Canceled) || errors.Is(f.err, context.DeadlineExceeded) {
+				return nil, errAuthRetry
+			}
 			return f.sess, f.err
 		}
 	}

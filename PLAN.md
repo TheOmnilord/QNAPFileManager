@@ -100,6 +100,11 @@ Ordering: `platform` before `fsops`; `workerpool` before any write path; `idmap.
 7. `id -G` / `getent` availability; `admin` uid; `administrators` group name and gid; whether `/etc/passwd` is a symlink.
 8. Hero: `/share/ZFS*_DATA` naming, per-share `st_dev`, ACL xattr name, `zfs` binary path, `aclmode`, `.zfs` visibility, `@Recycle` behaviour.
 9. `Pdeathsig` behaviour with `Credential`; free ports (`netstat -tlnp`).
+10. Whether the QTS proxy sets `X-Forwarded-For` (or another client-attribution header) on proxied requests. Without it every
+    peer is loopback, and the authentication failure budget can only key on the presented username: an attacker who
+    spams bad tokens for a known username can delay that user's uncached logins, and rotating usernames can slow all new
+    logins (established sessions and cached credentials are unaffected). This is an accepted residual risk of M0
+    (docs/reviews/m0-round6-adversarial.md finding 2) until the header is verified and per-client admission can be keyed on it.
 
 ## Verification
 

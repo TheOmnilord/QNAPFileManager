@@ -319,10 +319,11 @@ func TestSessionFollowersShareTotalWaitingBound(t *testing.T) {
 	s.AuthTimeout = 3 * time.Second
 	// Occupy every execution slot, independently of session-lock followers.
 	for i := 0; i < qtsauth.DefaultMaxConcurrentValidations; i++ {
-		if err := s.authAdmission.enter(context.Background(), true); err != nil {
+		revalidation := i%2 == 0
+		if err := s.authAdmission.enter(context.Background(), revalidation); err != nil {
 			t.Fatal(err)
 		}
-		defer s.authAdmission.leave(true)
+		defer s.authAdmission.leave(revalidation)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	var followers sync.WaitGroup

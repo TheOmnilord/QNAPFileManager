@@ -49,6 +49,16 @@ const readChunk = 256
 // cycle outside it would rather than spinning in this process.
 const maxLinkHops = 40
 
+// dirEntryInfo is one name from a directory read together with the metadata
+// that describes it, or the error that says why there is none. It exists
+// because the two platforms obtain that metadata differently — see readDirInfos
+// in open_linux.go and open_other.go — and List should not have to care which.
+type dirEntryInfo struct {
+	name string
+	info fs.FileInfo
+	err  error
+}
+
 // idMap is the uid/gid → name resolver. It is a process-wide value rather than
 // a parameter because it is a property of the machine, not of a request: the
 // worker sets it once at hello time, before it serves anything, and every
@@ -122,7 +132,25 @@ func resolve(r fsx.Root, apiPath string, followFinal bool) (jailPath, error) {
 		part := rest[0]
 		rest = rest[1:]
 		switch part {
-		case "", ".":
+		case "":
+			// A doubled separator inside a symlink target. The kernel collapses
+			// it to one and checks nothing extra, so neither does this.
+			continue
+		case ".":
+			// "." is not free. fsx.Clean refuses it in a request path, so the
+			// only way one arrives here is inside a symlink target — and there
+			// the kernel resolves it like any other component, against the
+			// directory it is written in: "file/." is ENOTDIR and "locked/."
+			// is EACCES for a user who cannot search locked, even though both
+			// name exactly what the walk is already standing on. Discarding it
+			// silently answered a question the kernel would have refused
+			// (INV-2), so the checks are made and their errors are the result.
+			if blocked != nil {
+				return jailPath{}, blocked
+			}
+			if err := checkTraversable(rt, relOf(done)); err != nil {
+				return jailPath{}, err
+			}
 			continue
 		case "..":
 			if blocked != nil {
@@ -335,9 +363,11 @@ func apiOf(parts []string) string {
 
 // List returns one page of a directory listing (backend plan §2.1).
 //
-// The listing is read with one getdents pass and one Info per entry — on Linux
-// DirEntry.Info is the data getdents already returned, so this is a single
-// syscall per chunk, not an Lstat per file. A symlink's own metadata is never
+// The listing is read one getdents chunk at a time, and every entry in a chunk
+// is described relative to the directory's own descriptor rather than by name
+// (readDirInfos): the names and the metadata then always come from the same
+// directory, even if that directory is renamed away and a symlink to somewhere
+// else takes its place mid-listing. A symlink's own metadata is never
 // followed: Size is the length of the link text and Mode is the link's mode,
 // exactly as ls -l reports them. The target is stat'ed for a symlink only when
 // opts.ResolveLinks asks for its type, or at /share where the share/volume-root
@@ -407,23 +437,23 @@ func List(ctx context.Context, r fsx.Root, plat *platform.Platform, dir string, 
 	entries := make([]fsx.Entry, 0, 64)
 	capped := false
 	for !capped {
-		des, readErr := f.ReadDir(readChunk)
+		des, readErr := readDirInfos(f, readChunk)
 		for _, de := range des {
-			name := de.Name()
+			name := de.name
 			hidden := strings.HasPrefix(name, ".")
 			if hidden && !o.ShowHidden {
 				continue
 			}
-			fi, err := de.Info()
-			if err != nil {
+			if de.err != nil {
 				// The entry was unlinked between getdents and the stat. That
 				// is a normal race in a live directory, not a failure of the
 				// listing.
-				if errors.Is(err, fs.ErrNotExist) {
+				if errors.Is(de.err, fs.ErrNotExist) {
 					continue
 				}
-				return fsx.Listing{}, err
+				return fsx.Listing{}, de.err
 			}
+			fi := de.info
 			child := fsx.Join(clean, name)
 			e := newEntry(child, []byte(name), fi, ids)
 			if mounts[name] {

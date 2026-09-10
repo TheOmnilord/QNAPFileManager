@@ -4,6 +4,9 @@ import {state,update,sessionGuard} from './state.js';
 import {initList,loadList} from './list.js';
 import {loadTree} from './tree.js';
 import {initViewer} from './viewer.js';
+import {sessionQuery,cleanSessionURL} from './bootstrap.js';
+
+let bootstrapQuery=sessionQuery(location.search);
 
 function theme(value) {
  if (!['auto','light','dark'].includes(value)) value='auto';
@@ -28,12 +31,15 @@ function navigate() {
 
 async function connect() {
  const valid=sessionGuard();
+ const params=bootstrapQuery;
+ bootstrapQuery={};
  try {
-  const session=await api('api/session');
+  const session=await api('api/session',params);
   if (!valid()) return;
   if (!session.authenticated) { signInNotice(); return; }
+  history.replaceState(history.state,'',cleanSessionURL(location.href));
   showSession(session);
- } catch(err) { if (valid()) error(err); }
+ } catch(err) { if (valid()) { if ('sid' in params) signInNotice(); error(err); } }
 }
 function showSession(session) {
   if (state.session) signInNotice();

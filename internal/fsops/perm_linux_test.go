@@ -212,3 +212,48 @@ func TestMetadataThroughNestedSearchOnlyDirectories(t *testing.T) {
 		t.Errorf("stat of a missing name = %v, want a not-exist error", err)
 	}
 }
+
+// TestADotComponentNeedsSearchPermissionOnTheDirectoryItNames: a symlink
+// target of "locked/." names locked itself, and naming it that way is a lookup
+// *inside* locked — which the kernel answers with EACCES for a user without
+// the search bit, exactly as it does for "locked/anything". The lstat that
+// classified locked from outside succeeded, so discarding the "." here reported
+// the directory as a usable target for a user the kernel would have refused
+// (INV-2), and the properties dialog advertised it as reachable.
+func TestADotComponentNeedsSearchPermissionOnTheDirectoryItNames(t *testing.T) {
+	requireSymlinks(t)
+	requireUnprivileged(t)
+	r, base := fixture(t)
+	mkdir(t, base, "locked")
+	write(t, base, "locked/secret", "not yours")
+	locked := filepath.Join(base, "locked")
+	chmodBack(t, locked, 0o755)
+	if err := os.Chmod(locked, 0o644); err != nil { // readable, not searchable
+		t.Fatal(err)
+	}
+	// The kernel has to be enforcing this for the test to mean anything: it is
+	// the "." lookup itself that needs the search bit here.
+	if _, err := os.Stat(filepath.Join(locked, ".")); !errors.Is(err, fs.ErrPermission) {
+		t.Skipf("this filesystem does not enforce the directory execute bit: %v", err)
+	}
+	if err := os.Symlink("locked/.", filepath.Join(base, "ptr")); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	if e, err := StatFollow(ctx, r, nil, "/ptr"); !errors.Is(err, fs.ErrPermission) {
+		t.Fatalf("entry %+v, err = %v, want a permission error", e, err)
+	} else if code := fsx.Code(err); code != "permission" {
+		t.Errorf("code = %q, want permission", code)
+	}
+	// Restoring the bit makes the same link resolve, so what was refused was the
+	// missing permission and not the "." itself.
+	if err := os.Chmod(locked, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if e, err := StatFollow(ctx, r, nil, "/ptr"); err != nil {
+		t.Fatalf("a searchable directory named through \"locked/.\": %v", err)
+	} else if e.Type != "dir" {
+		t.Errorf("type = %q, want dir", e.Type)
+	}
+}

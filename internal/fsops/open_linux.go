@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"strings"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
@@ -286,10 +287,10 @@ func openFinal(rt *os.Root, rel string) (*os.File, error) {
 // already followed every link on this path, so a symlink standing here is one
 // that appeared underneath us, and ELOOP says so rather than following it.
 //
-// osName is the directory's full OS path, used only to name the *os.File:
-// DirEntry.Info lstat's f.Name()+"/"+entry, so a jail-relative name would be
-// resolved against the process working directory and every entry would look
-// unlinked (the round-eight CI failure: every Linux listing came back empty).
+// osName is the directory's full OS path, and it now names the *os.File for
+// error messages only: readDirInfos stats every entry through this descriptor
+// rather than through a path built from f.Name(), so nothing here resolves a
+// name against the process working directory any more.
 func openDir(rt *os.Root, rel, osName string) (*os.File, error) {
 	dir, base := splitFinal(rel)
 	if base == "" || base == "." || base == ".." {
@@ -309,9 +310,150 @@ func openDir(rt *os.Root, rel, osName string) (*os.File, error) {
 	if err != nil {
 		return nil, &fs.PathError{Op: "openat", Path: rel, Err: err}
 	}
-	// A real O_RDONLY descriptor, so os.File.ReadDir reads it with getdents the
-	// way it reads any directory opened through os.Open.
+	// A real O_RDONLY descriptor, so os.File.Readdirnames reads it with getdents
+	// the way it reads any directory opened through os.Open.
 	return os.NewFile(uintptr(fd), osName), nil
+}
+
+// readDirInfos reads one chunk of a directory and describes each name, and on
+// Linux every part of that happens relative to the directory's own descriptor.
+//
+// That is the whole point of it. os.File.ReadDir hands back DirEntry values
+// whose Info() lstats f.Name()+"/"+name (unixDirent.Info in
+// $GOROOT/src/os/file_unix.go) unless the file came from an os.Root — and
+// openDir deliberately does not return an os.Root file, because os.Root asks
+// for read permission on every directory on the way. So Info() was a *path*
+// lookup: rename the listed directory and drop a symlink to somewhere else in
+// its place, and enumeration would carry on down the original descriptor while
+// the sizes, modes and owners came from the replacement — from outside the jail
+// if the link pointed there. Names from one directory, metadata from another.
+//
+// os.File.Readdir is not the answer either, whatever a given release does
+// internally: readdirFileInfo goes through f.lstatat in Go 1.26 but through
+// Lstat(f.name+"/"+name) in the releases before it, and this is not a property
+// to inherit from whichever toolchain builds the QPKG.
+//
+// So the names come from getdents (Readdirnames, which stats nothing) and each
+// one is then opened relative to the directory descriptor with O_PATH and
+// O_NOFOLLOW and fstat'ed — the same two-step statAt already uses, for the same
+// reason: O_PATH asks the kernel for nothing but the name, and O_NOFOLLOW makes
+// a symlink describe itself. A directory swapped in above us after openDir
+// cannot reach any of that, because none of it is ever named.
+//
+// A per-entry failure is reported per entry rather than for the listing: an
+// entry unlinked between getdents and the open is an ordinary race in a live
+// directory, and List drops it.
+func readDirInfos(f *os.File, n int) ([]dirEntryInfo, error) {
+	names, readErr := f.Readdirnames(n)
+	if len(names) == 0 {
+		return nil, readErr
+	}
+	rc, err := f.SyscallConn()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]dirEntryInfo, 0, len(names))
+	// One Control for the whole chunk: the descriptor is held once rather than
+	// re-acquired per entry.
+	if cerr := rc.Control(func(pfd uintptr) {
+		for _, name := range names {
+			fi, serr := lstatIn(int(pfd), name)
+			out = append(out, dirEntryInfo{name: name, info: fi, err: serr})
+		}
+	}); cerr != nil {
+		return nil, cerr
+	}
+	return out, readErr
+}
+
+// lstatIn is lstat(2) for one name inside an open directory, addressed by that
+// directory's descriptor and never by a path.
+func lstatIn(dirfd int, name string) (fs.FileInfo, error) {
+	var (
+		fd   int
+		serr error
+	)
+	for {
+		fd, serr = syscall.Openat(dirfd, name, oPath|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+		if serr != syscall.EINTR {
+			break
+		}
+	}
+	if serr != nil {
+		return nil, &fs.PathError{Op: "openat", Path: name, Err: serr}
+	}
+	defer syscall.Close(fd)
+	fi := &statFileInfo{name: name}
+	if err := syscall.Fstat(fd, &fi.st); err != nil {
+		return nil, &fs.PathError{Op: "fstat", Path: name, Err: err}
+	}
+	return fi, nil
+}
+
+// statFileInfo is an fs.FileInfo over a raw syscall.Stat_t.
+//
+// The os package has one of these and will not share it, and going through
+// os.NewFile just to call Stat would allocate an *os.File with a finalizer for
+// every entry of a fifty-thousand-entry listing. Sys returns the *syscall.Stat_t
+// itself, which is what statDetail (uid, gid, nlink) and fsx.statDetail (those
+// plus dev and ino) read, so an fsx.Entry built from this carries everything an
+// entry built from os.Lstat carries.
+//
+// The one thing it is not is an argument for os.SameFile, which type-asserts
+// both sides to the os package's own fileStat and answers false for anything
+// else. Nothing needs it to be: OpenRead's identity check compares FileInfos
+// from statAt, which are still the os package's own, and a listing entry is
+// never compared to anything.
+type statFileInfo struct {
+	name string
+	st   syscall.Stat_t
+}
+
+func (fi *statFileInfo) Name() string      { return fi.name }
+func (fi *statFileInfo) Size() int64       { return fi.st.Size }
+func (fi *statFileInfo) Mode() fs.FileMode { return statMode(fi.st.Mode) }
+func (fi *statFileInfo) IsDir() bool       { return fi.Mode().IsDir() }
+func (fi *statFileInfo) Sys() any          { return &fi.st }
+
+func (fi *statFileInfo) ModTime() time.Time {
+	sec, nsec := fi.st.Mtim.Unix()
+	return time.Unix(sec, nsec)
+}
+
+// statMode turns st_mode into an fs.FileMode, exactly as
+// fillFileStatFromSys does in $GOROOT/src/os/stat_linux.go. The permission bits
+// are the low nine; the file type is the S_IFMT field, which is a value and not
+// a bitmask, so it is switched on rather than tested; setuid, setgid and sticky
+// are separate flags in fs.FileMode and are carried over one by one because
+// fsx.ModeOctal and fsx.ModeString both report them.
+func statMode(m uint32) fs.FileMode {
+	mode := fs.FileMode(m & 0o777)
+	switch m & syscall.S_IFMT {
+	case syscall.S_IFBLK:
+		mode |= fs.ModeDevice
+	case syscall.S_IFCHR:
+		mode |= fs.ModeDevice | fs.ModeCharDevice
+	case syscall.S_IFDIR:
+		mode |= fs.ModeDir
+	case syscall.S_IFIFO:
+		mode |= fs.ModeNamedPipe
+	case syscall.S_IFLNK:
+		mode |= fs.ModeSymlink
+	case syscall.S_IFSOCK:
+		mode |= fs.ModeSocket
+	case syscall.S_IFREG:
+		// A regular file is the absence of a type bit.
+	}
+	if m&syscall.S_ISUID != 0 {
+		mode |= fs.ModeSetuid
+	}
+	if m&syscall.S_ISGID != 0 {
+		mode |= fs.ModeSetgid
+	}
+	if m&syscall.S_ISVTX != 0 {
+		mode |= fs.ModeSticky
+	}
+	return mode
 }
 
 // checkTraversable asks the kernel whether this process may search dir, and

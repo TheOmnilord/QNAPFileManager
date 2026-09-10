@@ -114,6 +114,11 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	authCancel()
 	if err != nil {
 		switch {
+		case errors.Is(err, errCSRF):
+			s.fail(w, r, "permission", "The request could not be verified. Refresh and try again.", "", "")
+		case errors.Is(err, errAuthRetry):
+			w.Header().Set("Retry-After", "1")
+			writeError(w, 503, "retry", "Authentication was interrupted. Try again.", "", r.URL.Path, "")
 		case errors.Is(err, context.DeadlineExceeded):
 			writeError(w, 504, "auth_timeout", "Authentication timed out. Try again.", "", r.URL.Path, "")
 		case errors.Is(err, qtsauth.ErrOverloaded):
@@ -147,12 +152,6 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		s.fail(w, r, "unauthorized", "Sign in to QTS to continue.", "", "")
 		return
-	}
-	if !safeMethod(r.Method) {
-		if !validCSRF(r, sess.csrf) {
-			s.fail(w, r, "permission", "The request could not be verified. Refresh and try again.", "", "")
-			return
-		}
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	method, ok := routes[r.URL.Path]

@@ -23,6 +23,7 @@ const (
 
 var errSession = errors.New("invalid session")
 var errSessionStoreFull = errors.New("session store full")
+var errCSRF = errors.New("invalid CSRF token or origin")
 
 type session struct {
 	mu                      sync.Mutex
@@ -238,6 +239,11 @@ func (s *Server) authenticateCredential(r *http.Request, sess *session, cred qts
 }
 
 func (s *Server) authenticateSession(w http.ResponseWriter, r *http.Request, old *session, cred qtsauth.Cred, hasCred bool) (*session, error) {
+	// CSRF is immutable and bound to this session. Reject before waiting for
+	// its lock or admitting any forced QTS revalidation.
+	if !safeMethod(r.Method) && !validCSRF(r, old.csrf) {
+		return nil, errCSRF
+	}
 	// Include requests that converged on this session during insertion too.
 	n := old.authRequests.Add(1)
 	defer old.authRequests.Add(-1)

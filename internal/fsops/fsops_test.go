@@ -893,6 +893,45 @@ func TestDotDotAfterAnUntraversableComponentIsRefused(t *testing.T) {
 	}
 }
 
+// TestADotComponentInALinkTargetIsStillTheKernelsToCheck: "." names the
+// directory the walk is standing on, and naming it is a lookup like any other —
+// the kernel requires that the thing being stood on *is* a directory. A link
+// targeting "b.txt/." is ENOTDIR, because b.txt is a regular file, even though
+// dropping the "." would leave a name that resolves perfectly well. Discarding
+// it here reported the file as the link's target and served it: an answer the
+// kernel would have refused (INV-2).
+func TestADotComponentInALinkTargetIsStillTheKernelsToCheck(t *testing.T) {
+	requireSymlinks(t)
+	requirePOSIXLinks(t)
+	r, base := fixture(t)
+	if err := os.Symlink("b.txt/.", filepath.Join(base, "dotfile")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("a/.", filepath.Join(base, "dotdir")); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	// The kernel has to be refusing it for the test to be measuring anything.
+	if _, err := os.Stat(filepath.Join(base, "dotfile")); err == nil {
+		t.Skip("this host resolves a link target of \"file/.\" to the file itself")
+	}
+	if e, err := StatFollow(ctx, r, nil, "/dotfile"); err == nil {
+		t.Fatalf("a link target of \"b.txt/.\" must fail the way the kernel fails it, got %+v", e)
+	} else if code := fsx.Code(err); code != "bad_request" {
+		t.Errorf("code = %q, want bad_request (%v)", code, err)
+	}
+	// And a "." on something that really is a directory still resolves, so this
+	// is the check the kernel makes rather than a blanket refusal.
+	e, err := StatFollow(ctx, r, nil, "/dotdir")
+	if err != nil {
+		t.Fatalf("a link target of \"a/.\" names the directory a: %v", err)
+	}
+	if e.Type != "dir" {
+		t.Errorf("entry = %+v, want the directory a described through the link", e)
+	}
+}
+
 // A symlink loop must end, and end as an error rather than as a hung worker.
 func TestSymlinkLoopsAreRefused(t *testing.T) {
 	requireSymlinks(t)

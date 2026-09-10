@@ -16,6 +16,23 @@ func openDir(rt *os.Root, rel, _ string) (*os.File, error) {
 	return rt.OpenFile(rel, os.O_RDONLY, 0)
 }
 
+// readDirInfos off Linux is os.File.ReadDir and DirEntry.Info, which is what
+// the shared listing used everywhere before Linux needed its own. The file
+// openDir returns here comes from os.Root, and an os.Root DirEntry loads its
+// metadata relative to the directory descriptor rather than through a path
+// (newUnixDirent in $GOROOT/src/os/file_unix.go takes the lstatat branch when
+// the parent was opened in a Root) — so the swap-the-directory-for-a-symlink
+// race the Linux version exists to close does not arise on this path either.
+func readDirInfos(f *os.File, n int) ([]dirEntryInfo, error) {
+	des, readErr := f.ReadDir(n)
+	out := make([]dirEntryInfo, 0, len(des))
+	for _, de := range des {
+		fi, err := de.Info()
+		out = append(out, dirEntryInfo{name: de.Name(), info: fi, err: err})
+	}
+	return out, readErr
+}
+
 // statAt off Linux is os.Root's own stat. There is no O_PATH to walk the
 // intermediate directories with, so the walk is os.Root's — which asks for read
 // permission on every directory on the way, where Linux now asks only for

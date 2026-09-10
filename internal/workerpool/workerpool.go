@@ -189,9 +189,10 @@ type Pool struct {
 	budgets  map[string]*budget
 	closed   bool
 
-	// stagedExe is the tmpfs copy of the worker binary, created once by
-	// workerExes; empty until then, and left empty if staging fails.
-	stageOnce sync.Once
+	// stagedExe is the tmpfs copy of the worker binary. It is created lazily by
+	// workerExes and cached only on success, so a transient failure (a full
+	// /tmp) does not disable non-root workers until a restart.
+	stageMu   sync.Mutex
 	stagedExe string
 
 	nextID atomic.Uint64

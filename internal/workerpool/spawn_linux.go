@@ -83,7 +83,7 @@ func (p *Pool) spawnProcess(who backend.Principal) (*client, error) {
 	// copy on a system tmpfs (outside that enforcement) is where the worker is
 	// exec'd from instead. The install path still works where it is reachable
 	// — QuTS hero's ZFS volumes, and the dev box — so it stays as the fallback.
-	candidates := p.workerExes(exe)
+	candidates := p.workerExes(exe, who.Root)
 	var cmd *exec.Cmd
 	var startErr error
 	for i, cand := range candidates {
@@ -169,22 +169,39 @@ func isExecDenied(err error) bool {
 		errors.Is(err, syscall.ENOENT)
 }
 
-// workerExes returns the binaries to try execing a worker from, best first: the
-// staged tmpfs copy (created once) then the install path. The staging is why a
-// worker can run at all on a QTS ext4 shared folder, whose access QNAP enforces
-// against a non-root uid regardless of the POSIX mode.
-func (p *Pool) workerExes(install string) []string {
-	p.stageOnce.Do(func() {
-		staged, err := stageWorkerBinary(install, p.tmpDir())
-		if err != nil {
+// workerExes returns the binaries to try execing a worker from, best first.
+//
+// A ROOT worker is never given the staged tmpfs copy: root can exec the
+// install-path binary directly (the daemon itself runs from there), so it has
+// no need of /tmp — and routing it through a world-adjacent location would be
+// the one place a tampered staged binary could run as root. Root uses the
+// install path alone.
+//
+// A non-root worker tries the staged copy first, because on a QTS ext4 shared
+// folder the install tree is unreachable to a non-root uid whatever its mode.
+// Staging is cached only on success, so a transient failure is retried on the
+// next spawn rather than disabling non-root workers until a restart.
+func (p *Pool) workerExes(install string, root bool) []string {
+	if root {
+		return dedupNonEmpty(install)
+	}
+	p.stageMu.Lock()
+	if p.stagedExe == "" {
+		if staged, err := stageWorkerBinary(install, p.tmpDir()); err != nil {
 			p.opts.Logger.Printf("workerpool: could not stage the worker binary on tmpfs (%v); using the install path", err)
-			return
+		} else {
+			p.stagedExe = staged
 		}
-		p.stagedExe = staged
-	})
+	}
+	staged := p.stagedExe
+	p.stageMu.Unlock()
+	return dedupNonEmpty(staged, install)
+}
+
+func dedupNonEmpty(paths ...string) []string {
 	var out []string
 	seen := map[string]bool{}
-	for _, e := range []string{p.stagedExe, install} {
+	for _, e := range paths {
 		if e != "" && !seen[e] {
 			seen[e] = true
 			out = append(out, e)
@@ -200,23 +217,35 @@ func (p *Pool) tmpDir() string {
 	return "/tmp"
 }
 
-// stageWorkerBinary copies src to a root-owned directory on the given tmpfs and
-// returns the copy's path. The directory is 0755 (world-traversable, not
-// world-writable) under a sticky /tmp, so a non-root worker can exec the binary
-// but cannot replace it. The copy is atomic: a temp file, chmod, then rename.
+// stageWorkerBinary copies src to a root-owned 0755 directory on the given
+// tmpfs and returns the copy's path, so a non-root worker can exec the binary
+// even where the install tree denies it.
+//
+// The security of this rests on two things the function verifies rather than
+// assumes, because /tmp is world-writable:
+//
+//   - The parent must be root-owned and sticky. Sticky is what stops a non-root
+//     user renaming or deleting our directory once it exists, and root-owned is
+//     what stops them having created a decoy we would adopt.
+//   - Our directory must be a real directory (not a symlink), root-owned, and
+//     not writable by group or other. It is created exclusively; a pre-existing
+//     entry is reused only if it passes those checks, and otherwise removed and
+//     recreated. So a directory an attacker pre-created is never written into.
+//
+// The copy itself is atomic and pathname-race-free: a CreateTemp file in the
+// verified directory, fchmod on the open descriptor, then a rename into place.
 func stageWorkerBinary(src, tmpDir string) (string, error) {
 	if src == "" {
 		return "", errors.New("no source binary to stage")
 	}
+	if err := requireRootStickyDir(tmpDir); err != nil {
+		return "", fmt.Errorf("staging parent %s is not a safe root-owned sticky directory: %w", tmpDir, err)
+	}
 	dir := filepath.Join(tmpDir, ".qnapfilemanager")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := ensureRootOwnedDir(dir); err != nil {
 		return "", err
 	}
-	// MkdirAll honours the umask, which on QTS can be 022 or stricter; force the
-	// directory world-traversable so any user's worker can reach the binary.
-	if err := os.Chmod(dir, 0o755); err != nil {
-		return "", err
-	}
+
 	in, err := os.Open(src)
 	if err != nil {
 		return "", err
@@ -228,16 +257,19 @@ func stageWorkerBinary(src, tmpDir string) (string, error) {
 		return "", err
 	}
 	tmpName := tmp.Name()
+	cleanup := func() { tmp.Close(); os.Remove(tmpName) }
 	if _, err := io.Copy(tmp, in); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
+		cleanup()
+		return "", err
+	}
+	// Fchmod the open descriptor, not the pathname: the directory is root-owned
+	// and not group/other-writable, but chmod-by-name is still the wrong habit
+	// in a shared /tmp.
+	if err := tmp.Chmod(0o755); err != nil {
+		cleanup()
 		return "", err
 	}
 	if err := tmp.Close(); err != nil {
-		os.Remove(tmpName)
-		return "", err
-	}
-	if err := os.Chmod(tmpName, 0o755); err != nil {
 		os.Remove(tmpName)
 		return "", err
 	}
@@ -247,6 +279,63 @@ func stageWorkerBinary(src, tmpDir string) (string, error) {
 		return "", err
 	}
 	return dst, nil
+}
+
+// requireRootStickyDir verifies that path is a directory (not a symlink) owned
+// by root with the sticky bit set. Nothing under a parent that is not both is
+// safe from a non-root user in /tmp.
+func requireRootStickyDir(path string) error {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("not a directory")
+	}
+	if fi.Mode()&os.ModeSticky == 0 {
+		return fmt.Errorf("not sticky")
+	}
+	if !rootOwned(fi) {
+		return fmt.Errorf("not owned by root")
+	}
+	return nil
+}
+
+// ensureRootOwnedDir makes dir a root-owned directory that is not writable by
+// group or other, creating it exclusively and removing any decoy an attacker
+// pre-created. The bounded loop closes the tiny window between removing a decoy
+// and recreating it; once our root-owned directory exists under a sticky parent
+// no non-root user can disturb it.
+func ensureRootOwnedDir(dir string) error {
+	for try := 0; try < 8; try++ {
+		err := os.Mkdir(dir, 0o755)
+		if err == nil {
+			return nil // we created it, so it is ours
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			return err
+		}
+		fi, lerr := os.Lstat(dir)
+		if lerr != nil {
+			continue
+		}
+		if fi.IsDir() && fi.Mode()&os.ModeSymlink == 0 && rootOwned(fi) && fi.Mode().Perm()&0o022 == 0 {
+			return nil // a pre-existing directory that is safe to reuse
+		}
+		// A decoy: a symlink, an attacker-owned directory, or a group/other
+		// writable one. Root may remove it (RemoveAll unlinks a symlink as-is
+		// rather than following it), then the loop recreates it.
+		if rerr := os.RemoveAll(dir); rerr != nil {
+			return rerr
+		}
+	}
+	return fmt.Errorf("could not create a safe %s", dir)
+}
+
+// rootOwned reports whether the file is owned by uid 0.
+func rootOwned(fi os.FileInfo) bool {
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	return ok && st.Uid == 0
 }
 
 // workerEnv is the whole environment a worker gets. Nothing is inherited: the

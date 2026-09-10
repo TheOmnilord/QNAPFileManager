@@ -245,6 +245,42 @@ func TestAuditContextCancellation(t *testing.T) {
 	}
 }
 
+// TestReconcileReadOnly proves the round-8 fix: after a settings rollback whose
+// config.Save errors, the guard is reconciled to the value ACTUALLY on disk (a
+// re-read), not a guess — because "save failed" does not imply "file unchanged"
+// (a rename can land before a later SyncDir/Chmod fails). If the re-read also
+// fails, it falls back fail-closed to read-only.
+func TestReconcileReadOnly(t *testing.T) {
+	loadOK := func(v bool) func(string) (config.Config, error) {
+		return func(string) (config.Config, error) { return config.Config{ReadOnly: v}, nil }
+	}
+	loadFail := func(string) (config.Config, error) { return config.Config{}, fmt.Errorf("reload failed") }
+	nolog := func(string, ...any) {}
+	saveErr := fmt.Errorf("sync dir failed after rename")
+
+	cases := []struct {
+		name    string
+		want    bool
+		saveErr error
+		load    func(string) (config.Config, error)
+		expect  bool
+	}{
+		{"save-ok-uses-want", false, nil, loadFail, false},
+		{"save-ok-uses-want-true", true, nil, loadFail, true},
+		{"save-fail-file-holds-prev", true, saveErr, loadOK(true), true},
+		{"save-fail-post-publish-file-swapped", true, saveErr, loadOK(false), false}, // the flagged case
+		{"save-fail-and-reload-fail-closes", false, saveErr, loadFail, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := reconcileReadOnly("/cfg.json", tc.want, tc.saveErr, tc.load, nolog)
+			if got != tc.expect {
+				t.Fatalf("reconcileReadOnly = %v, want %v", got, tc.expect)
+			}
+		})
+	}
+}
+
 func TestBatchMilestoneResultReflectsOutcome(t *testing.T) {
 	s, b := fixture(t, true)
 	s.guard.SetReadOnly(false)

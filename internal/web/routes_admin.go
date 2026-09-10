@@ -44,6 +44,34 @@ func (s *Server) getSettings(w http.ResponseWriter, r *http.Request, sess *sessi
 // CSRF + Origin + a forced milestone audit line gate the toggle instead. A
 // break-glass password exists only on the separate TLS listener (decision 3),
 // not on this route.
+// reconcileReadOnly decides the value the live guard (and in-memory config) must
+// take after a settings-toggle rollback whose config.Save returned saveErr. It
+// exists so the guard and the persisted config can never disagree in ANY failure
+// combination (round-7/8 reviews):
+//
+//   - saveErr == nil: the file now holds `want` (prevVal); use it.
+//   - saveErr != nil: "save failed" does NOT imply "file unchanged" — config.Save
+//     writes a temp file and renames it, so the rename can land (the file already
+//     holds `want`) while a later SyncDir or Chmod errors. Guessing would risk
+//     setting the guard opposite to the file, so re-read the file and match its
+//     actual value. If the re-read ALSO fails, the on-disk state is unknowable, so
+//     fail CLOSED (read-only on, writes blocked) and rely on the caller's log.
+//
+// load and logf are injected so the branches are unit-testable without forcing a
+// post-rename failure inside config.Save.
+func reconcileReadOnly(path string, want bool, saveErr error, load func(string) (config.Config, error), logf func(string, ...any)) bool {
+	if saveErr == nil {
+		return want
+	}
+	if loaded, lerr := load(path); lerr == nil {
+		logf("settings rollback: save failed (%v); reconciled guard to the on-disk readOnly=%v", saveErr, loaded.ReadOnly)
+		return loaded.ReadOnly
+	} else {
+		logf("settings rollback: save failed (%v) and reload failed (%v); guard forced read-only (fail-closed)", saveErr, lerr)
+		return true
+	}
+}
+
 func (s *Server) postSettings(w http.ResponseWriter, r *http.Request, sess *session) {
 	if !s.requireAdmin(w, r, sess) {
 		return
@@ -150,10 +178,8 @@ func (s *Server) postSettings(w http.ResponseWriter, r *http.Request, sess *sess
 		if s.ConfigPath != "" {
 			c := s.cfg
 			c.ReadOnly = prevVal
-			if serr := config.Save(s.ConfigPath, c); serr != nil {
-				s.logger.Printf("settings rollback: could not restore readOnly=%v after an audit failure: %v", prevVal, serr)
-				effective = newVal // could not un-persist; the file still holds newVal
-			}
+			serr := config.Save(s.ConfigPath, c)
+			effective = reconcileReadOnly(s.ConfigPath, prevVal, serr, config.Load, s.logger.Printf)
 		}
 		s.cfg.ReadOnly = effective
 		if s.guard != nil {

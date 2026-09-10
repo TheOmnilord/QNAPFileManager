@@ -68,7 +68,13 @@ func New(cfg config.Config, b backend.Backend, v *qtsauth.Verifier, ids *idmap.M
 		cp.Groups = append([]int{}, pinned.Groups...)
 		pinned = &cp
 	}
-	return &Server{cfg: cfg, backend: b, verifier: v, ids: ids, platform: p, pinned: pinned, version: version, logger: logger, sessions: make(map[string]*session)}
+	s := &Server{cfg: cfg, backend: b, verifier: v, ids: ids, platform: p, pinned: pinned, version: version, logger: logger, sessions: make(map[string]*session)}
+	// The admission channels are created here, before any goroutine can see
+	// the server, rather than lazily on the first request: the race detector
+	// caught a test reading them while the first request's once.Do was still
+	// assigning them. The lazy path stays as a guard for zero-value fixtures.
+	s.authAdmission.init()
+	return s
 }
 
 // routes is also the source of truth for the static JS endpoint contract test.

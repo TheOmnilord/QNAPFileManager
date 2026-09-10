@@ -129,3 +129,20 @@ HTTPS or is closed. The SSL port is taken from the redirect Location (port only;
 for a closed HTTP port, from `[Stunnel] Port` in uLinux.conf (default 443), and the self-signed QTS certificate is
 accepted (`InsecureSkipVerify`) because the connection is loopback only. `authLogin.cgi` on 8181 exposes `webAccessPort`,
 `stunnelEnabled` and `stunnelPort`, matching `[Stunnel]` in `uLinux.conf`.
+
+## 7. Third hardware finding: QTS ext4 shared folders deny non-root access to the QPKG tree (2026-09-10)
+
+On the QTS unit (.95), per-user workers failed with `fork/exec … permission denied` even though every directory in the
+install path was mode 0777/0755 and the binary 0755 with no POSIX ACL. A plain `cp` (stat) of the binary by the non-root
+SSH user also failed. So QTS enforces access to shared-folder contents (`/share/CE_CACHEDEV2_DATA`, ext4) beyond the POSIX
+mode: a non-root uid cannot reach into the `.qpkg` tree at all. The root daemon runs fine (it ignores the enforcement), so
+the only failure is the dropped-privilege worker. QuTS hero's ZFS volume does not enforce this, which is why the hero unit
+worked and the QTS unit did not.
+
+`/tmp` is a plain system tmpfs (`rw`, no `noexec`, not under `/share`), outside that enforcement. Fix (commit follows): the
+root daemon stages a copy of its worker binary into a root-owned 0755 directory on `/tmp` at first spawn and execs workers
+from there, with the install path kept as a fallback for units where it is reachable (hero, dev). The staged copy is
+root-owned under sticky `/tmp`, so a non-root user can exec but not replace it.
+
+Mount facts captured: `/` tmpfs mode 755; `/tmp` tmpfs 64 MiB; `/share` tmpfs 16 MiB; `/share/CE_CACHEDEV2_DATA` ext4
+(`data=ordered`, user quotas). `su` is not present in the QTS busybox. `getcfg System Version` = 5.2.9.

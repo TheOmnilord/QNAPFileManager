@@ -3,11 +3,15 @@ package workerpool
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"log"
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"syscall"
@@ -71,13 +75,51 @@ func (p *Pool) spawnProcess(who backend.Principal) (*client, error) {
 	if who.Root {
 		uid = 0
 	}
+
+	// Try the staged tmpfs copy of the binary first, then the install path.
+	// On QTS the QPKG lives on an ext4 shared folder whose access QNAP enforces
+	// beyond the POSIX mode: a worker that dropped to the user's uid could not
+	// even reach the binary, so every fork/exec returned EACCES. A root-owned
+	// copy on a system tmpfs (outside that enforcement) is where the worker is
+	// exec'd from instead. The install path still works where it is reachable
+	// — QuTS hero's ZFS volumes, and the dev box — so it stays as the fallback.
+	candidates := p.workerExes(exe)
+	var cmd *exec.Cmd
+	var startErr error
+	for i, cand := range candidates {
+		cmd = buildWorkerCmd(p.shutdownCtx, cand, uid, who, devnull, logw, childFile)
+		if startErr = cmd.Start(); startErr == nil {
+			break
+		}
+		if i == len(candidates)-1 || !isExecDenied(startErr) {
+			uc.Close()
+			return nil, fmt.Errorf("starting the worker for %s: %w", c.key, startErr)
+		}
+		p.opts.Logger.Printf("workerpool: worker %s could not exec %s (%v); trying the next binary", c.key, cand, startErr)
+	}
+	c.cmd = cmd
+	c.pid = cmd.Process.Pid
+	go func() {
+		defer close(c.exited)
+		if err := cmd.Wait(); err != nil {
+			p.opts.Logger.Printf("workerpool: worker %s (pid %d) exited: %v", c.key, c.pid, err)
+		}
+	}()
+	c.kill = func(ctx context.Context) { stopProcess(ctx, c) }
+	return c, nil
+}
+
+// buildWorkerCmd assembles the exec.Cmd for one worker from a candidate binary
+// path. It is a function of the path alone so a failed Start can be retried
+// against the next candidate with the same fds and credentials.
+func buildWorkerCmd(shutdownCtx context.Context, exe string, uid int, who backend.Principal, devnull *os.File, logw io.Writer, childFile *os.File) *exec.Cmd {
 	// The pool's context, not the requesting user's: a worker outlives the
 	// request that spawned it. What it buys is the end of the shutdown, where a
 	// process forked by a startup nothing had a handle for yet — one whose
 	// cmd.Start returned after the shutdown had finished sweeping — would
 	// otherwise be left running with a user's credentials and the front-end's
 	// descriptors, with nobody left to signal it.
-	cmd := exec.CommandContext(p.shutdownCtx, exe, "-worker", "-uid", strconv.Itoa(uid))
+	cmd := exec.CommandContext(shutdownCtx, exe, "-worker", "-uid", strconv.Itoa(uid))
 	// The cancellation aims at the process group, the way the signal ladder
 	// does, so anything the worker started dies with it rather than being
 	// reparented; os/exec's default would signal the leader alone. WaitDelay
@@ -113,21 +155,98 @@ func (p *Pool) spawnProcess(who backend.Principal) (*client, error) {
 			Groups: credGroups(who),
 		}
 	}
+	return cmd
+}
 
-	if err := cmd.Start(); err != nil {
-		uc.Close()
-		return nil, fmt.Errorf("starting the worker for %s: %w", c.key, err)
-	}
-	c.cmd = cmd
-	c.pid = cmd.Process.Pid
-	go func() {
-		defer close(c.exited)
-		if err := cmd.Wait(); err != nil {
-			p.opts.Logger.Printf("workerpool: worker %s (pid %d) exited: %v", c.key, c.pid, err)
+// isExecDenied reports whether a cmd.Start failure is the kind a different
+// binary path might avoid: the file could not be reached or executed. It is the
+// only failure worth retrying another candidate for — a bad flag or an OOM is
+// not.
+func isExecDenied(err error) bool {
+	return errors.Is(err, fs.ErrPermission) ||
+		errors.Is(err, syscall.EACCES) ||
+		errors.Is(err, syscall.ENOEXEC) ||
+		errors.Is(err, syscall.ENOENT)
+}
+
+// workerExes returns the binaries to try execing a worker from, best first: the
+// staged tmpfs copy (created once) then the install path. The staging is why a
+// worker can run at all on a QTS ext4 shared folder, whose access QNAP enforces
+// against a non-root uid regardless of the POSIX mode.
+func (p *Pool) workerExes(install string) []string {
+	p.stageOnce.Do(func() {
+		staged, err := stageWorkerBinary(install, p.tmpDir())
+		if err != nil {
+			p.opts.Logger.Printf("workerpool: could not stage the worker binary on tmpfs (%v); using the install path", err)
+			return
 		}
-	}()
-	c.kill = func(ctx context.Context) { stopProcess(ctx, c) }
-	return c, nil
+		p.stagedExe = staged
+	})
+	var out []string
+	seen := map[string]bool{}
+	for _, e := range []string{p.stagedExe, install} {
+		if e != "" && !seen[e] {
+			seen[e] = true
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+func (p *Pool) tmpDir() string {
+	if p.opts.TmpDir != "" {
+		return p.opts.TmpDir
+	}
+	return "/tmp"
+}
+
+// stageWorkerBinary copies src to a root-owned directory on the given tmpfs and
+// returns the copy's path. The directory is 0755 (world-traversable, not
+// world-writable) under a sticky /tmp, so a non-root worker can exec the binary
+// but cannot replace it. The copy is atomic: a temp file, chmod, then rename.
+func stageWorkerBinary(src, tmpDir string) (string, error) {
+	if src == "" {
+		return "", errors.New("no source binary to stage")
+	}
+	dir := filepath.Join(tmpDir, ".qnapfilemanager")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	// MkdirAll honours the umask, which on QTS can be 022 or stricter; force the
+	// directory world-traversable so any user's worker can reach the binary.
+	if err := os.Chmod(dir, 0o755); err != nil {
+		return "", err
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return "", err
+	}
+	defer in.Close()
+
+	tmp, err := os.CreateTemp(dir, "qfm-*")
+	if err != nil {
+		return "", err
+	}
+	tmpName := tmp.Name()
+	if _, err := io.Copy(tmp, in); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return "", err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return "", err
+	}
+	if err := os.Chmod(tmpName, 0o755); err != nil {
+		os.Remove(tmpName)
+		return "", err
+	}
+	dst := filepath.Join(dir, "qnapfilemanager")
+	if err := os.Rename(tmpName, dst); err != nil {
+		os.Remove(tmpName)
+		return "", err
+	}
+	return dst, nil
 }
 
 // workerEnv is the whole environment a worker gets. Nothing is inherited: the

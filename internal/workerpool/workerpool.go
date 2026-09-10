@@ -120,6 +120,11 @@ type Options struct {
 	// test binary does not understand -worker.
 	Executable string
 
+	// TmpDir is the tmpfs the worker binary is staged into so a non-root worker
+	// can exec it even when the install tree (a QTS shared folder) denies that.
+	// Empty means /tmp. Tests point it at t.TempDir().
+	TmpDir string
+
 	// Now is the clock. Nil means time.Now; tests replace it to age workers
 	// without sleeping.
 	Now func() time.Time
@@ -183,6 +188,11 @@ type Pool struct {
 	retiring map[*client]struct{}
 	budgets  map[string]*budget
 	closed   bool
+
+	// stagedExe is the tmpfs copy of the worker binary, created once by
+	// workerExes; empty until then, and left empty if staging fails.
+	stageOnce sync.Once
+	stagedExe string
 
 	nextID atomic.Uint64
 

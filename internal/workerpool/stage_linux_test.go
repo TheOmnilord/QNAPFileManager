@@ -7,17 +7,56 @@ import (
 	"testing"
 )
 
-// TestRequireRootStickyDir checks the parent gate: a normal temp directory is
-// not sticky and not root-owned, so it is refused; /tmp on a Linux runner is
-// root-owned and sticky, so it is accepted.
-func TestRequireRootStickyDir(t *testing.T) {
-	if err := requireRootStickyDir(t.TempDir()); err == nil {
-		t.Error("a non-sticky, non-root temp dir was accepted as a staging parent")
+// TestRequireSafeParentNonRoot checks the ownership half without root: a
+// directory this test owns is not root-owned, so it is refused.
+func TestRequireSafeParentNonRoot(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("this case is about a non-root-owned parent")
 	}
-	if err := requireRootStickyDir("/tmp"); err != nil {
-		// Every Linux system ships /tmp root-owned and sticky; if this fails the
-		// runner is unusual, not the code.
-		t.Skipf("/tmp is not the usual root-owned sticky dir here: %v", err)
+	if err := requireSafeParent(t.TempDir()); err == nil {
+		t.Error("a non-root-owned temp dir was accepted as a staging parent")
+	}
+}
+
+// TestRequireSafeParentRootGated constructs the three parents that matter, which
+// needs root to own them: a world-writable non-sticky dir (QTS /tmp) is refused;
+// a sticky 1777 dir (a proper /tmp) and a 0755 dir (the QTS root tmpfs) are both
+// accepted.
+func TestRequireSafeParentRootGated(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("constructing root-owned parents needs root")
+	}
+	for _, tc := range []struct {
+		name string
+		mode os.FileMode
+		ok   bool
+	}{
+		{"world-writable non-sticky", 0o777, false},
+		{"sticky 1777", 0o777 | os.ModeSticky, true},
+		{"root-only 0755", 0o755, true},
+		{"group-writable non-sticky", 0o775, false},
+	} {
+		dir := filepath.Join(t.TempDir(), tc.name)
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(dir, tc.mode); err != nil {
+			t.Fatal(err)
+		}
+		err := requireSafeParent(dir)
+		if tc.ok && err != nil {
+			t.Errorf("%s (%v) was refused: %v", tc.name, tc.mode, err)
+		}
+		if !tc.ok && err == nil {
+			t.Errorf("%s (%v) was accepted", tc.name, tc.mode)
+		}
+	}
+	// A symlink parent is refused (not a directory by Lstat).
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink("/", link); err == nil {
+		if requireSafeParent(link) == nil {
+			t.Error("a symlink was accepted as a staging parent")
+		}
 	}
 }
 

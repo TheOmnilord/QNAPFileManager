@@ -187,10 +187,18 @@ func (p *Pool) workerExes(install string, root bool) []string {
 	}
 	p.stageMu.Lock()
 	if p.stagedExe == "" {
-		if staged, err := stageWorkerBinary(install, p.tmpDir()); err != nil {
-			p.opts.Logger.Printf("workerpool: could not stage the worker binary on tmpfs (%v); using the install path", err)
-		} else {
+		for _, parent := range p.stagingParents() {
+			staged, err := stageWorkerBinary(install, parent)
+			if err != nil {
+				p.opts.Logger.Printf("workerpool: cannot stage the worker binary under %s (%v)", parent, err)
+				continue
+			}
 			p.stagedExe = staged
+			p.opts.Logger.Printf("workerpool: staged the worker binary at %s", staged)
+			break
+		}
+		if p.stagedExe == "" {
+			p.opts.Logger.Printf("workerpool: no safe staging directory found; using the install path")
 		}
 	}
 	staged := p.stagedExe
@@ -210,11 +218,17 @@ func dedupNonEmpty(paths ...string) []string {
 	return out
 }
 
-func (p *Pool) tmpDir() string {
+// stagingParents lists the directories to try staging the worker binary under,
+// best first. A test pins one with TmpDir. In production the list ends at "/":
+// the root filesystem is a root-owned, non-world-writable tmpfs on QTS (mode
+// 755), which is a safe parent even though QTS's /tmp is world-writable and not
+// sticky (so refused). "/tmp" is tried first for the ordinary case where it is
+// the usual sticky 1777.
+func (p *Pool) stagingParents() []string {
 	if p.opts.TmpDir != "" {
-		return p.opts.TmpDir
+		return []string{p.opts.TmpDir}
 	}
-	return "/tmp"
+	return []string{"/tmp", "/var/tmp", "/"}
 }
 
 // stageWorkerBinary copies src to a root-owned 0755 directory on the given
@@ -238,8 +252,8 @@ func stageWorkerBinary(src, tmpDir string) (string, error) {
 	if src == "" {
 		return "", errors.New("no source binary to stage")
 	}
-	if err := requireRootStickyDir(tmpDir); err != nil {
-		return "", fmt.Errorf("staging parent %s is not a safe root-owned sticky directory: %w", tmpDir, err)
+	if err := requireSafeParent(tmpDir); err != nil {
+		return "", fmt.Errorf("unsafe staging parent %s: %w", tmpDir, err)
 	}
 	dir := filepath.Join(tmpDir, ".qnapfilemanager")
 	if err := ensureRootOwnedDir(dir); err != nil {
@@ -281,10 +295,14 @@ func stageWorkerBinary(src, tmpDir string) (string, error) {
 	return dst, nil
 }
 
-// requireRootStickyDir verifies that path is a directory (not a symlink) owned
-// by root with the sticky bit set. Nothing under a parent that is not both is
-// safe from a non-root user in /tmp.
-func requireRootStickyDir(path string) error {
+// requireSafeParent verifies that path is a directory (not a symlink) owned by
+// root that a non-root user cannot write new entries into. That holds two ways:
+// a sticky directory (a proper /tmp, 1777) where only an entry's owner may
+// rename or delete it, or a directory with no group/other write at all (the QTS
+// root tmpfs, 0755) where only root may create entries. QTS's /tmp is 0777 and
+// not sticky, so it is neither, and is refused — anyone could replace a staged
+// binary there.
+func requireSafeParent(path string) error {
 	fi, err := os.Lstat(path)
 	if err != nil {
 		return err
@@ -292,11 +310,11 @@ func requireRootStickyDir(path string) error {
 	if !fi.IsDir() {
 		return fmt.Errorf("not a directory")
 	}
-	if fi.Mode()&os.ModeSticky == 0 {
-		return fmt.Errorf("not sticky")
-	}
 	if !rootOwned(fi) {
 		return fmt.Errorf("not owned by root")
+	}
+	if fi.Mode()&os.ModeSticky == 0 && fi.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("writable by group or other and not sticky")
 	}
 	return nil
 }

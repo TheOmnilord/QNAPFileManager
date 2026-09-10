@@ -139,10 +139,12 @@ mode: a non-root uid cannot reach into the `.qpkg` tree at all. The root daemon 
 the only failure is the dropped-privilege worker. QuTS hero's ZFS volume does not enforce this, which is why the hero unit
 worked and the QTS unit did not.
 
-`/tmp` is a plain system tmpfs (`rw`, no `noexec`, not under `/share`), outside that enforcement. Fix (commit follows): the
-root daemon stages a copy of its worker binary into a root-owned 0755 directory on `/tmp` at first spawn and execs workers
-from there, with the install path kept as a fallback for units where it is reachable (hero, dev). The staged copy is
-root-owned under sticky `/tmp`, so a non-root user can exec but not replace it.
+The fix stages a root-owned copy of the worker binary on a safe tmpfs and execs workers from there, with the install path
+kept as a fallback for units where it is reachable (hero, dev). Safe = a root-owned parent that is either sticky (a normal
+`/tmp`, 1777) or not group/other-writable (only root can add entries). **QTS `/tmp` is 0777 and NOT sticky**, so it is
+refused; the staging then falls to `/` itself, which the mount table shows is a root-owned `mode=755` tmpfs — the reliable
+safe parent on QTS. Order tried: `/tmp`, `/var/tmp`, `/`. Root workers never use the staged copy (root execs the install
+binary directly).
 
 Mount facts captured: `/` tmpfs mode 755; `/tmp` tmpfs 64 MiB; `/share` tmpfs 16 MiB; `/share/CE_CACHEDEV2_DATA` ext4
 (`data=ordered`, user quotas). `su` is not present in the QTS busybox. `getcfg System Version` = 5.2.9.

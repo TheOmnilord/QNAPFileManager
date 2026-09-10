@@ -43,17 +43,30 @@ func (s *Server) security(next http.Handler) http.Handler {
 	})
 }
 
-// ClientIP trusts the final proxy hop only when the immediate peer is loopback.
-func ClientIP(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		host = r.RemoteAddr
-	}
+// forwardedClientIP trusts the final proxy hop only from a loopback peer.
+func forwardedClientIP(r *http.Request) string {
+	host := peerHost(r)
 	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
 		hops := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
 		if last := net.ParseIP(strings.TrimSpace(hops[len(hops)-1])); last != nil {
 			return last.String()
 		}
 	}
+	return ""
+}
+
+func peerHost(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
 	return host
+}
+
+// ClientIP trusts the final proxy hop only when the immediate peer is loopback.
+func ClientIP(r *http.Request) string {
+	if ip := forwardedClientIP(r); ip != "" {
+		return ip
+	}
+	return peerHost(r)
 }

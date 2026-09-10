@@ -120,8 +120,8 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Retry-After", "2")
 			writeError(w, 503, "overloaded", "Authentication is busy. Try again shortly.", "", r.URL.Path, "")
 		case errors.Is(err, errAuthRateLimited):
-			w.Header().Set("Retry-After", "60")
-			writeError(w, 429, "rate_limited", "Too many failed authentication attempts. Try again in a minute.", "", r.URL.Path, "")
+			w.Header().Set("Retry-After", "1")
+			writeError(w, 429, "rate_limited", "Too many failed authentication attempts. Try again in a second.", "", r.URL.Path, "")
 		case errors.Is(err, errSessionStoreFull):
 			writeError(w, 503, "session_store_full", "The session store is full. Try again later.", "", r.URL.Path, "")
 		default:

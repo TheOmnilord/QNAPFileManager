@@ -51,10 +51,10 @@ func TestAuthenticationBurstBound(t *testing.T) {
 			results <- request(s, "GET", "/api/session", nil, map[string]string{"Cookie": fmt.Sprintf("NAS_USER=dev; qtoken=bogus-%d", i)})
 		}(i)
 	}
-	// All excess requests must finish while the eight CGI calls remain blocked.
+	// All excess requests must finish while the six new-login CGI calls remain blocked.
 	deadline := time.NewTimer(3 * time.Second)
 	defer deadline.Stop()
-	for i := 0; i < 128; i++ {
+	for i := 0; i < 130; i++ {
 		select {
 		case w := <-results:
 			assertAuthError(t, w, 503, "overloaded", "2")
@@ -62,16 +62,16 @@ func TestAuthenticationBurstBound(t *testing.T) {
 			t.Fatalf("only %d excess requests rejected before releasing QTS", i)
 		}
 	}
-	// 72 retained requests means at most eight active plus 64 waiting.
-	if calls.Load() > 8 || peak.Load() > 8 {
+	// 70 retained requests means at most six active plus 64 waiting.
+	if calls.Load() > 6 || peak.Load() > 6 {
 		t.Fatalf("calls=%d peak=%d", calls.Load(), peak.Load())
 	}
 	unblock()
-	for i := 0; i < 72; i++ {
+	for i := 0; i < 70; i++ {
 		select {
 		case w := <-results:
 			if w.Code == 429 {
-				assertAuthError(t, w, 429, "rate_limited", "60")
+				assertAuthError(t, w, 429, "rate_limited", "1")
 			} else {
 				assertAuthError(t, w, 401, "unauthorized", "")
 			}
@@ -282,7 +282,7 @@ func TestAuthenticationFailureLimiter(t *testing.T) {
 		t.Fatalf("repeated credential bypassed negative cache: %d", calls.Load())
 	}
 	for i := 0; i < 30; i++ {
-		assertAuthError(t, attempt("192.0.2.1", fmt.Sprintf("blocked-%d", i)), 429, "rate_limited", "60")
+		assertAuthError(t, attempt("192.0.2.1", fmt.Sprintf("blocked-%d", i)), 429, "rate_limited", "1")
 	}
 	if w := attempt("192.0.2.1", "valid"); w.Code != 200 || !strings.Contains(w.Body.String(), `"user":"dev"`) {
 		t.Fatalf("valid NAT peer blocked: %d %s", w.Code, w.Body)
@@ -292,23 +292,26 @@ func TestAuthenticationFailureLimiter(t *testing.T) {
 	old.binding = qtsauth.CacheKey(old.cred)
 	old.checked = time.Now().Add(-time.Minute)
 	s.insertSession(old)
-	assertAuthError(t, attempt("192.0.2.1", "revoked"), 429, "rate_limited", "60")
-	if old.dead.Load() || s.sessions[old.id] == nil {
-		t.Fatal("admission refusal destroyed an unverified session")
-	}
-	now = now.Add(59 * time.Second)
-	assertAuthError(t, attempt("192.0.2.1", "still-blocked"), 429, "rate_limited", "60")
-	assertAuthError(t, attempt("192.0.2.1", "0"), 429, "rate_limited", "60")
-	if calls.Load() != 21 {
-		t.Fatalf("exhausted budget contacted QTS: %d", calls.Load())
+	// Established sessions bypass the failure budget and are actually revoked.
+	assertAuthError(t, attempt("192.0.2.1", "revoked"), 401, "unauthorized", "")
+	if !old.dead.Load() || s.sessions[old.id] != nil {
+		t.Fatal("revoked session survived revalidation")
 	}
 	// A refusal must not poison the verifier's cache for another IP.
 	assertAuthError(t, attempt("192.0.2.2", "blocked-0"), 401, "unauthorized", "")
+	// Even an exhausted IP gets one uncached recovery attempt each second.
+	s.destroy(s.byCredential[qtsauth.CacheKey(qtsauth.Cred{Kind: qtsauth.KindSID, Token: "valid"})].id)
+	s.verifier.Invalidate(qtsauth.Cred{Kind: qtsauth.KindSID, Token: "valid"})
+	assertAuthError(t, attempt("192.0.2.1", "valid"), 429, "rate_limited", "1")
 	now = now.Add(time.Second)
-	assertAuthError(t, attempt("192.0.2.1", "recovered"), 401, "unauthorized", "")
-	if calls.Load() != 23 {
-		t.Fatalf("recovery did not contact QTS: %d", calls.Load())
+	if w := attempt("192.0.2.1", "valid"); w.Code != 200 {
+		t.Fatalf("recovery: %d %s", w.Code, w.Body)
 	}
+	assertAuthError(t, attempt("192.0.2.1", "still-blocked"), 429, "rate_limited", "1")
+	if calls.Load() != 24 {
+		t.Fatalf("unexpected upstream calls: %d", calls.Load())
+	}
+
 }
 
 func TestSessionFollowersShareTotalWaitingBound(t *testing.T) {
@@ -316,10 +319,10 @@ func TestSessionFollowersShareTotalWaitingBound(t *testing.T) {
 	s.AuthTimeout = 3 * time.Second
 	// Occupy every execution slot, independently of session-lock followers.
 	for i := 0; i < qtsauth.DefaultMaxConcurrentValidations; i++ {
-		if err := s.authAdmission.enter(context.Background()); err != nil {
+		if err := s.authAdmission.enter(context.Background(), true); err != nil {
 			t.Fatal(err)
 		}
-		defer s.authAdmission.leave()
+		defer s.authAdmission.leave(true)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	var followers sync.WaitGroup
@@ -385,8 +388,14 @@ func TestFailureBucketWindowAndBound(t *testing.T) {
 	if len(l.clients) != maxFailureClients || l.failed("new", "key", now) != errAuthRateLimited {
 		t.Fatal("failure table is not bounded")
 	}
-	if err := l.allow("new", now); err != errAuthRateLimited {
-		t.Fatal("full failure table admitted an uncached validation", err)
+	if err := l.allow("new", now); err != nil {
+		t.Fatal("full table blocked recovery", err)
+	}
+	if err := l.allow("another", now); err != errAuthRateLimited {
+		t.Fatal("full table failed to bound recovery", err)
+	}
+	if err := l.allow("another", now.Add(time.Second)); err != nil {
+		t.Fatal("full table did not recover", err)
 	}
 	if err := l.failed("new", "key", now.Add(time.Minute)); err != nil {
 		t.Fatal("inactive failure entries were not reclaimed", err)

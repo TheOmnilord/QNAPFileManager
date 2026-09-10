@@ -148,7 +148,6 @@ func (s *Server) reclaimExpiredLocked(old *session, now time.Time) bool {
 }
 
 func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (*session, error) {
-	now := time.Now()
 	cred, hasCred := qtsauth.FromRequest(r)
 	id, binding := "", ""
 	if c, err := r.Cookie("qfm_sid"); err == nil {
@@ -166,6 +165,30 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (*session,
 	if s.pinned == nil && !hasCred {
 		return nil, nil
 	}
+	var stored *session
+	var err error
+	if s.pinned != nil {
+		stored, err = s.createSession(r, cred)
+	} else {
+		stored, err = s.authAdmission.credential(r.Context(), binding, func() (*session, error) {
+			// A previous leader may have inserted a session since the initial lookup.
+			s.mu.Lock()
+			existing := s.byCredential[binding]
+			s.mu.Unlock()
+			if existing != nil {
+				return existing, nil
+			}
+			return s.createSession(r, cred)
+		})
+	}
+	if err != nil {
+		return nil, err
+	}
+	return s.authenticateSession(w, r, stored, cred, hasCred)
+}
+
+func (s *Server) createSession(r *http.Request, cred qtsauth.Cred) (*session, error) {
+	now := time.Now()
 	sess := &session{id: rand.Text(), csrf: rand.Text(), expires: now.Add(sessionTTL), checked: now}
 	if s.pinned != nil {
 		sess.who = *s.pinned
@@ -182,18 +205,18 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (*session,
 	if stored == nil {
 		return nil, errSessionStoreFull
 	}
-	return s.authenticateSession(w, r, stored, cred, hasCred)
+	return stored, nil
 }
 
 func (s *Server) authenticateCredential(r *http.Request, sess *session, cred qtsauth.Cred) error {
 	if s.verifier == nil {
 		return errSession
 	}
-	if err := s.authAdmission.enter(r.Context()); err != nil {
+	if err := s.authAdmission.enter(r.Context(), false); err != nil {
 		return err
 	}
-	defer s.authAdmission.leave()
-	verified, err := s.verifyCredential(r, cred)
+	defer s.authAdmission.leave(false)
+	verified, err := s.verifyCredential(r, cred, false)
 	if err != nil {
 		return err
 	}
@@ -235,15 +258,15 @@ func (s *Server) authenticateSession(w http.ResponseWriter, r *http.Request, old
 		if s.verifier == nil {
 			invalid = true
 		} else {
-			if err := s.authAdmission.enter(r.Context()); err != nil {
+			if err := s.authAdmission.enter(r.Context(), true); err != nil {
 				old.mu.Unlock()
 				return nil, err
 			}
-			defer s.authAdmission.leave()
+			defer s.authAdmission.leave(true)
 			if !safeMethod(r.Method) {
 				s.verifier.Invalidate(old.cred)
 			}
-			verified, err := s.verifyCredential(r, old.cred)
+			verified, err := s.verifyCredential(r, old.cred, true)
 			if ctxErr := r.Context().Err(); ctxErr != nil {
 				old.mu.Unlock()
 				return nil, ctxErr

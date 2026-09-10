@@ -77,6 +77,23 @@ internal/config/  internal/web/   JSON config; server, routes, security, static/
 qpkg/  scripts/  docs/  testdata/  .github/workflows/build.yml
 ```
 
+## Hardware bring-up (M0 verified on real hardware, 2026-09-10)
+
+M0 (read-only browse) is working end to end on both of the owner's NAS units — a QuTS hero (192.168.1.99, ZFS) and a
+QTS unit (192.168.1.95, ext4), firmware 5.2.x — installed from App Center, opened as a QTS desktop window, authenticated
+from the QTS session, browsing the whole filesystem as the signed-in user via a per-user worker. Five hardware-only
+fixes were needed on top of the CI-green M0, each described in docs/research/qts-integration-facts.md §5-7:
+
+1. The QTS reverse proxy joins its target with a doubled slash (`/qnapfilemanager//app.css`); collapse it before routing.
+2. The desktop opens the app at the bare proxy path, so the shell must use absolute URLs under the prefix.
+3. Force HTTPS: validate the QTS session over HTTPS on loopback when the HTTP port redirects or is closed.
+4. QTS ext4 shared folders deny a non-root worker even reaching the QPKG binary; stage the worker binary on a safe
+   root-owned tmpfs (`/tmp` when sticky, else `/`) and exec workers from there. (QuTS hero's ZFS volume does not enforce
+   this, so the hero worked without staging.)
+5. Make the install tree traversable and log worker-spawn failures with their cause.
+
+Running build at verification: 0.0.35. Still open: the administrator identity decision (below), and the M1 items.
+
 ## Milestones
 
 | Milestone | Exit criterion | Share |

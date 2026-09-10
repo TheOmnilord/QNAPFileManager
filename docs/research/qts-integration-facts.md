@@ -116,3 +116,16 @@ and a QTS NAS (also 5.2.x). Both behave identically for the points below.
   user `admin` (uid 0). A non-root SSH user cannot read the package's 0700 `logs/` directory: use `sudo`.
 - Still unverified: cookie names and attributes inside the desktop window, `authLogin.cgi` validation fields,
   forwarded headers set by the proxy.
+
+## 6. Second hardware finding: Force HTTPS (QTS unit, 2026-09-10)
+
+On the QTS unit at 192.168.1.95, "Force secure connection (HTTPS)" is on. `http://<nas>:8080/cgi-bin/authLogin.cgi`
+answers `302` to `https://<nas>:8181/cgi-bin/authLogin.cgi`; only the HTTPS stunnel port (8181 here) returns the XML.
+The daemon validated the QTS session over `http://127.0.0.1:8080`, received the 302 (redirects are not followed), could
+not parse it, and returned `503 qts_unavailable` — a styled shell with a "Connection temporarily unavailable" banner.
+
+Fix (commit follows): the loopback validation call now retries over HTTPS on 127.0.0.1 when the HTTP port redirects to
+HTTPS or is closed. The SSL port is taken from the redirect Location (port only; the host is forced back to loopback) or,
+for a closed HTTP port, from `[Stunnel] Port` in uLinux.conf (default 443), and the self-signed QTS certificate is
+accepted (`InsecureSkipVerify`) because the connection is loopback only. `authLogin.cgi` on 8181 exposes `webAccessPort`,
+`stunnelEnabled` and `stunnelPort`, matching `[Stunnel]` in `uLinux.conf`.

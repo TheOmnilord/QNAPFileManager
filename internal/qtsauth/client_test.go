@@ -131,7 +131,12 @@ func TestSlowServerHitsTimeout(t *testing.T) {
 	}
 }
 
-func TestRedirectIsNotFollowed(t *testing.T) {
+// TestRedirectHostIsNeverContacted is the security guarantee behind the
+// Force-HTTPS fallback: a redirect is retried only on loopback, never at the
+// host the Location names. The redirect here points at another server; that
+// server must not be touched, and because the retry goes to a closed loopback
+// SSL port the call ends ErrUnreachable rather than chasing the redirect.
+func TestRedirectHostIsNeverContacted(t *testing.T) {
 	var elsewhere int32
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&elsewhere, 1)
@@ -144,12 +149,14 @@ func TestRedirectIsNotFollowed(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := testClient(srv, time.Second).ValidateQToken(context.Background(), "admin", "t")
-	if !errors.Is(err, ErrBadResponse) {
-		t.Fatalf("error = %v, want ErrBadResponse", err)
+	c := testClient(srv, time.Second)
+	c.SSLPort = 1 // a closed loopback port, so the HTTPS fallback fails deterministically
+	_, err := c.ValidateQToken(context.Background(), "admin", "t")
+	if !errors.Is(err, ErrUnreachable) {
+		t.Fatalf("error = %v, want ErrUnreachable", err)
 	}
 	if n := atomic.LoadInt32(&elsewhere); n != 0 {
-		t.Fatalf("redirect target was contacted %d times; redirects must never be followed", n)
+		t.Fatalf("redirect target was contacted %d times; the redirect host must never be followed", n)
 	}
 }
 

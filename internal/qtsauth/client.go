@@ -43,6 +43,10 @@ import (
 const (
 	// DefaultPort is the QTS HTTP port when uLinux.conf cannot be read.
 	DefaultPort = 8080
+	// DefaultSSLPort is the QTS HTTPS (stunnel) port when uLinux.conf cannot be
+	// read. QTS "Force HTTPS" redirects the HTTP port here, and on such a unit
+	// the loopback validation call must be made over HTTPS instead.
+	DefaultSSLPort = 443
 	// DefaultTimeout bounds a single authLogin.cgi call. The endpoint is a
 	// fork-per-request CGI, so it must never be allowed to hang a handler.
 	DefaultTimeout = 5 * time.Second
@@ -82,6 +86,10 @@ type Client struct {
 	// MaxBody caps the response body read from the endpoint. Zero means
 	// DefaultMaxBody.
 	MaxBody int64
+	// SSLPort is the QTS HTTPS (stunnel) port used for the loopback fallback
+	// when BaseURL is http and the unit enforces HTTPS. Zero means
+	// DefaultSSLPort. It is only ever combined with host 127.0.0.1.
+	SSLPort int
 
 	once sync.Once
 	def  *http.Client
@@ -126,8 +134,25 @@ func NewHTTPClient(baseURL string, timeout time.Duration) *http.Client {
 // and identity-and-hero-plan.md §5.4 item 8 both list this as unverified; the
 // keys tried here are the ones QNAP firmware is reported to use.
 func Detect(ulinuxConfPath string) *Client {
-	port := DetectPort(ulinuxConfPath)
-	return New("http://127.0.0.1:" + strconv.Itoa(port))
+	c := New("http://127.0.0.1:" + strconv.Itoa(DetectPort(ulinuxConfPath)))
+	c.SSLPort = DetectSSLPort(ulinuxConfPath)
+	return c
+}
+
+// DetectSSLPort returns the QTS HTTPS (stunnel) port from uLinux.conf, or
+// DefaultSSLPort. It is the port the loopback fallback uses when the unit
+// enforces HTTPS (Force HTTPS) and the plain HTTP port only redirects.
+func DetectSSLPort(ulinuxConfPath string) int {
+	if sec, err := readINISection(ulinuxConfPath, "Stunnel"); err == nil {
+		for _, key := range []string{"port", "ssl port"} {
+			if v, ok := sec[key]; ok {
+				if p, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && p > 0 && p < 65536 {
+					return p
+				}
+			}
+		}
+	}
+	return DefaultSSLPort
 }
 
 // DetectPort returns the QTS web port from uLinux.conf, or DefaultPort.
@@ -250,14 +275,30 @@ func (c *Client) get(ctx context.Context, query string) (Result, error) {
 	if base == "" {
 		return Result{}, fmt.Errorf("qtsauth: empty BaseURL: %w", ErrUnreachable)
 	}
+	res, fallback, err := c.getFrom(ctx, base, query)
+	if err == nil || fallback == "" {
+		return res, err
+	}
+	// The unit enforces HTTPS: the plain HTTP port only redirects here, or is
+	// closed. Retry once over HTTPS on loopback, with the self-signed QTS
+	// certificate accepted. There is no second fallback, so this cannot loop.
+	res, _, err = c.getFrom(ctx, fallback, query)
+	return res, err
+}
+
+// getFrom performs one validation call against base. A non-empty fallback URL
+// means the caller may retry there: it is returned only for an HTTP base that
+// redirected to HTTPS (Force HTTPS) or that could not be reached, and it is
+// always an https://127.0.0.1 URL, so a retry can never leave the loopback.
+func (c *Client) getFrom(ctx context.Context, base, query string) (Result, string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+AuthPath+"?"+query, nil)
 	if err != nil {
-		return Result{}, fmt.Errorf("qtsauth: build request for %s: %w", redactQuery(query), ErrUnreachable)
+		return Result{}, "", fmt.Errorf("qtsauth: build request for %s: %w", redactQuery(query), ErrUnreachable)
 	}
 	req.Header.Set("Accept", "text/xml, application/xml, */*")
 	req.Header.Set("User-Agent", "qnapfilemanager")
 
-	resp, err := c.httpClient().Do(req)
+	resp, err := c.clientFor(base).Do(req)
 	if err != nil {
 		// *url.Error stringifies the whole URL, credential included; keep only
 		// the underlying cause so tokens never reach a log.
@@ -265,23 +306,85 @@ func (c *Client) get(ctx context.Context, query string) (Result, error) {
 		if errors.As(err, &ue) && ue.Err != nil {
 			err = ue.Err
 		}
-		return Result{}, fmt.Errorf("qtsauth: %s: %w", redactQuery(query), errors.Join(err, ErrUnreachable))
+		// An unreachable HTTP port may just mean the unit disabled it in favour
+		// of HTTPS; offer the configured SSL port on loopback as a fallback.
+		return Result{}, c.httpsFallback(base, 0), fmt.Errorf("qtsauth: %s: %w", redactQuery(query), errors.Join(err, ErrUnreachable))
 	}
 	defer func() {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
 		_ = resp.Body.Close()
 	}()
 
-	// Redirects are never followed (CheckRedirect returns ErrUseLastResponse),
-	// so a 3xx lands here and is rejected rather than chased to another host.
+	// Redirects are never followed by the client (CheckRedirect returns
+	// ErrUseLastResponse), so a 3xx lands here. A redirect to HTTPS is QTS
+	// "Force HTTPS": take only the port from it, force the host back to
+	// loopback, and let the caller retry there.
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		if fb := c.httpsFallback(base, httpsPort(resp.Header.Get("Location"))); fb != "" {
+			return Result{}, fb, fmt.Errorf("qtsauth: HTTP endpoint redirected to HTTPS: %w", ErrBadResponse)
+		}
+		return Result{}, "", fmt.Errorf("qtsauth: unexpected status %d: %w", resp.StatusCode, ErrBadResponse)
+	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return Result{}, fmt.Errorf("qtsauth: unexpected status %d: %w", resp.StatusCode, ErrBadResponse)
+		return Result{}, "", fmt.Errorf("qtsauth: unexpected status %d: %w", resp.StatusCode, ErrBadResponse)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, c.maxBody()))
 	if err != nil {
-		return Result{}, fmt.Errorf("qtsauth: read body: %w", errors.Join(err, ErrUnreachable))
+		return Result{}, "", fmt.Errorf("qtsauth: read body: %w", errors.Join(err, ErrUnreachable))
 	}
-	return parseResponse(body)
+	res, err := parseResponse(body)
+	return res, "", err
+}
+
+// clientFor returns the HTTP client to use for base: the configured one when it
+// matches BaseURL, otherwise a fresh client whose TLS verification is disabled
+// only for the https loopback fallback.
+func (c *Client) clientFor(base string) *http.Client {
+	if strings.EqualFold(strings.TrimRight(base, "/"), strings.TrimRight(c.BaseURL, "/")) {
+		return c.httpClient()
+	}
+	timeout := DefaultTimeout
+	if c.HTTP != nil && c.HTTP.Timeout > 0 {
+		timeout = c.HTTP.Timeout
+	}
+	return NewHTTPClient(base, timeout)
+}
+
+// httpsFallback returns the loopback HTTPS URL to retry against, or "" when no
+// fallback applies. It is offered only for an http base (so a retry never
+// loops), and it always pins the host to 127.0.0.1: only the numeric port is
+// taken from the redirect (port>0) or, failing that, from configuration.
+func (c *Client) httpsFallback(base string, port int) string {
+	if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(base)), "http://") {
+		return ""
+	}
+	if port <= 0 || port >= 65536 {
+		port = c.SSLPort
+	}
+	if port <= 0 || port >= 65536 {
+		port = DefaultSSLPort
+	}
+	return "https://127.0.0.1:" + strconv.Itoa(port)
+}
+
+// httpsPort returns the port of an https redirect Location, or 0 when the
+// Location is missing, unparseable, or not https. Only the port is ever used;
+// the host in the Location is discarded so validation stays on loopback.
+func httpsPort(location string) int {
+	if location == "" {
+		return 0
+	}
+	u, err := url.Parse(location)
+	if err != nil || !strings.EqualFold(u.Scheme, "https") {
+		return 0
+	}
+	if p := u.Port(); p != "" {
+		if n, err := strconv.Atoi(p); err == nil && n > 0 && n < 65536 {
+			return n
+		}
+		return 0
+	}
+	return 443
 }
 
 // redactQuery keeps token values out of error strings and logs.

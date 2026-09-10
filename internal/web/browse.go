@@ -285,14 +285,35 @@ func (s *Server) text(w http.ResponseWriter, r *http.Request, sess *session) {
 		return
 	}
 	defer f.Close()
-	// Probe at least 8 KiB even when the requested preview is smaller.
-	data, err := io.ReadAll(io.LimitReader(f, max(limit+1, 8192)))
+	streamFile, err := prepareDownloadStream(f)
 	if err != nil {
 		s.backendError(w, r, p, err)
 		return
 	}
+	defer streamFile.Close()
+	ctx := r.Context()
+	readDone, closed := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(closed)
+		select {
+		case <-ctx.Done():
+		case <-readDone:
+		}
+		// Wake a blocked pollable read on cancellation, and release the stream
+		// as soon as EOF or the byte cap ends the read.
+		_ = streamFile.Close()
+	}()
+	// Probe at least 8 KiB even when the requested preview is smaller.
+	data, err := io.ReadAll(io.LimitReader(downloadReader{ctx: ctx, reader: streamFile}, max(limit+1, 8192)))
+	close(readDone)
+	<-closed
+	interrupted := ctx.Err() != nil
+	if err != nil && !interrupted {
+		s.backendError(w, r, p, err)
+		return
+	}
 	binary := bytes.IndexByte(data[:min(len(data), 8192)], 0) >= 0
-	truncated := int64(len(data)) > limit
+	truncated := int64(len(data)) > limit || interrupted
 	content := data[:min(int64(len(data)), limit)]
 	etag := fmt.Sprintf(`W/"%x"`, sha256.Sum256([]byte(fmt.Sprintf("%s:%d:%d", p, e.Size, e.MTime.UnixNano()))))
 	writeJSON(w, map[string]any{"content": string(content), "bytes": len(content), "truncated": truncated, "binary": binary, "mode": e.Mode, "mtime": e.MTime, "etag": etag})

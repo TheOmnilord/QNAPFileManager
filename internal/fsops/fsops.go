@@ -346,7 +346,10 @@ func apiOf(parts []string) string {
 // The directory is opened with O_DIRECTORY where the platform has it, so a fifo
 // named in the request is refused by the kernel before open(2) can block on it:
 // a readable fifo with no writer would otherwise hold a worker slot until the
-// process died, and sixty-four of them would take the whole worker.
+// process died, and sixty-four of them would take the whole worker. On Linux
+// the directories above it are walked with O_PATH instead (openDir), so the
+// listing asks for read permission where the kernel does — on the directory
+// being listed — and only search permission on the way there.
 //
 // opts.ShowHidden is the one filter applied here, because hiding entries after
 // the fact would break paging. opts.ShowVolumeRoots is deliberately *not* a
@@ -372,7 +375,7 @@ func List(ctx context.Context, r fsx.Root, plat *platform.Platform, dir string, 
 	if err := ctx.Err(); err != nil {
 		return fsx.Listing{}, err
 	}
-	f, err := tg.rt.OpenFile(tg.rel, openDirFlags(), 0)
+	f, err := openDir(tg.rt, tg.rel)
 	if err != nil {
 		// O_DIRECTORY reports "this is not a directory" as ENOTDIR, which the
 		// API vocabulary spells bad_request. An lstat tells that apart from a

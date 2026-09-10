@@ -4,10 +4,17 @@ package fsops
 
 import "os"
 
-// openDirFlags off Linux is a plain read-only open: there is no O_DIRECTORY, so
-// the "is this really a directory" answer comes from the fstat that follows.
-// Nothing but the dev loop runs here, and it has no fifos to be parked on.
-func openDirFlags() int { return os.O_RDONLY }
+// openDir off Linux is a plain read-only open through the root. There is no
+// O_DIRECTORY, so the "is this really a directory" answer comes from the fstat
+// List does next; nothing but the dev loop runs here, and it has no fifos to be
+// parked on. There is no O_PATH either, so the walk to the directory is
+// os.Root's own — which asks for read permission on every directory on the way,
+// where Linux now asks only for search. Stricter than the kernel rather than
+// looser, and for the same reason statAt gives: this platform is the Windows
+// dev box, whose ACLs have no "search but not read" shape to get wrong.
+func openDir(rt *os.Root, rel string) (*os.File, error) {
+	return rt.OpenFile(rel, os.O_RDONLY, 0)
+}
 
 // statAt off Linux is os.Root's own stat. There is no O_PATH to walk the
 // intermediate directories with, so the walk is os.Root's — which asks for read

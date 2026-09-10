@@ -103,6 +103,49 @@ func TestOpenReadThroughASearchOnlyDirectory(t *testing.T) {
 	}
 }
 
+// TestListThroughASearchOnlyDirectory: a listing needs read permission on the
+// directory being listed and search permission on the ones above it. os.Root's
+// walk opened every intermediate component O_RDONLY, so listing /outer/child
+// demanded the read bit on outer too and returned EACCES where the kernel
+// returns the listing — a private index (0111) holding a readable subdirectory
+// is an ordinary shape for a share. The refusal on outer itself is the other
+// half: the read bit is still the kernel's to require where it does require it.
+func TestListThroughASearchOnlyDirectory(t *testing.T) {
+	requireUnprivileged(t)
+	base := tempDir(t)
+	mkdir(t, base, "outer/child")
+	write(t, base, "outer/child/leaf.txt", "listable")
+	outer := filepath.Join(base, "outer")
+	chmodBack(t, outer, 0o755)
+	if err := os.Chmod(outer, 0o111); err != nil { // searchable, not readable
+		t.Fatal(err)
+	}
+	// The kernel has to be enforcing the read bit for the test to mean anything.
+	if _, err := os.ReadDir(outer); err == nil {
+		t.Skip("this filesystem does not enforce the directory read bit")
+	}
+	r := newRoot(t, base)
+	ctx := context.Background()
+
+	l, err := List(ctx, r, nil, "/outer/child", fsx.ListOptions{})
+	if err != nil {
+		t.Fatalf("listing a readable directory inside a search-only one: %v", err)
+	}
+	if l.Total != 1 || len(l.Entries) != 1 || l.Entries[0].Name != "leaf.txt" {
+		t.Fatalf("listing = %+v, want the one entry leaf.txt", l)
+	}
+	if l.Path != "/outer/child" || l.Parent != "/outer" {
+		t.Errorf("path = %q, parent = %q, want /outer/child and /outer", l.Path, l.Parent)
+	}
+
+	// And the directory with no read bit is still the kernel's to refuse.
+	if _, err := List(ctx, r, nil, "/outer", fsx.ListOptions{}); !errors.Is(err, fs.ErrPermission) {
+		t.Errorf("listing a directory with no read bit = %v, want a permission error", err)
+	} else if code := fsx.Code(err); code != "permission" {
+		t.Errorf("code = %q, want permission", code)
+	}
+}
+
 // TestMetadataThroughNestedSearchOnlyDirectories is the same rule for every
 // operation that only needs to *reach* a name rather than to enumerate one, and
 // for more than one directory deep — because the walk os.Root does is the same

@@ -186,11 +186,78 @@ func TestStaticAndHeaders(t *testing.T) {
 		}
 	}
 	w := request(s, "GET", "/api/fs/list?path=/", nil, nil)
-	if w.Code != 401 || !strings.Contains(w.Body.String(), `"code":"unauthorized"`) || w.Header().Get("Cache-Control") != "no-store" {
+	if w.Code != 401 || !strings.HasPrefix(w.Header().Get("Content-Type"), "application/json") || !strings.Contains(w.Body.String(), `"code":"unauthorized"`) || w.Header().Get("Cache-Control") != "no-store" {
 		t.Fatalf("unauthenticated: %d %s", w.Code, w.Body)
 	}
 	if w.Header().Get("Location") != "" {
 		t.Fatal("authentication must never redirect")
+	}
+}
+
+func TestStaticShellWithInvalidSession(t *testing.T) {
+	for _, switched := range []bool{false, true} {
+		t.Run(map[bool]string{false: "expired", true: "QTS user switch"}[switched], func(t *testing.T) {
+			s, _ := fixture(t, false)
+			s.cfg.Web.ProxyPrefix = "/qnapfilemanager"
+			old := &session{id: "old-session", csrf: "private-csrf", who: backend.Principal{User: "private-user"}, expires: time.Now().Add(-time.Second)}
+			headers := map[string]string{}
+			if switched {
+				old.expires = time.Now().Add(time.Hour)
+				old.binding = qtsauth.CacheKey(qtsauth.Cred{Kind: "qtoken", User: "private-user", Token: "old-token"})
+				headers["Cookie"] = "qfm_sid=old-session; NAS_USER=new-user; qtoken=new-token"
+			}
+			s.sessions[old.id] = old
+			cookie := &http.Cookie{Name: "qfm_sid", Value: old.id}
+			for _, prefix := range []string{"", "/qnapfilemanager"} {
+				for _, asset := range []struct{ path, name, ct string }{
+					{"/", "index.html", "text/html"},
+					{"/index.html", "index.html", "text/html"},
+					{"/app.css", "app.css", "text/css"},
+					{"/js/app.js", "js/app.js", "text/javascript"},
+				} {
+					w := request(s, "GET", prefix+asset.path, cookie, headers)
+					want, err := assets.ReadFile("static/" + asset.name)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if w.Code != http.StatusOK || !strings.HasPrefix(w.Header().Get("Content-Type"), asset.ct) || w.Body.String() != string(want) {
+						t.Fatalf("public asset %s: %d %s", prefix+asset.path, w.Code, w.Body)
+					}
+					if len(w.Result().Cookies()) != 0 || s.sessionLookups != 0 {
+						t.Fatal("static assets must not authenticate or personalize the response")
+					}
+				}
+			}
+			for _, endpoint := range []string{"/api/session", "/api/fs/list?path=/"} {
+				w := request(s, "GET", endpoint, cookie, headers)
+				if w.Code != http.StatusUnauthorized || !strings.HasPrefix(w.Header().Get("Content-Type"), "application/json") {
+					t.Fatalf("invalid session %s: %d %s", endpoint, w.Code, w.Body)
+				}
+			}
+		})
+	}
+}
+
+func TestEveryAPIRequiresAuthentication(t *testing.T) {
+	s, _ := fixture(t, false)
+	for endpoint, method := range routes {
+		w := request(s, method, endpoint, nil, nil)
+		if endpoint == "/api/session" && method == "GET" {
+			// The one public answer: a first visit with nothing presented
+			// learns only that it is not signed in, never a csrf token.
+			if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"authenticated":false`) || !strings.Contains(w.Body.String(), `"csrf":""`) {
+				t.Errorf("anonymous %s: %d %s", endpoint, w.Code, w.Body)
+			}
+			continue
+		}
+		if w.Code != http.StatusUnauthorized || !strings.HasPrefix(w.Header().Get("Content-Type"), "application/json") {
+			t.Errorf("unauthenticated %s: %d %s", endpoint, w.Code, w.Body)
+		}
+	}
+	for _, endpoint := range []string{"/api", "/api/unknown"} {
+		if w := request(s, "GET", endpoint, nil, nil); w.Code != http.StatusUnauthorized {
+			t.Errorf("unauthenticated %s: %d", endpoint, w.Code)
+		}
 	}
 }
 

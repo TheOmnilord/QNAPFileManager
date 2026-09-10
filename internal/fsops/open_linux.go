@@ -9,15 +9,6 @@ import (
 	"unsafe"
 )
 
-// openDirFlags is what List passes to open(2) for the directory it enumerates.
-//
-// O_DIRECTORY makes the kernel refuse anything that is not a directory, and it
-// refuses it in may_open(2) — before the fifo machinery runs. That is what
-// stops "list /path/to/a/fifo" from parking a worker goroutine inside open(2)
-// with no writer on the other end, where no deadline in this process can reach
-// it; sixty-four such requests would otherwise take every slot the worker has.
-func openDirFlags() int { return os.O_RDONLY | syscall.O_DIRECTORY }
-
 // oPath is O_PATH. The value is the same on every Linux architecture, but the
 // standard syscall package only spells it out for some of them (amd64, the
 // architecture the NAS x86 build targets, is one of the ones it omits), so it is
@@ -268,6 +259,53 @@ func openFinal(rt *os.Root, rel string) (*os.File, error) {
 	if err != nil {
 		return nil, &fs.PathError{Op: "openat", Path: rel, Err: err}
 	}
+	return os.NewFile(uintptr(fd), rel), nil
+}
+
+// openDir opens the directory List enumerates, and is the other half of the
+// O_PATH rule: read permission is asked for on the directory being listed, and
+// on nothing above it.
+//
+// os.Root.OpenFile could not draw that line. Its walk opens every intermediate
+// component O_RDONLY (rootOpenDir, $GOROOT/src/os/root_unix.go), so listing
+// /outer/child needed read permission on outer as well as on child — and the
+// kernel needs only search on outer. Mode 0111 on outer with a 0755 child
+// inside is exactly that shape, an ordinary one for a share with a private
+// index, and it came back EACCES for a listing the kernel would have given.
+// Refusing what the kernel allows is the wrong half of INV-2, the same way it
+// was for stat and for downloads. So the ancestors are walked with walkOPath
+// and only the final component is opened for reading.
+//
+// O_DIRECTORY makes the kernel refuse anything that is not a directory, and it
+// refuses it in may_open(2) — before the fifo machinery runs. That is what
+// stops "list /path/to/a/fifo" from parking a worker goroutine inside open(2)
+// with no writer on the other end, where no deadline in this process can reach
+// it; sixty-four such requests would otherwise take every slot the worker has.
+//
+// O_NOFOLLOW is the rule openFinal keeps for the same reason: resolve() has
+// already followed every link on this path, so a symlink standing here is one
+// that appeared underneath us, and ELOOP says so rather than following it.
+func openDir(rt *os.Root, rel string) (*os.File, error) {
+	dir, base := splitFinal(rel)
+	if base == "" || base == "." || base == ".." {
+		// The jail base itself, or a name openat cannot address on its own.
+		// os.Root resolves it against the descriptor it holds, with no
+		// intermediate component to over-ask for.
+		return rt.OpenFile(rel, os.O_RDONLY|syscall.O_DIRECTORY, 0)
+	}
+	parent, err := walkOPath(rt, dir)
+	if err != nil {
+		return nil, err
+	}
+	defer parent.Close()
+
+	fd, err := openatIn(parent, base,
+		os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC)
+	if err != nil {
+		return nil, &fs.PathError{Op: "openat", Path: rel, Err: err}
+	}
+	// A real O_RDONLY descriptor, so os.File.ReadDir reads it with getdents the
+	// way it reads any directory opened through os.Open.
 	return os.NewFile(uintptr(fd), rel), nil
 }
 

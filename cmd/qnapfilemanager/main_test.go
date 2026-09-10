@@ -101,19 +101,28 @@ func TestSessionReflectsReadOnlyOff(t *testing.T) {
 	}
 }
 
+// Unknown API routes answer 401 before routing when nobody is signed in, so
+// the route table cannot be enumerated anonymously; unknown non-API paths are
+// a plain 404 from the static handler.
 func TestUnknownRouteIs404JSON(t *testing.T) {
 	s := newServer(config.Default(), fsx.Root{}, log.New(io.Discard, "", 0))
-	for _, p := range []string{"/missing", "/api/missing"} {
+	for p, want := range map[string]struct {
+		status int
+		code   string
+	}{
+		"/missing":     {http.StatusNotFound, "not_found"},
+		"/api/missing": {http.StatusUnauthorized, "unauthorized"},
+	} {
 		rec := httptest.NewRecorder()
 		s.handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, p, nil))
-		if rec.Code != http.StatusNotFound {
-			t.Errorf("%s: status = %d, want 404", p, rec.Code)
+		if rec.Code != want.status {
+			t.Errorf("%s: status = %d, want %d", p, rec.Code, want.status)
 		}
 		var e apiError
 		if err := json.Unmarshal(rec.Body.Bytes(), &e); err != nil {
 			t.Errorf("%s: body is not the error envelope: %v", p, err)
-		} else if e.Error.Code != "not_found" {
-			t.Errorf("%s: code = %q", p, e.Error.Code)
+		} else if e.Error.Code != want.code {
+			t.Errorf("%s: code = %q, want %q", p, e.Error.Code, want.code)
 		}
 	}
 }

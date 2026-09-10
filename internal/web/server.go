@@ -92,9 +92,15 @@ func (s *Server) Handler() http.Handler {
 }
 
 func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
-	api := strings.HasPrefix(r.URL.Path, "/api/")
+	api := r.URL.Path == "/api" || strings.HasPrefix(r.URL.Path, "/api/")
 	if api || r.URL.Path == "/" || r.URL.Path == "/index.html" {
 		w.Header().Set("Cache-Control", "no-store")
+	}
+	if !api {
+		// Embedded assets contain no user data. Let the shell load even with
+		// stale QTS credentials; api/session drives the sign-in notice.
+		s.static(w, r)
+		return
 	}
 	timeout := s.AuthTimeout
 	if timeout <= 0 {
@@ -119,23 +125,34 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, errSessionStoreFull):
 			writeError(w, 503, "session_store_full", "The session store is full. Try again later.", "", r.URL.Path, "")
 		default:
+			// api/session is the one API answer an unauthenticated page may
+			// read: it carries no user data and tells the shell whether to
+			// show the sign-in notice. The packaging smoke test reads
+			// readOnly from it before any QTS session exists.
+			if r.Method == http.MethodGet && r.URL.Path == "/api/session" && anonymous(r) {
+				s.sessionInfo(w, r, nil)
+				return
+			}
 			s.fail(w, r, "unauthorized", "Sign in to QTS again to continue.", "", "")
 		}
 		return
 	}
-	if !safeMethod(r.Method) {
-		if sess == nil {
-			s.fail(w, r, "unauthorized", "Sign in to QTS to continue.", "", "")
+	if sess == nil {
+		// A first visit with nothing presented: api/session answers publicly
+		// (see the anonymous rule above) so the shell can render its sign-in
+		// notice and the smoke test can read readOnly.
+		if r.Method == http.MethodGet && r.URL.Path == "/api/session" && anonymous(r) {
+			s.sessionInfo(w, r, nil)
 			return
 		}
+		s.fail(w, r, "unauthorized", "Sign in to QTS to continue.", "", "")
+		return
+	}
+	if !safeMethod(r.Method) {
 		if !validCSRF(r, sess.csrf) {
 			s.fail(w, r, "permission", "The request could not be verified. Refresh and try again.", "", "")
 			return
 		}
-	}
-	if !api {
-		s.static(w, r)
-		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	method, ok := routes[r.URL.Path]
@@ -146,10 +163,6 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	if r.Method != method && !(r.Method == "HEAD" && method == "GET") {
 		w.Header().Set("Allow", method)
 		writeError(w, 405, "bad_request", "Method not allowed.", "", r.URL.Path, "")
-		return
-	}
-	if sess == nil && r.URL.Path != "/api/session" {
-		s.fail(w, r, "unauthorized", "Sign in to QTS to continue.", "", "")
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)

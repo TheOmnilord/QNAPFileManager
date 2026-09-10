@@ -314,7 +314,10 @@ func runServe(args []string, stderr io.Writer) error {
 	if runtime.GOOS == "linux" && cfg.Auth.Mode != config.AuthLocal {
 		client := qtsauth.Detect("/etc/config/uLinux.conf")
 		if cfg.Auth.QTSPort != 0 {
-			client = qtsauth.New(fmt.Sprintf("http://127.0.0.1:%d", cfg.Auth.QTSPort))
+			// Override only the HTTP base; keep the detected SSL port so a
+			// Force-HTTPS unit still has its loopback fallback.
+			client.BaseURL = fmt.Sprintf("http://127.0.0.1:%d", cfg.Auth.QTSPort)
+			client.HTTP = qtsauth.NewHTTPClient(client.BaseURL, qtsauth.DefaultTimeout)
 		}
 		verifier = qtsauth.NewVerifier(client)
 	}

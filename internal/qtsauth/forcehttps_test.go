@@ -91,7 +91,7 @@ func TestHTTPUnreachableFallsBackToConfiguredSSLPort(t *testing.T) {
 // ErrUnreachable.
 func TestHTTPSBaseHasNoFallbackLoop(t *testing.T) {
 	c := New("https://127.0.0.1:1")
-	if fb := c.httpsFallback("https://127.0.0.1:1", 0); fb != "" {
+	if fb := c.httpsFallback("https://127.0.0.1:1"); fb != "" {
 		t.Fatalf("https base offered a fallback %q", fb)
 	}
 	if _, err := c.ValidateSID(context.Background(), "token"); err == nil {
@@ -99,17 +99,42 @@ func TestHTTPSBaseHasNoFallbackLoop(t *testing.T) {
 	}
 }
 
-func TestHTTPSPortFromLocation(t *testing.T) {
-	for loc, want := range map[string]int{
-		"https://192.168.1.95:8181/cgi-bin/authLogin.cgi": 8181,
-		"https://nas/cgi-bin/authLogin.cgi":               443,
-		"http://192.168.1.95:8080/x":                      0, // not https
-		"":                                                0,
-		"://bad":                                          0,
+func TestIsHTTPSLocation(t *testing.T) {
+	for loc, want := range map[string]bool{
+		"https://192.168.1.95:8181/cgi-bin/authLogin.cgi": true,
+		"https://nas/cgi-bin/authLogin.cgi":               true,
+		"http://192.168.1.95:8080/x":                      false,
+		"":                                                false,
+		"://bad":                                          false,
 	} {
-		if got := httpsPort(loc); got != want {
-			t.Errorf("httpsPort(%q) = %d, want %d", loc, got, want)
+		if got := isHTTPSLocation(loc); got != want {
+			t.Errorf("isHTTPSLocation(%q) = %v, want %v", loc, got, want)
 		}
+	}
+}
+
+// TestRedirectPortIsIgnored confirms the hardening from the review: even when
+// the Force-HTTPS redirect names a port, validation uses the CONFIGURED SSL
+// port on loopback, so a compromised HTTP endpoint cannot point it elsewhere.
+func TestRedirectPortIsIgnored(t *testing.T) {
+	tls := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/xml")
+		_, _ = w.Write([]byte(validXML))
+	}))
+	defer tls.Close()
+	realSSL := mustPort(t, tls.URL)
+
+	httpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Redirect names a bogus port; it must be ignored in favour of SSLPort.
+		http.Redirect(w, r, "https://attacker.example:9443/", http.StatusFound)
+	}))
+	defer httpSrv.Close()
+
+	c := New(httpSrv.URL)
+	c.SSLPort = realSSL
+	res, err := c.ValidateSID(context.Background(), "token")
+	if err != nil || !res.AuthPassed {
+		t.Fatalf("res=%+v err=%v; the configured SSL port should have answered", res, err)
 	}
 }
 

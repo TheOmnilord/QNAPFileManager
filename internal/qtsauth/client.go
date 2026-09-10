@@ -300,15 +300,21 @@ func (c *Client) getFrom(ctx context.Context, base, query string) (Result, strin
 
 	resp, err := c.clientFor(base).Do(req)
 	if err != nil {
-		// *url.Error stringifies the whole URL, credential included; keep only
-		// the underlying cause so tokens never reach a log.
-		var ue *url.Error
-		if errors.As(err, &ue) && ue.Err != nil {
-			err = ue.Err
+		// The transport error text can carry the whole request URL — and, when
+		// a malformed redirect Location is what failed to parse, the token in
+		// it. Never fold that text into the returned error: classify it by
+		// sentinel only (so the web layer can still tell a timeout from an
+		// unreachable endpoint) and name only the redacted query.
+		cause := ErrUnreachable
+		switch {
+		case errors.Is(err, context.Canceled):
+			cause = context.Canceled
+		case errors.Is(err, context.DeadlineExceeded):
+			cause = context.DeadlineExceeded
 		}
 		// An unreachable HTTP port may just mean the unit disabled it in favour
 		// of HTTPS; offer the configured SSL port on loopback as a fallback.
-		return Result{}, c.httpsFallback(base, 0), fmt.Errorf("qtsauth: %s: %w", redactQuery(query), errors.Join(err, ErrUnreachable))
+		return Result{}, c.httpsFallback(base), fmt.Errorf("qtsauth: %s: %w", redactQuery(query), errors.Join(cause, ErrUnreachable))
 	}
 	defer func() {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
@@ -317,11 +323,14 @@ func (c *Client) getFrom(ctx context.Context, base, query string) (Result, strin
 
 	// Redirects are never followed by the client (CheckRedirect returns
 	// ErrUseLastResponse), so a 3xx lands here. A redirect to HTTPS is QTS
-	// "Force HTTPS": take only the port from it, force the host back to
-	// loopback, and let the caller retry there.
+	// "Force HTTPS": retry on loopback at the CONFIGURED SSL port. The port in
+	// the Location is deliberately ignored, so a compromised HTTP endpoint
+	// cannot point validation at some other local TLS service.
 	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
-		if fb := c.httpsFallback(base, httpsPort(resp.Header.Get("Location"))); fb != "" {
-			return Result{}, fb, fmt.Errorf("qtsauth: HTTP endpoint redirected to HTTPS: %w", ErrBadResponse)
+		if isHTTPSLocation(resp.Header.Get("Location")) {
+			if fb := c.httpsFallback(base); fb != "" {
+				return Result{}, fb, fmt.Errorf("qtsauth: HTTP endpoint redirected to HTTPS: %w", ErrBadResponse)
+			}
 		}
 		return Result{}, "", fmt.Errorf("qtsauth: unexpected status %d: %w", resp.StatusCode, ErrBadResponse)
 	}
@@ -352,39 +361,30 @@ func (c *Client) clientFor(base string) *http.Client {
 
 // httpsFallback returns the loopback HTTPS URL to retry against, or "" when no
 // fallback applies. It is offered only for an http base (so a retry never
-// loops), and it always pins the host to 127.0.0.1: only the numeric port is
-// taken from the redirect (port>0) or, failing that, from configuration.
-func (c *Client) httpsFallback(base string, port int) string {
+// loops), always pins the host to 127.0.0.1, and always uses the CONFIGURED
+// SSL port — never a port taken from the response — so nothing an endpoint
+// returns can steer validation to another local service.
+func (c *Client) httpsFallback(base string) string {
 	if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(base)), "http://") {
 		return ""
 	}
-	if port <= 0 || port >= 65536 {
-		port = c.SSLPort
-	}
+	port := c.SSLPort
 	if port <= 0 || port >= 65536 {
 		port = DefaultSSLPort
 	}
 	return "https://127.0.0.1:" + strconv.Itoa(port)
 }
 
-// httpsPort returns the port of an https redirect Location, or 0 when the
-// Location is missing, unparseable, or not https. Only the port is ever used;
-// the host in the Location is discarded so validation stays on loopback.
-func httpsPort(location string) int {
+// isHTTPSLocation reports whether a redirect Location is an https URL. Only the
+// scheme is inspected; the host and port are never used (the fallback is pinned
+// to loopback and the configured SSL port), so this only distinguishes a
+// Force-HTTPS redirect from some other 3xx.
+func isHTTPSLocation(location string) bool {
 	if location == "" {
-		return 0
+		return false
 	}
 	u, err := url.Parse(location)
-	if err != nil || !strings.EqualFold(u.Scheme, "https") {
-		return 0
-	}
-	if p := u.Port(); p != "" {
-		if n, err := strconv.Atoi(p); err == nil && n > 0 && n < 65536 {
-			return n
-		}
-		return 0
-	}
-	return 443
+	return err == nil && strings.EqualFold(u.Scheme, "https")
 }
 
 // redactQuery keeps token values out of error strings and logs.

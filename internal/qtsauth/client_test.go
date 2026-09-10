@@ -150,10 +150,11 @@ func TestRedirectHostIsNeverContacted(t *testing.T) {
 	defer srv.Close()
 
 	c := testClient(srv, time.Second)
-	c.SSLPort = 1 // a closed loopback port, so the HTTPS fallback fails deterministically
+	// The redirect is to http (not an https Force-HTTPS signal), so it gets no
+	// fallback and is rejected; either way the redirect host is never touched.
 	_, err := c.ValidateQToken(context.Background(), "admin", "t")
-	if !errors.Is(err, ErrUnreachable) {
-		t.Fatalf("error = %v, want ErrUnreachable", err)
+	if !errors.Is(err, ErrBadResponse) {
+		t.Fatalf("error = %v, want ErrBadResponse", err)
 	}
 	if n := atomic.LoadInt32(&elsewhere); n != 0 {
 		t.Fatalf("redirect target was contacted %d times; the redirect host must never be followed", n)

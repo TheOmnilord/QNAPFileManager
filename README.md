@@ -6,7 +6,7 @@ filesystem (`/`, `/etc`, `/root`, `.qpkg` directories, raw volume mounts), edit 
 needs SSH or Telnet. Every operation runs with the signed-in user's own Linux identity; administrators can switch to a
 root mode for system paths.
 
-Status: **M0 in progress**. Start with [PLAN.md](PLAN.md).
+Status: **M0 (read-only browse) implemented and reviewed**; CI builds the QPKG. Next: the supervised install on the NAS (M1). Start with [PLAN.md](PLAN.md).
 
 ## Why
 

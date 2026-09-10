@@ -1144,6 +1144,11 @@ func TestATrailingSeparatorInALinkTargetRequiresADirectory(t *testing.T) {
 // The component split itself, which is the same on every host for a target
 // written with forward slashes. It runs where the kernel behaviour above cannot
 // be observed, so a regression in the splitting is caught on the dev box too.
+//
+// A trailing separator comes back as dirMark and never as ".": the two make
+// different demands of the kernel — a directory requirement against a lookup
+// inside the directory — and the "." spelling charged a search permission the
+// kernel does not charge for "dir/".
 func TestLinkTargetSplitKeepsTrailingSeparators(t *testing.T) {
 	cases := []struct {
 		in  string
@@ -1151,15 +1156,17 @@ func TestLinkTargetSplitKeepsTrailingSeparators(t *testing.T) {
 		abs []string // splitOSPath, for an absolute one
 	}{
 		{"a/b", []string{"a", "b"}, []string{"a", "b"}},
-		{"a/b/", []string{"a", "b", "."}, []string{"a", "b", "."}},
+		{"a/b/", []string{"a", "b", dirMark}, []string{"a", "b", dirMark}},
 		// splitLink leaves an interior doubled separator as the empty component
 		// resolve() skips; splitOSPath drops it. Either way nothing is checked
-		// for it, and the trailing pair still becomes the one ".".
-		{"a//b//", []string{"a", "", "b", "."}, []string{"a", "b", "."}},
+		// for it, and the trailing pair still becomes the one dirMark.
+		{"a//b//", []string{"a", "", "b", dirMark}, []string{"a", "b", dirMark}},
 		{"a/./b", []string{"a", ".", "b"}, []string{"a", ".", "b"}},
-		{"a/../", []string{"a", "..", "."}, []string{"a", "..", "."}},
+		{"a/../", []string{"a", "..", dirMark}, []string{"a", "..", dirMark}},
+		// A literal "." keeps its own spelling, and "./" is both: the lookup the
+		// dot asks for and the directory requirement the separator adds.
 		{".", []string{"."}, []string{"."}},
-		{"./", []string{".", "."}, []string{".", "."}},
+		{"./", []string{".", dirMark}, []string{".", dirMark}},
 	}
 	for _, c := range cases {
 		if got := splitLink(c.in); !equalStrings(got, c.rel) {
@@ -1171,8 +1178,17 @@ func TestLinkTargetSplitKeepsTrailingSeparators(t *testing.T) {
 	}
 	// The root of an absolute target is the one directory a trailing separator
 	// names on its own.
-	if got := splitOSPath("/"); !equalStrings(got, []string{"."}) {
-		t.Errorf("splitOSPath(%q) = %q, want %q", "/", got, []string{"."})
+	if got := splitOSPath("/"); !equalStrings(got, []string{dirMark}) {
+		t.Errorf("splitOSPath(%q) = %q, want %q", "/", got, []string{dirMark})
+	}
+	// The mark cannot be mistaken for a name: neither splitter can produce a
+	// component containing a separator, so nothing a target says can spell it.
+	for _, in := range []string{"a", "a/b", "a//b", "..", "a/dirMark"} {
+		for _, got := range append(splitLink(in), splitOSPath("/"+in)...) {
+			if got == dirMark {
+				t.Errorf("splitting %q produced the mark as a component", in)
+			}
+		}
 	}
 }
 

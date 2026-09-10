@@ -55,6 +55,20 @@ const maxLinkHops = 40
 // handful is already more patience than a live filesystem deserves.
 const maxFollowRetries = 8
 
+// dirMark is the pseudo-component splitLink and splitOSPath put at the end of a
+// symlink target that was written with a trailing separator, and the only thing
+// in the walk that is not a name. It carries the one extra requirement such a
+// target makes — "what this resolves to must be a directory" — separately from
+// the components, because the kernel's terminal slash is exactly that
+// requirement and nothing more: no lookup inside the directory, and so no search
+// permission on it.
+//
+// A separator is the one byte a path component cannot contain, which is what
+// makes this safe to carry in the same []string as real names: neither splitter
+// can ever produce it from a target, and resolve consumes it rather than
+// appending it to the resolved components.
+const dirMark = "/"
+
 // dirEntryInfo is one name from a directory read together with the metadata
 // that describes it, or the error that says why there is none. It exists
 // because the two platforms obtain that metadata differently — see readDirInfos
@@ -158,15 +172,34 @@ func resolve(r fsx.Root, apiPath string, followFinal bool) (jailPath, error) {
 			// (INV-2), so the checks are made and their errors are the result.
 			// This holds for every shape of target: a relative "locked/.", an
 			// absolute "/share/locked/.", and a target that is nothing but "."
-			// all arrive here as a component (linkParts, splitLink). A target
-			// that ends in a separator — "dir/", "/share/x/" — arrives as one
-			// too, because that is exactly what it asks of the kernel: look the
-			// last component up, then look inside it.
+			// all arrive here as a component (linkParts, splitLink).
 			if blocked != nil {
 				return jailPath{}, blocked
 			}
 			if err := checkTraversable(j, relOf(done)); err != nil {
 				return jailPath{}, err
+			}
+			continue
+		case dirMark:
+			// A trailing separator in a symlink target — "dir/", "/share/x/".
+			// It is *not* the "." above, and spelling it as one was a real
+			// difference: the kernel's rule for a terminal slash is that the
+			// object just resolved must be a directory, with no further lookup
+			// inside it (fs/namei.c, LOOKUP_DIRECTORY). "." asks for the lookup
+			// as well, so it also needs the search bit — and a link targeting
+			// "locked/" was refused for a user who may stat locked but not
+			// search it, where the kernel resolves it happily. So the
+			// requirement is carried as its own component and costs no
+			// permission of its own.
+			//
+			// Nothing more is asked here because the requirement has already
+			// been decided: whatever component this mark follows was classified
+			// with a non-empty rest — the mark itself — so a symlink there was
+			// followed within the hop bound and anything that is not a
+			// directory set blocked to the ENOTDIR-mapped error below. A mark
+			// with nothing before it names the jail base, which is a directory.
+			if blocked != nil {
+				return jailPath{}, blocked
 			}
 			continue
 		case "..":
@@ -282,14 +315,16 @@ func linkParts(r fsx.Root, apiPath, link string) (parts []string, absolute bool,
 		}
 	}
 	// A "." in the head names the directory the walk has already reached rather
-	// than a new one, so it says nothing about *where* the head is and takes no
-	// part in the containment mapping. It still has to survive it: the mapping
-	// is where the dots used to be lost, and losing them let StatFollow answer
-	// for "/share/locked/." a user the kernel would have refused. So the head is
-	// located with the dots left out and handed back to the walk with them in.
+	// than a new one, and a dirMark — the target's trailing separator — names no
+	// directory at all, so neither says anything about *where* the head is and
+	// neither takes part in the containment mapping. They still have to survive
+	// it: the mapping is where they used to be lost, and losing them let
+	// StatFollow answer for "/share/locked/." and "/share/file/" users the
+	// kernel would have refused. So the head is located without them and handed
+	// back to the walk with them in.
 	located := make([]string, 0, len(head))
 	for _, c := range head {
-		if c != "." {
+		if c != "." && c != dirMark {
 			located = append(located, c)
 		}
 	}
@@ -307,12 +342,14 @@ func linkParts(r fsx.Root, apiPath, link string) (parts []string, absolute bool,
 	// exactly how many of the head's components the jail base itself accounts
 	// for. Those are dropped from the head as written, along with any "." among
 	// them: a dot at or above the base names a directory this walk did not
-	// traverse and has no business asking the kernel about. Everything below the
-	// base is kept with the spelling the link gave it.
+	// traverse and has no business asking the kernel about. A dirMark is never
+	// dropped by the count — it is not a component — and stays for the walk,
+	// where it requires of the base what the trailing separator asked.
+	// Everything below the base is kept with the spelling the link gave it.
 	skip := len(located) - len(splitRel(strings.TrimPrefix(api, "/")))
 	rest := head
 	for skip > 0 && len(rest) > 0 {
-		if rest[0] != "." {
+		if rest[0] != "." && rest[0] != dirMark {
 			skip--
 		}
 		rest = rest[1:]
@@ -328,16 +365,16 @@ func linkParts(r fsx.Root, apiPath, link string) (parts []string, absolute bool,
 // ".." are kept, because the walk is what decides what they mean.
 //
 // A trailing separator is not empty in the way a doubled one is: "/share/x/"
-// asks the kernel to look up "x" and then to look inside it, so it resolves
-// only when x is a directory (or a symlink to one) and the caller may search
-// it. Dropping it turned "/share/file/" — ENOTDIR to the kernel — into a
-// perfectly good stat of the file (INV-2). It comes back as the "." the kernel
-// effectively appends, and resolve() makes the check.
+// asks the kernel to look x up and then requires x to be a directory, so it
+// resolves only when x is one (or a symlink ending at one). Dropping it turned
+// "/share/file/" — ENOTDIR to the kernel — into a perfectly good stat of the
+// file (INV-2). It comes back as dirMark, which is that requirement and not the
+// "." the kernel would additionally have looked up.
 func splitOSPath(p string) []string {
 	p = p[len(filepath.VolumeName(p)):]
 	parts := strings.FieldsFunc(p, isOSSeparator)
 	if endsInSeparator(p) {
-		parts = append(parts, ".")
+		parts = append(parts, dirMark)
 	}
 	return parts
 }
@@ -411,13 +448,13 @@ func splitRel(rel string) []string {
 // that directory like any other name — so the component survives here and
 // resolve() asks (INV-2).
 //
-// A trailing separator survives too, as the "." it amounts to. "dir/" resolves
-// where "file/" is ENOTDIR: the kernel looks the last component up and then
-// looks *inside* it, so the target only names something when that something is
-// a directory — or a symlink that ends at one — and the caller may search it.
-// Trimming the separator dropped that requirement and let StatFollow answer for
-// "file/" with the file, which a listing then offered for download as a working
-// link (INV-2 again).
+// A trailing separator survives too, as dirMark. "dir/" resolves where "file/"
+// is ENOTDIR: the kernel looks the last component up and then requires it to be
+// a directory — or a symlink that ends at one. Trimming the separator dropped
+// that requirement and let StatFollow answer for "file/" with the file, which a
+// listing then offered for download as a working link (INV-2 again). Spelling
+// it "." instead overshot in the other direction: that is a lookup *inside* the
+// directory, and it refused "locked/" for a user the kernel allows.
 //
 // Everything else is splitRel: interior separators collapse, and ".." is left
 // for the walk to apply.
@@ -428,13 +465,13 @@ func splitLink(link string) []string {
 		// Only reachable for a target of nothing but separators, which is
 		// absolute and never arrives here; "" is refused before the split.
 		if dirOnly {
-			return []string{"."}
+			return []string{dirMark}
 		}
 		return nil
 	}
 	parts := strings.Split(link, "/")
 	if dirOnly {
-		parts = append(parts, ".")
+		parts = append(parts, dirMark)
 	}
 	return parts
 }

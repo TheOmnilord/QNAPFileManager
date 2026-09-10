@@ -348,6 +348,89 @@ func TestADotComponentNeedsSearchPermissionOnTheDirectoryItNames(t *testing.T) {
 	}
 }
 
+// TestATrailingSeparatorDoesNotNeedSearchPermission is the other half of the
+// dot rule, and the line between the two: a terminal slash is not a "."
+//
+// The kernel's rule for "locked/" is that what the name resolves to must be a
+// directory — LOOKUP_DIRECTORY, checked against the object itself, with no
+// further lookup inside it. "locked/." asks for that lookup as well, and that is
+// the one that needs the search bit. Carrying the trailing separator as a
+// synthetic "." collapsed the two: a share pointing at a directory the user may
+// see but not enter — the ordinary shape of a locked-down QNAP folder — stopped
+// resolving, so StatFollow refused it and the listing showed the link with no
+// target type at all, where the kernel hands the directory over (INV-2, in the
+// direction of excess refusal).
+func TestATrailingSeparatorDoesNotNeedSearchPermission(t *testing.T) {
+	requireSymlinks(t)
+	requireUnprivileged(t)
+	r, base := fixture(t)
+	mkdir(t, base, "locked")
+	write(t, base, "locked/secret", "not yours")
+	locked := filepath.Join(base, "locked")
+	sep := string(filepath.Separator)
+	chmodBack(t, locked, 0o755)
+	if err := os.Chmod(locked, 0o644); err != nil { // readable, not searchable
+		t.Fatal(err)
+	}
+	// Both halves have to be the kernel's own behaviour for the comparison to
+	// measure anything: the dot refused, the trailing separator allowed. Neither
+	// path goes through filepath.Join, which would clean the tail away and stat
+	// locked itself.
+	if _, err := os.Stat(locked + sep + "."); !errors.Is(err, fs.ErrPermission) {
+		t.Skipf("this filesystem does not enforce the directory execute bit: %v", err)
+	}
+	if _, err := os.Stat(locked + sep); err != nil {
+		t.Skipf("this kernel does not resolve a trailing separator on an unsearchable directory: %v", err)
+	}
+	links := map[string]string{
+		"slash":    "locked/",
+		"absslash": locked + sep,
+		"dot":      "locked/.",
+	}
+	for name, target := range links {
+		if err := os.Symlink(target, filepath.Join(base, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx := context.Background()
+
+	// The directory requirement alone: no search permission is charged, and the
+	// link describes the directory it names.
+	for _, name := range []string{"slash", "absslash"} {
+		e, err := StatFollow(ctx, r, nil, "/"+name)
+		if err != nil {
+			t.Errorf("StatFollow(%q) names a directory the user may stat but not search: %v", name, err)
+			continue
+		}
+		if e.Type != "dir" {
+			t.Errorf("StatFollow(%q) type = %q, want dir", name, e.Type)
+		}
+		if e, err := Stat(ctx, r, nil, "/"+name); err != nil {
+			t.Errorf("Stat(%q): %v", name, err)
+		} else if e.TargetType != "dir" || e.LinkResolved != "/locked" {
+			t.Errorf("Stat(%q) = %+v, want a link resolved to /locked with target type dir", name, e)
+		}
+	}
+
+	// And the "." spelling is still refused, because that one really is a lookup
+	// inside locked.
+	if e, err := StatFollow(ctx, r, nil, "/dot"); !errors.Is(err, fs.ErrPermission) {
+		t.Fatalf("entry %+v, err = %v, want a permission error", e, err)
+	} else if code := fsx.Code(err); code != "permission" {
+		t.Errorf("code = %q, want permission", code)
+	}
+
+	// Reaching *through* the trailing separator is a search of locked like any
+	// other, so it stays refused: what the separator dropped is the check on the
+	// final directory, not the ones inside it.
+	if f, _, err := OpenRead(ctx, r, "/slash/secret"); err == nil {
+		f.Close()
+		t.Error("a download through a directory the user cannot search must be refused")
+	} else if !errors.Is(err, fs.ErrPermission) {
+		t.Errorf("reading through an unsearchable directory = %v, want a permission error", err)
+	}
+}
+
 // TestADotInAnAbsoluteLinkTargetNeedsTheSameSearchPermission is the same rule
 // for the shape QTS actually writes: /share/Public is an absolute symlink, and
 // so is everything under it that an operator points somewhere else by hand. An

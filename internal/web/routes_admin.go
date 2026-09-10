@@ -145,12 +145,22 @@ func (s *Server) postSettings(w http.ResponseWriter, r *http.Request, sess *sess
 		}
 	}
 
-	// 2. Persist. Nothing is applied yet, so a save failure leaves the live guard
-	//    and the file untouched; record the failure durably (adv 10) and refuse.
+	// 2. Persist. A save FAILURE does not imply the file is untouched — config.Save
+	//    renames a temp file into place, so the rename can land (the file now holds
+	//    newVal) before a later SyncDir/Chmod errors (round-10). The guard has not
+	//    been flipped yet, so on failure reconcile it and s.cfg to whatever is
+	//    ACTUALLY on disk (re-read; fail-closed if unreadable) before refusing, so
+	//    the guard and the config can never disagree even on this early-return path,
+	//    exactly as the rollback path does.
 	if s.ConfigPath != "" {
 		c := s.cfg
 		c.ReadOnly = newVal
 		if err := config.Save(s.ConfigPath, c); err != nil {
+			effective := reconcileReadOnly(s.ConfigPath, prevVal, err, config.Load, s.logger.Printf)
+			s.cfg.ReadOnly = effective
+			if s.guard != nil {
+				s.guard.SetReadOnly(effective)
+			}
 			_ = auditResult("error", "internal", fmt.Sprintf("save failed: %v", err))
 			s.fail(w, r, "internal", "The setting could not be saved.", "", err.Error())
 			return

@@ -207,6 +207,19 @@ func (g *Guard) Check(op Op, p string) error {
 		}
 	}
 
+	// 3b. Containment: deleting or renaming a directory that CONTAINS the daemon's
+	//     own installation subtree would relocate that subtree — its binary, its
+	//     config (the password hash) and its logs (the audit trail) — out of the
+	//     protected prefix, defeating every install-dir rule, which only matches the
+	//     subtree itself. The kernel blocks deleting a non-empty ancestor, but a
+	//     RENAME of one succeeds, so it is the real vector; refuse operating on any
+	//     strict ancestor of the install dir (round-10 final review). Ancestors that
+	//     are volume roots are already caught in step 3; this closes the plain
+	//     intermediate directories above the install dir (e.g. the .qpkg folder).
+	if op&(OpDelete|OpRename) != 0 && strictAncestor(p, g.installDir) {
+		return fmt.Errorf("%s contains the file manager's own installation and audit trail: %w", p, ErrProtected)
+	}
+
 	// 4. The rule table. A Deny match wins over everything and returns at once;
 	//    a Warn match is remembered and reported only if nothing denies.
 	warn := ""
@@ -237,6 +250,11 @@ func (g *Guard) Classify(p string) string {
 		return "protected"
 	}
 	if fn := g.mountChecker(); fn != nil && fn(p) {
+		return "protected"
+	}
+	// A strict ancestor of the install tree is protected: renaming it would
+	// relocate the install and audit subtree out of protection (round-10).
+	if strictAncestor(p, g.installDir) {
 		return "protected"
 	}
 	// A path that offers any confirmable operation is a caution ("warn") area
@@ -305,6 +323,13 @@ func (g *Guard) Reasons(op Op, p string) []string {
 		}
 	}
 	return out
+}
+
+// strictAncestor reports whether p is a proper ancestor directory of child:
+// child lies within p and is not p itself. Both are fsx.Clean absolute paths; an
+// empty child (no install dir configured) has no ancestors, so it returns false.
+func strictAncestor(p, child string) bool {
+	return child != "" && p != child && fsx.IsWithin(child, p)
 }
 
 // matches applies a rule to a path with path-boundary semantics: an Exact rule

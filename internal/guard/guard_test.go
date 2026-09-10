@@ -224,6 +224,48 @@ func TestInstallDirProtection(t *testing.T) {
 	}
 }
 
+// TestAncestorContainmentProtection proves the round-10 fix: a directory that
+// CONTAINS the install/audit subtree cannot be renamed or deleted through the
+// file manager, even though it is not itself a rule prefix — renaming it would
+// relocate the whole protected subtree out of protection. Reads and creates on
+// such an ancestor stay allowed; only delete/rename of it are refused.
+func TestAncestorContainmentProtection(t *testing.T) {
+	g := New(testInstall, false) // testInstall = /share/CACHEDEV1_DATA/.qpkg/QNAPFileManager
+	// The .qpkg folder and the volume data dir both contain the install tree.
+	ancestors := []string{
+		"/share/CACHEDEV1_DATA/.qpkg",
+		"/share/CACHEDEV1_DATA",
+	}
+	for _, a := range ancestors {
+		if err := g.Check(OpRename, a); !errors.Is(err, ErrProtected) {
+			t.Errorf("rename of install-tree ancestor %q should be protected, got %v", a, err)
+		}
+		if err := g.Check(OpDelete, a); !errors.Is(err, ErrProtected) {
+			t.Errorf("delete of install-tree ancestor %q should be protected, got %v", a, err)
+		}
+		if got := g.Classify(a); got != "protected" {
+			t.Errorf("Classify(%q) = %q, want protected", a, got)
+		}
+		// Non-destructive ops on an ancestor are untouched.
+		if err := g.Check(OpRead, a); err != nil {
+			t.Errorf("read of ancestor %q should be allowed, got %v", a, err)
+		}
+	}
+	// A sibling that merely shares a textual prefix is NOT an ancestor.
+	if err := g.Check(OpRename, "/share/CACHEDEV1_DATA/.qpkg-other"); errors.Is(err, ErrProtected) {
+		t.Error("a sibling of the .qpkg dir must not be treated as an install-tree ancestor")
+	}
+	// The install dir itself and its descendants remain protected by their own rules.
+	if err := g.Check(OpRename, testInstall); !errors.Is(err, ErrProtected) {
+		t.Errorf("rename of the install dir itself should be protected, got %v", err)
+	}
+	// With no install dir configured, ancestor protection does not fire.
+	none := New("", false)
+	if err := none.Check(OpRename, "/share/CACHEDEV1_DATA/.qpkg"); err != nil {
+		t.Errorf("no install dir means no ancestor protection, got %v", err)
+	}
+}
+
 // TestNeverWriteComponents covers .zfs (any depth), /proc and /sys.
 func TestNeverWriteComponents(t *testing.T) {
 	g := New("", false)

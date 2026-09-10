@@ -96,6 +96,12 @@ func TestReadOnlyIntentDurableBeforeApply(t *testing.T) {
 	if !s.guard.ReadOnly() {
 		t.Fatal("the live guard was flipped despite the persist failing")
 	}
+	// The step-2 save-failure path reconciles too: the guard and the in-memory
+	// config must agree (round-10). Here the file is unwritable and unreadable, so
+	// the reconciliation fails closed to read-only and both must read true.
+	if s.cfg.ReadOnly != s.guard.ReadOnly() {
+		t.Fatalf("after a persist failure, s.cfg.ReadOnly=%v disagrees with the guard=%v", s.cfg.ReadOnly, s.guard.ReadOnly())
+	}
 	if err := logger.Close(); err != nil {
 		t.Fatal(err)
 	}

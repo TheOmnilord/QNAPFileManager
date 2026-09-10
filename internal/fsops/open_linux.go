@@ -8,6 +8,8 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
+
+	"qnapfilemanager/internal/fsx"
 )
 
 // oPath is O_PATH. The value is the same on every Linux architecture, but the
@@ -16,7 +18,7 @@ import (
 // written here rather than made a per-GOARCH problem.
 const oPath = 0x200000
 
-// walkOPath opens the directory named by rel inside rt and hands back a
+// walkOPath opens the directory named by rel inside the jail and hands back a
 // descriptor for it, one component at a time, asking the kernel for nothing it
 // does not need.
 //
@@ -34,11 +36,14 @@ const oPath = 0x200000
 // Each component here is opened O_PATH instead: the kernel resolves the name
 // and returns a handle that can be the dirfd of a later openat, and checks
 // nothing else. Resolving the name still needs search permission on the parent,
-// which is exactly the permission the kernel itself requires, and no more.
+// which is exactly the permission the kernel itself requires, and no more. The
+// jail base is the same rule applied to the start of the walk: fsx.Jail is an
+// O_PATH descriptor for it, so a search-only -jail directory no longer costs
+// the worker every operation it was going to perform.
 //
 // The confinement is unchanged, and it is worth being explicit about why:
 //
-//   - the walk starts at rt's own descriptor, reached through os.Root, so there
+//   - the walk starts at the jail's own descriptor, which has no name, so there
 //     is no name for it to be given;
 //   - every step is an openat relative to the previous descriptor, so nothing
 //     is resolved through this process's cwd or through an absolute path;
@@ -53,10 +58,10 @@ const oPath = 0x200000
 //     could only disagree with the first.
 //
 // The caller owns the returned descriptor and must close it.
-func walkOPath(rt *os.Root, rel string) (*os.File, error) {
-	// "." is the jail base itself. os.Root resolves that against the descriptor
-	// it holds, so this needs no name and cannot be pointed anywhere else.
-	dir, err := rt.OpenFile(".", oPath|syscall.O_DIRECTORY|syscall.O_CLOEXEC, 0)
+func walkOPath(j fsx.Jail, rel string) (*os.File, error) {
+	// The jail base itself, addressed by descriptor: it needs no name and
+	// cannot be pointed anywhere else.
+	dir, err := j.OpenBase()
 	if err != nil {
 		return nil, err
 	}
@@ -108,26 +113,35 @@ func openatIn(dir *os.File, name string, flags int) (int, error) {
 	return fd, nil
 }
 
-// statAt is lstat(2) — or stat(2), when follow is set — for a path that has
-// already been resolved, taken through the O_PATH walk rather than through
-// os.Root so that a search-only directory on the way costs nothing.
+// statAt is lstat(2) for a path that has already been resolved, taken through
+// the O_PATH walk rather than through os.Root so that a search-only directory
+// on the way costs nothing.
 //
 // The metadata itself comes from fstat on an O_PATH descriptor for the final
 // component, opened O_NOFOLLOW so a symlink describes itself. Going through a
 // descriptor rather than fstatat is deliberate: what comes back is the os
 // package's own FileInfo, so os.SameFile still works on it — and os.SameFile is
 // what OpenRead uses to prove the descriptor it opened is the file it checked.
-func statAt(rt *os.Root, rel string, follow bool) (os.FileInfo, error) {
+//
+// There is no follow variant. Following a link means checking where it lands,
+// and resolve() is the only thing here that knows how; statPath re-resolves
+// rather than asking for a stat that follows (see statFollowing).
+func statAt(j fsx.Jail, rel string) (os.FileInfo, error) {
 	dir, base := splitFinal(rel)
 	if base == "" || base == "." || base == ".." {
-		// The jail base itself, or a name openat cannot address on its own.
-		// There is nothing above it to walk, so os.Root asks for nothing extra.
-		if follow {
-			return rt.Stat(rel)
+		if rel == "." || rel == "" {
+			// The jail base itself: the one path with nothing above it to walk,
+			// and nothing to look up either. The lookup that would answer it
+			// lives in the base's parent, which is outside the jail, so the
+			// answer comes from an fstat on the handle.
+			return j.StatBase()
 		}
-		return rt.Lstat(rel)
+		// A trailing "." or ".." is not a name openat can address here, and
+		// resolve() never produces one: it applies both itself, component by
+		// component, with the kernel's own permission checks.
+		return nil, &fs.PathError{Op: "statat", Path: rel, Err: syscall.EINVAL}
 	}
-	parent, err := walkOPath(rt, dir)
+	parent, err := walkOPath(j, dir)
 	if err != nil {
 		return nil, err
 	}
@@ -139,29 +153,22 @@ func statAt(rt *os.Root, rel string, follow bool) (os.FileInfo, error) {
 	}
 	f := os.NewFile(uintptr(fd), rel)
 	defer f.Close()
-	fi, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if follow && fi.Mode()&fs.ModeSymlink != 0 {
-		// resolve() follows every link on a path it was asked to follow, so a
-		// link still here is one that appeared underneath us. Following it is
-		// os.Root's job, because following it safely means checking that it
-		// lands back inside the jail, and os.Root is what knows how to do that.
-		return rt.Stat(rel)
-	}
-	return fi, nil
+	return f.Stat()
 }
 
 // readlinkAt is readlink(2) for an already-resolved path, through the same
 // O_PATH walk and for the same reason: naming a link inside a search-only
 // directory is not a listing.
-func readlinkAt(rt *os.Root, rel string) (string, error) {
+func readlinkAt(j fsx.Jail, rel string) (string, error) {
 	dir, base := splitFinal(rel)
 	if base == "" || base == "." || base == ".." {
-		return rt.Readlink(rel)
+		// The jail base is a directory and readlink of a directory is EINVAL,
+		// which is also the honest answer for a trailing "." or ".." — neither
+		// is a name openat can address here, and neither ever reaches this far:
+		// resolve() applies both itself.
+		return "", &fs.PathError{Op: "readlinkat", Path: rel, Err: syscall.EINVAL}
 	}
-	parent, err := walkOPath(rt, dir)
+	parent, err := walkOPath(j, dir)
 	if err != nil {
 		return "", err
 	}
@@ -243,13 +250,13 @@ func readlinkatIn(dirfd int, name string, buf []byte) (int, error) {
 // interrupt a blocked syscall. With the flag the open returns immediately and
 // fstat gets its turn. The caller clears it again once the descriptor has been
 // proved to be a regular file (clearNonblock).
-func openFinal(rt *os.Root, rel string) (*os.File, error) {
+func openFinal(j fsx.Jail, rel string) (*os.File, error) {
 	dir, base := splitFinal(rel)
 	if base == "" || base == "." || base == ".." {
 		// Never a regular file, and never something to hand to openat here.
 		return nil, &fs.PathError{Op: "openat", Path: rel, Err: syscall.EINVAL}
 	}
-	parent, err := walkOPath(rt, dir)
+	parent, err := walkOPath(j, dir)
 	if err != nil {
 		return nil, err
 	}
@@ -290,16 +297,23 @@ func openFinal(rt *os.Root, rel string) (*os.File, error) {
 // osName is the directory's full OS path, and it now names the *os.File for
 // error messages only: readDirInfos stats every entry through this descriptor
 // rather than through a path built from f.Name(), so nothing here resolves a
-// name against the process working directory any more.
-func openDir(rt *os.Root, rel, osName string) (*os.File, error) {
+// name against the process working directory any more. (The jail base names
+// itself, which is the same string: r.OS("/") is the base.)
+func openDir(j fsx.Jail, rel, osName string) (*os.File, error) {
 	dir, base := splitFinal(rel)
 	if base == "" || base == "." || base == ".." {
-		// The jail base itself, or a name openat cannot address on its own.
-		// os.Root resolves it against the descriptor it holds, with no
-		// intermediate component to over-ask for.
-		return rt.OpenFile(rel, os.O_RDONLY|syscall.O_DIRECTORY, 0)
+		if rel == "." || rel == "" {
+			// The jail base itself: opened O_RDONLY relative to the handle,
+			// with no intermediate component to over-ask for — and with the
+			// base's own read bit still the kernel's to require, which is why
+			// the handle being O_PATH does not make a private -jail directory
+			// listable (INV-2).
+			return j.OpenBaseDir()
+		}
+		// A trailing "." or ".." is not a name openat can address here.
+		return nil, &fs.PathError{Op: "openat", Path: rel, Err: syscall.EINVAL}
 	}
-	parent, err := walkOPath(rt, dir)
+	parent, err := walkOPath(j, dir)
 	if err != nil {
 		return nil, err
 	}
@@ -483,8 +497,8 @@ func statMode(m uint32) fs.FileMode {
 // itself; opening dir directly would not, because O_PATH deliberately skips the
 // permission check on the thing being opened. Every descriptor involved is
 // O_PATH, so nothing here needs read permission on anything.
-func checkTraversable(rt *os.Root, dir string) error {
-	d, err := walkOPath(rt, dir)
+func checkTraversable(j fsx.Jail, dir string) error {
+	d, err := walkOPath(j, dir)
 	if err != nil {
 		return err
 	}

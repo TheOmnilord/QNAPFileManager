@@ -13,11 +13,12 @@
 // fsx.Clean, which refuses a "." or a ".." component rather than resolving it:
 // only the kernel may resolve those, one component at a time, against the
 // symlinks and the search permissions that are actually there.
-// Every syscall goes through the *os.Root that fsx.Root.Open
-// holds: the kernel resolves each component against that directory's descriptor
-// and refuses one that would leave it, so the jail is enforced by openat rather
-// than by string comparison. The unjailed production case is the same code path
-// with the filesystem root as its base.
+// Every syscall goes through the fsx.Jail that fsx.Root.Open holds — on Linux
+// an O_PATH descriptor for the jail base, elsewhere an *os.Root: the kernel
+// resolves each component against that directory's descriptor and refuses one
+// that would leave it, so the jail is enforced by openat rather than by string
+// comparison. The unjailed production case is the same code path with the
+// filesystem root as its base.
 package fsops
 
 import (
@@ -49,6 +50,11 @@ const readChunk = 256
 // cycle outside it would rather than spinning in this process.
 const maxLinkHops = 40
 
+// maxFollowRetries bounds the re-resolution in statFollowing. Each round is a
+// symlink that appeared where the walk had just found something else, so a
+// handful is already more patience than a live filesystem deserves.
+const maxFollowRetries = 8
+
 // dirEntryInfo is one name from a directory read together with the metadata
 // that describes it, or the error that says why there is none. It exists
 // because the two platforms obtain that metadata differently — see readDirInfos
@@ -77,17 +83,17 @@ func SetIDMap(m *idmap.Map) { idMap.Store(m) }
 // IDMap returns the installed resolver, or nil.
 func IDMap() *idmap.Map { return idMap.Load() }
 
-// jailPath is one API path resolved against the jail: the open root every
-// syscall goes through, the name to hand its methods, and the API path that
+// jailPath is one API path resolved against the jail: the open handle every
+// syscall goes through, the name to resolve against it, and the API path that
 // names the result.
 type jailPath struct {
-	rt  *os.Root
-	rel string // slash-separated and relative to rt, "." for the base itself
-	api string // the API path rel corresponds to
+	jail fsx.Jail
+	rel  string // slash-separated and relative to the jail base, "." for the base itself
+	api  string // the API path rel corresponds to
 }
 
-// resolve walks an API path inside the jail's *os.Root, one component at a
-// time, and returns what to operate on.
+// resolve walks an API path inside the jail, one component at a time, and
+// returns what to operate on.
 //
 // os.Root would happily do the walk itself — but it refuses an absolute symlink
 // target outright, and QTS is built out of them (/share/Public pointing at
@@ -114,7 +120,7 @@ type jailPath struct {
 // that hands the operation a descriptor rather than a name) is M1 work, when
 // the mutating operations arrive and the stakes change.
 func resolve(r fsx.Root, apiPath string, followFinal bool) (jailPath, error) {
-	rt, err := r.Open()
+	j, err := r.Open()
 	if err != nil {
 		return jailPath{}, err
 	}
@@ -156,7 +162,7 @@ func resolve(r fsx.Root, apiPath string, followFinal bool) (jailPath, error) {
 			if blocked != nil {
 				return jailPath{}, blocked
 			}
-			if err := checkTraversable(rt, relOf(done)); err != nil {
+			if err := checkTraversable(j, relOf(done)); err != nil {
 				return jailPath{}, err
 			}
 			continue
@@ -185,7 +191,7 @@ func resolve(r fsx.Root, apiPath string, followFinal bool) (jailPath, error) {
 			// the permission is asked for before the component is popped, and
 			// "locked/../report" fails for a user who cannot traverse "locked"
 			// exactly as it would in the shell (INV-2).
-			if err := checkTraversable(rt, relOf(done)); err != nil {
+			if err := checkTraversable(j, relOf(done)); err != nil {
 				return jailPath{}, err
 			}
 			done = done[:len(done)-1]
@@ -196,7 +202,7 @@ func resolve(r fsx.Root, apiPath string, followFinal bool) (jailPath, error) {
 			continue
 		}
 		cand := relJoin(relOf(done), part)
-		fi, err := statAt(rt, cand, false)
+		fi, err := statAt(j, cand)
 		if err != nil {
 			// Not there at all, or not readable: keep the component as written
 			// so the caller's syscall reports it, and remember why.
@@ -217,7 +223,7 @@ func resolve(r fsx.Root, apiPath string, followFinal bool) (jailPath, error) {
 		if hops > maxLinkHops {
 			return jailPath{}, fmt.Errorf("%q: too many levels of symbolic links: %w", apiPath, fsx.ErrUnsupported)
 		}
-		link, err := readlinkAt(rt, cand)
+		link, err := readlinkAt(j, cand)
 		if err != nil {
 			return jailPath{}, err
 		}
@@ -230,7 +236,7 @@ func resolve(r fsx.Root, apiPath string, followFinal bool) (jailPath, error) {
 		}
 		rest = append(parts, rest...)
 	}
-	return jailPath{rt: rt, rel: relOf(done), api: apiOf(done)}, nil
+	return jailPath{jail: j, rel: relOf(done), api: apiOf(done)}, nil
 }
 
 // linkParts turns one readlink(2) result into the components resolution should
@@ -454,13 +460,13 @@ func List(ctx context.Context, r fsx.Root, plat *platform.Platform, dir string, 
 		return fsx.Listing{}, err
 	}
 	osDir, _ := r.OS(tg.api) // names the handle and keys the mount table; never a syscall path
-	f, err := openDir(tg.rt, tg.rel, osDir)
+	f, err := openDir(tg.jail, tg.rel, osDir)
 	if err != nil {
 		// O_DIRECTORY reports "this is not a directory" as ENOTDIR, which the
 		// API vocabulary spells bad_request. An lstat tells that apart from a
 		// genuine failure without depending on an errno that differs per
 		// platform.
-		if fi, serr := statAt(tg.rt, tg.rel, false); serr == nil && !fi.IsDir() {
+		if fi, serr := statAt(tg.jail, tg.rel); serr == nil && !fi.IsDir() {
 			return fsx.Listing{}, fmt.Errorf("%q is not a directory: %w", clean, fsx.ErrBadName)
 		}
 		// A directory we cannot read is an error, not a partial listing: a
@@ -514,7 +520,7 @@ func List(ctx context.Context, r fsx.Root, plat *platform.Platform, dir string, 
 			if e.IsSymlink {
 				// The parent is already resolved, so the link is addressed
 				// directly beneath it rather than resolved again per entry.
-				resolveLink(&e, r, tg.rt, relJoin(tg.rel, name), child, o.ResolveLinks || shareDir, o.ResolveLinks)
+				resolveLink(&e, r, tg.jail, relJoin(tg.rel, name), child, o.ResolveLinks || shareDir, o.ResolveLinks)
 			}
 			if shareDir {
 				// §2.2: at /share we return everything and label it. The
@@ -594,18 +600,18 @@ func statPath(ctx context.Context, r fsx.Root, plat *platform.Platform, p string
 	if err := ctx.Err(); err != nil {
 		return fsx.Entry{}, err
 	}
-	var fi os.FileInfo
-	if follow {
-		fi, err = statAt(tg.rt, tg.rel, true)
-	} else {
-		fi, err = statAt(tg.rt, tg.rel, false)
-	}
+	fi, err := statAt(tg.jail, tg.rel)
 	if err != nil {
 		return fsx.Entry{}, err
 	}
+	if follow {
+		if tg, fi, err = statFollowing(r, clean, tg, fi); err != nil {
+			return fsx.Entry{}, err
+		}
+	}
 	e := newEntry(clean, []byte(fsx.Base(clean)), fi, IDMap())
 	if e.IsSymlink {
-		resolveLink(&e, r, tg.rt, tg.rel, clean, true, true)
+		resolveLink(&e, r, tg.jail, tg.rel, clean, true, true)
 	}
 	if osPath, err := r.OS(tg.api); err == nil && plat != nil && plat.IsMountPoint(osPath) {
 		e.MountPoint = true
@@ -620,6 +626,38 @@ func statPath(ctx context.Context, r fsx.Root, plat *platform.Platform, p string
 		}
 	}
 	return e, nil
+}
+
+// statFollowing completes a stat that follows the final symlink.
+//
+// resolve(followFinal: true) has already followed every link on the path, so
+// what it hands back is a name that was not a symlink when it was classified.
+// A symlink standing there now is one that appeared underneath us — a race in a
+// live filesystem, not a shape a caller can ask for — and the answer is to
+// resolve the path again rather than to make a stat that follows: following a
+// link safely means checking where it lands, and resolve() is the only thing
+// here that knows how (an absolute target has to be mapped back into the jail,
+// and a target outside it refused). A stat that followed on its own would be
+// the one syscall in this package that could reach out of the jail, which is
+// exactly what INV-2's containment forbids.
+//
+// The retries are bounded because losing this race repeatedly is a filesystem
+// being rewritten underneath the request, not a path to keep chasing.
+func statFollowing(r fsx.Root, clean string, tg jailPath, fi os.FileInfo) (jailPath, os.FileInfo, error) {
+	for tries := 0; fi.Mode()&fs.ModeSymlink != 0; tries++ {
+		if tries >= maxFollowRetries {
+			return jailPath{}, nil, fmt.Errorf("%q keeps being replaced by a symlink while it is resolved: %w",
+				clean, fsx.ErrUnsupported)
+		}
+		var err error
+		if tg, err = resolve(r, clean, true); err != nil {
+			return jailPath{}, nil, err
+		}
+		if fi, err = statAt(tg.jail, tg.rel); err != nil {
+			return jailPath{}, nil, err
+		}
+	}
+	return tg, fi, nil
 }
 
 // Readlink returns the raw target text of a symlink, byte for byte.
@@ -638,7 +676,7 @@ func Readlink(ctx context.Context, r fsx.Root, p string) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	return readlinkAt(tg.rt, tg.rel)
+	return readlinkAt(tg.jail, tg.rel)
 }
 
 // OpenRead opens a regular file for reading as this process's identity — which
@@ -681,7 +719,7 @@ func OpenRead(ctx context.Context, r fsx.Root, p string) (*os.File, fsx.Entry, e
 	if err := ctx.Err(); err != nil {
 		return nil, fsx.Entry{}, err
 	}
-	before, err := statAt(tg.rt, tg.rel, false)
+	before, err := statAt(tg.jail, tg.rel)
 	if err != nil {
 		return nil, fsx.Entry{}, err
 	}
@@ -696,7 +734,7 @@ func OpenRead(ctx context.Context, r fsx.Root, p string) (*os.File, fsx.Entry, e
 		return nil, fsx.Entry{}, fmt.Errorf("%q is a %s, not a regular file: %w",
 			clean, fsx.TypeString(before.Mode()), fsx.ErrUnsupported)
 	}
-	f, err := openFinal(tg.rt, tg.rel)
+	f, err := openFinal(tg.jail, tg.rel)
 	if err != nil {
 		return nil, fsx.Entry{}, err
 	}
@@ -755,8 +793,8 @@ func newEntry(apiPath string, name []byte, fi os.FileInfo, ids *idmap.Map) fsx.E
 // A target outside the jail leaves both empty rather than leaking a host path:
 // the link itself stays fully visible, because hiding it would be lying about
 // the directory, but where it points is not this daemon's to disclose.
-func resolveLink(e *fsx.Entry, r fsx.Root, rt *os.Root, rel, apiPath string, wantType, wantResolved bool) {
-	if t, err := readlinkAt(rt, rel); err == nil {
+func resolveLink(e *fsx.Entry, r fsx.Root, j fsx.Jail, rel, apiPath string, wantType, wantResolved bool) {
+	if t, err := readlinkAt(j, rel); err == nil {
 		e.SetLinkTarget([]byte(t))
 	}
 	if !wantType {
@@ -768,7 +806,7 @@ func resolveLink(e *fsx.Entry, r fsx.Root, rt *os.Root, rel, apiPath string, wan
 	}
 	// The path is fully resolved by now, so lstat is the target's own metadata
 	// and needs no second pass through the link.
-	st, err := statAt(tg.rt, tg.rel, false)
+	st, err := statAt(tg.jail, tg.rel)
 	if err != nil {
 		return // dangling or unreadable; TargetType stays empty, as documented
 	}

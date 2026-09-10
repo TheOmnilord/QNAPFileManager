@@ -15,7 +15,7 @@ import (
 // The zero Root is the identity used in production: "/etc/passwd" maps to
 // "/etc/passwd".
 //
-// Root is the API↔OS path mapper and the owner of the one *os.Root every
+// Root is the API↔OS path mapper and the owner of the one Jail every
 // filesystem syscall goes through (see Open). Nothing else in the codebase
 // constructs an OS path or opens a jail. That is what lets the whole daemon run
 // on Windows against testdata\fakeroot, gives every test a sandbox for free
@@ -34,34 +34,39 @@ type Root struct {
 // thing the identity mapping has always produced ("/etc/passwd" → "\etc\passwd").
 const identityDir = "/"
 
-// identityRoot is the shared *os.Root of the unjailed mapping. It is a package
+// identityJail is the shared Jail of the unjailed mapping. It is a package
 // singleton because there is only ever one of it, it costs a single descriptor
 // for the life of the process, and the zero Root — which production uses and
 // which no constructor ever touched — has to be usable as it stands.
-var identityRoot = sync.OnceValues(func() (*os.Root, error) { return os.OpenRoot(identityDir) })
+var identityJail = sync.OnceValues(func() (Jail, error) { return openJail(identityDir) })
 
-// handle is the lazily opened *os.Root behind a jailed Root, held by pointer so
+// handle is the lazily opened Jail behind a jailed Root, held by pointer so
 // that every copy of the Root shares one descriptor.
+//
+// Lazy is not an optimisation here: the daemon starts as root and the worker
+// becomes the user before it serves anything, so opening on first use is what
+// makes the handle the *user's* — obtained with the credentials the kernel is
+// meant to apply, rather than with root's, which would pass every check.
 type handle struct {
 	dir  string
 	once sync.Once
-	r    *os.Root
+	j    Jail
 	err  error
 }
 
-func (h *handle) open() (*os.Root, error) {
-	h.once.Do(func() { h.r, h.err = os.OpenRoot(h.dir) })
-	return h.r, h.err
+func (h *handle) open() (Jail, error) {
+	h.once.Do(func() { h.j, h.err = openJail(h.dir) })
+	return h.j, h.err
 }
 
 // close releases the descriptor, and makes a later open fail rather than hand
 // out a fresh one: after shutdown there is nothing left to serve.
 func (h *handle) close() error {
 	h.once.Do(func() { h.err = fmt.Errorf("the jail root %q is closed: %w", h.dir, os.ErrClosed) })
-	if h.r == nil {
+	if h.j == nil {
 		return nil
 	}
-	return h.r.Close()
+	return h.j.Close()
 }
 
 // NewRoot builds a Root from a jail directory. An empty base — and "/", which
@@ -87,23 +92,23 @@ func NewRoot(base string) (Root, error) {
 	return Root{base: abs, h: &handle{dir: abs}}, nil
 }
 
-// Open returns the *os.Root that every filesystem operation is performed
-// against: the jail directory, or the filesystem root when unjailed. It is
-// opened once and shared, so callers must not close what it returns — Close
-// does that, once, when the pool shuts down.
+// Open returns the Jail that every filesystem operation is performed against:
+// the jail directory, or the filesystem root when unjailed. It is opened once
+// and shared, so callers must not close what it returns — Close does that,
+// once, when the pool shuts down.
 //
-// The point of the type is that os.Root resolves each path component relative
-// to a directory descriptor it holds, refusing any component that would leave
-// the tree. That is what makes the jail a real one rather than a lexical
-// check: a symlink inside it can no longer point the operation at /etc, and
-// there is no window between checking a path and using it in which a component
-// could be swapped for one. The unjailed production case goes through the same
-// call so there is exactly one code path.
-func (r Root) Open() (*os.Root, error) {
+// The point of the type is that every path component is resolved relative to a
+// directory descriptor rather than by name, so nothing can leave the tree. That
+// is what makes the jail a real one rather than a lexical check: a symlink
+// inside it can no longer point the operation at /etc, and there is no window
+// between checking a path and using it in which a component could be swapped
+// for one. The unjailed production case goes through the same call so there is
+// exactly one code path.
+func (r Root) Open() (Jail, error) {
 	if r.h != nil {
 		return r.h.open()
 	}
-	return identityRoot()
+	return identityJail()
 }
 
 // Close releases the jail's descriptor. Closing an unjailed Root is a no-op:
@@ -115,10 +120,10 @@ func (r Root) Close() error {
 	return r.h.close()
 }
 
-// Rel maps an API path to the name to hand a method of the *os.Root from Open:
+// Rel maps an API path to the name to resolve against the Jail from Open:
 // slash-separated, relative to the base, and "." for the base itself. It
 // applies the same defensive cleaning and the same Windows backslash refusal as
-// OS, so a path can never climb out of the tree even before os.Root looks at it.
+// OS, so a path can never climb out of the tree even before the kernel sees it.
 func (r Root) Rel(apiPath string) (string, error) {
 	c, err := r.cleanAPI(apiPath)
 	if err != nil {

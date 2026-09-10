@@ -213,6 +213,93 @@ func TestMetadataThroughNestedSearchOnlyDirectories(t *testing.T) {
 	}
 }
 
+// TestASearchOnlyJailBase is the round-seven finding, and the one directory the
+// O_PATH walk could not help with: the jail base itself.
+//
+// os.OpenRoot opens it O_RDONLY, so a worker whose user had search but no read
+// permission on the -jail directory failed at the handle — every request in
+// that worker, including the ones the kernel would have allowed, because the
+// walk that asks only for search never got to run. The handle is an O_PATH
+// descriptor now, which is a handle and nothing more, and the permissions are
+// charged where the kernel charges them: reaching a known child needs search on
+// the base, enumerating the base needs its read bit, and stat of the base
+// itself is an fstat on a descriptor that is already open.
+//
+// Mode 0111 with readable things inside is not a contrived shape — it is a
+// share with a private index, and "-jail /share/CACHEDEV1_DATA" on a NAS whose
+// top-level directory is not world-readable is the same shape by accident.
+func TestASearchOnlyJailBase(t *testing.T) {
+	requireUnprivileged(t)
+	base := tempDir(t)
+	write(t, base, "known.txt", "readable all the same")
+	mkdir(t, base, "sub")
+	write(t, base, "sub/leaf.txt", "listable")
+	chmodBack(t, base, 0o755)
+	if err := os.Chmod(base, 0o111); err != nil { // searchable, not readable
+		t.Fatal(err)
+	}
+	// The kernel has to be enforcing the read bit for the test to mean anything.
+	if _, err := os.ReadDir(base); err == nil {
+		t.Skip("this filesystem does not enforce the directory read bit")
+	}
+	r := newRoot(t, base)
+	ctx := context.Background()
+
+	// The base itself is still describable: the descriptor is proof it was
+	// reachable, and the lookup that would answer stat("/") lives in its parent,
+	// which is outside the jail.
+	if e, err := Stat(ctx, r, nil, "/"); err != nil {
+		t.Fatalf("stat of a search-only jail base: %v", err)
+	} else if e.Type != "dir" || e.Path != "/" {
+		t.Errorf("entry = %+v, want the directory /", e)
+	}
+	// A known child is reachable, which is what the search bit means.
+	if e, err := Stat(ctx, r, nil, "/known.txt"); err != nil {
+		t.Fatalf("stat of a known child of a search-only jail base: %v", err)
+	} else if e.Size != int64(len("readable all the same")) {
+		t.Errorf("size = %d, want %d", e.Size, len("readable all the same"))
+	}
+	f, e, err := OpenRead(ctx, r, "/known.txt")
+	if err != nil {
+		t.Fatalf("downloading a readable file out of a search-only jail base: %v", err)
+	}
+	f.Close()
+	if e.Size != int64(len("readable all the same")) {
+		t.Errorf("size = %d, want %d", e.Size, len("readable all the same"))
+	}
+	// And a readable subdirectory is browsable, because the read bit is asked
+	// for on the directory being listed and on nothing above it.
+	l, err := List(ctx, r, nil, "/sub", fsx.ListOptions{})
+	if err != nil {
+		t.Fatalf("listing a readable subdirectory of a search-only jail base: %v", err)
+	}
+	if l.Total != 1 || len(l.Entries) != 1 || l.Entries[0].Name != "leaf.txt" {
+		t.Fatalf("listing = %+v, want the one entry leaf.txt", l)
+	}
+
+	// The base's own read bit is still the kernel's to require: an O_PATH handle
+	// is not a licence to enumerate what it names (INV-2).
+	if _, err := List(ctx, r, nil, "/", fsx.ListOptions{}); !errors.Is(err, fs.ErrPermission) {
+		t.Errorf("listing a jail base with no read bit = %v, want a permission error", err)
+	} else if code := fsx.Code(err); code != "permission" {
+		t.Errorf("code = %q, want permission", code)
+	}
+	// A name that is not there is still ENOENT rather than EACCES.
+	if _, err := Stat(ctx, r, nil, "/missing.txt"); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("stat of a missing name = %v, want a not-exist error", err)
+	}
+	// Restoring the read bit makes the same listing work, so what was refused
+	// was the missing permission and not the handle.
+	if err := os.Chmod(base, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if l, err := List(ctx, r, nil, "/", fsx.ListOptions{}); err != nil {
+		t.Fatalf("listing the base once it is readable: %v", err)
+	} else if l.Total != 2 {
+		t.Errorf("listing = %+v, want known.txt and sub", l)
+	}
+}
+
 // TestADotComponentNeedsSearchPermissionOnTheDirectoryItNames: a symlink
 // target of "locked/." names locked itself, and naming it that way is a lookup
 // *inside* locked — which the kernel answers with EACCES for a user without

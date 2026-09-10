@@ -13,9 +13,10 @@
  <nav id="toolbar" aria-label="File actions">
   <button id="btnTree" aria-controls="tree" aria-expanded="false">Folders</button>
   <button id="btnBack" title="Back (Alt+Left)">←</button><button id="btnFwd" title="Forward (Alt+Right)">→</button><button id="btnUp" title="Parent folder (Backspace)">↑</button><button id="btnRefresh" title="Refresh (F5)">↻</button>
-  <button id="btnMkdir" disabled aria-disabled="true" title="Changes arrive in M1; this version only browses.">New folder</button>
-  <button id="btnUpload" disabled aria-disabled="true" title="Uploads are not available in this read-only version.">Upload</button>
+  <button id="btnMkdir" disabled>New folder</button>
+  <button id="btnUpload" disabled aria-disabled="true" title="Uploads are not available in this version.">Upload</button>
   <button id="btnDownload" disabled>Download</button><button id="btnView" disabled>View text</button><button id="btnProps" disabled>Properties</button>
+  <button id="btnRename" disabled>Rename</button><button id="btnDelete" disabled>Delete</button>
   <label class="filter"><span class="visually-hidden">Filter loaded names</span><input id="searchBox" type="text" placeholder="Filter loaded names (/)"></label>
   <label><input id="chkHidden" type="checkbox"> Hidden</label><button id="btnShortcuts" title="Keyboard shortcuts (?)">?</button>
  </nav>
@@ -35,7 +36,19 @@
 </div>
 <dialog id="dlgViewer" aria-labelledby="viewerTitle"><h2 id="viewerTitle">Text viewer</h2><p id="viewerNote"></p><pre id="viewerContent" tabindex="0"></pre><div class="bar"><button id="viewerDownload">Download</button><button data-close>Close</button></div></dialog>
 <dialog id="dlgProps" aria-labelledby="propsTitle"><h2 id="propsTitle">Properties</h2><pre id="propsContent"></pre><button data-close>Close</button></dialog>
-<dialog id="dlgSettings" aria-labelledby="settingsTitle"><h2 id="settingsTitle">Display settings</h2><label for="theme">Theme</label><select id="theme"><option value="auto">Auto</option><option value="light">Light</option><option value="dark">Dark</option></select><p>This version supports browsing and downloading. Filesystem changes and root mode are unavailable.</p><button data-close>Close</button></dialog>
+<dialog id="dlgSettings" aria-labelledby="settingsTitle"><h2 id="settingsTitle">Settings</h2>
+ <label for="theme">Theme</label><select id="theme"><option value="auto">Auto</option><option value="light">Light</option><option value="dark">Dark</option></select>
+ <section id="adminSettings" hidden>
+  <h3>Safety</h3>
+  <p><label><input type="checkbox" id="setReadOnly"> Read-only mode</label></p>
+  <p id="setReadOnlyNote" class="hint">While read-only mode is on, no files can be created, renamed or deleted. Turning it off makes changes possible.</p>
+  <h3>Audit log</h3>
+  <div id="auditWrap"><table id="auditTable"><thead><tr><th>Time</th><th>User</th><th>Op</th><th>Path</th><th>Result</th></tr></thead><tbody id="auditRows"></tbody></table></div>
+  <div class="bar"><button id="btnAuditRefresh">Refresh</button><button id="btnAuditDownload">Download .jsonl</button></div>
+ </section>
+ <button data-close>Close</button></dialog>
+<dialog id="dlgPrompt" aria-labelledby="promptTitle"><h2 id="promptTitle">Name</h2><label id="promptLabel" for="promptInput">Name</label><input id="promptInput" type="text"><div class="bar"><button id="promptOK">OK</button><button data-close>Cancel</button></div></dialog>
+<dialog id="dlgConfirm" aria-labelledby="confirmTitle"><h2 id="confirmTitle">Confirm</h2><p id="confirmBody"></p><p id="confirmWhy" class="hint" hidden></p><label id="confirmPhraseLabel" for="confirmPhrase" hidden>Type the name to confirm <input id="confirmPhrase" type="text"></label><div class="bar"><button id="confirmOK">Confirm</button><button data-close>Cancel</button></div></dialog>
 <dialog id="dlgSession" aria-labelledby="sessionTitle"><h2 id="sessionTitle">Session</h2><p id="sessionDetails"></p><button id="btnLogout">Sign out of this app</button><button data-close>Close</button></dialog>
 <dialog id="dlgShortcuts" aria-labelledby="shortcutsTitle"><h2 id="shortcutsTitle">Browse with the keyboard</h2><p>↑ ↓ / Home / End / Page Up / Page Down: move<br>Shift + movement: extend selection<br>Ctrl + movement: keep selection<br>Space: toggle · Ctrl+A: select all<br>Enter: open · F4: view text · Alt+Enter: properties<br>Backspace: parent · Alt+←/→: back/forward<br>Ctrl+L: edit path · /: filter loaded names<br>Ctrl+H: hidden files · F5: refresh<br>Shift+F10 / Menu: actions · Esc: clear or close<br>?: shortcuts</p><button data-close>Close</button></dialog>
 </body></html>

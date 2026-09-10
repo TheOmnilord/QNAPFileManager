@@ -48,7 +48,7 @@ func TestProxyJoinedPathsAreNotRedirected(t *testing.T) {
 func TestProxyJoinedPathsUnderThePrefix(t *testing.T) {
 	cfg := config.Default()
 	cfg.Web.ProxyPrefix = "/qnapfilemanager"
-	s := New(cfg, nil, nil, nil, nil, nil, "test", nil)
+	s := New(cfg, nil, nil, nil, nil, nil, "test", nil, nil, nil, nil)
 	for path, ctype := range map[string]string{
 		"/qnapfilemanager//app.css":     "text/css",
 		"/qnapfilemanager//js/app.js":   "text/javascript",

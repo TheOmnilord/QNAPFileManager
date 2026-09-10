@@ -4,6 +4,8 @@ import {state,update,sessionGuard} from './state.js';
 import {initList,loadList} from './list.js';
 import {loadTree} from './tree.js';
 import {initViewer} from './viewer.js';
+import {initActions} from './actions.js';
+import {initSettings,loadAudit} from './settings.js';
 import {sessionBootstrap,transientAuthError} from './bootstrap.js';
 
 const bootstrap=sessionBootstrap(location.href,url => history.replaceState(history.state,'',url),
@@ -51,12 +53,13 @@ function showSession(session) {
   if (state.session) signInNotice();
   update({session}); $('#signin').hidden=true;
   $('#identity').textContent=`${session.user} · ${session.admin ? 'Administrator' : 'User'}`;
-  $('#sessionDetails').textContent=`${session.user} · uid ${session.uid}, gid ${session.gid} · ${session.viaQTS ? 'QTS session' : 'Pinned development identity'} · root mode off${session.groupsIncomplete ? ' · Warning: groups incomplete' : ''}`;
-  $('#chipReadonly').textContent='Read-only browse';
+  $('#sessionDetails').textContent=`${session.user} · uid ${session.uid}, gid ${session.gid} · ${session.viaQTS ? 'QTS session' : 'Pinned development identity'} · ${session.rootMode ? 'root mode' : 'normal user'} · ${session.canWrite ? 'changes enabled' : 'read-only'}${session.groupsIncomplete ? ' · Warning: groups incomplete' : ''}`;
+  $('#chipReadonly').textContent='Read-only'; $('#chipReadonly').hidden=!!session.canWrite;
+  $('#adminSettings').hidden=!session.admin; $('#setReadOnly').checked=session.readOnly;
   if (session.groupsIncomplete) $('#announce').textContent='Warning: supplementary groups are incomplete.';
   navigate(); loadTree();
 }
-initList(); initViewer();
+initList(); initViewer(); initActions(); initSettings();
 $('.skip').addEventListener('click',ev => { ev.preventDefault(); $('#list').focus(); });
 window.addEventListener('hashchange',navigate);
 $('#btnRetry').addEventListener('click',connect);
@@ -68,7 +71,7 @@ $('#pathEdit').addEventListener('keydown',ev => { if (ev.key==='Enter') { if (!e
 $('#btnTree').addEventListener('click',() => { const open=$('#tree').classList.toggle('open'); $('#btnTree').setAttribute('aria-expanded',String(open)); if(open) $('#tree').querySelector('[tabindex="0"]')?.focus(); });
 function hidden() { update({hidden:$('#chkHidden').checked}); loadList(); loadTree(); }
 $('#chkHidden').addEventListener('change',hidden);
-$('#btnSettings').addEventListener('click',() => openDialog('#dlgSettings')); $('#userMenu').addEventListener('click',() => openDialog('#dlgSession')); $('#btnShortcuts').addEventListener('click',() => openDialog('#dlgShortcuts'));
+$('#btnSettings').addEventListener('click',() => { openDialog('#dlgSettings'); if (state.session?.admin) loadAudit(); }); $('#userMenu').addEventListener('click',() => openDialog('#dlgSession')); $('#btnShortcuts').addEventListener('click',() => openDialog('#dlgShortcuts'));
 for (const button of document.querySelectorAll('[data-close]')) button.addEventListener('click',() => button.closest('dialog').close());
 $('#btnLogout').addEventListener('click',async () => {
  // Start with the current CSRF token, then invalidate pending reads immediately.

@@ -15,14 +15,17 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"syscall"
 	"time"
 
+	"qnapfilemanager/internal/audit"
 	"qnapfilemanager/internal/backend"
 	"qnapfilemanager/internal/config"
 	"qnapfilemanager/internal/fsx"
+	"qnapfilemanager/internal/guard"
 	"qnapfilemanager/internal/idmap"
 	"qnapfilemanager/internal/logfile"
 	"qnapfilemanager/internal/platform"
@@ -330,10 +333,65 @@ func runServe(args []string, stderr io.Writer) error {
 			logger.Printf("worker shutdown: %v", err)
 		}
 	}()
+
+	// The guard is the front-end safety layer (INV-1): read-only mode, the
+	// protected-path table, mount-point roots and confirmation tokens, all
+	// decided from the path alone before any dispatch to a worker.
+	g := guard.New(guardInstallDir(o.configPath, root), shareIsRAM(plat))
+	g.SetMountPointChecker(plat.IsMountPointByTable)
+	g.SetReadOnly(cfg.ReadOnly)
+
+	// The audit log lives beside the app log (or config.logging.audit when set)
+	// and records every mutation with intent and result phases.
+	auditPath := cfg.Logging.Audit
+	if auditPath == "" {
+		dir := "."
+		if cfg.Logging.File != "" {
+			dir = filepath.Dir(cfg.Logging.File)
+		}
+		auditPath = filepath.Join(dir, "audit.jsonl")
+	}
+	auditor, err := audit.Open(auditPath, cfg.Logging.QuLog)
+	if err != nil {
+		return fmt.Errorf("opening the audit log: %w", err)
+	}
+	defer auditor.Close()
+
 	srv := newServer(cfg, root, logger)
 	srv.dev = o.dev
-	srv.frontend = web.New(cfg, poolBackend{b}, verifier, ids, plat, pinned, version, logger).Handler()
+	frontend := web.New(cfg, poolBackend{b}, verifier, ids, plat, pinned, version, logger, g, auditor, nil)
+	frontend.ConfigPath = o.configPath
+	frontend.AuditPath = auditPath
+	srv.frontend = frontend.Handler()
 	return srv.run(context.Background())
+}
+
+// guardInstallDir is the API path of the daemon's own installation tree, used
+// by the guard to refuse deleting or rewriting itself and to hide its config
+// and logs from the file manager. It is left empty inside a -jail (dev loop),
+// where no real install path maps to a jailed API path and the rules would only
+// misfire. In production the config sits at <install>/config/<file>, so the
+// grandparent of the config path is the install root; the executable's
+// grandparent is the fallback.
+func guardInstallDir(configPath string, root fsx.Root) string {
+	if root.Jailed() {
+		return ""
+	}
+	if configPath != "" {
+		return filepath.ToSlash(filepath.Dir(filepath.Dir(configPath)))
+	}
+	if exe, err := os.Executable(); err == nil {
+		return filepath.ToSlash(filepath.Dir(filepath.Dir(exe)))
+	}
+	return ""
+}
+
+// shareIsRAM reports whether /share is the QTS system tmpfs, so the guard
+// refuses creating files that would be lost on reboot. It mirrors the display
+// hint web.ramShare uses.
+func shareIsRAM(plat *platform.Platform) bool {
+	m, ok := plat.MountFor("/share")
+	return ok && m.MountPoint == "/share" && m.FSType == "tmpfs"
 }
 
 // server owns listener lifetime; internal/web owns the HTTP application.
@@ -351,7 +409,7 @@ type poolBackend struct{ *workerpool.Pool }
 func (b poolBackend) Stats() any { return b.Pool.Stats() }
 
 func newServer(cfg config.Config, root fsx.Root, logger *log.Logger) *server {
-	return &server{cfg: cfg, root: root, logger: logger, frontend: web.New(cfg, nil, nil, nil, nil, nil, version, logger).Handler()}
+	return &server{cfg: cfg, root: root, logger: logger, frontend: web.New(cfg, nil, nil, nil, nil, nil, version, logger, nil, nil, nil).Handler()}
 }
 
 // sessionResponse is the shape the UI polls on first load.

@@ -373,9 +373,13 @@ func principal(id idmap.Ident) backend.Principal {
 }
 
 func (s *Server) sessionInfo(w http.ResponseWriter, r *http.Request, sess *session) {
-	v := map[string]any{"authenticated": sess != nil, "user": "", "admin": false, "rootMode": false, "uid": -1, "gid": -1, "groups": []int{}, "readOnly": s.cfg.ReadOnly, "version": s.version, "isQTS": s.isQTS(), "family": s.platform.Family, "csrf": "", "viaQTS": false}
+	readOnly := s.readOnly()
+	v := map[string]any{"authenticated": sess != nil, "user": "", "admin": false, "rootMode": false, "uid": -1, "gid": -1, "groups": []int{}, "readOnly": readOnly, "canWrite": false, "version": s.version, "isQTS": s.isQTS(), "family": s.platform.Family, "csrf": "", "viaQTS": false}
 	if sess != nil {
 		v["rootMode"] = sess.who.Root
+		// The UI enables mutating controls on canWrite alone: a live session and
+		// read-only mode off.
+		v["canWrite"] = !readOnly
 	}
 	if sess != nil {
 		v["user"], v["admin"], v["uid"], v["gid"], v["groups"], v["csrf"], v["viaQTS"] = sess.who.User, sess.admin, sess.who.UID, sess.who.GID, sess.who.Groups, sess.csrf, sess.kind != ""

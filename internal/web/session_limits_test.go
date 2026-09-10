@@ -163,7 +163,7 @@ func TestSessionLookupConstantWork(t *testing.T) {
 func BenchmarkAuthenticateIndexed(b *testing.B) {
 	for _, size := range []int{1, 20000} {
 		b.Run(fmt.Sprint(size), func(b *testing.B) {
-			s := New(config.Default(), nil, nil, nil, nil, &backend.Principal{User: "dev"}, "test", nil)
+			s := New(config.Default(), nil, nil, nil, nil, &backend.Principal{User: "dev"}, "test", nil, nil, nil, nil)
 			s.MaxSessions, s.MaxSessionsPerUser = size, size
 			for i := 0; i < size; i++ {
 				s.insertSession(indexedTestSession(fmt.Sprint(i), "dev"))

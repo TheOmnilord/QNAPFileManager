@@ -17,7 +17,7 @@ func statusCode(code string) int {
 		return 400
 	case "unauthorized":
 		return 401
-	case "permission", "protected", "readonly":
+	case "permission", "protected", "readonly", "read_only":
 		return 403
 	case "not_found":
 		return 404

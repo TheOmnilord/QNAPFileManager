@@ -17,7 +17,7 @@ func TestShellUsesAbsoluteURLsUnderTheProxyPrefix(t *testing.T) {
 	for prefix, base := range map[string]string{"": "/", "/qnapfilemanager": "/qnapfilemanager/"} {
 		cfg := config.Default()
 		cfg.Web.ProxyPrefix = prefix
-		s := New(cfg, nil, nil, nil, nil, nil, "test", nil)
+		s := New(cfg, nil, nil, nil, nil, nil, "test", nil, nil, nil, nil)
 		w := request(s, "GET", "/", nil, nil)
 		if w.Code != http.StatusOK {
 			t.Fatalf("prefix %q: status %d", prefix, w.Code)

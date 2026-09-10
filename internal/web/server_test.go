@@ -20,6 +20,7 @@ import (
 	"qnapfilemanager/internal/backend"
 	"qnapfilemanager/internal/config"
 	"qnapfilemanager/internal/fsx"
+	"qnapfilemanager/internal/guard"
 	"qnapfilemanager/internal/idmap"
 	"qnapfilemanager/internal/platform"
 	"qnapfilemanager/internal/qtsauth"
@@ -114,6 +115,39 @@ func (b *fakeBackend) List(ctx context.Context, p backend.Principal, name string
 	return fsx.Listing{Path: name, Parent: fsx.Parent(name), Entries: entries[start:end], Total: total, Truncated: end < total}, nil
 }
 
+// The Mutator half of the fake backend: real os operations under the temp dir,
+// so mkdir/rename/delete are exercised end to end without the worker pool.
+func (b *fakeBackend) Mkdir(ctx context.Context, p backend.Principal, dir, name string, mode os.FileMode, parents bool) (fsx.Entry, error) {
+	b.last = p
+	target := fsx.Join(dir, name)
+	if mode == 0 {
+		mode = 0o755
+	}
+	var err error
+	if parents {
+		err = os.MkdirAll(b.osPath(target), mode)
+	} else {
+		err = os.Mkdir(b.osPath(target), mode)
+	}
+	if err != nil {
+		return fsx.Entry{}, err
+	}
+	return b.Stat(ctx, p, target)
+}
+func (b *fakeBackend) Rename(_ context.Context, p backend.Principal, from, to string, overwrite bool) error {
+	b.last = p
+	if !overwrite {
+		if _, err := os.Lstat(b.osPath(to)); err == nil {
+			return os.ErrExist
+		}
+	}
+	return os.Rename(b.osPath(from), b.osPath(to))
+}
+func (b *fakeBackend) Delete(_ context.Context, p backend.Principal, name string) error {
+	b.last = p
+	return os.Remove(b.osPath(name))
+}
+
 func fixture(t *testing.T, pinned bool) (*Server, *fakeBackend) {
 	t.Helper()
 	b := &fakeBackend{dir: t.TempDir()}
@@ -126,7 +160,9 @@ func fixture(t *testing.T, pinned bool) (*Server, *fakeBackend) {
 	if pinned {
 		p = &backend.Principal{User: "dev", UID: 1000, GID: 100, Groups: []int{100, 200}, Root: true}
 	}
-	return New(config.Default(), b, nil, nil, nil, p, "test", nil), b
+	// A real guard so the mutation routes are exercised; the fakeBackend is
+	// auto-detected as the Mutator by New.
+	return New(config.Default(), b, nil, nil, nil, p, "test", nil, guard.New("", false), nil, nil), b
 }
 func request(s *Server, method, target string, cookie *http.Cookie, headers map[string]string) *httptest.ResponseRecorder {
 	r := httptest.NewRequest(method, target, nil)
@@ -246,7 +282,8 @@ func TestStaticShellWithInvalidSession(t *testing.T) {
 
 func TestEveryAPIRequiresAuthentication(t *testing.T) {
 	s, _ := fixture(t, false)
-	for endpoint, method := range routes {
+	for endpoint, methods := range routes {
+		method := methods[0]
 		w := request(s, method, endpoint, nil, nil)
 		if endpoint == "/api/session" && method == "GET" {
 			// The one public answer: a first visit with nothing presented

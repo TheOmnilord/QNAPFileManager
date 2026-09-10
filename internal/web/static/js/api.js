@@ -43,7 +43,7 @@ export async function api(endpoint,params={},options={}) {
   connectionNotice('QTS temporarily unavailable','Your session is being kept while QTS reconnects. Please retry shortly.');
  }
  if (!response.ok) throw Object.assign(new Error([data?.error?.message,data?.error?.path].filter(Boolean).join(' — ') || `Request failed (${response.status})`),failure,{
-  code:data?.error?.code,transient:response.status===503 && data?.error?.code==='qts_unavailable'
+  code:data?.error?.code,confirm:data?.confirm,transient:response.status===503 && data?.error?.code==='qts_unavailable'
  });
  return data;
 }

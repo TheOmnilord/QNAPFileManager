@@ -11,6 +11,16 @@ let typeAhead = '', typedAt = 0;
 const rowHeight = () => matchMedia('(max-width:30rem)').matches ? 44 : 36;
 export const entryAt = index => state.pages.get(Math.floor(index/pageSize))?.[index%pageSize];
 export const focused = () => entryAt(state.focus);
+// extraActions lets other modules (actions.js) contribute context-menu items
+// without list.js importing them, which would create a cycle. Each is
+// {label, run(entry), show?(entry), disabled?(entry)}.
+export const extraActions = [];
+// selectedEntries returns the explicitly selected entries in order, or null in
+// select-all (exclude) mode, which M1 mutations do not support.
+export function selectedEntries() {
+ if (state.exclude) return null;
+ return [...state.selection].sort((a,b) => a-b).map(entryAt).filter(Boolean);
+}
 const navigable = e => e && !(e.volumeRoot && state.path==='/share') && (!state.filter || e.name.toLocaleLowerCase().includes(state.filter.toLocaleLowerCase()));
 function query(offset) { return {...pathArgs(state),offset,limit:pageSize,sort:state.sort,desc:state.desc,hidden:state.hidden,volumes:false}; }
 
@@ -80,13 +90,29 @@ function syncSelection() {
 
 function status() {
  const n = countSelected();
- $('#status').textContent = `${n.toLocaleString()} of ${state.total.toLocaleString()} selected · ${state.path} · ${state.session?.family || ''} · read-only browse${state.filter ? ' · Filtering loaded names only' : ''}`;
- const e = focused(), one = n === 1 && e && selected(state.focus);
+ const mode = state.session?.canWrite ? 'read-write' : 'read-only browse';
+ $('#status').textContent = `${n.toLocaleString()} of ${state.total.toLocaleString()} selected · ${state.path} · ${state.session?.family || ''} · ${mode}${state.filter ? ' · Filtering loaded names only' : ''}`;
+ refreshToolbar();
+}
+
+// refreshToolbar reflects the current selection and the session's write
+// capability onto every action button. Mutating buttons are disabled (never
+// hidden) with a title saying why, per the safety plan §3.2/§4.1.
+export function refreshToolbar() {
+ const n = countSelected(), e = focused(), one = n === 1 && e && selected(state.focus);
+ const canWrite = !!state.session?.canWrite;
  $('#btnDownload').disabled = !one || !isReadable(e);
  $('#btnView').disabled = !one || !isReadable(e);
  const hint = one && !isReadable(e) ? actionHint(e) : '';
  $('#btnDownload').title = hint; $('#btnView').title = hint;
  $('#btnProps').disabled = !one;
+ const ro = 'Read-only mode is on. Turn it off in Settings to make changes.';
+ $('#btnMkdir').disabled = !canWrite;
+ $('#btnMkdir').title = canWrite ? 'New folder' : ro;
+ $('#btnRename').disabled = !canWrite || n !== 1;
+ $('#btnRename').title = !canWrite ? ro : (n !== 1 ? 'Select one item to rename.' : 'Rename');
+ $('#btnDelete').disabled = !canWrite || n < 1;
+ $('#btnDelete').title = !canWrite ? ro : (n < 1 ? 'Select items to delete.' : 'Delete');
 }
 
 export function render() {
@@ -158,12 +184,16 @@ export function contextMenu(e) {
  const actions = [['Open',() => open(e),!isDirectory(e) && !isReadable(e)],['Properties',() => properties(e)],['Copy full path',async () => { try { await navigator.clipboard.writeText(e.path); announce('Path copied.'); } catch { error(new Error('Could not copy the path. Use the path field to copy it.')); } }]];
  if (isReadable(e) || isSymlink(e) && !hasTarget(e)) actions.splice(1,0,['View text',() => view(e),!isReadable(e)],['Download',() => download(e),!isReadable(e)]);
  if (isSymlink(e) && (e.targetType === 'dir' || !hasTarget(e))) actions.push(['Go to target',() => { location.hash = route(fileTarget(e)); },!hasTarget(e)]);
+ for (const a of extraActions) if (!a.show || a.show(e)) actions.push([a.label,() => a.run(e),a.disabled?.(e)]);
  for (const [label,action,disabled] of actions) { const b = el('button',{role:'menuitem',tabindex:'-1'},label); b.disabled=!!disabled; if (disabled) b.title=actionHint(e); b.addEventListener('click',() => { menu.hidden=true; action(); }); menu.append(b); }
  menu.hidden=false; const first=menu.querySelector('button:not(:disabled)'); first.tabIndex=0; first.focus();
 }
 
 export function initList() {
- subscribe(() => { if (!state.session) { $('#btnDownload').disabled=true; $('#btnView').disabled=true; $('#btnProps').disabled=true; topHeight?.(0); bottomHeight?.(0); } });
+ subscribe(() => {
+  if (!state.session) { for (const id of ['#btnDownload','#btnView','#btnProps','#btnMkdir','#btnRename','#btnDelete']) $(id).disabled=true; topHeight?.(0); bottomHeight?.(0); }
+  else refreshToolbar();
+ });
  topHeight = heightRule('#listSpacer'); bottomHeight = heightRule('#listTail');
  $('#listViewport').addEventListener('scroll',render); window.addEventListener('resize',render);
  $('#searchBox').addEventListener('input',ev => { update({filter:ev.target.value}); render(); });

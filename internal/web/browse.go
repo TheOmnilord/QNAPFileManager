@@ -339,7 +339,7 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request, sess *session) {
 		s.backendError(w, r, "", err)
 		return
 	}
-	writeJSON(w, map[string]any{"version": s.version, "readOnly": s.cfg.ReadOnly, "rootMode": false, "isQTS": s.isQTS(), "family": s.platform.Family, "qtsVersion": s.platform.Firmware})
+	writeJSON(w, map[string]any{"version": s.version, "readOnly": s.readOnly(), "rootMode": false, "isQTS": s.isQTS(), "family": s.platform.Family, "qtsVersion": s.platform.Firmware})
 }
 
 func (s *Server) diag(w http.ResponseWriter, r *http.Request, sess *session) {

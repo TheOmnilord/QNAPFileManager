@@ -15,8 +15,10 @@ import (
 	"sync"
 	"time"
 
+	"qnapfilemanager/internal/audit"
 	"qnapfilemanager/internal/backend"
 	"qnapfilemanager/internal/config"
+	"qnapfilemanager/internal/guard"
 	"qnapfilemanager/internal/idmap"
 	"qnapfilemanager/internal/platform"
 	"qnapfilemanager/internal/qtsauth"
@@ -26,14 +28,28 @@ import (
 var assets embed.FS
 
 type Server struct {
-	cfg          config.Config
-	backend      backend.Backend
-	verifier     *qtsauth.Verifier
-	ids          *idmap.Map
-	platform     *platform.Platform
-	pinned       *backend.Principal
-	version      string
-	logger       *log.Logger
+	cfg      config.Config
+	backend  backend.Backend
+	verifier *qtsauth.Verifier
+	ids      *idmap.Map
+	platform *platform.Platform
+	pinned   *backend.Principal
+	version  string
+	logger   *log.Logger
+
+	// M1 mutation spine. All three are nil-tolerant so read-only fixtures and
+	// the placeholder server in cmd keep working; the mutation routes refuse
+	// service when guard or mutator is absent.
+	guard   *guard.Guard
+	auditor *audit.Logger
+	mutator backend.Mutator
+	// ConfigPath is where a read-only toggle is persisted (config.Save); empty
+	// means the change is applied in memory only. AuditPath is the JSON-lines
+	// file /api/audit/export streams. Both are set by the caller after New.
+	ConfigPath string
+	AuditPath  string
+	cfgMu      sync.Mutex // serialises read-only toggles and their persistence
+
 	mu           sync.Mutex
 	sessions     map[string]*session
 	byCredential map[string]*session
@@ -51,7 +67,7 @@ type Server struct {
 	authTransportOnce sync.Once
 }
 
-func New(cfg config.Config, b backend.Backend, v *qtsauth.Verifier, ids *idmap.Map, p *platform.Platform, pinned *backend.Principal, version string, logger *log.Logger) *Server {
+func New(cfg config.Config, b backend.Backend, v *qtsauth.Verifier, ids *idmap.Map, p *platform.Platform, pinned *backend.Principal, version string, logger *log.Logger, g *guard.Guard, auditor *audit.Logger, mutator backend.Mutator) *Server {
 	cfg.Normalize()
 	if logger == nil {
 		logger = log.New(io.Discard, "", 0)
@@ -68,7 +84,15 @@ func New(cfg config.Config, b backend.Backend, v *qtsauth.Verifier, ids *idmap.M
 		cp.Groups = append([]int{}, pinned.Groups...)
 		pinned = &cp
 	}
-	s := &Server{cfg: cfg, backend: b, verifier: v, ids: ids, platform: p, pinned: pinned, version: version, logger: logger, sessions: make(map[string]*session)}
+	s := &Server{cfg: cfg, backend: b, verifier: v, ids: ids, platform: p, pinned: pinned, version: version, logger: logger, sessions: make(map[string]*session), guard: g, auditor: auditor}
+	// The mutator may be supplied explicitly or, as the production pool does,
+	// implemented by the backend itself; type-assert it so cmd can pass nil.
+	if mutator == nil {
+		if m, ok := b.(backend.Mutator); ok {
+			mutator = m
+		}
+	}
+	s.mutator = mutator
 	// The admission channels are created here, before any goroutine can see
 	// the server, rather than lazily on the first request: the race detector
 	// caught a test reading them while the first request's once.Do was still
@@ -78,10 +102,25 @@ func New(cfg config.Config, b backend.Backend, v *qtsauth.Verifier, ids *idmap.M
 }
 
 // routes is also the source of truth for the static JS endpoint contract test.
-var routes = map[string]string{
-	"/api/session": "GET", "/api/status": "GET", "/api/fs/list": "GET",
-	"/api/fs/stat": "GET", "/api/fs/roots": "GET", "/api/fs/download": "GET",
-	"/api/fs/text": "GET", "/api/ids": "GET", "/api/diag": "GET", "/api/logout": "POST",
+// The value is the set of methods a path answers; a request for anything else
+// gets 405 with an Allow header.
+var routes = map[string][]string{
+	"/api/session": {"GET"}, "/api/status": {"GET"}, "/api/fs/list": {"GET"},
+	"/api/fs/stat": {"GET"}, "/api/fs/roots": {"GET"}, "/api/fs/download": {"GET"},
+	"/api/fs/text": {"GET"}, "/api/ids": {"GET"}, "/api/diag": {"GET"}, "/api/logout": {"POST"},
+	"/api/fs/mkdir": {"POST"}, "/api/fs/rename": {"POST"}, "/api/fs/delete": {"POST"},
+	"/api/settings": {"GET", "POST"}, "/api/audit": {"GET"}, "/api/audit/export": {"GET"},
+}
+
+// allowedMethod reports whether method is served by one of methods; a HEAD is
+// answered wherever GET is.
+func allowedMethod(methods []string, method string) bool {
+	for _, m := range methods {
+		if m == method || (method == "HEAD" && m == "GET") {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) Handler() http.Handler {
@@ -197,13 +236,13 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-	method, ok := routes[r.URL.Path]
+	methods, ok := routes[r.URL.Path]
 	if !ok {
 		s.fail(w, r, "not_found", "No such endpoint.", "", "")
 		return
 	}
-	if r.Method != method && !(r.Method == "HEAD" && method == "GET") {
-		w.Header().Set("Allow", method)
+	if !allowedMethod(methods, r.Method) {
+		w.Header().Set("Allow", strings.Join(methods, ", "))
 		writeError(w, 405, "bad_request", "Method not allowed.", "", r.URL.Path, "")
 		return
 	}
@@ -231,6 +270,22 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		s.identities(w, r)
 	case "/api/diag":
 		s.diag(w, r, sess)
+	case "/api/fs/mkdir":
+		s.mkdir(w, r, sess)
+	case "/api/fs/rename":
+		s.rename(w, r, sess)
+	case "/api/fs/delete":
+		s.delete(w, r, sess)
+	case "/api/settings":
+		if r.Method == http.MethodGet {
+			s.getSettings(w, r, sess)
+		} else {
+			s.postSettings(w, r, sess)
+		}
+	case "/api/audit":
+		s.auditTail(w, r, sess)
+	case "/api/audit/export":
+		s.auditExport(w, r, sess)
 	case "/api/logout":
 		s.destroy(sess.id)
 		s.cookie(w, r, "", -1)
@@ -272,6 +327,16 @@ func (s *Server) static(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "HEAD" {
 		_, _ = w.Write(data)
 	}
+}
+
+// readOnly reports the live read-only state: the guard is authoritative once
+// wired (its flag is atomic and the settings toggle drives it), otherwise the
+// loaded config value stands.
+func (s *Server) readOnly() bool {
+	if s.guard != nil {
+		return s.guard.ReadOnly()
+	}
+	return s.cfg.ReadOnly
 }
 
 // basePath is the absolute path every asset and API URL is built under:

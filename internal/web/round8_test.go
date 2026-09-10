@@ -267,9 +267,10 @@ func TestReconcileReadOnly(t *testing.T) {
 	}{
 		{"save-ok-uses-want", false, nil, loadFail, false},
 		{"save-ok-uses-want-true", true, nil, loadFail, true},
-		{"save-fail-file-holds-prev", true, saveErr, loadOK(true), true},
-		{"save-fail-post-publish-file-swapped", true, saveErr, loadOK(false), false}, // the flagged case
-		{"save-fail-and-reload-fail-closes", false, saveErr, loadFail, true},
+		// saveErr set: the guard must follow whatever the file actually holds.
+		{"save-fail-file-reads-prev", true, saveErr, loadOK(true), true},     // rollback landed prevVal before erroring
+		{"save-fail-file-reads-newval", true, saveErr, loadOK(false), false}, // rollback did not land; file still newVal
+		{"save-fail-and-reload-fail-closes", false, saveErr, loadFail, true}, // file unreadable → fail-closed read-only
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

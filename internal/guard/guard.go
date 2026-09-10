@@ -93,8 +93,14 @@ var (
 type Guard struct {
 	rules      []Rule
 	installDir string
-	shareIsRAM bool
-	readOnly   atomic.Bool
+	// installDirCanon is the symlink-resolved spelling of installDir, filled by
+	// CanonicalizeRoots when it differs from the lexical installDir. The ancestor
+	// containment check tests BOTH spellings, so renaming an ancestor named by the
+	// canonical path (/data/.qpkg when installDir is /alias/.qpkg/app) is refused
+	// too, not only an ancestor of the lexical spelling (round-12).
+	installDirCanon string
+	shareIsRAM      bool
+	readOnly        atomic.Bool
 
 	mu      sync.RWMutex
 	mountFn func(apiPath string) bool
@@ -152,6 +158,25 @@ func (g *Guard) CanonicalizeRoots(resolve func(apiPath string) (string, bool)) {
 		extra = append(extra, dup)
 	}
 	g.rules = append(g.rules, extra...)
+	// Canonicalise the install dir used by the containment check (round-12), so an
+	// ancestor of the RESOLVED install path is refused too — otherwise, with a
+	// symlinked install path (/alias -> /data, installDir /alias/.qpkg/app),
+	// renaming /data/.qpkg would relocate the install and audit tree out of
+	// protection, matching neither the lexical-ancestor check nor the duplicated
+	// /data/.qpkg/app rule (which only governs the subtree itself).
+	if g.installDir != "" {
+		if canon, ok := resolve(g.installDir); ok && canon != "" && canon != g.installDir {
+			g.installDirCanon = canon
+		}
+	}
+}
+
+// isInstallAncestor reports whether p is a strict ancestor of the install tree by
+// EITHER its lexical or its canonical (symlink-resolved) spelling. Renaming or
+// deleting such a directory would relocate the install and audit subtree out of
+// protection, so Check and Classify both refuse it (round-10, round-12).
+func (g *Guard) isInstallAncestor(p string) bool {
+	return strictAncestor(p, g.installDir) || strictAncestor(p, g.installDirCanon)
 }
 
 // SetReadOnly turns global read-only mode on or off. When on, Check refuses
@@ -216,7 +241,7 @@ func (g *Guard) Check(op Op, p string) error {
 	//     strict ancestor of the install dir (round-10 final review). Ancestors that
 	//     are volume roots are already caught in step 3; this closes the plain
 	//     intermediate directories above the install dir (e.g. the .qpkg folder).
-	if op&(OpDelete|OpRename) != 0 && strictAncestor(p, g.installDir) {
+	if op&(OpDelete|OpRename) != 0 && g.isInstallAncestor(p) {
 		return fmt.Errorf("%s contains the file manager's own installation and audit trail: %w", p, ErrProtected)
 	}
 
@@ -252,9 +277,10 @@ func (g *Guard) Classify(p string) string {
 	if fn := g.mountChecker(); fn != nil && fn(p) {
 		return "protected"
 	}
-	// A strict ancestor of the install tree is protected: renaming it would
-	// relocate the install and audit subtree out of protection (round-10).
-	if strictAncestor(p, g.installDir) {
+	// A strict ancestor of the install tree (by either spelling) is protected:
+	// renaming it would relocate the install and audit subtree out of protection
+	// (round-10, round-12).
+	if g.isInstallAncestor(p) {
 		return "protected"
 	}
 	// A path that offers any confirmable operation is a caution ("warn") area

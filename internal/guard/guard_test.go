@@ -266,6 +266,35 @@ func TestAncestorContainmentProtection(t *testing.T) {
 	}
 }
 
+// TestAncestorContainmentCanonicalInstall proves the round-12 fix: when the
+// install path is reached through a symlinked ancestor, the containment check
+// refuses renaming/deleting an ancestor named by the CANONICAL spelling too, not
+// only the lexical one — otherwise renaming /data/.qpkg (with /alias -> /data,
+// installDir /alias/.qpkg/app) would relocate the install and audit tree.
+func TestAncestorContainmentCanonicalInstall(t *testing.T) {
+	g := New("/alias/.qpkg/app", false)
+	resolve := func(p string) (string, bool) {
+		if p == "/alias" || strings.HasPrefix(p, "/alias/") {
+			return "/data" + strings.TrimPrefix(p, "/alias"), true
+		}
+		return p, false
+	}
+	g.CanonicalizeRoots(resolve)
+	// Both the canonical and the lexical ancestor spellings must be refused.
+	for _, a := range []string{"/data/.qpkg", "/alias/.qpkg", "/data", "/alias"} {
+		if err := g.Check(OpRename, a); !errors.Is(err, ErrProtected) {
+			t.Errorf("rename of install-tree ancestor %q should be protected, got %v", a, err)
+		}
+		if got := g.Classify(a); got != "protected" {
+			t.Errorf("Classify(%q) = %q, want protected", a, got)
+		}
+	}
+	// A sibling under the resolved root is not an ancestor of the install tree.
+	if err := g.Check(OpRename, "/data/other"); errors.Is(err, ErrProtected) {
+		t.Error("/data/other is not an install ancestor and must not be protected")
+	}
+}
+
 // TestNeverWriteComponents covers .zfs (any depth), /proc and /sys.
 func TestNeverWriteComponents(t *testing.T) {
 	g := New("", false)

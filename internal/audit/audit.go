@@ -64,10 +64,12 @@ const (
 	bigDeleteBytes = 1 << 30 // 1 GiB
 )
 
-// Event is one line of the audit log. Path holds a UTF-8 path; a path that is
-// not valid UTF-8 is moved to PathB64 (base64 of the raw bytes) by Write so it
-// survives JSON round-tripping, which would otherwise replace the bad bytes
-// with U+FFFD and lose the name.
+// Event is one line of the audit log. Path and Dst hold UTF-8 paths; a value
+// that is not valid UTF-8 is moved to PathB64 / DstB64 (base64 of the raw bytes)
+// by prepare so it survives JSON round-tripping, which would otherwise replace
+// the bad bytes with U+FFFD and lose the name — critical for a rename, where the
+// destination distinguishes the target and an overwrite may destroy an existing
+// entry (round-12).
 type Event struct {
 	T       time.Time `json:"t"`
 	Actor   string    `json:"actor"`
@@ -79,6 +81,7 @@ type Event struct {
 	Path    string    `json:"path"`
 	PathB64 string    `json:"pathB64,omitempty"`
 	Dst     string    `json:"dst,omitempty"`
+	DstB64  string    `json:"dstB64,omitempty"`
 	Job     string    `json:"job,omitempty"`
 	Phase   string    `json:"phase"`  // "intent" | "result"
 	Result  string    `json:"result"` // "ok" | "error" | "denied" | "cancelled"
@@ -174,6 +177,13 @@ func (l *Logger) prepare(ev Event) Event {
 	if ev.Path != "" && !utf8.ValidString(ev.Path) {
 		ev.PathB64 = base64.StdEncoding.EncodeToString([]byte(ev.Path))
 		ev.Path = ""
+	}
+	// The rename destination gets the same treatment (round-12): a non-UTF-8 Dst
+	// must not be flattened to U+FFFD, or two distinct destinations become
+	// indistinguishable in the trail.
+	if ev.Dst != "" && !utf8.ValidString(ev.Dst) {
+		ev.DstB64 = base64.StdEncoding.EncodeToString([]byte(ev.Dst))
+		ev.Dst = ""
 	}
 	return ev
 }
@@ -550,10 +560,14 @@ func message(ev Event) string {
 	if p == "" && ev.PathB64 != "" {
 		p = "b64:" + ev.PathB64
 	}
+	d := ev.Dst
+	if d == "" && ev.DstB64 != "" {
+		d = "b64:" + ev.DstB64
+	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s %s %s", ev.Result, ev.Op, p)
-	if ev.Dst != "" {
-		fmt.Fprintf(&b, " -> %s", ev.Dst)
+	if d != "" {
+		fmt.Fprintf(&b, " -> %s", d)
 	}
 	if ev.Actor != "" {
 		fmt.Fprintf(&b, " by %s (uid %d)", ev.Actor, ev.UID)

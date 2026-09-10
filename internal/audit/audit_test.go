@@ -210,6 +210,39 @@ func TestNonUTF8Path(t *testing.T) {
 	}
 }
 
+// TestNonUTF8Dst proves the round-12 fix: a non-UTF-8 rename DESTINATION is
+// preserved in DstB64 rather than flattened to U+FFFD, so two distinct
+// destinations stay distinguishable in the trail (and an overwrite target is
+// recorded exactly).
+func TestNonUTF8Dst(t *testing.T) {
+	l, _ := openTest(t, false)
+	rawDst := "/data/\xff\xfetarget"
+	l.Write(Event{Op: "rename", Path: "/data/src", Dst: rawDst, Phase: "result", Result: "ok"})
+	if err := l.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	evs, err := l.Tail(1)
+	if err != nil {
+		t.Fatalf("Tail: %v", err)
+	}
+	if len(evs) != 1 {
+		t.Fatalf("got %d events, want 1", len(evs))
+	}
+	if evs[0].Dst != "" {
+		t.Fatalf("Dst should be cleared for non-UTF-8, got %q", evs[0].Dst)
+	}
+	if evs[0].DstB64 == "" {
+		t.Fatalf("DstB64 not populated")
+	}
+	dec, err := base64.StdEncoding.DecodeString(evs[0].DstB64)
+	if err != nil {
+		t.Fatalf("DstB64 decode: %v", err)
+	}
+	if string(dec) != rawDst {
+		t.Fatalf("round-trip mismatch: %q != %q", dec, rawDst)
+	}
+}
+
 // TestWriteSyncNotGatedBySlowMirror proves the standard P2 fix: a wedged QuLog
 // mirror must not turn a successfully fsynced intent into a false ErrSyncTimeout.
 // The mirror is made to block well past WriteSync's own 2s timeout; WriteSync must

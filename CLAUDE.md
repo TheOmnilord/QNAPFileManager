@@ -14,7 +14,7 @@ reverse proxy. Everything File Station cannot reach (`/`, `/etc`, `.qpkg`, raw v
 - **Opus and gpt-6-astra are the orchestra.** Implementation is fanned out to Opus subagents (`model: opus`) and to
   Codex running `gpt-6-astra` (the `codex-worker` project agent, or the Codex plugin `task --model gpt-6-astra`).
 - **gpt-6-astra at high effort reviews everything Claude produces**, with a normal review and an adversarial review,
-  iteratively, at most ten rounds per piece of work:
+  iteratively, up to ten rounds per piece of work, extendable to fifteen when findings are still being accepted (owner, 2026-09-10):
 
   ```bash
   codex exec review -m gpt-6-astra -c model_reasoning_effort="high" --uncommitted

@@ -543,6 +543,161 @@ func TestResolveRefusesRootFromNSS(t *testing.T) {
 	}
 }
 
+// A user whose QTS name is all digits must never be resolved through the
+// helpers: getent passwd 1000 and id -u 1000 are uid lookups and would answer
+// with whoever owns uid 1000.
+func TestLookupNSSRefusesNumericName(t *testing.T) {
+	m := newTestMap(t)
+	s := &stubExec{reply: map[string]string{
+		// What the NAS would answer if these ever ran: alice, not the
+		// authenticated LDAP user called "1000".
+		"getent passwd 1000": "alice:x:1000:100:Alice:/share/homes/alice:/bin/sh\n",
+		"id -u 1000":         "1000\n",
+		"id -g 1000":         "100\n",
+		"id -G 1000":         "100 1050\n",
+	}}
+	m.Exec = s.run
+
+	for _, name := range []string{"1000", "0", "007", "99999999999999999999"} {
+		if !ValidName(name) {
+			t.Errorf("ValidName(%q) = false; the name itself is well formed", name)
+		}
+		if _, err := m.LookupNSS(context.Background(), name); !errors.Is(err, ErrNumericName) {
+			t.Errorf("LookupNSS(%q) err = %v, want ErrNumericName", name, err)
+		}
+		if _, err := m.Resolve(context.Background(), name); !errors.Is(err, ErrNumericName) {
+			t.Errorf("Resolve(%q) err = %v, want ErrNumericName", name, err)
+		}
+	}
+	if got := s.seen(); len(got) != 0 {
+		t.Fatalf("a helper ran for a numeric name: %v", got)
+	}
+
+	// The cache refuses it too, and caches nothing.
+	c := NewCache(m, time.Minute)
+	if _, err := c.Resolve(context.Background(), "1000"); !errors.Is(err, ErrNumericName) {
+		t.Errorf("cached Resolve err = %v, want ErrNumericName", err)
+	}
+	if c.Len() != 0 {
+		t.Error("a refused numeric name was cached")
+	}
+
+	// Unless /etc/passwd itself lists that exact name, which is name-keyed and
+	// therefore unambiguous.
+	p, g := writeFixtures(t, passwdFixture+"1000:x:1234:100:Numeric:/share/homes/1000:/bin/sh\n", groupFixture)
+	m2 := Open(p, g)
+	m2.checkInterval = 0
+	m2.Exec = s.run
+	id, err := m2.LookupNSS(context.Background(), "1000")
+	if err != nil {
+		t.Fatalf("LookupNSS(1000) with a passwd entry: %v", err)
+	}
+	if id.UID != 1234 || id.Name != "1000" || id.Source != SourcePasswd {
+		t.Errorf("id = %+v, want the passwd entry for 1000", id)
+	}
+	if got := s.seen(); len(got) != 0 {
+		t.Fatalf("a helper ran for a local numeric name: %v", got)
+	}
+}
+
+// getent must answer for the name that was asked for, byte for byte.
+func TestLookupNSSRefusesNameMismatch(t *testing.T) {
+	m := newTestMap(t)
+
+	// getent passwd <name> answering about somebody else.
+	s := &stubExec{reply: map[string]string{
+		"getent passwd jane": "alice:x:1000:100:Alice:/share/homes/alice:/bin/sh\n",
+		"id -G jane":         "100 1050\n",
+	}}
+	m.Exec = s.run
+	if _, err := m.LookupNSS(context.Background(), "jane"); !errors.Is(err, ErrNameMismatch) {
+		t.Errorf("err = %v, want ErrNameMismatch", err)
+	}
+
+	// Case differences are a mismatch as well: NSS names are byte strings.
+	s = &stubExec{reply: map[string]string{
+		"getent passwd jane": "Jane:x:20001:20000:Jane:/share/homes/jane:/bin/sh\n",
+	}}
+	m.Exec = s.run
+	if _, err := m.LookupNSS(context.Background(), "jane"); !errors.Is(err, ErrNameMismatch) {
+		t.Errorf("case mismatch err = %v, want ErrNameMismatch", err)
+	}
+
+	// The id path is cross-checked against getent passwd <uid>.
+	s = &stubExec{
+		reply: map[string]string{
+			"id -u jane":          "1000\n",
+			"id -g jane":          "100\n",
+			"id -G jane":          "100\n",
+			"getent passwd 1000":  "alice:x:1000:100:Alice:/share/homes/alice:/bin/sh\n",
+			"getent passwd 20001": "jane:x:20001:20000:Jane:/share/homes/jane:/bin/sh\n",
+		},
+		fail: map[string]bool{"getent passwd jane": true},
+	}
+	m.Exec = s.run
+	if _, err := m.LookupNSS(context.Background(), "jane"); !errors.Is(err, ErrNameMismatch) {
+		t.Errorf("id path err = %v, want ErrNameMismatch", err)
+	}
+
+	// A matching name on both paths still succeeds.
+	s = &stubExec{reply: map[string]string{
+		"getent passwd jane": "jane:x:20001:20000:Jane:/share/homes/jane:/bin/sh\n",
+		"id -G jane":         "20000 10513\n",
+	}}
+	m.Exec = s.run
+	id, err := m.LookupNSS(context.Background(), "jane")
+	if err != nil {
+		t.Fatalf("matching getent answer: %v", err)
+	}
+	if id.UID != 20001 || id.GID != 20000 || id.Source != SourceNSS {
+		t.Errorf("id = %+v", id)
+	}
+
+	// And so does the id path when getent agrees about the uid.
+	s = &stubExec{
+		reply: map[string]string{
+			"id -u jane":          "20001\n",
+			"id -g jane":          "20000\n",
+			"id -G jane":          "20000 10513\n",
+			"getent passwd 20001": "jane:x:20001:20000:Jane:/share/homes/jane:/bin/sh\n",
+		},
+		fail: map[string]bool{"getent passwd jane": true},
+	}
+	m.Exec = s.run
+	id, err = m.LookupNSS(context.Background(), "jane")
+	if err != nil {
+		t.Fatalf("agreeing cross-check: %v", err)
+	}
+	if id.UID != 20001 || !eqInts(id.Groups, []int{10513, 20000}) {
+		t.Errorf("id = %+v", id)
+	}
+}
+
+// The DOMAIN\user form, which is what actually reaches this package on a
+// domain-joined NAS, is unaffected by the name binding.
+func TestLookupNSSDomainNameUnaffected(t *testing.T) {
+	m := newTestMap(t)
+	s := &stubExec{reply: map[string]string{
+		`getent passwd DOMAIN\alice`: `DOMAIN\alice:x:20003:20000:Alice:/share/homes/DOMAIN/alice:/bin/sh`,
+		`id -G DOMAIN\alice`:         "20000 10513\n",
+	}}
+	m.Exec = s.run
+
+	id, err := m.Resolve(context.Background(), `DOMAIN\alice`)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if id.Name != `DOMAIN\alice` || id.UID != 20003 || id.GID != 20000 {
+		t.Errorf("id = %+v", id)
+	}
+	if want := []int{10513, 20000}; !eqInts(id.Groups, want) {
+		t.Errorf("groups = %v, want %v", id.Groups, want)
+	}
+	if got := s.seen(); len(got) != 2 {
+		t.Errorf("calls = %v, want getent + id -G only", got)
+	}
+}
+
 func TestCacheResolve(t *testing.T) {
 	m := newTestMap(t)
 	s := &stubExec{reply: map[string]string{
@@ -610,9 +765,10 @@ func TestCacheExpiry(t *testing.T) {
 	if _, err := c.Resolve(context.Background(), "jane"); err != nil {
 		t.Fatal(err)
 	}
-	// Two full resolutions: getent (fails), id -u, id -g, id -G each time.
-	if got := len(s.seen()); got != 8 {
-		t.Errorf("helper calls = %d, want 8", got)
+	// Two full resolutions: getent by name (fails), id -u, the getent uid
+	// cross-check (fails), id -g and id -G each time.
+	if got := len(s.seen()); got != 10 {
+		t.Errorf("helper calls = %d, want 10", got)
 	}
 }
 

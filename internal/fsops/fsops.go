@@ -158,7 +158,10 @@ func resolve(r fsx.Root, apiPath string, followFinal bool) (jailPath, error) {
 			// (INV-2), so the checks are made and their errors are the result.
 			// This holds for every shape of target: a relative "locked/.", an
 			// absolute "/share/locked/.", and a target that is nothing but "."
-			// all arrive here as a component (linkParts, splitLink).
+			// all arrive here as a component (linkParts, splitLink). A target
+			// that ends in a separator — "dir/", "/share/x/" — arrives as one
+			// too, because that is exactly what it asks of the kernel: look the
+			// last component up, then look inside it.
 			if blocked != nil {
 				return jailPath{}, blocked
 			}
@@ -320,15 +323,38 @@ func linkParts(r fsx.Root, apiPath, link string) (parts []string, absolute bool,
 }
 
 // splitOSPath breaks an absolute OS path into its components, volume name
-// dropped and empty components (a doubled separator, a trailing one) with it.
-// Both separators count on Windows, where a symlink target may be written
-// either way; "." and ".." are kept, because the walk is what decides what they
-// mean.
+// dropped and empty components (a doubled separator) with it. Both separators
+// count on Windows, where a symlink target may be written either way; "." and
+// ".." are kept, because the walk is what decides what they mean.
+//
+// A trailing separator is not empty in the way a doubled one is: "/share/x/"
+// asks the kernel to look up "x" and then to look inside it, so it resolves
+// only when x is a directory (or a symlink to one) and the caller may search
+// it. Dropping it turned "/share/file/" — ENOTDIR to the kernel — into a
+// perfectly good stat of the file (INV-2). It comes back as the "." the kernel
+// effectively appends, and resolve() makes the check.
 func splitOSPath(p string) []string {
 	p = p[len(filepath.VolumeName(p)):]
-	return strings.FieldsFunc(p, func(c rune) bool {
-		return c == '/' || (runtime.GOOS == "windows" && c == '\\')
-	})
+	parts := strings.FieldsFunc(p, isOSSeparator)
+	if endsInSeparator(p) {
+		parts = append(parts, ".")
+	}
+	return parts
+}
+
+// isOSSeparator reports whether a rune separates components of a symlink target
+// on this host.
+func isOSSeparator(c rune) bool {
+	return c == '/' || (runtime.GOOS == "windows" && c == '\\')
+}
+
+// endsInSeparator reports whether a symlink target names a directory outright
+// by ending in a separator. An empty target has no components to qualify.
+func endsInSeparator(p string) bool {
+	if p == "" {
+		return false
+	}
+	return isOSSeparator(rune(p[len(p)-1]))
 }
 
 // isAbsLink reports whether a symlink target is absolute on this host. On
@@ -345,24 +371,26 @@ func isAbsLink(link string) bool {
 }
 
 // baseFor returns the Root an absolute symlink target should be mapped through,
-// or false when the target is outside the jail altogether. The jail base is
-// re-resolved when the direct comparison fails: a jail reached through a symlink
-// (/tmp on a Mac) or spelled as a Windows 8.3 short name resolves to a
+// or false when the target is outside the jail altogether. When the direct
+// comparison fails the base's canonical alias is tried: a jail reached through a
+// symlink (/tmp on a Mac) or spelled as a Windows 8.3 short name resolves to a
 // different string than the one the operator configured, and refusing the
 // entire jail over a spelling would be worse than useless.
+//
+// The alias is the one fsx computed when the jail handle was acquired, not a
+// fresh resolution. Re-resolving the base here would mean a path-based,
+// symlink-following lookup on every request that met an absolute link — outside
+// the jail, in the middle of serving a user's path, which is exactly the shape
+// of lookup the descriptor walk exists to remove.
 func baseFor(r fsx.Root, osPath string) (fsx.Root, bool) {
 	if r.Contains(osPath) {
 		return r, true
 	}
-	real, err := filepath.EvalSymlinks(r.Base())
-	if err != nil {
+	alias, ok := r.CanonicalAlias()
+	if !ok {
 		return r, false
 	}
-	rr, err := fsx.NewRoot(real)
-	if err != nil {
-		return r, false
-	}
-	return rr, rr.Contains(osPath)
+	return alias, alias.Contains(osPath)
 }
 
 // splitRel splits a root-relative path into components. "." and "" are no
@@ -375,20 +403,40 @@ func splitRel(rel string) []string {
 }
 
 // splitLink splits a relative symlink target into the components resolution
-// continues with. It is splitRel with one deliberate difference: a target of
-// "." is one component and not none.
+// continues with. It is splitRel with two deliberate differences.
 //
-// splitRel spells the jail base itself "."; a link target does not. "." there
-// is a lookup the kernel makes inside the directory the link lives in, and it
-// needs search permission on that directory like any other name — so the
-// component survives here and resolve() asks (INV-2). Everything else is the
-// same: separators collapse, and ".." is left for the walk to apply.
+// A target of "." is one component and not none. splitRel spells the jail base
+// itself "."; a link target does not. "." there is a lookup the kernel makes
+// inside the directory the link lives in, and it needs search permission on
+// that directory like any other name — so the component survives here and
+// resolve() asks (INV-2).
+//
+// A trailing separator survives too, as the "." it amounts to. "dir/" resolves
+// where "file/" is ENOTDIR: the kernel looks the last component up and then
+// looks *inside* it, so the target only names something when that something is
+// a directory — or a symlink that ends at one — and the caller may search it.
+// Trimming the separator dropped that requirement and let StatFollow answer for
+// "file/" with the file, which a listing then offered for download as a working
+// link (INV-2 again).
+//
+// Everything else is splitRel: interior separators collapse, and ".." is left
+// for the walk to apply.
 func splitLink(link string) []string {
+	dirOnly := endsInSeparator(link)
 	link = strings.Trim(link, "/")
 	if link == "" {
+		// Only reachable for a target of nothing but separators, which is
+		// absolute and never arrives here; "" is refused before the split.
+		if dirOnly {
+			return []string{"."}
+		}
 		return nil
 	}
-	return strings.Split(link, "/")
+	parts := strings.Split(link, "/")
+	if dirOnly {
+		parts = append(parts, ".")
+	}
+	return parts
 }
 
 // relOf renders resolved components as the name an os.Root method takes.
@@ -475,9 +523,11 @@ func List(ctx context.Context, r fsx.Root, plat *platform.Platform, dir string, 
 		return fsx.Listing{}, err
 	}
 	defer f.Close()
-	if fi, err := f.Stat(); err != nil {
+	dirInfo, err := f.Stat()
+	if err != nil {
 		return fsx.Listing{}, err
-	} else if !fi.IsDir() {
+	}
+	if !dirInfo.IsDir() {
 		// The platforms without O_DIRECTORY get the same answer, one syscall
 		// later.
 		return fsx.Listing{}, fmt.Errorf("%q is not a directory: %w", clean, fsx.ErrBadName)
@@ -567,7 +617,7 @@ func List(ctx context.Context, r fsx.Root, plat *platform.Platform, dir string, 
 		Entries:   out,
 		Total:     total,
 		Truncated: capped || off+len(out) < total,
-		Notes:     dirNotes(plat, clean, osDir, capped),
+		Notes:     dirNotes(plat, clean, osDir, mountPointAt(r, plat, tg, dirInfo, osDir), capped),
 	}
 	return l, nil
 }
@@ -613,7 +663,11 @@ func statPath(ctx context.Context, r fsx.Root, plat *platform.Platform, p string
 	if e.IsSymlink {
 		resolveLink(&e, r, tg.jail, tg.rel, clean, true, true)
 	}
-	if osPath, err := r.OS(tg.api); err == nil && plat != nil && plat.IsMountPoint(osPath) {
+	osPath, osErr := r.OS(tg.api)
+	if osErr != nil {
+		osPath = ""
+	}
+	if mountPointAt(r, plat, tg, fi, osPath) {
 		e.MountPoint = true
 	}
 	if fsx.Parent(clean) == "/share" {
@@ -919,10 +973,66 @@ func volumeRootNames(plat *platform.Platform, want bool) map[string]bool {
 	return out
 }
 
+// mountPointAt reports whether an already-resolved path is a mount point,
+// without ever handing a pathname to the kernel.
+//
+// The mount table answers first and answers by name, which is safe because
+// reading it resolves nothing. What is left is the mount that appeared since the
+// table was last read, and that is settled by comparing devices the walk already
+// holds — never by Platform.IsMountPoint, whose fallback stats the path and
+// follows its symlinks. Under -jail that fallback is a lookup outside the jail:
+// with /escape → /proc inside the base, it stats /proc and reports its mount
+// status, which is metadata about a filesystem this request was refused.
+//
+// plat == nil means "no platform knowledge", and the documented answer to that
+// is that nothing is flagged (see List).
+func mountPointAt(r fsx.Root, plat *platform.Platform, tg jailPath, fi os.FileInfo, osPath string) bool {
+	if plat == nil {
+		return false
+	}
+	if osPath != "" && plat.IsMountPointByTable(osPath) {
+		return true
+	}
+	return crossesDevice(r, tg, fi)
+}
+
+// crossesDevice compares the st_dev of the thing the walk resolved with the
+// st_dev of the directory it lives in — a mount point is where those differ.
+//
+// Both come from descriptors: fi is the descriptor-relative stat the caller
+// already made (an lstat, so a symlink describes itself and reports its own
+// filesystem, not its target's), and the parent is stat'ed relative to the same
+// jail handle. Nothing here can address a directory outside the jail.
+//
+// The jail base is the one path with no parent to compare against: the lookup
+// that would answer it lives above the base, which is outside the jail. Unjailed
+// the base is "/", which is a mount point by definition and always in the table
+// anyway; under -jail the mount table is the only answer available and the
+// device comparison declines to guess.
+func crossesDevice(r fsx.Root, tg jailPath, fi os.FileInfo) bool {
+	if tg.rel == "." || tg.rel == "" {
+		return !r.Jailed()
+	}
+	self, ok := devOf(fi)
+	if !ok {
+		return false
+	}
+	pfi, err := statAt(tg.jail, path.Dir(tg.rel))
+	if err != nil {
+		return false
+	}
+	up, ok := devOf(pfi)
+	if !ok {
+		return false
+	}
+	return self != up
+}
+
 // childMountPoints is the set of names in osDir that the mount table calls
-// mount points. The table is consulted once per listing rather than per entry:
-// Platform.IsMountPoint falls back to a pair of stat calls, which is the right
-// answer for a single entry and the wrong price for ten thousand.
+// mount points. The table is consulted once per listing rather than per entry,
+// and it is the whole answer here: a per-entry device comparison would be a stat
+// of every name in a directory of ten thousand, for a mount that the next
+// refresh of the table will report anyway.
 func childMountPoints(plat *platform.Platform, osDir string) map[string]bool {
 	if plat == nil {
 		return nil
@@ -947,7 +1057,10 @@ func childMountPoints(plat *platform.Platform, osDir string) map[string]bool {
 }
 
 // dirNotes are the human-readable remarks about the directory itself.
-func dirNotes(plat *platform.Platform, apiPath, osPath string, capped bool) []string {
+// mountPoint is mountPointAt's answer for the directory being listed; it is
+// passed in rather than recomputed here because deciding it needs the walk's
+// descriptors, which this function does not have.
+func dirNotes(plat *platform.Platform, apiPath, osPath string, mountPoint, capped bool) []string {
 	var notes []string
 	if capped {
 		notes = append(notes, fmt.Sprintf("more than %d entries; the listing was capped", fsx.MaxListLimit))
@@ -955,7 +1068,7 @@ func dirNotes(plat *platform.Platform, apiPath, osPath string, capped bool) []st
 	if plat == nil {
 		return notes
 	}
-	if plat.IsMountPoint(osPath) {
+	if mountPoint {
 		notes = append(notes, "mount point")
 	}
 	if plat.For(osPath).Tmpfs {

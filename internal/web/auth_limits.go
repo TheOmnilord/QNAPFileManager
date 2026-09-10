@@ -140,6 +140,12 @@ func (s *Server) verifyCredential(r *http.Request, cred qtsauth.Cred, revalidati
 		ctx = context.WithValue(ctx, authBudgetKey{}, &authBudget{s: s, ip: client, cancel: cancel})
 	}
 	verified, err := s.verifier.Verify(ctx, cred)
+	if qtsUnavailable(err) {
+		// Infrastructure failures are not credential failures. Do not retain
+		// the verifier's negative cache or charge the bad-credential budget.
+		s.verifier.Invalidate(cred)
+		return qtsauth.Session{}, err
+	}
 	if ctxErr := r.Context().Err(); ctxErr != nil {
 		return qtsauth.Session{}, ctxErr
 	}

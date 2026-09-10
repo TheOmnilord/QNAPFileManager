@@ -1044,6 +1044,150 @@ func TestALinkTargetOfNothingButADotNamesTheDirectoryTheLinkIsIn(t *testing.T) {
 	f.Close()
 }
 
+// TestATrailingSeparatorInALinkTargetRequiresADirectory: "file/" is not "file".
+// The kernel looks the last component up and then looks *inside* it, so a link
+// targeting "b.txt/" is broken with ENOTDIR while one targeting "a/" names the
+// directory a. Trimming the separator erased that requirement: StatFollow
+// answered with the regular file and a listing offered the link as a working
+// one, which is an answer the kernel refuses (INV-2). Both spellings of a
+// target are covered, because the absolute one is what QTS writes.
+func TestATrailingSeparatorInALinkTargetRequiresADirectory(t *testing.T) {
+	requireSymlinks(t)
+	requirePOSIXLinks(t)
+	r, base := fixture(t)
+	sep := string(filepath.Separator)
+	links := map[string]string{
+		"slashfile":    "b.txt/",
+		"slashdir":     "a/",
+		"absslashfile": filepath.Join(base, "b.txt") + sep,
+		"absslashdir":  filepath.Join(base, "a") + sep,
+		// Through a link of its own, so the directory requirement is applied to
+		// where the chain ends rather than to the first name in it.
+		"tofile":       "b.txt",
+		"todir":        "a",
+		"viafileslash": "tofile/",
+		"viadirslash":  "todir/",
+	}
+	for name, target := range links {
+		if err := os.Symlink(target, filepath.Join(base, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx := context.Background()
+
+	// The kernel has to be refusing it for the test to be measuring anything.
+	if _, err := os.Stat(filepath.Join(base, "slashfile")); err == nil {
+		t.Skip("this host resolves a link target of \"file/\" to the file itself")
+	}
+
+	for _, name := range []string{"slashfile", "absslashfile", "viafileslash"} {
+		if e, err := StatFollow(ctx, r, nil, "/"+name); err == nil {
+			t.Errorf("StatFollow(%q) must fail the way the kernel fails it, got %+v", name, e)
+		} else if code := fsx.Code(err); code != "bad_request" {
+			t.Errorf("StatFollow(%q) code = %q, want bad_request (%v)", name, code, err)
+		}
+		if l, err := List(ctx, r, nil, "/"+name, fsx.ListOptions{}); err == nil {
+			t.Errorf("List(%q) must fail the way the kernel fails it, got %+v", name, l)
+		} else if code := fsx.Code(err); code != "bad_request" {
+			t.Errorf("List(%q) code = %q, want bad_request (%v)", name, code, err)
+		}
+	}
+
+	// A trailing separator on something that really is a directory still
+	// resolves, so this is the kernel's check and not a blanket refusal.
+	for _, name := range []string{"slashdir", "absslashdir", "viadirslash"} {
+		e, err := StatFollow(ctx, r, nil, "/"+name)
+		if err != nil {
+			t.Errorf("StatFollow(%q) names the directory a: %v", name, err)
+			continue
+		}
+		if e.Type != "dir" {
+			t.Errorf("StatFollow(%q) = %+v, want the directory a described through the link", name, e)
+		}
+		if e, err := Stat(ctx, r, nil, "/"+name); err != nil {
+			t.Errorf("Stat(%q): %v", name, err)
+		} else if e.LinkResolved != "/a" {
+			t.Errorf("Stat(%q) resolved = %q, want /a", name, e.LinkResolved)
+		}
+		f, _, err := OpenRead(ctx, r, "/"+name+"/one.txt")
+		if err != nil {
+			t.Errorf("reading through %q: %v", name, err)
+			continue
+		}
+		f.Close()
+	}
+
+	// And the listing describes the broken ones as broken: the link is still
+	// there, with no target type and nothing resolved, so the UI cannot offer a
+	// download of a file the kernel would not have handed over.
+	l, err := List(ctx, r, nil, "/", fsx.ListOptions{ResolveLinks: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"slashfile", "absslashfile", "viafileslash"} {
+		e, ok := find(l, name)
+		if !ok || !e.IsSymlink {
+			t.Errorf("entry %q = %+v (present: %v), want the symlink itself", name, e, ok)
+			continue
+		}
+		if e.TargetType != "" || e.LinkResolved != "" {
+			t.Errorf("entry %q = %+v, want an unusable link: no target type, nothing resolved", name, e)
+		}
+	}
+	for _, name := range []string{"slashdir", "absslashdir", "viadirslash"} {
+		if e, ok := find(l, name); !ok || e.TargetType != "dir" {
+			t.Errorf("entry %q = %+v (present: %v), want a link to a directory", name, e, ok)
+		}
+	}
+}
+
+// The component split itself, which is the same on every host for a target
+// written with forward slashes. It runs where the kernel behaviour above cannot
+// be observed, so a regression in the splitting is caught on the dev box too.
+func TestLinkTargetSplitKeepsTrailingSeparators(t *testing.T) {
+	cases := []struct {
+		in  string
+		rel []string // splitLink, for a relative target
+		abs []string // splitOSPath, for an absolute one
+	}{
+		{"a/b", []string{"a", "b"}, []string{"a", "b"}},
+		{"a/b/", []string{"a", "b", "."}, []string{"a", "b", "."}},
+		// splitLink leaves an interior doubled separator as the empty component
+		// resolve() skips; splitOSPath drops it. Either way nothing is checked
+		// for it, and the trailing pair still becomes the one ".".
+		{"a//b//", []string{"a", "", "b", "."}, []string{"a", "b", "."}},
+		{"a/./b", []string{"a", ".", "b"}, []string{"a", ".", "b"}},
+		{"a/../", []string{"a", "..", "."}, []string{"a", "..", "."}},
+		{".", []string{"."}, []string{"."}},
+		{"./", []string{".", "."}, []string{".", "."}},
+	}
+	for _, c := range cases {
+		if got := splitLink(c.in); !equalStrings(got, c.rel) {
+			t.Errorf("splitLink(%q) = %q, want %q", c.in, got, c.rel)
+		}
+		if got := splitOSPath("/" + c.in); !equalStrings(got, c.abs) {
+			t.Errorf("splitOSPath(%q) = %q, want %q", "/"+c.in, got, c.abs)
+		}
+	}
+	// The root of an absolute target is the one directory a trailing separator
+	// names on its own.
+	if got := splitOSPath("/"); !equalStrings(got, []string{"."}) {
+		t.Errorf("splitOSPath(%q) = %q, want %q", "/", got, []string{"."})
+	}
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // A symlink loop must end, and end as an error rather than as a hung worker.
 func TestSymlinkLoopsAreRefused(t *testing.T) {
 	requireSymlinks(t)
@@ -1160,13 +1304,17 @@ func TestNotesForARAMDisk(t *testing.T) {
 	}
 	// dirNotes reads the mount table by OS path, which under -jail does not
 	// describe the fake tree; call it directly with the path the NAS would
-	// have so the wording itself is covered.
-	notes := dirNotes(plat, "/share", "/share", false)
+	// have so the wording itself is covered. The mount-point flag is the table's
+	// own answer, which is what List now passes it.
+	if !plat.IsMountPointByTable("/share") {
+		t.Fatal("the fixture table must call /share a mount point")
+	}
+	notes := dirNotes(plat, "/share", "/share", plat.IsMountPointByTable("/share"), false)
 	joined := strings.Join(notes, "; ")
 	if !strings.Contains(joined, "mount point") || !strings.Contains(joined, "RAM disk") {
 		t.Fatalf("notes = %v", notes)
 	}
-	if notes := dirNotes(plat, "/big", "/", true); len(notes) == 0 || !strings.Contains(notes[0], "capped") {
+	if notes := dirNotes(plat, "/big", "/", false, true); len(notes) == 0 || !strings.Contains(notes[0], "capped") {
 		t.Fatalf("a capped listing must say so: %v", notes)
 	}
 }

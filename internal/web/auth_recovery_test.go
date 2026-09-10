@@ -75,7 +75,7 @@ func TestUnattributedFailureRecovery(t *testing.T) {
 					t.Fatalf("bogus credential: %d %s", w.Code, w.Body)
 				}
 				if i == 300 {
-					old.checked = time.Now().Add(-time.Minute)
+					old.checked = s.now().Add(-time.Minute)
 					s.verifier.Invalidate(old.cred)
 					if w := attempt("", "", cookie); w.Code != 200 {
 						t.Fatalf("revalidation during burst: %d %s", w.Code, w.Body)

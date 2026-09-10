@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"net"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -17,6 +18,7 @@ import (
 
 const (
 	sessionTTL                = 12 * time.Hour
+	qtsUnavailableGrace       = 5 * time.Minute
 	DefaultMaxSessions        = 10000
 	DefaultMaxSessionsPerUser = 16
 )
@@ -24,6 +26,12 @@ const (
 var errSession = errors.New("invalid session")
 var errSessionStoreFull = errors.New("session store full")
 var errCSRF = errors.New("invalid CSRF token or origin")
+
+func qtsUnavailable(err error) bool {
+	var networkError net.Error
+	return errors.Is(err, qtsauth.ErrUnreachable) || errors.Is(err, qtsauth.ErrBadResponse) ||
+		errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &networkError) && networkError.Timeout())
+}
 
 type session struct {
 	mu                      sync.Mutex
@@ -38,6 +46,7 @@ type session struct {
 	note             string
 	cred             qtsauth.Cred
 	checked          time.Time
+	unavailableSince time.Time // guarded by session.mu; reset only by successful validation
 	expires          time.Time // guarded by Server.mu after insertion
 }
 
@@ -160,6 +169,15 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (*session,
 	s.mu.Lock()
 	old := s.lookupSessionLocked(id, binding)
 	s.mu.Unlock()
+	var replaced *session
+	if old != nil && s.pinned == nil && hasCred && binding != old.binding {
+		if !safeMethod(r.Method) || r.URL.Path != "/api/session" {
+			return nil, errSession
+		}
+		// Validate the new bootstrap credential before retiring the old session.
+		// A rejected launch must not revoke the cookie's still-valid session.
+		replaced, old = old, nil
+	}
 	if old != nil {
 		return s.authenticateSession(w, r, old, cred, hasCred)
 	}
@@ -190,11 +208,15 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (*session,
 	if err != nil {
 		return nil, err
 	}
-	return s.authenticateSession(w, r, stored, cred, hasCred)
+	sess, err := s.authenticateSession(w, r, stored, cred, hasCred)
+	if err == nil && replaced != nil {
+		s.destroy(replaced.id)
+	}
+	return sess, err
 }
 
 func (s *Server) createSession(r *http.Request, cred qtsauth.Cred) (*session, error) {
-	now := time.Now()
+	now := s.now()
 	sess := &session{id: rand.Text(), csrf: rand.Text(), expires: now.Add(sessionTTL), checked: now}
 	if s.pinned != nil {
 		sess.who = *s.pinned
@@ -258,14 +280,14 @@ func (s *Server) authenticateSession(w http.ResponseWriter, r *http.Request, old
 	if err := s.authAdmission.lockSession(r.Context(), old); err != nil {
 		return nil, err
 	}
-	now := time.Now()
+	now := s.now()
 	s.mu.Lock()
 	invalid := old.dead.Load() || !now.Before(old.expires)
 	s.mu.Unlock()
 	if s.pinned == nil && hasCred && qtsauth.CacheKey(cred) != old.binding {
 		invalid = true
 	}
-	if !invalid && s.pinned == nil && (!safeMethod(r.Method) || now.Sub(old.checked) >= 60*time.Second) {
+	if !invalid && s.pinned == nil && (!safeMethod(r.Method) || !old.unavailableSince.IsZero() || now.Sub(old.checked) >= 60*time.Second) {
 		if s.verifier == nil {
 			invalid = true
 		} else {
@@ -274,13 +296,26 @@ func (s *Server) authenticateSession(w http.ResponseWriter, r *http.Request, old
 				return nil, err
 			}
 			defer s.authAdmission.leave(true)
-			if !safeMethod(r.Method) {
+			if !safeMethod(r.Method) || !old.unavailableSince.IsZero() {
 				s.verifier.Invalidate(old.cred)
 			}
 			verified, err := s.verifyCredential(r, old.cred, true)
 			if ctxErr := r.Context().Err(); ctxErr != nil {
+				err = ctxErr
+			}
+			if qtsUnavailable(err) {
+				if old.unavailableSince.IsZero() {
+					old.unavailableSince = now
+				}
+				expired := !s.now().Before(old.unavailableSince.Add(qtsUnavailableGrace))
+				if expired {
+					s.destroy(old.id)
+					s.cookie(w, r, "", -1)
+				}
 				old.mu.Unlock()
-				return nil, ctxErr
+				// Keep the credential during the bounded outage grace, but never
+				// authorize operations using a failed validation.
+				return nil, err
 			}
 			if errors.Is(err, errAuthRateLimited) || errors.Is(err, qtsauth.ErrOverloaded) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				old.mu.Unlock()
@@ -301,6 +336,7 @@ func (s *Server) authenticateSession(w http.ResponseWriter, r *http.Request, old
 					old.admin, old.note = idmap.DecideAdmin(verified.IsAdmin(), ident, s.ids, s.cfg.Auth.AdminRequiresBoth)
 					old.partial = ident.Partial
 					old.checked = verified.ValidatedAt
+					old.unavailableSince = time.Time{}
 				}
 			}
 		}

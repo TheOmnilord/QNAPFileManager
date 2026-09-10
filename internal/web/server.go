@@ -125,8 +125,9 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, errAuthRetry):
 			w.Header().Set("Retry-After", "1")
 			writeError(w, 503, "retry", "Authentication was interrupted. Try again.", "", r.URL.Path, "")
-		case errors.Is(err, context.DeadlineExceeded):
-			writeError(w, 504, "auth_timeout", "Authentication timed out. Try again.", "", r.URL.Path, "")
+		case qtsUnavailable(err):
+			w.Header().Set("Retry-After", "2")
+			writeError(w, 503, "qts_unavailable", "QTS authentication is temporarily unavailable. Try again shortly.", "", r.URL.Path, "")
 		case errors.Is(err, qtsauth.ErrOverloaded):
 			w.Header().Set("Retry-After", "2")
 			writeError(w, 503, "overloaded", "Authentication is busy. Try again shortly.", "", r.URL.Path, "")

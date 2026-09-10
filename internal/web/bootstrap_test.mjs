@@ -60,8 +60,8 @@ test('Retry after transient exhaustion is bounded and never makes an anonymous r
  assert.deepEqual(delays,[250,500,1000]);
 });
 
-test('definitive 401 and 429 clear credentials without retries', async () => {
- for (const status of [401,429]) {
+test('definitive 401 clears credentials without retries', async () => {
+ for (const status of [401]) {
   const calls=[];
   const connect=sessionBootstrap('https://nas/?sid=secret',() => {},async params => {
    calls.push({...params});
@@ -72,6 +72,75 @@ test('definitive 401 and 429 clear credentials without retries', async () => {
   await connect();
   assert.deepEqual(calls,[{sid:'secret'},{}]);
  }
+});
+
+test('429 retains SID and honors bounded Retry-After through API errors', async t => {
+ t.mock.method(Date,'now',() => Date.parse('Thu, 10 Sep 2026 12:00:00 GMT'));
+ for (const [retryAfter,delay] of [
+  ['1',1000],['60',5000],['0',0],[null,250],['invalid',250],['-1',250],
+  ['Thu, 10 Sep 2026 12:00:02 GMT',2000],['Thu, 10 Sep 2026 12:01:00 GMT',5000]
+ ]) {
+  for (const body of ['<html>busy</html>',JSON.stringify({error:{message:'Try again'}})]) {
+   const calls=[],delays=[];
+   t.mock.method(globalThis,'fetch',async url => {
+    calls.push(url);
+    return calls.length===1 ? new Response(body,{status:429,headers:retryAfter===null ? {} : {'Retry-After':retryAfter}}) :
+     new Response(JSON.stringify({authenticated:true}));
+   });
+   const connect=sessionBootstrap('https://nas/?sid=secret&user=alice',() => {},
+    params => api('api/session',params),async ms => delays.push(ms));
+   assert.deepEqual(await connect(),{authenticated:true});
+   assert.deepEqual(calls,['api/session?sid=secret&user=alice','api/session?sid=secret&user=alice']);
+   assert.deepEqual(delays,[delay]);
+   await connect();
+   assert.equal(calls.at(-1),'api/session');
+  }
+ }
+});
+
+test('429 exhaustion remains terminal for a pending SID, including an empty SID', async () => {
+ for (const sid of ['secret','']) {
+  const calls=[],delays=[];
+  const connect=sessionBootstrap(`https://nas/?sid=${sid}`,() => {},async params => {
+   calls.push({...params});
+   throw {status:429,retryAfter:'1'};
+  },async ms => delays.push(ms));
+  await assert.rejects(connect(),/Reopen QNAPFileManager/);
+  await assert.rejects(connect(),/Reopen QNAPFileManager/);
+  assert.deepEqual(calls,Array.from({length:4},() => ({sid})));
+  assert.deepEqual(delays,[1000,1000,1000]);
+ }
+});
+
+test('cookie Retry starts a fresh bounded attempt after exhaustion, including after SID success', async () => {
+ for (const initialSID of [false,true]) {
+  const calls=[],delays=[];
+  let recovered=false;
+  const connect=sessionBootstrap('https://nas/'+(initialSID ? '?sid=secret' : ''),() => {},async params => {
+   calls.push({...params});
+   if (Object.hasOwn(params,'sid') || recovered) return {authenticated:true};
+   throw {status:503};
+  },async ms => delays.push(ms));
+  if (initialSID) await connect();
+  for (let click=0; click<2; click++) await assert.rejects(connect(),/Please retry/);
+  assert.deepEqual(calls.slice(initialSID ? 1 : 0),Array.from({length:8},() => ({})));
+  assert.deepEqual(delays,[250,500,1000,250,500,1000]);
+  recovered=true;
+  assert.deepEqual(await connect(),{authenticated:true});
+  assert.deepEqual(calls.at(-1),{});
+ }
+});
+
+test('non-authentication errors do not discard a pending SID', async () => {
+ const calls=[];
+ const connect=sessionBootstrap('https://nas/?sid=secret',() => {},async params => {
+  calls.push({...params});
+  if (calls.length===1) throw {status:500};
+  return {authenticated:true};
+ },async () => assert.fail('unexpected retry'));
+ await assert.rejects(connect(),err => err.status===500);
+ assert.deepEqual(await connect(),{authenticated:true});
+ assert.deepEqual(calls,[{sid:'secret'},{sid:'secret'}]);
 });
 
 test('expiry during backoff prevents further credential requests', async () => {
@@ -90,7 +159,7 @@ test('API exposes transient HTTP and network failures to bootstrap without a DOM
    t.mock.method(globalThis,'fetch',async () => new Response(body,{status}));
    await assert.rejects(api('api/session'),err => {
     assert.equal(err.status,status);
-    assert.equal(transientAuthError(err),status!==429);
+    assert.equal(transientAuthError(err),true);
     return true;
    });
   }

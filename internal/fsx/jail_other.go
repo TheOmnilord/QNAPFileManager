@@ -2,7 +2,10 @@
 
 package fsx
 
-import "os"
+import (
+	"os"
+	"path/filepath"
+)
 
 // Jail off Linux is *os.Root itself.
 //
@@ -23,3 +26,15 @@ type Jail = *os.Root
 
 // openJail opens the confinement handle.
 func openJail(dir string) (Jail, error) { return os.OpenRoot(dir) }
+
+// canonicalDir resolves the jail base's pathname. There is no way to name a
+// descriptor here, so this is filepath.EvalSymlinks — a path-based resolution,
+// but one made exactly once per jail, at open time, rather than once per
+// request. On Windows it is also what expands an 8.3 short name.
+func canonicalDir(dir string, _ Jail) string {
+	real, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return ""
+	}
+	return filepath.Clean(real)
+}

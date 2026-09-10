@@ -2,6 +2,7 @@ package fsx
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -181,6 +182,75 @@ func TestRootTempDirRoundTrip(t *testing.T) {
 	}
 	if _, err := r.API(""); !errors.Is(err, ErrNotAbsolute) {
 		t.Fatalf("an empty OS path must be rejected, got %v", err)
+	}
+}
+
+// TestCanonicalAlias covers the round-eight finding: the canonical spelling of
+// the jail base is computed once, when the handle is acquired, and reused. A
+// request must never re-resolve the base by pathname, so the alias has to be
+// available — and stable — from the handle alone.
+func TestCanonicalAlias(t *testing.T) {
+	real := t.TempDir()
+	if resolved, err := filepath.EvalSymlinks(real); err == nil {
+		real = resolved
+	}
+	link := filepath.Join(t.TempDir(), "jail")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("symlinks are not available here: %v", err)
+	}
+
+	r, err := NewRoot(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = r.Close() })
+
+	// Nothing is resolved until the handle is opened, which is what makes the
+	// canonical base the *user's* answer rather than the daemon's.
+	if _, err := r.Open(); err != nil {
+		t.Fatal(err)
+	}
+	canon := r.CanonicalBase()
+	if canon != real {
+		t.Fatalf("CanonicalBase = %q, want %q", canon, real)
+	}
+	if r.CanonicalBase() != canon {
+		t.Fatal("the canonical base must be computed once and reused")
+	}
+
+	alias, ok := r.CanonicalAlias()
+	if !ok {
+		t.Fatal("a base reached through a symlink must have an alias")
+	}
+	if !alias.Contains(filepath.Join(real, "file.txt")) {
+		t.Fatalf("the alias %q does not contain a path under %q", alias.Base(), real)
+	}
+	if r.Contains(filepath.Join(real, "file.txt")) {
+		t.Fatal("the configured spelling should not have contained the resolved path; the test proves nothing")
+	}
+	if api, err := alias.API(real); err != nil || api != "/" {
+		t.Fatalf("alias.API(%q) = %q, %v, want /", real, api, err)
+	}
+
+	// A base that is already canonical has no alias to offer, and neither has
+	// the identity mapping.
+	direct, err := NewRoot(real)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = direct.Close() })
+	if _, err := direct.Open(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := direct.CanonicalAlias(); ok {
+		t.Error("a canonical base must not report an alias")
+	}
+	var identity Root
+	if identity.CanonicalBase() != "" {
+		t.Error("the identity mapping has no base to canonicalise")
+	}
+	if _, ok := identity.CanonicalAlias(); ok {
+		t.Error("the identity mapping must not report an alias")
 	}
 }
 

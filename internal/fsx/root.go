@@ -52,10 +52,19 @@ type handle struct {
 	once sync.Once
 	j    Jail
 	err  error
+	// canon is the base's canonical spelling, computed once, here, from the
+	// handle that was just opened. It is empty when the base could not be
+	// canonicalised at all. Written inside the once and read only after it, so
+	// every reader is synchronised by the same sync.Once.
+	canon string
 }
 
 func (h *handle) open() (Jail, error) {
-	h.once.Do(func() { h.j, h.err = openJail(h.dir) })
+	h.once.Do(func() {
+		if h.j, h.err = openJail(h.dir); h.err == nil {
+			h.canon = canonicalDir(h.dir, h.j)
+		}
+	})
 	return h.j, h.err
 }
 
@@ -158,6 +167,45 @@ func (r Root) Jailed() bool { return r.base != "" }
 
 // Base is the OS directory the jail is rooted at, empty when not jailed.
 func (r Root) Base() string { return r.base }
+
+// CanonicalBase is the jail base's canonical spelling: the pathname with every
+// symlink resolved away, and on Windows the 8.3 short name expanded. It is
+// computed exactly once, when the jail handle is acquired, and from the handle
+// itself where the platform can name a descriptor — so a request never resolves
+// the base by pathname again. Resolving a pathname is precisely the lookup the
+// O_PATH handle exists to replace: it follows symlinks the kernel would follow
+// for *some* process at *some* time, which under -jail can mean stat'ing a
+// directory outside the jail.
+//
+// It is empty for an unjailed Root, for a handle that could not be opened, and
+// for a base that could not be canonicalised.
+func (r Root) CanonicalBase() string {
+	if r.h == nil {
+		return ""
+	}
+	if _, err := r.h.open(); err != nil {
+		return ""
+	}
+	return r.h.canon
+}
+
+// CanonicalAlias returns a Root that maps the same jail, sharing the same
+// descriptor, under the base's canonical spelling — and false when there is no
+// alias worth speaking of: an unjailed Root, a base that is already canonical,
+// or one that could not be resolved.
+//
+// It exists for one job: deciding whether an absolute symlink target lands
+// inside the jail when the operator spelled the jail one way and the target
+// spells it another (a jail reached through a symlink, /tmp on a Mac, or a
+// Windows short name). The alias is a *name*, like Root.OS; syscalls still go
+// through the one descriptor both Roots share.
+func (r Root) CanonicalAlias() (Root, bool) {
+	canon := r.CanonicalBase()
+	if canon == "" || pathEqual(canon, r.base) {
+		return r, false
+	}
+	return Root{base: canon, h: r.h}, true
+}
 
 // OS maps an API path to the OS path it names. The argument is cleaned
 // defensively and the result is verified: OS never returns a path outside the

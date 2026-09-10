@@ -12,6 +12,10 @@
 //     list of /etc/group, so it is always added to Ident.Groups explicitly.
 //   - The NSS path never yields uid 0. If a helper claims uid 0 for a name that
 //     /etc/passwd does not also map to uid 0, resolution fails closed.
+//   - The NSS path is name bound. getent(1) and id(1) read an all-digit operand
+//     as a uid, so an authenticated user literally named "1000" would come back
+//     as whoever owns uid 1000; such names are refused unless /etc/passwd lists
+//     them, and every helper answer must name the user that was asked for.
 //
 // A Map is safe for concurrent use. On Windows the files simply do not exist,
 // every lookup misses, and the default NSS runner returns an error.
@@ -57,6 +61,15 @@ var (
 	ErrNoHelper    = errors.New("idmap: no NSS helper available")
 	ErrBadOutput   = errors.New("idmap: unexpected helper output")
 	ErrRootRefused = errors.New("idmap: refusing uid 0 from the NSS path for a user absent from passwd")
+
+	// ErrNumericName is returned for an all-digit user name that /etc/passwd
+	// does not list: the NSS helpers would read it as a uid and answer for a
+	// different account.
+	ErrNumericName = errors.New("idmap: refusing a numeric user name on the NSS path")
+
+	// ErrNameMismatch is returned when a helper answers with a passwd entry
+	// belonging to some other user than the one that was looked up.
+	ErrNameMismatch = errors.New("idmap: helper answered for a different user name")
 )
 
 // nameRE is the whitelist a name must match before it is ever handed to an
@@ -251,34 +264,18 @@ func parse(passwd, group []byte) *snapshot {
 	s := newSnapshot()
 
 	for _, line := range lines(passwd) {
-		if skipLine(line) {
-			continue
-		}
-		f := strings.Split(line, ":")
-		if len(f) < 6 {
-			continue
-		}
-		name := f[0]
-		if name == "" {
-			continue
-		}
-		uid, ok := atoiStrict(f[2])
+		e, ok := parsePasswdRow(line)
 		if !ok {
 			continue
 		}
-		gid, ok := atoiStrict(f[3])
-		if !ok {
-			continue
-		}
-		e := passwdEnt{name: name, uid: uid, gid: gid, home: f[5]}
-		if _, dup := s.byName[name]; dup {
+		if _, dup := s.byName[e.name]; dup {
 			continue // first entry wins
 		}
-		s.byName[name] = e
-		if _, dup := s.uidToName[uid]; !dup {
-			s.uidToName[uid] = name
+		s.byName[e.name] = e
+		if _, dup := s.uidToName[e.uid]; !dup {
+			s.uidToName[e.uid] = e.name
 		}
-		s.users = append(s.users, Ident{Name: name, UID: uid, GID: gid, Home: e.home, Source: SourcePasswd})
+		s.users = append(s.users, Ident{Name: e.name, UID: e.uid, GID: e.gid, Home: e.home, Source: SourcePasswd})
 	}
 
 	for _, line := range lines(group) {
@@ -491,19 +488,39 @@ func (m *Map) runHelper(ctx context.Context, name string, args ...string) ([]byt
 // id -g, and then id -G for supplementary groups. No shell is used and the
 // name is validated first. When id -G is unavailable the identity is returned
 // with only the primary group and Partial set, so the UI can say so out loud.
+//
+// The lookup is bound to the name throughout. An all-digit name is never
+// handed to a helper, because both getent(1) and id(1) would treat it as a uid
+// and answer for whoever owns that uid; it resolves only when /etc/passwd
+// lists that exact name, and otherwise fails with ErrNumericName. Every helper
+// answer that carries a passwd name field must repeat the requested name byte
+// for byte, or the lookup fails with ErrNameMismatch.
 func (m *Map) LookupNSS(ctx context.Context, name string) (Ident, error) {
 	if !ValidName(name) {
 		return Ident{}, fmt.Errorf("%w: %q", ErrInvalidName, name)
+	}
+	if isNumericName(name) {
+		// /etc/passwd is keyed by name, so a local user really called "1000"
+		// is still resolvable; the helpers are not asked.
+		if local, lerr := m.LookupUser(name); lerr == nil {
+			return local, nil
+		}
+		return Ident{}, fmt.Errorf("%w: %q would be read as a uid by getent and id", ErrNumericName, name)
 	}
 
 	id := Ident{Name: name, Source: SourceNSS}
 	haveUID := false
 
-	// Preferred: one getent call gives uid, gid and home together.
+	// Preferred: one getent call gives uid, gid and home together. The answer
+	// counts only when its name field is the name we asked for.
 	if out, err := m.runHelper(ctx, "getent", "passwd", name); err == nil {
-		if e, ok := firstPasswdEnt(out); ok {
+		e, match, other := passwdEntFor(out, name)
+		switch {
+		case match:
 			id.UID, id.GID, id.Home = e.uid, e.gid, e.home
 			haveUID = true
+		case other:
+			return Ident{}, fmt.Errorf("%w: getent passwd %s answered for %q", ErrNameMismatch, name, e.name)
 		}
 	}
 
@@ -515,6 +532,14 @@ func (m *Map) LookupNSS(ctx context.Context, name string) (Ident, error) {
 		uid, ok := singleNumber(out)
 		if !ok {
 			return Ident{}, fmt.Errorf("%w: id -u %s", ErrBadOutput, name)
+		}
+		// Cross-check the uid against getent where getent exists: if that uid
+		// belongs to a different passwd name, the identity is ambiguous and is
+		// refused rather than issued.
+		if cout, cerr := m.runHelper(ctx, "getent", "passwd", strconv.Itoa(uid)); cerr == nil {
+			if e, ok := firstPasswdEnt(cout); ok && e.name != name {
+				return Ident{}, fmt.Errorf("%w: id -u %s gave uid %d, which getent maps to %q", ErrNameMismatch, name, uid, e.name)
+			}
 		}
 		out, err = m.runHelper(ctx, "id", "-g", name)
 		if err != nil {
@@ -544,27 +569,69 @@ func (m *Map) LookupNSS(ctx context.Context, name string) (Ident, error) {
 	return id, nil
 }
 
+// isNumericName reports whether name consists only of decimal digits, i.e.
+// whether getent(1) and id(1) would take it for a uid rather than a name.
+func isNumericName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		if name[i] < '0' || name[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// parsePasswdRow parses one passwd-format row, rejecting comments, NIS compat
+// lines, short rows and non-numeric ids.
+func parsePasswdRow(line string) (passwdEnt, bool) {
+	if skipLine(line) {
+		return passwdEnt{}, false
+	}
+	f := strings.Split(line, ":")
+	if len(f) < 6 || f[0] == "" {
+		return passwdEnt{}, false
+	}
+	uid, ok := atoiStrict(f[2])
+	if !ok {
+		return passwdEnt{}, false
+	}
+	gid, ok := atoiStrict(f[3])
+	if !ok {
+		return passwdEnt{}, false
+	}
+	return passwdEnt{name: f[0], uid: uid, gid: gid, home: f[5]}, true
+}
+
 // firstPasswdEnt parses the first usable row of getent passwd output.
 func firstPasswdEnt(out []byte) (passwdEnt, bool) {
 	for _, line := range lines(out) {
-		if skipLine(line) {
-			continue
+		if e, ok := parsePasswdRow(line); ok {
+			return e, true
 		}
-		f := strings.Split(line, ":")
-		if len(f) < 6 || f[0] == "" {
-			continue
-		}
-		uid, ok := atoiStrict(f[2])
-		if !ok {
-			continue
-		}
-		gid, ok := atoiStrict(f[3])
-		if !ok {
-			continue
-		}
-		return passwdEnt{name: f[0], uid: uid, gid: gid, home: f[5]}, true
 	}
 	return passwdEnt{}, false
+}
+
+// passwdEntFor picks the row of getent passwd output that belongs to want.
+// match is true when a row names want exactly. When no row does but rows were
+// parsed, the first of them is returned with other true, so the caller can
+// refuse an answer about somebody else instead of silently adopting it.
+func passwdEntFor(out []byte, want string) (ent passwdEnt, match, other bool) {
+	for _, line := range lines(out) {
+		e, ok := parsePasswdRow(line)
+		if !ok {
+			continue
+		}
+		if e.name == want {
+			return e, true, false
+		}
+		if !other {
+			ent, other = e, true
+		}
+	}
+	return ent, false, other
 }
 
 // singleNumber requires the output to be exactly one all-numeric token.
@@ -595,7 +662,9 @@ func numberList(out []byte) ([]int, bool) {
 
 // Resolve looks name up in /etc/passwd first and falls back to the NSS
 // helpers. It never invents root: an NSS answer of uid 0 for a name the passwd
-// file does not also map to uid 0 is refused.
+// file does not also map to uid 0 is refused. An all-digit name that passwd
+// does not list is refused as well (ErrNumericName), and a helper answer that
+// names another user is refused (ErrNameMismatch).
 func (m *Map) Resolve(ctx context.Context, name string) (Ident, error) {
 	if id, err := m.LookupUser(name); err == nil {
 		return id, nil

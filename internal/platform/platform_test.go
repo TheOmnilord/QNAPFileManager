@@ -256,6 +256,51 @@ func TestUbuntuTable(t *testing.T) {
 	}
 }
 
+// TestIsMountPointByTableMakesNoLookup pins the difference between the two
+// classifiers, because the containment of every jailed caller rests on it: the
+// table-only one must never reach the path probe, whose stat follows symlinks
+// and can therefore describe a filesystem the caller was refused.
+func TestIsMountPointByTableMakesNoLookup(t *testing.T) {
+	p := load(t, "ubuntu_mountinfo.txt")
+
+	var probed []string
+	restore := mountProbe
+	mountProbe = func(path string) bool {
+		probed = append(probed, path)
+		return true // the probe's answer must be the only way to get "true" here
+	}
+	t.Cleanup(func() { mountProbe = restore })
+
+	// Absent from the table, and the table is all IsMountPointByTable may read.
+	if p.IsMountPointByTable("/nowhere/at/all") {
+		t.Error("IsMountPointByTable answered true for a path the table does not mention")
+	}
+	if len(probed) != 0 {
+		t.Fatalf("IsMountPointByTable resolved %v; it must make no filesystem lookup at all", probed)
+	}
+
+	// The same path through IsMountPoint still falls back, which is the
+	// behaviour the fallback's own tests rely on.
+	if !p.IsMountPoint("/nowhere/at/all") {
+		t.Error("IsMountPoint did not reach the path probe")
+	}
+	if len(probed) != 1 || probed[0] != "/nowhere/at/all" {
+		t.Fatalf("probe calls = %v, want exactly one for /nowhere/at/all", probed)
+	}
+
+	// A table hit answers before the probe, on either entry point.
+	probed = nil
+	if !p.IsMountPointByTable("/proc") || !p.IsMountPoint("/proc") {
+		t.Error("/proc is in the fixture table and must be a mount point on both paths")
+	}
+	if len(probed) != 0 {
+		t.Fatalf("a table hit probed %v", probed)
+	}
+	if p.IsMountPointByTable("") {
+		t.Error("the empty path is not a mount point")
+	}
+}
+
 func TestRefreshLeavesStaticTableAlone(t *testing.T) {
 	// A golden table must survive Refresh even when the test runs on a Linux
 	// host whose /proc/self/mountinfo is readable.

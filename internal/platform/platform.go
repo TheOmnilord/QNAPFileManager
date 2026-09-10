@@ -301,23 +301,50 @@ func (p *Platform) MayCross(from, to FSCaps) bool {
 	return to.Storage && !to.Network && to.Domain == from.Domain
 }
 
-// IsMountPoint reports whether osPath is itself a mount point. The mount table
-// is authoritative; on Linux a st_dev comparison against the parent catches
-// mounts that appeared since the last refresh.
-func (p *Platform) IsMountPoint(osPath string) bool {
+// IsMountPointByTable reports whether osPath is a mount point according to the
+// mount table alone. It touches the filesystem only to re-read
+// /proc/self/mountinfo, and never resolves osPath: no stat, no symlink
+// following, nothing the caller's own confinement did not already permit.
+//
+// This is the entry point for anything holding a path inside a jail. Its
+// path-resolving sibling below is fine for a name the caller chose (a configured
+// mount, a diagnostic) and wrong for one a user supplied: under -jail, a symlink
+// inside the jail pointing at /proc would have IsMountPoint stat /proc and
+// report what it found there, which is a lookup outside the jail however
+// harmless the answer looks.
+func (p *Platform) IsMountPointByTable(osPath string) bool {
 	clean := normalizePath(osPath)
 	if clean == "" {
 		return false
 	}
 	p.maybeRefresh()
 	p.mu.RLock()
+	defer p.mu.RUnlock()
 	_, ok := p.caps[clean]
-	p.mu.RUnlock()
-	if ok {
+	return ok
+}
+
+// IsMountPoint reports whether osPath is itself a mount point. The mount table
+// is authoritative; on Linux a st_dev comparison against the parent catches
+// mounts that appeared since the last refresh.
+//
+// The fallback resolves osPath by pathname and follows symlinks doing it, so a
+// caller that got its path from a user must use IsMountPointByTable instead and
+// compare devices through descriptors it already holds.
+func (p *Platform) IsMountPoint(osPath string) bool {
+	if p.IsMountPointByTable(osPath) {
 		return true
 	}
-	return statIsMountPoint(clean)
+	clean := normalizePath(osPath)
+	if clean == "" {
+		return false
+	}
+	return mountProbe(clean)
 }
+
+// mountProbe is the stat fallback IsMountPoint uses. It is a variable so that a
+// test can record whether the path-based probe was reached at all.
+var mountProbe = statIsMountPoint
 
 // VolumeRoots returns the storage mounts that are direct children of /share:
 // the volume roots on QTS (CACHEDEV1_DATA), on QuTS hero (ZFS530_DATA) and on

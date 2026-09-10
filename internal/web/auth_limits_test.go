@@ -119,14 +119,17 @@ func TestAuthenticationDeadline(t *testing.T) {
 				cookie = &http.Cookie{Name: "qfm_sid", Value: old.id}
 			}
 			if phase == "session-lock" {
-				old := s.insertSession(indexedTestSession("busy", "domainuser"))
+				old := indexedTestSession("busy", "domainuser")
+				old.cred = qtsauth.Cred{Kind: qtsauth.KindSID, Token: "slow"}
+				old.binding = qtsauth.CacheKey(old.cred)
+				s.insertSession(old)
 				old.mu.Lock()
 				defer old.mu.Unlock()
 				cookie = &http.Cookie{Name: "qfm_sid", Value: old.id}
 			}
 			start := time.Now()
 			w := request(s, "GET", "/api/session?sid=slow", cookie, nil)
-			assertAuthError(t, w, 504, "auth_timeout", "")
+			assertAuthError(t, w, 503, "qts_unavailable", "2")
 			if time.Since(start) > time.Second {
 				t.Fatal("authentication exceeded its deadline")
 			}
@@ -290,7 +293,7 @@ func TestAuthenticationFailureLimiter(t *testing.T) {
 	old := indexedTestSession("revoked", "dev")
 	old.cred = qtsauth.Cred{Kind: qtsauth.KindSID, Token: "revoked"}
 	old.binding = qtsauth.CacheKey(old.cred)
-	old.checked = time.Now().Add(-time.Minute)
+	old.checked = s.now().Add(-time.Minute)
 	s.insertSession(old)
 	// Established sessions bypass the failure budget and are actually revoked.
 	assertAuthError(t, attempt("192.0.2.1", "revoked"), 401, "unauthorized", "")

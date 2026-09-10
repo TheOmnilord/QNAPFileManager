@@ -1,8 +1,12 @@
 package fsx
 
 import (
+	"fmt"
 	"io/fs"
 	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 )
 
@@ -76,6 +80,54 @@ func openJail(dir string) (Jail, error) {
 		return nil, &fs.PathError{Op: "open", Path: dir, Err: err}
 	}
 	return &oPathJail{f: os.NewFile(uintptr(fd), dir)}, nil
+}
+
+// canonicalDir names the jail base the way the kernel names it: by reading the
+// handle's own entry in /proc/self/fd rather than by resolving the pathname a
+// second time. The descriptor *is* the base, so the answer describes the
+// directory that was opened and cannot be steered by a symlink swapped in
+// afterwards — and no lookup outside the jail is made to obtain it.
+//
+// EvalSymlinks is the fallback for a kernel with no /proc mounted. It resolves
+// by pathname, which is what the O_PATH walk exists to avoid, so it is confined
+// to this one call: open time, once per jail, before the worker serves anything.
+func canonicalDir(dir string, j Jail) string {
+	if oj, ok := j.(*oPathJail); ok {
+		if name, err := oj.canonicalName(); err == nil {
+			return name
+		}
+	}
+	if real, err := filepath.EvalSymlinks(dir); err == nil {
+		return filepath.Clean(real)
+	}
+	return ""
+}
+
+// canonicalName reads /proc/self/fd/<n> for the handle. A directory that has
+// been unlinked reads back with a " (deleted)" suffix and a kernel without /proc
+// fails outright; both are refused rather than turned into a pathname that names
+// something else.
+func (j *oPathJail) canonicalName() (string, error) {
+	rc, err := j.f.SyscallConn()
+	if err != nil {
+		return "", err
+	}
+	var (
+		name string
+		rerr error
+	)
+	if cerr := rc.Control(func(pfd uintptr) {
+		name, rerr = os.Readlink("/proc/self/fd/" + strconv.Itoa(int(pfd)))
+	}); cerr != nil {
+		return "", cerr
+	}
+	if rerr != nil {
+		return "", rerr
+	}
+	if !strings.HasPrefix(name, "/") || strings.HasSuffix(name, " (deleted)") {
+		return "", fmt.Errorf("the kernel names the jail root %q, which is not a usable path", name)
+	}
+	return filepath.Clean(name), nil
 }
 
 // sysOpen is open(2), retried over EINTR.

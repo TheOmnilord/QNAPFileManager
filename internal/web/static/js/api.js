@@ -28,12 +28,18 @@ export async function api(endpoint,params={},options={}) {
  try { response = await fetch(apiURL(endpoint,params),{...options,headers,credentials:'same-origin',cache:'no-store'}); }
  catch { throw Object.assign(new Error('Cannot reach the QNAPFileManager service — is it still running?'),{network:true}); }
  if (response.status === 401 && valid()) signInNotice();
+ const failure={status:response.status,retryAfter:response.headers.get('Retry-After')};
  let data;
  try { data = await response.json(); }
  catch {
   // Proxies may return HTML for timeouts or overloads; preserve the status.
-  throw Object.assign(new Error(`Request failed (${response.status})`),{status:response.status,network:response.ok});
+  throw Object.assign(new Error(`Request failed (${response.status})`),failure,{network:response.ok});
  }
- if (!response.ok) throw Object.assign(new Error([data?.error?.message,data?.error?.path].filter(Boolean).join(' — ') || `Request failed (${response.status})`),{status:response.status});
+ if (response.status===503 && data?.error?.code==='qts_unavailable' && state.session && valid()) {
+  connectionNotice('QTS temporarily unavailable','Your session is being kept while QTS reconnects. Please retry shortly.');
+ }
+ if (!response.ok) throw Object.assign(new Error([data?.error?.message,data?.error?.path].filter(Boolean).join(' — ') || `Request failed (${response.status})`),failure,{
+  code:data?.error?.code,transient:response.status===503 && data?.error?.code==='qts_unavailable'
+ });
  return data;
 }

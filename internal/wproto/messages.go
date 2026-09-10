@@ -210,6 +210,14 @@ type DeleteReq struct {
 	Trash bool `json:"t,omitempty"`
 }
 
+// DeleteOneReq removes a single item (OpDelete, M1): a file, an empty
+// directory, or a symlink (the link itself, never its target). A non-empty
+// directory comes back as not_empty rather than being recursed into —
+// recursive delete and trash are the job-shaped DeleteReq above, in M2.
+type DeleteOneReq struct {
+	Path []byte `json:"p"`
+}
+
 // Prog is a progress update on a running job. The worker coalesces these to
 // at most 10 a second or one per 8 MiB, whichever comes first, so a
 // million-file delete does not flood the socket.

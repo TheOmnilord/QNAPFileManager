@@ -54,4 +54,28 @@ type Backend interface {
 	Ping(ctx context.Context, who Principal) error
 }
 
+// Mutator executes the M1 filesystem mutations as a principal: create a
+// directory, rename (or move within the jail), delete a single item. It is a
+// separate interface from Backend, not an extension of it, so internal/web
+// keeps compiling against Backend alone until the write routes are wired; the
+// production *workerpool.Pool satisfies both.
+//
+// As with Backend, every path is an API path already through fsx.Clean, and
+// non-UTF-8 names travel as raw bytes inside the strings. The kernel makes
+// every permission decision inside the worker (INV-2); these methods surface
+// its errors unchanged, mapped to the shared vocabulary by fsx.Code.
+type Mutator interface {
+	// Mkdir creates <dir>/<name> and returns the new entry. mode 0 means 0755
+	// (less the worker's umask); parents creates missing intermediates.
+	Mkdir(ctx context.Context, who Principal, dir, name string, mode os.FileMode, parents bool) (fsx.Entry, error)
+	// Rename moves from to to, which may be in different directories. An
+	// existing destination is refused unless overwrite is set; a rename across
+	// filesystems is fsx.ErrCrossDevice.
+	Rename(ctx context.Context, who Principal, from, to string, overwrite bool) error
+	// Delete removes one item: a file, an empty directory, or a symlink (the
+	// link itself). A non-empty directory is refused (not_empty); recursion and
+	// trash are M2.
+	Delete(ctx context.Context, who Principal, path string) error
+}
+
 func itoa(i int) string { return strconv.Itoa(i) }

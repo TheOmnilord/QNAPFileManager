@@ -157,9 +157,11 @@ func TestHelloThenServe(t *testing.T) {
 	}
 
 	// An op this worker does not implement is "unsupported", never silence.
-	f = req(t, tr, 7, wproto.OpMkdir, wproto.MkdirReq{Dir: []byte("/"), Name: []byte("x")})
+	// OpProps is still unimplemented (M3), so it is the honest stand-in now that
+	// mkdir/rename/delete are handled.
+	f = req(t, tr, 7, wproto.OpProps, wproto.StatReq{Path: []byte("/")})
 	if f.Kind != wproto.KindErr || f.Err.Code != "unsupported" {
-		t.Fatalf("mkdir = %+v", f)
+		t.Fatalf("unimplemented op = %+v", f)
 	}
 
 	// bye is acknowledged and ends the loop cleanly.
@@ -173,6 +175,56 @@ func TestHelloThenServe(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("bye did not end the loop")
+	}
+}
+
+// TestMutationsOverTheWorker exercises the M1 write ops end to end over the
+// in-process transport: the same path the Windows dev loop and ModeInProcess
+// take. mkdir returns the new entry; rename and delete answer with a plain ok
+// and leave the tree the way the request asked.
+func TestMutationsOverTheWorker(t *testing.T) {
+	base := fixture(t)
+	tr, _ := dial(t, base)
+	if f := req(t, tr, 1, wproto.OpHello, wproto.HelloReq{JailRoot: base, Umask: 0o022}); f.Kind != wproto.KindOK {
+		t.Fatalf("hello = %+v", f)
+	}
+
+	// mkdir replies with the new entry.
+	f := req(t, tr, 2, wproto.OpMkdir, wproto.MkdirReq{Dir: []byte("/"), Name: []byte("made")})
+	if f.Kind != wproto.KindOK {
+		t.Fatalf("mkdir = %+v", f.Err)
+	}
+	var sr wproto.StatResp
+	if err := f.Unmarshal(&sr); err != nil {
+		t.Fatal(err)
+	}
+	if sr.Entry.Type != "dir" || sr.Entry.Path != "/made" {
+		t.Fatalf("mkdir entry = %+v", sr.Entry)
+	}
+	if fi, err := os.Stat(filepath.Join(base, "made")); err != nil || !fi.IsDir() {
+		t.Fatalf("the directory was not created: %v", err)
+	}
+
+	// rename moves the fixture's file and answers with an empty ok.
+	if f := req(t, tr, 3, wproto.OpRename, wproto.RenameReq{From: []byte("/a.txt"), To: []byte("/made/b.txt")}); f.Kind != wproto.KindOK {
+		t.Fatalf("rename = %+v", f.Err)
+	}
+	if _, err := os.Stat(filepath.Join(base, "made", "b.txt")); err != nil {
+		t.Fatalf("the file was not moved: %v", err)
+	}
+
+	// delete removes it.
+	if f := req(t, tr, 4, wproto.OpDelete, wproto.DeleteOneReq{Path: []byte("/made/b.txt")}); f.Kind != wproto.KindOK {
+		t.Fatalf("delete = %+v", f.Err)
+	}
+	if _, err := os.Stat(filepath.Join(base, "made", "b.txt")); !os.IsNotExist(err) {
+		t.Fatalf("the file survived delete: %v", err)
+	}
+
+	// The fixture's empty directory deletes too.
+	f = req(t, tr, 5, wproto.OpDelete, wproto.DeleteOneReq{Path: []byte("/d")})
+	if f.Kind != wproto.KindOK {
+		t.Fatalf("removing the empty fixture dir /d = %+v", f.Err)
 	}
 }
 

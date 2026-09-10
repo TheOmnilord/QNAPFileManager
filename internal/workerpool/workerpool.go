@@ -656,6 +656,62 @@ func (p *Pool) OpenRead(ctx context.Context, who backend.Principal, path string)
 	return files[0], resp.Entry, nil
 }
 
+// --- backend.Mutator ---------------------------------------------------
+
+var _ backend.Mutator = (*Pool)(nil)
+
+// Mkdir creates a directory as the user's worker and returns the new entry.
+// mkdir passes no descriptor, so the ordinary RPC path carries it in both
+// modes: in-process it travels the net.Pipe to the worker goroutine exactly as
+// a real socketpair would.
+func (p *Pool) Mkdir(ctx context.Context, who backend.Principal, dir, name string, mode os.FileMode, parents bool) (fsx.Entry, error) {
+	c, err := p.acquire(ctx, who)
+	if err != nil {
+		return fsx.Entry{}, err
+	}
+	defer p.release(c)
+	f, _, err := p.call(ctx, c, wproto.OpMkdir, wproto.MkdirReq{
+		Dir:     []byte(dir),
+		Name:    []byte(name),
+		Mode:    uint32(mode),
+		Parents: parents,
+	})
+	if err != nil {
+		return fsx.Entry{}, err
+	}
+	var resp wproto.StatResp
+	if err := f.Unmarshal(&resp); err != nil {
+		return fsx.Entry{}, err
+	}
+	return resp.Entry, nil
+}
+
+// Rename moves from to to as the user's worker.
+func (p *Pool) Rename(ctx context.Context, who backend.Principal, from, to string, overwrite bool) error {
+	c, err := p.acquire(ctx, who)
+	if err != nil {
+		return err
+	}
+	defer p.release(c)
+	_, _, err = p.call(ctx, c, wproto.OpRename, wproto.RenameReq{
+		From:      []byte(from),
+		To:        []byte(to),
+		Overwrite: overwrite,
+	})
+	return err
+}
+
+// Delete removes one item as the user's worker (M1: single, non-recursive).
+func (p *Pool) Delete(ctx context.Context, who backend.Principal, path string) error {
+	c, err := p.acquire(ctx, who)
+	if err != nil {
+		return err
+	}
+	defer p.release(c)
+	_, _, err = p.call(ctx, c, wproto.OpDelete, wproto.DeleteOneReq{Path: []byte(path)})
+	return err
+}
+
 // Ping proves the principal's worker is alive, spawning it if needed.
 func (p *Pool) Ping(ctx context.Context, who backend.Principal) error {
 	c, err := p.acquire(ctx, who)

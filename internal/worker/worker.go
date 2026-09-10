@@ -424,6 +424,12 @@ func (s *session) dispatch(ctx context.Context, f wproto.Frame) {
 		s.stat(ctx, f)
 	case wproto.OpReadlink:
 		s.readlink(ctx, f)
+	case wproto.OpMkdir:
+		s.mkdir(ctx, f)
+	case wproto.OpRename:
+		s.rename(ctx, f)
+	case wproto.OpDelete:
+		s.delete(ctx, f)
 	case wproto.OpOpenRead:
 		s.openRead(ctx, f)
 	default:
@@ -488,6 +494,53 @@ func (s *session) readlink(ctx context.Context, f wproto.Frame) {
 		resp.Resolved = []byte(e.LinkResolved)
 	}
 	s.replyOK(f.ID, resp)
+}
+
+// mkdir creates a directory as the user and replies with the new entry. The
+// kernel applies the worker's umask and enforces write permission on the
+// parent, so a directory this returns is one the user was allowed to create.
+func (s *session) mkdir(ctx context.Context, f wproto.Frame) {
+	var req wproto.MkdirReq
+	if err := f.Unmarshal(&req); err != nil {
+		s.replyErr(f.ID, err, nil)
+		return
+	}
+	e, err := fsops.Mkdir(ctx, s.root, string(req.Dir), string(req.Name), os.FileMode(req.Mode), req.Parents)
+	if err != nil {
+		s.replyErr(f.ID, err, req.Dir)
+		return
+	}
+	s.replyOK(f.ID, wproto.StatResp{Entry: e})
+}
+
+// rename moves one item to another name or directory as the user, and replies
+// with an empty ok.
+func (s *session) rename(ctx context.Context, f wproto.Frame) {
+	var req wproto.RenameReq
+	if err := f.Unmarshal(&req); err != nil {
+		s.replyErr(f.ID, err, nil)
+		return
+	}
+	if err := fsops.Rename(ctx, s.root, string(req.From), string(req.To), req.Overwrite); err != nil {
+		s.replyErr(f.ID, err, req.From)
+		return
+	}
+	s.replyOK(f.ID, nil)
+}
+
+// delete removes one item as the user (M1: single, non-recursive) and replies
+// with an empty ok.
+func (s *session) delete(ctx context.Context, f wproto.Frame) {
+	var req wproto.DeleteOneReq
+	if err := f.Unmarshal(&req); err != nil {
+		s.replyErr(f.ID, err, nil)
+		return
+	}
+	if err := fsops.Delete(ctx, s.root, string(req.Path)); err != nil {
+		s.replyErr(f.ID, err, req.Path)
+		return
+	}
+	s.replyOK(f.ID, nil)
 }
 
 // openRead answers with the file descriptor itself, on the reply frame. The

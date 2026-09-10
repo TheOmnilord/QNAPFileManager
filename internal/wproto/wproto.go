@@ -22,6 +22,7 @@ const (
 	OpProps     Op = "props"
 	OpMkdir     Op = "mkdir"
 	OpRename    Op = "rename"
+	OpDelete    Op = "delete" // single, non-recursive delete (M1); recursive delete and trash are the job-shaped DeleteReq (M2)
 	OpReadlink  Op = "readlink"
 	OpChmod     Op = "chmod"
 	OpChown     Op = "chown"

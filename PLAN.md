@@ -40,6 +40,10 @@ chmod, chown, ACL awareness.
 - **INV-1**: no filesystem read of user data or any mutation for a non-root session ever executes in the root front-end process. The front-end only does guard metadata work (`Lstat`, `EvalSymlinks`, `statfs`, mountinfo). Enforced by an import-graph test: `internal/web` must not import `internal/fsops`.
 - **INV-2**: permission decisions are made by the Linux kernel, never re-implemented. The app computes hints to grey out controls, treats `EACCES`/`EPERM` as truth, and re-`Lstat`s after chmod/chown to report what actually happened.
 
+## M1 write-path review status
+
+The M1 write path (mkdir, rename, single + batch delete, the read-only toggle, the guard, and the audit trail) went through an iterative gpt-6-astra review (standard + adversarial, Fable judging), fourteen rounds, ending on a clean holistic pass (round 14) whose readiness verdict was: proceed with a supervised hardware test of mkdir/rename/delete under the four accepted residuals below. Every round is saved under `docs/reviews/m1-round*`. No known open correctness or security finding remains outside those four residuals. Not a production sign-off — the NAS checklist below still gates that.
+
 ## Accepted safety residuals (M1)
 
 These are known, bounded gaps that the M1 review accepted rather than closed now; each has a code comment pointing here.

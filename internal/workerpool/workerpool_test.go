@@ -263,6 +263,50 @@ func TestReadlinkRoundTrip(t *testing.T) {
 	}
 }
 
+// TestResolveRoundTrip exercises OpResolve end to end through the in-process
+// pool: the request crosses the net.Pipe to the worker goroutine, is resolved as
+// the user by fsops.ResolvePath, and the canonical API path comes back. This is
+// the front-end's replacement for resolving symlinks in the root process
+// (round-3 finding 2).
+func TestResolveRoundTrip(t *testing.T) {
+	p, _ := testPool(t, nil)
+	ctx := context.Background()
+	who := alice()
+
+	// A plain existing directory resolves to itself under followLeaf.
+	if got, err := p.Resolve(ctx, who, "/dir", true); err != nil {
+		t.Fatalf("Resolve(/dir, followLeaf=true): %v", err)
+	} else if got != "/dir" {
+		t.Errorf("got %q, want /dir", got)
+	}
+	// A not-yet-existing leaf is kept literal under !followLeaf (a mkdir target).
+	if got, err := p.Resolve(ctx, who, "/dir/newname", false); err != nil {
+		t.Fatalf("Resolve(/dir/newname, followLeaf=false): %v", err)
+	} else if got != "/dir/newname" {
+		t.Errorf("got %q, want /dir/newname", got)
+	}
+
+	// A symlinked parent comes back under its canonical spelling.
+	p.mu.Lock()
+	base := p.opts.Root.Base()
+	p.mu.Unlock()
+	if err := os.Symlink(filepath.Join(base, "dir"), filepath.Join(base, "plink")); err != nil {
+		t.Skipf("symlinks are not available here: %v", err)
+	}
+	if got, err := p.Resolve(ctx, who, "/plink/file.txt", false); err != nil {
+		t.Fatalf("Resolve(/plink/file.txt, followLeaf=false): %v", err)
+	} else if got != "/dir/file.txt" {
+		t.Errorf("got %q, want /dir/file.txt", got)
+	}
+
+	// A missing path still surfaces the honest error across the wire.
+	if _, err := p.Resolve(ctx, who, "/nope/child", true); err == nil {
+		t.Error("resolving through a missing directory must fail")
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("err = %v, want an ErrNotExist", err)
+	}
+}
+
 func TestErrorsCrossTheWire(t *testing.T) {
 	p, _ := testPool(t, nil)
 	ctx := context.Background()

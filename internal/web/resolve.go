@@ -1,42 +1,34 @@
 package web
 
 import (
+	"context"
 	"path/filepath"
 
+	"qnapfilemanager/internal/backend"
 	"qnapfilemanager/internal/fsx"
 )
 
 // resolveForGuard hardens an API path against parent-symlink aliasing before it
-// reaches guard.Check. The guard reasons lexically over the spelled path, but
-// the worker resolves symlinks in an operation's directory before it touches
-// the filesystem — so an alias such as /tmp/x -> /etc/config would let a write
-// slip past a prefix rule that names the real location. This resolves the path
-// in the root front-end (INV-1 permits EvalSymlinks/Lstat/statfs/mountinfo as
-// guard metadata work) through the jail mapping and returns the canonical API
-// path to guard on.
+// reaches guard.Check, resolving it AS THE USER inside the worker (INV-2) rather
+// than as root in the front-end. The worker resolves symlinks in an operation's
+// directory before it touches the filesystem — so an alias such as
+// /tmp/x -> /etc/config would let a write slip past a prefix rule that names the
+// real location — and the resolution runs under the user's own credentials, so a
+// component the user cannot search returns the kernel's permission error rather
+// than a root-resolved canonical path. This closes both the static requested-path
+// permission bypass (round-3 finding 2: root resolving through a directory the
+// user cannot traverse) and the root-resolution oracle: an unsearchable
+// component yields EACCES, not a leaked target.
 //
-// resolveLeaf true resolves the whole path — used for mkdir's parent directory,
-// which already exists. resolveLeaf false resolves only the parent and keeps the
-// final component unresolved: that is the correct semantics for delete (which
-// removes the link itself, not its target) and rename (which operates on the
-// named entry). filepath.EvalSymlinks resolves against the real OS path r.OS
-// produces; r.API refuses a resolution that escaped the jail. On any failure
-// (ENOENT, a path outside the jail, an EvalSymlinks error) it falls back to the
-// cleaned input so the worker returns the honest kernel error rather than the
-// guard inventing one.
-func resolveForGuard(r fsx.Root, apiPath string, resolveLeaf bool) string {
-	if resolveLeaf {
-		if resolved, ok := evalToAPI(r, apiPath); ok {
-			return resolved
-		}
-		return apiPath
-	}
-	parent := fsx.Parent(apiPath)
-	leaf := fsx.Base(apiPath)
-	if resolvedParent, ok := evalToAPI(r, parent); ok {
-		return fsx.Join(resolvedParent, leaf)
-	}
-	return apiPath
+// followLeaf true resolves the whole existing path — used for mkdir's parent
+// directory. followLeaf false resolves only the parent and keeps the final
+// component literal: the correct semantics for delete (which removes the link
+// itself, not its target) and rename (which operates on the named entry). The
+// error is surfaced to the caller unchanged (mapped by fsx.Code): a permission
+// error, ErrOutsideRoot, or any other kernel failure is returned to the client;
+// there is deliberately no lexical fallback and no root-side resolution.
+func (s *Server) resolveForGuard(ctx context.Context, who backend.Principal, apiPath string, followLeaf bool) (string, error) {
+	return s.mutator.Resolve(ctx, who, apiPath, followLeaf)
 }
 
 // ResolveAPIPath resolves every symlink in an API path through the jail mapping

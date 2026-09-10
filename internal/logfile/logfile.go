@@ -87,6 +87,24 @@ func (w *Writer) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// Sync flushes the file's buffered data to stable storage by calling the
+// underlying *os.File.Sync. A durable audit line (an intent line, a safety
+// milestone) is only truly persisted once this returns, so the caller can wait
+// on it before proceeding. It returns os.ErrClosed on a deliberately closed
+// writer and nil when the file is momentarily not open (a rotation could not
+// reopen it): there is nothing buffered in that case, and the next Write reopens.
+func (w *Writer) Sync() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return os.ErrClosed
+	}
+	if w.f == nil {
+		return nil
+	}
+	return w.f.Sync()
+}
+
 // rotate is called with the lock held. Windows will not rename a file that is
 // still open, so the handle is closed first; if anything fails the writer is
 // reopened on the original path rather than left without a destination.

@@ -11,6 +11,12 @@ let typeAhead = '', typedAt = 0;
 const rowHeight = () => matchMedia('(max-width:30rem)').matches ? 44 : 36;
 export const entryAt = index => state.pages.get(Math.floor(index/pageSize))?.[index%pageSize];
 export const focused = () => entryAt(state.focus);
+// selectedOne resolves the single SELECTED entry, or null when the selection is
+// not exactly one item, or when focus has moved off the selected row (Ctrl+Arrow
+// moves focus without changing the selection). Rename and Properties act on this,
+// never on focused() alone, so a toolbar action cannot target a focused-but-
+// unselected entry (standard P2 / round-3 finding 7).
+export const selectedOne = () => { const e = focused(); return countSelected() === 1 && e && selected(state.focus) ? e : null; };
 // extraActions lets other modules (actions.js) contribute context-menu items
 // without list.js importing them, which would create a cycle. Each is
 // {label, run(entry), show?(entry), disabled?(entry)}.
@@ -126,8 +132,8 @@ export function refreshToolbar() {
  const ro = 'Read-only mode is on. Turn it off in Settings to make changes.';
  $('#btnMkdir').disabled = !canWrite;
  $('#btnMkdir').title = canWrite ? 'New folder' : ro;
- $('#btnRename').disabled = !canWrite || n !== 1;
- $('#btnRename').title = !canWrite ? ro : (n !== 1 ? 'Select one item to rename.' : 'Rename');
+ $('#btnRename').disabled = !canWrite || !one;
+ $('#btnRename').title = !canWrite ? ro : (!one ? 'Select one item to rename.' : 'Rename');
  $('#btnDelete').disabled = !canWrite || n < 1;
  $('#btnDelete').title = !canWrite ? ro : (n < 1 ? 'Select items to delete.' : 'Delete');
 }

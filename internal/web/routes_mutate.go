@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -155,23 +156,58 @@ type mutation struct {
 
 // clean rewrites any resolved-path spelling in msg to the requested path it
 // stands for, so neither a guard verdict nor a worker error reveals a
-// root-resolved target (adv resolve.go). A nil or identity subs map is a no-op.
+// user-resolved target (adv resolve.go / round-3 finding 2 disclosure). A worker
+// error string may carry the resolved path either absolute ("/etc/config/file")
+// or relative ("etc/config/file"), so both spellings are rewritten. A nil or
+// identity subs map is a no-op. The longest resolved keys are rewritten first so
+// a parent-prefix mapping cannot pre-empt a more specific one.
 func (m mutation) clean(msg string) string {
-	for resolved, requested := range m.subs {
-		if resolved != "" && resolved != requested {
-			msg = strings.ReplaceAll(msg, resolved, requested)
+	if len(m.subs) == 0 {
+		return msg
+	}
+	keys := make([]string, 0, len(m.subs))
+	for resolved := range m.subs {
+		keys = append(keys, resolved)
+	}
+	sort.Slice(keys, func(i, j int) bool { return len(keys[i]) > len(keys[j]) })
+	for _, resolved := range keys {
+		requested := m.subs[resolved]
+		if resolved == "" || resolved == requested {
+			continue
+		}
+		msg = strings.ReplaceAll(msg, resolved, requested)
+		// A relative spelling (no leading slash) can appear in a worker error,
+		// e.g. "etc/config/file" for /etc/config/file; rewrite it to the requested
+		// path's relative spelling too.
+		relResolved := strings.TrimPrefix(resolved, "/")
+		relRequested := strings.TrimPrefix(requested, "/")
+		if relResolved != "" && relResolved != resolved {
+			msg = strings.ReplaceAll(msg, relResolved, relRequested)
 		}
 	}
 	return msg
 }
 
+// addParentSub records the resolved→requested mapping for the parent directories
+// of a resolved/requested pair, so a guard verdict or worker error naming an
+// operation's parent (an OpCreate on the destination's parent, say) is rewritten
+// to the requested spelling too (adv 3 disclosure).
+func addParentSub(subs map[string]string, resolved, requested string) {
+	rp, qp := fsx.Parent(resolved), fsx.Parent(requested)
+	if rp != qp {
+		subs[rp] = qp
+	}
+}
+
 // writeAudit records one phase of a mutation. Durable lines — the pre-dispatch
 // intent, any real denial, and any milestone — take the synchronous sink path so
 // a crash cannot lose them (adv 10); a routine confirmation challenge and an
-// ordinary success stay async. It is a no-op when no logger is wired.
-func (s *Server) writeAudit(sess *session, r *http.Request, m mutation, phase, result, code, detail string, milestone bool) {
+// ordinary success stay async. It returns the durable-write error (nil when the
+// line was async or no logger is wired), so an intent caller can refuse dispatch
+// when the intent could not be persisted (adv 1 / standard P1).
+func (s *Server) writeAudit(sess *session, r *http.Request, m mutation, phase, result, code, detail string, milestone bool) error {
 	if s.auditor == nil {
-		return
+		return nil
 	}
 	ev := audit.Event{
 		Actor:          sess.who.User,
@@ -196,10 +232,22 @@ func (s *Server) writeAudit(sess *session, r *http.Request, m mutation, phase, r
 	// any forced milestone are durable.
 	durable := phase == "intent" || milestone || (result == "denied" && code != "confirm_required")
 	if durable {
-		s.auditor.WriteSync(ev)
-		return
+		return s.auditor.WriteSync(ev)
 	}
 	s.auditor.Write(ev)
+	return nil
+}
+
+// auditIntent writes a mutation's intent line durably and, on failure, refuses
+// the mutation with a 500 "audit_unavailable" (adv 1 / standard P1): a change
+// whose intent a crash could lose must not be dispatched. It returns true when
+// the intent was persisted and the caller may proceed.
+func (s *Server) auditIntent(w http.ResponseWriter, r *http.Request, sess *session, m mutation, milestone bool) bool {
+	if err := s.writeAudit(sess, r, m, "intent", "", "", "", milestone); err != nil {
+		writeError(w, http.StatusInternalServerError, "audit_unavailable", "The change was refused: its audit record could not be saved.", m.path, m.op, err.Error())
+		return false
+	}
+	return true
 }
 
 // authorize applies the guard verdict guardErr (from guard.Check, or the worst
@@ -283,6 +331,19 @@ func (s *Server) finish(w http.ResponseWriter, r *http.Request, sess *session, m
 	return true
 }
 
+// failResolve answers a failed user-side path resolution (round-3 finding 2). The
+// worker resolved the operation's path as the user and returned the kernel's own
+// error — a permission denial for an unsearchable component, ErrOutsideRoot for
+// an escape, or another failure. It is surfaced honestly, mapped by fsx.Code,
+// against the REQUESTED spelling; there is no lexical fallback and no root-side
+// resolution. The error text names only the requested path (resolution stops at
+// the failing component before any target is revealed), so no resolved spelling
+// leaks.
+func (s *Server) failResolve(w http.ResponseWriter, r *http.Request, requested string, err error) {
+	code := fsx.Code(err)
+	s.fail(w, r, code, backendMessage(code), requested, err.Error())
+}
+
 // backendMessage is the plain-language message for a backend error code, shared
 // with backendError.
 func backendMessage(code string) string {
@@ -334,9 +395,20 @@ func (s *Server) mkdir(w http.ResponseWriter, r *http.Request, sess *session) {
 	// on the parent catches the /share RAM disk and never-write regions; a second
 	// OpCreate on the target catches an entry-specific protection such as a ".zfs"
 	// name (adv 6).
-	resolvedDir := resolveForGuard(s.Root, dir, true)
+	// Resolve dir AS THE USER inside the worker (round-3 finding 2): the user's
+	// own traversal permissions apply, so a parent the user cannot search returns
+	// permission here rather than being resolved by root. dir already exists, so
+	// resolve it fully (followLeaf=true).
+	resolvedDir, rerr := s.resolveForGuard(r.Context(), sess.who, dir, true)
+	if rerr != nil {
+		s.failResolve(w, r, dir, rerr)
+		return
+	}
 	resolvedTarget := fsx.Join(resolvedDir, body.Name)
 	m := mutation{op: "mkdir", path: target, subs: map[string]string{resolvedDir: dir, resolvedTarget: target}}
+	// Resolution can also *erase* a protected prefix — a protected root that is
+	// itself a symlink, /etc/config -> /ordinary/config (adv 1a) — so the requested
+	// spelling is guarded too and the stricter verdict governs (worstGuard).
 	guardErr := worstGuard(
 		s.guard.Check(guard.OpCreate, dir),
 		s.guard.Check(guard.OpCreate, target),
@@ -346,7 +418,9 @@ func (s *Server) mkdir(w http.ResponseWriter, r *http.Request, sess *session) {
 	if !s.authorize(w, r, sess, guardErr, false, m, target, []string{target}, false, body.Confirm, guard.Summary{Files: 1}) {
 		return
 	}
-	s.writeAudit(sess, r, m, "intent", "", "", "", false)
+	if !s.auditIntent(w, r, sess, m, false) {
+		return
+	}
 	// Dispatch against the resolved parent, binding the operation as tightly as
 	// possible to what was guarded (adv 1b / standard P1); see the residual-race
 	// note in PLAN.md §2.0.
@@ -419,9 +493,27 @@ func (s *Server) rename(w http.ResponseWriter, r *http.Request, sess *session) {
 	// on the named entry, not its symlink target (standard 1 / adv 1). Resolution
 	// can also erase a protected prefix (adv 1a), so the requested spellings are
 	// guarded too and the stricter verdict governs.
-	guardFrom := resolveForGuard(s.Root, from, false)
-	guardTo := resolveForGuard(s.Root, to, false)
+	// Resolve both paths AS THE USER inside the worker (round-3 finding 2), each
+	// keeping its final component literal (followLeaf=false): a rename operates on
+	// the named entry, not its symlink target. A component the user cannot search
+	// returns permission here rather than being resolved by root.
+	guardFrom, rerr := s.resolveForGuard(r.Context(), sess.who, from, false)
+	if rerr != nil {
+		s.failResolve(w, r, from, rerr)
+		return
+	}
+	guardTo, rerr := s.resolveForGuard(r.Context(), sess.who, to, false)
+	if rerr != nil {
+		s.failResolve(w, r, to, rerr)
+		return
+	}
 	m := mutation{op: "rename", path: from, dst: to, subs: map[string]string{guardFrom: from, guardTo: to}}
+	// The guard also names each operation's parent (an OpCreate on the
+	// destination's parent), so map the resolved parents back to the requested
+	// spelling too — otherwise a resolved destination parent (/etc/config for a
+	// requested /alias/new) would surface in a verdict or worker error (adv 3).
+	addParentSub(m.subs, guardFrom, from)
+	addParentSub(m.subs, guardTo, to)
 	// A rename removes the source entry from its old location and creates one at
 	// the destination — and, with overwrite, replaces whatever is already there.
 	// Guard every one of those, not just the destination's parent (standard 2 /
@@ -463,7 +555,9 @@ func (s *Server) rename(w http.ResponseWriter, r *http.Request, sess *session) {
 	if !s.authorize(w, r, sess, guardErr, false, m, from, tokenParts, true, body.Confirm, guard.Summary{Files: 1}) {
 		return
 	}
-	s.writeAudit(sess, r, m, "intent", "", "", "", false)
+	if !s.auditIntent(w, r, sess, m, false) {
+		return
+	}
 	// Dispatch against the resolved paths, binding to what was guarded (adv 1b);
 	// the residual race is documented in PLAN.md §2.0.
 	err = s.mutator.Rename(r.Context(), sess.who, guardFrom, guardTo, body.Overwrite)
@@ -479,6 +573,35 @@ func (s *Server) rename(w http.ResponseWriter, r *http.Request, sess *session) {
 // one direction or overwrite value cannot be redeemed for another.
 func renameTokenParts(from, to string, overwrite bool) []string {
 	return []string{"from=" + from, "to=" + to, "overwrite=" + strconv.FormatBool(overwrite)}
+}
+
+// deleteWarnings builds the confirmation summary's warning lines for a delete:
+// the guard's path-free reasons for every spelling that is warn- or deny-class
+// (so the client shows WHY a protected path needs a deliberate acknowledgement,
+// standard P1 / adv 4), plus a scale note when the delete is large. The reasons
+// never contain the path itself (guard.Reasons), so a resolved spelling cannot
+// leak into the summary. Duplicate reasons across the requested and resolved
+// spelling are collapsed.
+func deleteWarnings(g *guard.Guard, requested, resolved string, big bool, files, bytes int64) []string {
+	var out []string
+	seen := map[string]bool{}
+	add := func(reasons []string) {
+		for _, reason := range reasons {
+			if reason == "" || seen[reason] {
+				continue
+			}
+			seen[reason] = true
+			out = append(out, reason)
+		}
+	}
+	add(g.Reasons(guard.OpDelete, requested))
+	if resolved != requested {
+		add(g.Reasons(guard.OpDelete, resolved))
+	}
+	if big {
+		out = append(out, fmt.Sprintf("Large permanent delete: %d item(s), %d byte(s). This cannot be undone.", files, bytes))
+	}
+	return out
 }
 
 // worstGuard reduces several guard.Check results to the single most severe one,
@@ -563,9 +686,13 @@ func (s *Server) delete(w http.ResponseWriter, r *http.Request, sess *session) {
 // mutator's mapped error otherwise, or {ok:true}.
 func (s *Server) deleteSingle(w http.ResponseWriter, r *http.Request, sess *session, p, confirm string) {
 	// Delete removes the link itself, so resolve only the parent and keep the
-	// final component (standard 1 / adv 1). Guard on both the requested and the
-	// resolved spelling and take the stricter verdict (adv 1a).
-	guardPath := resolveForGuard(s.Root, p, false)
+	// final component (followLeaf=false), AS THE USER inside the worker (round-3
+	// finding 2): a parent the user cannot search returns permission here.
+	guardPath, rerr := s.resolveForGuard(r.Context(), sess.who, p, false)
+	if rerr != nil {
+		s.failResolve(w, r, p, rerr)
+		return
+	}
 	m := mutation{op: "delete", path: p, files: 1, subs: map[string]string{guardPath: p}}
 	// Stat the target as the user to measure it. A stat failure (gone, unreadable)
 	// simply leaves the size at zero; the guard's path rules and the worker's own
@@ -577,6 +704,12 @@ func (s *Server) deleteSingle(w http.ResponseWriter, r *http.Request, sess *sess
 		m.bytes = e.Size
 		big = guard.NeedsConfirm(guard.OpDelete, guardPath, 1, e.Size)
 	}
+	// Show WHY this delete is confirmable: a protected/warn path's reasons and,
+	// for a large delete, the measured totals (standard P1 / adv 4). The reasons
+	// are path-free (guard.Reasons), so no resolved spelling leaks into the
+	// summary; the client requires an explicit acknowledgement whenever they are
+	// present. Both spellings contribute, since the stricter verdict governs.
+	summary.Warnings = deleteWarnings(s.guard, p, guardPath, big, summary.Files, summary.Bytes)
 	// In M1 every delete is permanent (trash is M2), so a delete of any size
 	// requires a redeemed confirmation token, not just a warn-class path or a
 	// multi-GiB target (adv 9 / decision 10). extraConfirm is therefore always on.
@@ -587,7 +720,9 @@ func (s *Server) deleteSingle(w http.ResponseWriter, r *http.Request, sess *sess
 	if !s.authorize(w, r, sess, guardErr, true, m, p, []string{p}, false, confirm, summary) {
 		return
 	}
-	s.writeAudit(sess, r, m, "intent", "", "", "", big)
+	if !s.auditIntent(w, r, sess, m, big) {
+		return
+	}
 	// Dispatch against the resolved path (adv 1b); residual race noted in §2.0.
 	err := s.mutator.Delete(r.Context(), sess.who, guardPath)
 	if !s.finish(w, r, sess, m, err, big) {
@@ -612,26 +747,56 @@ func (s *Server) deleteBatch(w http.ResponseWriter, r *http.Request, sess *sessi
 		writeError(w, http.StatusForbidden, "read_only", "Read-only mode is on. Turn it off in Settings to make changes.", "", "delete", "")
 		return
 	}
-	// Resolve each item's parent once (the leaf stays, as delete removes the link
-	// itself). Measure the items as the user so a large-delete milestone sees the
-	// real size (adv 9 / adv 10). In M1 every delete is permanent, so the batch
-	// always needs a redeemed confirmation token, regardless of size or path
-	// (decision 10) — the warn-path and scale checks below only feed the summary.
+	// Resolve each item's parent AS THE USER inside the worker (followLeaf=false;
+	// the leaf stays, as delete removes the link itself) (round-3 finding 2). A
+	// resolution failure for one item — a parent the user cannot search — is
+	// recorded against that item and never dispatched, rather than aborting the
+	// batch. Measure each item as the user so the summary and the milestone see
+	// real sizes (adv 9 / adv 10). In M1 every delete is permanent, so the batch
+	// always needs a redeemed confirmation token regardless of size or path
+	// (decision 10); the warn-path and scale reasons below feed the summary.
 	resolved := make([]string, len(paths))
+	resolveErr := make([]error, len(paths))
+	sizes := make([]int64, len(paths))
 	var totalBytes int64
+	var warnings []string
+	warnSeen := map[string]bool{}
+	addWarn := func(reasons []string) {
+		for _, reason := range reasons {
+			if reason == "" || warnSeen[reason] {
+				continue
+			}
+			warnSeen[reason] = true
+			warnings = append(warnings, reason)
+		}
+	}
 	for i, p := range paths {
-		resolved[i] = resolveForGuard(s.Root, p, false)
+		rp, rerr := s.resolveForGuard(r.Context(), sess.who, p, false)
+		if rerr != nil {
+			resolveErr[i] = rerr
+			// Even an unresolvable item contributes its requested-path warnings.
+			addWarn(s.guard.Reasons(guard.OpDelete, p))
+			continue
+		}
+		resolved[i] = rp
 		if e, statErr := s.backend.Stat(r.Context(), sess.who, p); statErr == nil {
+			sizes[i] = e.Size
 			totalBytes += e.Size
 		}
+		addWarn(deleteWarnings(s.guard, p, rp, false, 0, 0))
 	}
 	// big marks a batch worth a QuLog milestone: more than 100 files or more than
 	// 1 GiB (adv 10). The measured totals are carried into the audit event.
 	big := guard.NeedsConfirm(guard.OpDelete, "", len(paths), totalBytes)
-	// A batch always needs confirmation now; audit the challenge/invalid-token
+	if big {
+		warnings = append(warnings, fmt.Sprintf("Large permanent delete: %d item(s), %d byte(s). This cannot be undone.", len(paths), totalBytes))
+	}
+	// A batch always needs confirmation now; the summary carries the path-free
+	// reasons and the totals so the client shows them and requires an explicit
+	// acknowledgement (standard P1 / adv 4). Audit the challenge/invalid-token
 	// rejection as a denial (adv 10) before demanding the token.
 	tokenRedeemed := false
-	summary := guard.Summary{Files: int64(len(paths)), Bytes: totalBytes}
+	summary := guard.Summary{Files: int64(len(paths)), Bytes: totalBytes, Warnings: warnings}
 	if confirm != "" && s.guard.Redeem(confirm, "delete", paths, false) == nil {
 		tokenRedeemed = true
 	} else {
@@ -652,9 +817,23 @@ func (s *Server) deleteBatch(w http.ResponseWriter, r *http.Request, sess *sessi
 		Code    string `json:"code,omitempty"`
 	}
 	results := make([]itemResult, 0, len(paths))
+	// Track what ACTUALLY happened, so the response outcome and the milestone
+	// totals reflect the real result, never the requested totals (adv 6).
+	var succeeded, failed int
+	var succeededBytes int64
 	for i, p := range paths {
 		m := mutation{op: "delete", path: p, subs: map[string]string{resolved[i]: p}}
 		res := itemResult{Path: p}
+		// An item whose path could not be resolved as the user (finding 2) is
+		// reported with the kernel's own code and never dispatched.
+		if resolveErr[i] != nil {
+			code := fsx.Code(resolveErr[i])
+			s.writeAudit(sess, r, m, "result", "denied", code, m.clean(resolveErr[i].Error()), false)
+			res.Code = code
+			failed++
+			results = append(results, res)
+			continue
+		}
 		// Re-check every item immediately before its own dispatch and honour every
 		// guard verdict, not just ErrProtected: an administrator who enabled
 		// read-only mid-batch must stop writes here, and a warn item may proceed
@@ -668,17 +847,20 @@ func (s *Server) deleteBatch(w http.ResponseWriter, r *http.Request, sess *sessi
 		case errors.Is(err, guard.ErrReadOnly):
 			s.writeAudit(sess, r, m, "result", "denied", "read_only", m.clean(err.Error()), false)
 			res.Code = "read_only"
+			failed++
 			results = append(results, res)
 			continue
 		case errors.Is(err, guard.ErrProtected):
 			s.writeAudit(sess, r, m, "result", "denied", "protected", m.clean(err.Error()), false)
 			res.Code = "protected"
+			failed++
 			results = append(results, res)
 			continue
 		case errors.Is(err, guard.ErrConfirmRequired):
 			if !tokenRedeemed {
 				s.writeAudit(sess, r, m, "result", "denied", "confirm_required", m.clean(err.Error()), false)
 				res.Code = "confirm_required"
+				failed++
 				results = append(results, res)
 				continue
 			}
@@ -686,26 +868,51 @@ func (s *Server) deleteBatch(w http.ResponseWriter, r *http.Request, sess *sessi
 			code := fsx.Code(err)
 			s.writeAudit(sess, r, m, "result", "denied", code, m.clean(err.Error()), false)
 			res.Code = code
+			failed++
 			results = append(results, res)
 			continue
 		}
-		s.writeAudit(sess, r, m, "intent", "", "", "", false)
+		// The item's intent must be durably recorded before its dispatch; if it
+		// cannot be, refuse this item rather than deleting without a record (adv 1).
+		if aerr := s.writeAudit(sess, r, m, "intent", "", "", "", false); aerr != nil {
+			res.Code = "audit_unavailable"
+			failed++
+			results = append(results, res)
+			continue
+		}
 		// Dispatch against the resolved path (adv 1b); residual race noted in §2.0.
 		if err := s.mutator.Delete(r.Context(), sess.who, resolved[i]); err != nil {
 			code := fsx.Code(err)
 			s.writeAudit(sess, r, m, "result", "error", code, m.clean(err.Error()), false)
 			res.Code = code
+			failed++
 		} else {
 			s.writeAudit(sess, r, m, "result", "ok", "", "", false)
 			res.OK = true
+			succeeded++
+			succeededBytes += sizes[i]
 		}
 		results = append(results, res)
 	}
-	// A large batch (>100 files or >1 GiB) is mirrored to QuLog as one milestone
-	// carrying the measured totals (adv 10 / standard P2).
-	if big {
-		bm := mutation{op: "delete", files: int64(len(paths)), bytes: totalBytes}
-		s.writeAudit(sess, r, bm, "result", "ok", "", fmt.Sprintf("batch delete of %d items", len(paths)), true)
+	// Overall outcome from what actually happened (adv 6): all succeeded → "ok",
+	// none succeeded → "error", a mix → "partial".
+	outcome := "ok"
+	switch {
+	case succeeded == 0:
+		outcome = "error"
+	case failed > 0:
+		outcome = "partial"
 	}
-	writeJSON(w, map[string]any{"results": results})
+	// A large batch is mirrored to QuLog as one milestone carrying the ACTUAL
+	// succeeded totals and outcome, not the requested totals (adv 6 / adv 10 /
+	// standard P2).
+	if big {
+		bm := mutation{op: "delete", files: int64(succeeded), bytes: succeededBytes}
+		result := "ok"
+		if succeeded == 0 {
+			result = "error"
+		}
+		s.writeAudit(sess, r, bm, "result", result, "", fmt.Sprintf("batch delete: %d of %d items, %d bytes (%s)", succeeded, len(paths), succeededBytes, outcome), true)
+	}
+	writeJSON(w, map[string]any{"results": results, "outcome": outcome, "attempted": len(paths), "succeeded": succeeded, "failed": failed})
 }

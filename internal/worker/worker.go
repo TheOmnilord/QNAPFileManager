@@ -424,6 +424,8 @@ func (s *session) dispatch(ctx context.Context, f wproto.Frame) {
 		s.stat(ctx, f)
 	case wproto.OpReadlink:
 		s.readlink(ctx, f)
+	case wproto.OpResolve:
+		s.resolve(ctx, f)
 	case wproto.OpMkdir:
 		s.mkdir(ctx, f)
 	case wproto.OpRename:
@@ -494,6 +496,24 @@ func (s *session) readlink(ctx context.Context, f wproto.Frame) {
 		resp.Resolved = []byte(e.LinkResolved)
 	}
 	s.replyOK(f.ID, resp)
+}
+
+// resolve canonicalises an API path as the user and replies with the canonical
+// spelling. It runs the same O_PATH walk every other operation does, so the
+// resolution enforces the user's own traversal permissions instead of the root
+// front-end resolving symlinks it could reach but the user could not (INV-2).
+func (s *session) resolve(ctx context.Context, f wproto.Frame) {
+	var req wproto.ResolveReq
+	if err := f.Unmarshal(&req); err != nil {
+		s.replyErr(f.ID, err, nil)
+		return
+	}
+	api, err := fsops.ResolvePath(ctx, s.root, string(req.Path), req.FollowLeaf)
+	if err != nil {
+		s.replyErr(f.ID, err, req.Path)
+		return
+	}
+	s.replyOK(f.ID, wproto.ResolveResp{Path: []byte(api)})
 }
 
 // mkdir creates a directory as the user and replies with the new entry. The

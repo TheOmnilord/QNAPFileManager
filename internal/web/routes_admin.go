@@ -64,6 +64,7 @@ func (s *Server) postSettings(w http.ResponseWriter, r *http.Request, sess *sess
 	// one order and apply in the reverse (standard 5 / adv 8). A save failure
 	// leaves both the file and the guard untouched.
 	s.cfgMu.Lock()
+	prevVal := s.cfg.ReadOnly
 	var saveErr error
 	if s.ConfigPath != "" {
 		c := s.cfg
@@ -90,13 +91,31 @@ func (s *Server) postSettings(w http.ResponseWriter, r *http.Request, sess *sess
 		return
 	}
 	if s.auditor != nil {
-		// The moment writes become possible on a root daemon is a milestone; write
-		// it durably (adv 10).
-		s.auditor.WriteSync(audit.Event{
+		// The moment writes become possible on a root daemon is a milestone that a
+		// crash must not lose, so it must be DURABLY recorded before the toggle is
+		// acknowledged (adv 1 / standard P1). If the durable write fails, revert the
+		// toggle — restoring both the live guard and the persisted file to prevVal —
+		// and refuse, rather than leaving writes possible with no record of when.
+		if err := s.auditor.WriteSync(audit.Event{
 			Actor: sess.who.User, UID: sess.who.UID, Admin: sess.admin, Root: sess.who.Root,
 			IP: ClientIP(r), Op: "readonly", Phase: "result", Result: "ok",
 			Detail: fmt.Sprintf("readOnly=%v", newVal), ForceMilestone: true,
-		})
+		}); err != nil {
+			s.cfgMu.Lock()
+			if s.guard != nil {
+				s.guard.SetReadOnly(prevVal)
+			}
+			if s.ConfigPath != "" {
+				c := s.cfg
+				c.ReadOnly = prevVal
+				if config.Save(s.ConfigPath, c) == nil {
+					s.cfg.ReadOnly = prevVal
+				}
+			}
+			s.cfgMu.Unlock()
+			s.fail(w, r, "audit_unavailable", "The change was refused: its audit record could not be saved.", "", err.Error())
+			return
+		}
 	}
 	writeJSON(w, map[string]any{"readOnly": newVal})
 }

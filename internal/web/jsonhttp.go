@@ -38,6 +38,10 @@ func statusCode(code string) int {
 		return 428
 	case "cancelled":
 		return 408
+	case "audit_unavailable":
+		// A mutation refused because its durable audit record could not be written
+		// (adv 1): the daemon's own failure, so a 500.
+		return 500
 	default:
 		return 500
 	}

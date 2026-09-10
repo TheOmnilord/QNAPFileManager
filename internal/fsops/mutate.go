@@ -28,6 +28,74 @@ import (
 	"qnapfilemanager/internal/fsx"
 )
 
+// ResolvePath resolves an API path to its canonical spelling as the caller, and
+// is the worker-side answer to round-3 finding 2: the root front-end used to
+// resolve a path's symlinks itself, which resolved as root and let an operation
+// named through a directory the *user* cannot traverse succeed anyway (INV-2),
+// and leaked the targets of symlinks in inaccessible directories. Run here, in
+// the per-user worker, every lookup is an O_PATH openat against the jail — so a
+// component the user cannot search is the kernel's own EACCES, not something the
+// front-end resolves around, and a symlink target the user cannot reach is never
+// read on the front-end's behalf.
+//
+// followLeaf true resolves the whole path — the final component is followed —
+// and is for naming an existing directory (mkdir's dir). followLeaf false
+// resolves the parent and keeps the final component literal, which is the
+// correct semantics for delete and rename (they operate on the named entry, not
+// on its target) and for mkdir's new name: a non-existent leaf is fine there,
+// and a symlink leaf is left as the link.
+//
+// The returned path is the canonical API path — resolve()'s api spelling, which
+// for followLeaf false is the resolved parent joined with the kept leaf. resolve
+// defers the errno of an unsearchable or missing component to the caller's next
+// syscall, so this forces that answer out itself: with followLeaf it stats the
+// resolved target (an existing directory must be reachable), and without it it
+// asks the kernel whether the resolved parent is searchable — the permission a
+// create, rename or delete of the leaf inside it actually needs. Either way the
+// jail is never escaped: resolve refuses an absolute symlink target that leaves
+// the base with fsx.ErrOutsideRoot.
+func ResolvePath(ctx context.Context, r fsx.Root, apiPath string, followLeaf bool) (string, error) {
+	clean, err := fsx.Clean(apiPath)
+	if err != nil {
+		return "", err
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	tg, err := resolve(r, clean, followLeaf)
+	if err != nil {
+		return "", err
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if followLeaf {
+		// The whole path was resolved; a directory named this way must actually
+		// be there and reachable. statAt surfaces the EACCES or ENOENT resolve
+		// remembered but left for a syscall to report — which is exactly the
+		// finding-2 case, where the final component sits under a directory the
+		// user cannot search.
+		if _, err := statAt(tg.jail, tg.rel); err != nil {
+			return "", err
+		}
+		return tg.api, nil
+	}
+	// The leaf is kept literal and may not exist yet (a mkdir target), so it is
+	// not stat'ed. The resolved parent must be searchable all the same — that is
+	// the permission looking the leaf up, or creating it, inside the parent
+	// needs, and an unsearchable or missing ancestor is the kernel's error here
+	// rather than a path the front-end silently accepts.
+	parts := splitRel(tg.rel)
+	parentRel := "."
+	if len(parts) > 1 {
+		parentRel = relOf(parts[:len(parts)-1])
+	}
+	if err := checkTraversable(tg.jail, parentRel); err != nil {
+		return "", err
+	}
+	return tg.api, nil
+}
+
 // Mkdir creates <dir>/<name> and returns the new entry.
 //
 // The name is validated as a single component; dir is resolved (following the

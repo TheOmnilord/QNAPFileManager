@@ -1,7 +1,7 @@
 // Run with: node --test internal/web/list_test.mjs
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
-import {initList,render} from './static/js/list.js';
+import {initList,render,selectedOne,refreshToolbar} from './static/js/list.js';
 import {state,update} from './static/js/state.js';
 
 // Minimal element doubles: no browser or DOM dependency required.
@@ -114,6 +114,24 @@ test('Space, range arrows, focus-only arrows, select-all and Escape update exist
  await key('Escape');
  rows.forEach((row,i) => { selection(row,false); assert.equal(rowAt(i),row); });
  assert.equal(get('#btnView').disabled,true);
+});
+
+test('Rename targets the selected entry, not a focused-but-unselected one (round-3 finding 7)', async () => {
+ const rows=setup(3);
+ update({session:{family:'test',canWrite:true}});
+ rows[0].listeners.click({}); // select index 0, focus 0
+ assert.equal(state.focus,0);
+ assert.equal(selectedOne()?.path,'/item0');
+ refreshToolbar();
+ assert.equal(get('#btnRename').disabled,false,'Rename enabled for the single selected entry');
+ // Ctrl+ArrowDown moves focus to row 1 WITHOUT changing the selection.
+ await key('ArrowDown',{ctrlKey:true});
+ assert.equal(state.focus,1);
+ assert.equal(state.selection.has(0),true,'selection unchanged by Ctrl+Arrow');
+ assert.equal(state.selection.has(1),false);
+ assert.equal(selectedOne(),null,'no single selected+focused entry after Ctrl+Arrow');
+ refreshToolbar();
+ assert.equal(get('#btnRename').disabled,true,'Rename disabled: it must not target the focused-but-unselected row');
 });
 
 test('virtual scrolling and data renders rebuild rows with current selection and focus', async () => {

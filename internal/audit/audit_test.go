@@ -321,6 +321,32 @@ func TestWriteSyncDurable(t *testing.T) {
 	}
 }
 
+// TestWriteSyncReturnsErrorOnSinkFailure proves the round-3 finding 3 fix:
+// WriteSync returns an error when the durable write cannot reach the sink, so a
+// caller can refuse the mutation. A closed sink fails every write.
+func TestWriteSyncReturnsErrorOnSinkFailure(t *testing.T) {
+	l, _ := openTest(t, false)
+	defer l.Close()
+	if err := l.w.Close(); err != nil { // sink now refuses writes
+		t.Fatalf("closing sink: %v", err)
+	}
+	if err := l.WriteSync(Event{Op: "delete", Path: "/x", Phase: "intent"}); err == nil {
+		t.Fatal("WriteSync returned nil despite a failing sink")
+	}
+}
+
+// TestWriteSyncOnClosedLogger proves WriteSync fails closed on a closed logger
+// (the route uses this to refuse a mutation when audit is unavailable).
+func TestWriteSyncOnClosedLogger(t *testing.T) {
+	l, _ := openTest(t, false)
+	if err := l.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := l.WriteSync(Event{Op: "delete", Path: "/x", Phase: "intent"}); err == nil {
+		t.Fatal("WriteSync on a closed logger returned nil, want an error")
+	}
+}
+
 // TestConfirmChallengeNotMilestone proves a routine confirmation challenge
 // (denied with code confirm_required) is recorded but is not a QuLog milestone,
 // while an invalid presented token (confirm_invalid) and other denials are.

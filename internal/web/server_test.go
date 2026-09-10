@@ -148,6 +148,58 @@ func (b *fakeBackend) Delete(_ context.Context, p backend.Principal, name string
 	return os.Remove(b.osPath(name))
 }
 
+// Resolve mirrors the worker-side resolver over the fake's temp dir, resolving
+// symlinks with filepath.EvalSymlinks and mapping back to an API path. It runs
+// "as the user" only in shape — the fake cannot drop privilege — but it lets the
+// route's resolveForGuard exercise the same followLeaf semantics as production:
+// followLeaf resolves the whole path, otherwise the parent is resolved and the
+// leaf kept literal (round-3 finding 2). A missing parent or an escape surfaces
+// as the underlying error, mapped by fsx.Code just as the worker's would be.
+func (b *fakeBackend) Resolve(_ context.Context, p backend.Principal, name string, followLeaf bool) (string, error) {
+	b.last = p
+	if followLeaf {
+		osResolved, err := filepath.EvalSymlinks(b.osPath(name))
+		if err != nil {
+			return "", err
+		}
+		return b.apiOf(osResolved)
+	}
+	parent, leaf := fsx.Parent(name), fsx.Base(name)
+	osParent, err := filepath.EvalSymlinks(b.osPath(parent))
+	if err != nil {
+		return "", err
+	}
+	api, err := b.apiOf(osParent)
+	if err != nil {
+		return "", err
+	}
+	return fsx.Join(api, leaf), nil
+}
+
+// apiOf maps an OS path under the fake's temp dir back to an API path, reporting
+// fsx.ErrOutsideRoot for anything that escaped it. The base is itself resolved
+// with EvalSymlinks so a temp dir reached through a symlink or a Windows 8.3
+// short name — the osPath argument came through EvalSymlinks — still maps back
+// to "/" rather than reading as an escape.
+func (b *fakeBackend) apiOf(osPath string) (string, error) {
+	base := b.dir
+	if resolved, err := filepath.EvalSymlinks(b.dir); err == nil {
+		base = resolved
+	}
+	rel, err := filepath.Rel(base, osPath)
+	if err != nil {
+		return "", fsx.ErrOutsideRoot
+	}
+	rel = filepath.ToSlash(rel)
+	if rel == "." {
+		return "/", nil
+	}
+	if rel == ".." || strings.HasPrefix(rel, "../") {
+		return "", fsx.ErrOutsideRoot
+	}
+	return "/" + rel, nil
+}
+
 func fixture(t *testing.T, pinned bool) (*Server, *fakeBackend) {
 	t.Helper()
 	b := &fakeBackend{dir: t.TempDir()}

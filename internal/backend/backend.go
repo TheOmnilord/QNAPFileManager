@@ -76,6 +76,15 @@ type Mutator interface {
 	// link itself). A non-empty directory is refused (not_empty); recursion and
 	// trash are M2.
 	Delete(ctx context.Context, who Principal, path string) error
+	// Resolve returns the canonical API path for path, resolved as the principal
+	// inside the worker so the O_PATH walk enforces the user's own traversal
+	// permissions (INV-2) — closing the front-end's static requested-path bypass
+	// (round-3 finding 2). followLeaf resolves the whole path (an existing
+	// directory, such as mkdir's dir); when it is false the parent is resolved
+	// and the final component kept literal (a named entry to create, rename or
+	// delete). A component the user cannot search surfaces as the kernel's
+	// permission error; a non-existent leaf under !followLeaf is not an error.
+	Resolve(ctx context.Context, who Principal, path string, followLeaf bool) (string, error)
 }
 
 func itoa(i int) string { return strconv.Itoa(i) }

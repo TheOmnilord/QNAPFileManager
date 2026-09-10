@@ -13,6 +13,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -39,10 +40,16 @@ const bufferDepth = 1024
 const dropReportInterval = 5 * time.Second
 
 // writeSyncTimeout bounds how long WriteSync waits for a durable line to reach
-// the sink before giving up and letting the request proceed. Long enough to
-// ride out a brief rotation or a slow disk, short enough that a wedged drain
+// the sink (write + fsync) before giving up and returning an error. Long enough
+// to ride out a brief rotation or a slow disk, short enough that a wedged drain
 // cannot stall a mutation.
 const writeSyncTimeout = 2 * time.Second
+
+// syncWriters bounds the number of concurrent durable writers. A wedged sink
+// can hold at most this many goroutines, rather than one per call (adv 1): once
+// all slots are held by stuck writes, further WriteSync calls fail closed on the
+// admission timeout instead of piling up.
+const syncWriters = 4
 
 // bigDeleteFiles and bigDeleteBytes are the thresholds above which a delete is
 // a milestone worth mirroring to QuLog.
@@ -107,6 +114,12 @@ type Logger struct {
 	mu     sync.RWMutex // guards closed / channel send vs. Close
 	closed bool
 
+	// syncSem bounds the number of durable (WriteSync) writers in flight, so a
+	// wedged sink can never spawn goroutines without limit (adv 1). syncWG tracks
+	// the admitted durable writers so Close can join them before closing the file.
+	syncSem chan struct{}
+	syncWG  sync.WaitGroup
+
 	// drainMu is held by the drain goroutine around each file write. Tests
 	// hold it to freeze the drain and prove Write drops instead of blocking.
 	drainMu sync.Mutex
@@ -125,11 +138,12 @@ func Open(path string, qulog bool) (*Logger, error) {
 		return nil, err
 	}
 	l := &Logger{
-		path:  path,
-		w:     w,
-		qulog: qulog,
-		ch:    make(chan Event, bufferDepth),
-		done:  make(chan struct{}),
+		path:    path,
+		w:       w,
+		qulog:   qulog,
+		ch:      make(chan Event, bufferDepth),
+		done:    make(chan struct{}),
+		syncSem: make(chan struct{}, syncWriters),
 		logFn: func(sev qnap.Severity, msg string) error {
 			return qnap.Log(context.Background(), sev, msg)
 		},
@@ -169,33 +183,69 @@ func (l *Logger) Write(ev Event) {
 	}
 }
 
-// WriteSync writes ev straight to the sink, bypassing the drop-on-overflow
-// channel, and returns once it is persisted (or writeSyncTimeout elapses). It
-// is the durable path for the lines a crash must not lose: a mutation's INTENT
-// line, written before the work is dispatched, and every milestone (a denial, a
-// read-only toggle, a large delete). Ordinary result lines stay on the async
-// Write path. The write runs under drainMu, serialised with the drain
-// goroutine's own writes, so the two never interleave on the file. If the drain
-// is wedged the write is still queued to land when the lock frees; WriteSync
-// only stops waiting for it.
-func (l *Logger) WriteSync(ev Event) {
+// ErrSyncTimeout is returned by WriteSync when a durable write cannot reach the
+// sink (write + fsync, or even a writer slot) within writeSyncTimeout. A caller
+// that must not proceed without a durable record — a mutation's intent line, a
+// safety-setting milestone — treats it, and any other WriteSync error, as a hard
+// failure and refuses the operation (adv 1).
+var ErrSyncTimeout = errors.New("audit: durable write timed out")
+
+// WriteSync writes ev straight to the sink AND fsyncs it, synchronously,
+// returning nil only once it is durably persisted. It is the path for the lines
+// a crash must not lose: a mutation's INTENT line, written before the work is
+// dispatched, and every milestone (a denial, a read-only toggle, a large
+// delete). Ordinary result lines stay on the async Write path.
+//
+// Admission is bounded by syncSem, so a wedged sink holds at most syncWriters
+// goroutines rather than one per call (adv 1). The actual write+fsync runs on a
+// worker goroutine that owns its semaphore slot until it finishes, so a stuck
+// write cannot be abandoned back into the pool; WriteSync itself stops waiting
+// after writeSyncTimeout and returns ErrSyncTimeout. On a closed logger it
+// returns os.ErrClosed. The write runs under drainMu, serialised with the drain
+// goroutine so the two never interleave on the file.
+func (l *Logger) WriteSync(ev Event) error {
 	ev = l.prepare(ev)
 	l.mu.RLock()
-	closed := l.closed
-	l.mu.RUnlock()
-	if closed {
-		return
+	if l.closed {
+		l.mu.RUnlock()
+		return os.ErrClosed
 	}
-	done := make(chan struct{})
-	go func() {
-		l.drainMu.Lock()
-		l.emit(ev)
-		l.drainMu.Unlock()
-		close(done)
-	}()
+	// Register as an in-flight durable writer while still holding the read lock,
+	// so Close (which takes the write lock, sets closed, then Waits) cannot begin
+	// its Wait between this check and the Add.
+	l.syncWG.Add(1)
+	l.mu.RUnlock()
+
+	timer := time.NewTimer(writeSyncTimeout)
+	defer timer.Stop()
+
+	// Bounded admission. A slot is held by the worker below until its write
+	// finishes, so at most syncWriters durable writes exist at once.
 	select {
-	case <-done:
-	case <-time.After(writeSyncTimeout):
+	case l.syncSem <- struct{}{}:
+	case <-l.done:
+		l.syncWG.Done()
+		return os.ErrClosed
+	case <-timer.C:
+		l.syncWG.Done()
+		return ErrSyncTimeout
+	}
+
+	res := make(chan error, 1)
+	go func() {
+		defer l.syncWG.Done()
+		defer func() { <-l.syncSem }()
+		l.drainMu.Lock()
+		err := l.emitSync(ev)
+		l.drainMu.Unlock()
+		res <- err
+	}()
+
+	select {
+	case err := <-res:
+		return err
+	case <-timer.C:
+		return ErrSyncTimeout
 	}
 }
 
@@ -223,6 +273,10 @@ func (l *Logger) Close() error {
 	l.mu.Unlock()
 
 	<-l.done
+	// Join the admitted durable writers before closing the file, so an in-flight
+	// WriteSync cannot write into a closed sink (adv 1). The drain has finished
+	// and released drainMu, so a writer blocked on it now proceeds.
+	l.syncWG.Wait()
 	return l.w.Close()
 }
 
@@ -260,6 +314,37 @@ func (l *Logger) emit(ev Event) {
 			l.errLog(fmt.Sprintf("milestone not mirrored to QuLog (%d total): %v", n, err))
 		}
 	}
+}
+
+// emitSync writes one event as a JSON line and fsyncs it, returning an error if
+// either the write or the fsync fails. It is the durable counterpart of emit,
+// used by WriteSync so an acknowledged intent line is truly on stable storage,
+// not merely in the OS page cache (adv 1 / standard P1). A milestone-mirror
+// failure does not fail the durable write — the audit line is already persisted;
+// the mirror miss is counted and surfaced exactly as in emit.
+func (l *Logger) emitSync(ev Event) error {
+	b, err := json.Marshal(ev)
+	if err != nil {
+		return err
+	}
+	b = append(b, '\n')
+	if _, err := l.w.Write(b); err != nil {
+		n := atomic.AddInt64(&l.writeErrors, 1)
+		l.reportWriteErr(err, n)
+		return err
+	}
+	if err := l.w.Sync(); err != nil {
+		n := atomic.AddInt64(&l.writeErrors, 1)
+		l.reportWriteErr(err, n)
+		return err
+	}
+	if l.qulog && l.logFn != nil && isMilestone(ev) {
+		if err := l.logFn(severity(ev), message(ev)); err != nil {
+			n := atomic.AddInt64(&l.milestoneDrops, 1)
+			l.errLog(fmt.Sprintf("milestone not mirrored to QuLog (%d total): %v", n, err))
+		}
+	}
+	return nil
 }
 
 // reportWriteErr surfaces a sink write failure through errLog, rate-limited to

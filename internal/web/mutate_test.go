@@ -3,6 +3,8 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -16,6 +18,46 @@ import (
 	"qnapfilemanager/internal/fsx"
 	"qnapfilemanager/internal/guard"
 )
+
+// resolveStub overrides the fake backend's Resolve to model a worker resolving a
+// path AS THE USER (round-3 finding 2): a path under blocked returns the kernel's
+// permission error (an unsearchable parent), and a path whose parent is an alias
+// resolves to a protected spelling — used to prove that spelling is never
+// disclosed to the client. Everything else defers to the real fake resolver.
+type resolveStub struct {
+	*fakeBackend
+	blocked string            // an API prefix the user cannot traverse
+	aliases map[string]string // requested dir -> resolved dir
+}
+
+func (rs *resolveStub) Resolve(ctx context.Context, p backend.Principal, name string, followLeaf bool) (string, error) {
+	blockedHit := func(x string) bool {
+		return rs.blocked != "" && (x == rs.blocked || strings.HasPrefix(x, rs.blocked+"/"))
+	}
+	if blockedHit(name) {
+		return "", fs.ErrPermission
+	}
+	if followLeaf {
+		if v, ok := rs.aliases[name]; ok {
+			return v, nil
+		}
+		return rs.fakeBackend.Resolve(ctx, p, name, true)
+	}
+	parent := fsx.Parent(name)
+	if blockedHit(parent) {
+		return "", fs.ErrPermission
+	}
+	if v, ok := rs.aliases[parent]; ok {
+		return fsx.Join(v, fsx.Base(name)), nil
+	}
+	return rs.fakeBackend.Resolve(ctx, p, name, false)
+}
+
+// readBody drains an httptest response body to a string for substring checks.
+func readBody(resp *http.Response) string {
+	b, _ := io.ReadAll(resp.Body)
+	return string(b)
+}
 
 // mustSymlink creates a symlink or skips the test. Windows refuses symlink
 // creation without the privilege, and the guard's parent-symlink resolution is
@@ -531,4 +573,211 @@ type apiEnvelope struct {
 	Error struct {
 		Code, Message, Path, Op string
 	} `json:"error"`
+}
+
+// TestMutationThroughUnsearchableDirReturnsPermission proves the round-3 finding
+// 2 fix: a mutation named through a directory the user cannot traverse resolves
+// AS THE USER, so it returns the kernel's permission error rather than being
+// resolved by root and dispatched behind the user's back.
+func TestMutationThroughUnsearchableDirReturnsPermission(t *testing.T) {
+	s, b := fixture(t, true)
+	s.guard.SetReadOnly(false)
+	s.mutator = &resolveStub{fakeBackend: b, blocked: "/private"}
+	c, csrf := sessionCookie(t, s)
+
+	resp := post(s, "/api/fs/mkdir", c, csrf, `{"dir":"/private","name":"x"}`)
+	if resp.StatusCode != 403 {
+		t.Fatalf("mkdir through unsearchable dir status %d, want 403", resp.StatusCode)
+	}
+	var e apiEnvelope
+	json.NewDecoder(resp.Body).Decode(&e)
+	if e.Error.Code != "permission" {
+		t.Fatalf("mkdir code %q, want permission", e.Error.Code)
+	}
+
+	resp2 := post(s, "/api/fs/delete", c, csrf, `{"path":"/private/secret"}`)
+	if resp2.StatusCode != 403 {
+		t.Fatalf("delete through unsearchable dir status %d, want 403", resp2.StatusCode)
+	}
+	json.NewDecoder(resp2.Body).Decode(&e)
+	if e.Error.Code != "permission" {
+		t.Fatalf("delete code %q, want permission", e.Error.Code)
+	}
+	// The operation was never dispatched: nothing was created on disk.
+	if _, err := os.Stat(filepath.Join(b.dir, "private")); !os.IsNotExist(err) {
+		t.Fatal("a directory was created despite the resolution being denied")
+	}
+}
+
+// TestNoResolvedPathDisclosed proves the round-3 finding 2 disclosure fix: when
+// a requested path resolves (as the user) to a protected spelling, neither the
+// confirmation message, the error path, nor the summary reveals that resolved
+// spelling — the client only ever sees the path it named.
+func TestNoResolvedPathDisclosed(t *testing.T) {
+	s, b := fixture(t, true)
+	s.guard.SetReadOnly(false)
+	s.mutator = &resolveStub{fakeBackend: b, aliases: map[string]string{"/alias": "/etc/config"}}
+	c, csrf := sessionCookie(t, s)
+
+	// mkdir into /alias resolves to the warn-class /etc/config → 409, but the
+	// resolved spelling must not appear anywhere in the response.
+	resp := post(s, "/api/fs/mkdir", c, csrf, `{"dir":"/alias","name":"new"}`)
+	if resp.StatusCode != 409 {
+		t.Fatalf("mkdir status %d, want 409", resp.StatusCode)
+	}
+	if body := readBody(resp); strings.Contains(body, "etc/config") {
+		t.Fatalf("resolved path disclosed in mkdir confirmation: %s", body)
+	}
+
+	// delete under /alias likewise resolves to /etc/config; the summary must carry
+	// a path-free warning and disclose no resolved spelling.
+	resp2 := post(s, "/api/fs/delete", c, csrf, `{"path":"/alias/smb.conf"}`)
+	if resp2.StatusCode != 409 {
+		t.Fatalf("delete status %d, want 409", resp2.StatusCode)
+	}
+	raw := readBody(resp2)
+	if strings.Contains(raw, "etc/config") {
+		t.Fatalf("resolved path disclosed in delete challenge: %s", raw)
+	}
+	var out struct {
+		Confirm struct {
+			Summary struct{ Warnings []string }
+		} `json:"confirm"`
+	}
+	json.Unmarshal([]byte(raw), &out)
+	if len(out.Confirm.Summary.Warnings) == 0 {
+		t.Fatal("protected delete challenge carried no warning")
+	}
+}
+
+// TestMutationRefusedWhenIntentNotDurable proves the round-3 finding 3 / standard
+// P1 fix: when a mutation's intent line cannot be durably written, the mutation
+// is refused (500 audit_unavailable) rather than dispatched. A closed logger's
+// WriteSync fails, standing in for a wedged or failing sink.
+func TestMutationRefusedWhenIntentNotDurable(t *testing.T) {
+	s, b := fixture(t, true)
+	s.guard.SetReadOnly(false)
+	logger, err := audit.Open(filepath.Join(t.TempDir(), "audit.jsonl"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := logger.Close(); err != nil { // now every WriteSync fails
+		t.Fatal(err)
+	}
+	s.auditor = logger
+	c, csrf := sessionCookie(t, s)
+	resp := post(s, "/api/fs/mkdir", c, csrf, `{"dir":"/","name":"nope"}`)
+	if resp.StatusCode != 500 {
+		t.Fatalf("status %d, want 500", resp.StatusCode)
+	}
+	var e apiEnvelope
+	json.NewDecoder(resp.Body).Decode(&e)
+	if e.Error.Code != "audit_unavailable" {
+		t.Fatalf("code %q, want audit_unavailable", e.Error.Code)
+	}
+	if _, err := os.Stat(filepath.Join(b.dir, "nope")); !os.IsNotExist(err) {
+		t.Fatal("mkdir was dispatched despite its intent not being durable")
+	}
+}
+
+// TestReadOnlyToggleRefusedWhenMilestoneNotDurable proves the round-3 finding 3
+// fix for the safety toggle: disabling read-only is refused and reverted when its
+// milestone cannot be durably recorded.
+func TestReadOnlyToggleRefusedWhenMilestoneNotDurable(t *testing.T) {
+	s, _ := fixture(t, true)
+	s.guard.SetReadOnly(true)
+	s.ConfigPath = filepath.Join(t.TempDir(), "config.json")
+	logger, err := audit.Open(filepath.Join(t.TempDir(), "audit.jsonl"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.Close()
+	s.auditor = logger
+	c, csrf := sessionCookie(t, s)
+	s.sessions[c.Value].admin = true
+	resp := post(s, "/api/settings", c, csrf, `{"readOnly":false}`)
+	if resp.StatusCode != 500 {
+		t.Fatalf("status %d, want 500", resp.StatusCode)
+	}
+	var e apiEnvelope
+	json.NewDecoder(resp.Body).Decode(&e)
+	if e.Error.Code != "audit_unavailable" {
+		t.Fatalf("code %q, want audit_unavailable", e.Error.Code)
+	}
+	if !s.readOnly() {
+		t.Fatal("read-only was disabled despite the milestone not being durable (should have reverted)")
+	}
+}
+
+// TestProtectedDeleteChallengeCarriesWarnings proves the round-3 finding 4 /
+// standard P1 fix: a protected/warn delete's confirmation challenge carries the
+// guard's reason so the client can show it and demand an acknowledgement.
+func TestProtectedDeleteChallengeCarriesWarnings(t *testing.T) {
+	s, b := fixture(t, true)
+	s.guard.SetReadOnly(false)
+	if err := os.MkdirAll(filepath.Join(b.dir, "etc", "config"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(b.dir, "etc", "config", "smb.conf"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, csrf := sessionCookie(t, s)
+	resp := post(s, "/api/fs/delete", c, csrf, `{"path":"/etc/config/smb.conf"}`)
+	if resp.StatusCode != 409 {
+		t.Fatalf("status %d, want 409", resp.StatusCode)
+	}
+	var out struct {
+		Confirm struct {
+			Summary struct{ Warnings []string }
+		} `json:"confirm"`
+	}
+	json.NewDecoder(resp.Body).Decode(&out)
+	if len(out.Confirm.Summary.Warnings) == 0 {
+		t.Fatal("protected delete challenge carried no warnings")
+	}
+}
+
+// TestBatchDeletePartialOutcome proves the round-3 finding 6 fix: a batch where
+// one item fails reports an accurate per-item result array and a "partial"
+// outcome with true totals, not a blanket success.
+func TestBatchDeletePartialOutcome(t *testing.T) {
+	s, b := fixture(t, true)
+	s.guard.SetReadOnly(false)
+	if err := os.WriteFile(filepath.Join(b.dir, "d1"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// d2 deliberately does not exist, so its delete fails not_found.
+	c, csrf := sessionCookie(t, s)
+	first := post(s, "/api/fs/delete", c, csrf, `{"paths":[{"path":"/d1"},{"path":"/d2"}]}`)
+	if first.StatusCode != 409 {
+		t.Fatalf("first batch status %d, want 409", first.StatusCode)
+	}
+	var tok struct{ Confirm struct{ Token string } }
+	json.NewDecoder(first.Body).Decode(&tok)
+	if tok.Confirm.Token == "" {
+		t.Fatal("no batch confirmation token")
+	}
+	resp := post(s, "/api/fs/delete", c, csrf, `{"paths":[{"path":"/d1"},{"path":"/d2"}],"confirm":"`+tok.Confirm.Token+`"}`)
+	if resp.StatusCode != 200 {
+		t.Fatalf("batch status %d", resp.StatusCode)
+	}
+	var out struct {
+		Outcome                      string
+		Succeeded, Failed, Attempted int
+		Results                      []struct {
+			Path string
+			OK   bool
+			Code string
+		}
+	}
+	json.NewDecoder(resp.Body).Decode(&out)
+	if out.Outcome != "partial" {
+		t.Fatalf("outcome %q, want partial", out.Outcome)
+	}
+	if out.Succeeded != 1 || out.Failed != 1 || out.Attempted != 2 {
+		t.Fatalf("totals succeeded=%d failed=%d attempted=%d", out.Succeeded, out.Failed, out.Attempted)
+	}
+	if len(out.Results) != 2 || !out.Results[0].OK || out.Results[1].Code != "not_found" {
+		t.Fatalf("results %+v", out.Results)
+	}
 }

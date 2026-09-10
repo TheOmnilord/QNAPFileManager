@@ -9,6 +9,28 @@ import (
 	"testing"
 )
 
+func TestSync(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sync.log")
+	w, err := Open(path, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("line\n")); err != nil {
+		t.Fatal(err)
+	}
+	// Sync succeeds on an open writer, flushing the write to stable storage.
+	if err := w.Sync(); err != nil {
+		t.Fatalf("Sync on open writer: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// After Close, Sync reports the writer is closed rather than syncing a nil file.
+	if err := w.Sync(); err != os.ErrClosed {
+		t.Fatalf("Sync after Close = %v, want os.ErrClosed", err)
+	}
+}
+
 func TestAppendsAcrossOpens(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "logs", "gitbackup.log")
 	w, err := Open(path, 0)

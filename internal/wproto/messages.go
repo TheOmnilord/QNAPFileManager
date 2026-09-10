@@ -95,6 +95,23 @@ type ReadlinkReq struct {
 	Path []byte `json:"p"`
 }
 
+// ResolveReq asks the worker to resolve an API path to its canonical spelling
+// as the user, so the O_PATH walk enforces the caller's own traversal
+// permissions (INV-2) rather than the root front-end resolving symlinks it
+// could reach but the user could not. FollowLeaf resolves the whole path (an
+// existing directory); when it is false the parent is resolved and the final
+// component is kept literal (a named entry to create, rename or delete).
+type ResolveReq struct {
+	Path       []byte `json:"p"`
+	FollowLeaf bool   `json:"l,omitempty"`
+}
+
+// ResolveResp carries the canonical API path. It is bytes for the same reason
+// every other name here is: a non-UTF-8 Linux filename survives the round trip.
+type ResolveResp struct {
+	Path []byte `json:"p"`
+}
+
 type ReadlinkResp struct {
 	Target []byte `json:"t"`
 	// Resolved is the fully evaluated target, empty when dangling or looping.

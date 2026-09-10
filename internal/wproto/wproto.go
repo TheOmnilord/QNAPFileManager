@@ -24,6 +24,7 @@ const (
 	OpRename    Op = "rename"
 	OpDelete    Op = "delete" // single, non-recursive delete (M1); recursive delete and trash are the job-shaped DeleteReq (M2)
 	OpReadlink  Op = "readlink"
+	OpResolve   Op = "resolve" // resolve an API path to its canonical spelling, as the user
 	OpChmod     Op = "chmod"
 	OpChown     Op = "chown"
 	OpOpenRead  Op = "openread"

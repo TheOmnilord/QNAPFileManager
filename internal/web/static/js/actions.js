@@ -1,7 +1,7 @@
 import {api} from './api.js';
 import {$,el,error,announce,openDialog,pathArgs} from './dom.js';
 import {state,sessionGuard} from './state.js';
-import {loadList,focused,selectionEntries,extraActions} from './list.js';
+import {loadList,focused,selectedOne,selectionEntries,extraActions} from './list.js';
 import {loadTree} from './tree.js';
 
 // post sends a JSON body to a mutation route. api() attaches the CSRF header and
@@ -128,9 +128,17 @@ export async function deleteEntries(entries) {
   // dialog above already covered it, so approve it silently; a warn-class area
   // (server sends summary.warnings) still shows the detailed grade-2 dialog.
   const res=await runMutation('api/fs/delete',body,(confirm,message) => {
-   const warnings=confirm.summary?.warnings||[];
-   if (!warnings.length) return true;
-   return confirmDialog({title:'Confirm deletion',body:message||'This location needs confirmation.',why:warnings.join(' · '),danger:true});
+   const s=confirm.summary||{};
+   const warnings=s.warnings||[];
+   // A protected/warn path carries warnings; a large delete crosses the scale
+   // thresholds (100 files or 1 GiB, matching the server's guard.NeedsConfirm).
+   // Either one must be shown and explicitly acknowledged (standard P1 / adv 4);
+   // only a plain, small, unprotected permanent delete — already covered by the
+   // grade-1 dialog above — is auto-approved.
+   const large=(s.files||0)>100 || (s.bytes||0)>(1<<30);
+   if (!warnings.length && !large) return true;
+   const why=warnings.length ? warnings.join(' · ') : `${(s.files||0).toLocaleString()} item(s), ${(s.bytes||0).toLocaleString()} byte(s). This cannot be undone.`;
+   return confirmDialog({title:'Confirm deletion',body:message||'This delete needs confirmation.',why,danger:true});
   });
   if (!valid()) return;
   if (res===null) return;
@@ -158,7 +166,7 @@ export async function deleteSelection() {
 
 export function initActions() {
  $('#btnMkdir').addEventListener('click',() => newFolder());
- $('#btnRename').addEventListener('click',() => renameEntry(focused()));
+ $('#btnRename').addEventListener('click',() => { const e=selectedOne(); if (e) renameEntry(e); });
  $('#btnDelete').addEventListener('click',() => deleteSelection());
  // Context-menu entries, added without list.js importing this module.
  extraActions.push({label:'Rename…',show:() => !!state.session?.canWrite,run:e => renameEntry(e)});

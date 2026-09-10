@@ -712,6 +712,31 @@ func (p *Pool) Delete(ctx context.Context, who backend.Principal, path string) e
 	return err
 }
 
+// Resolve canonicalises an API path in the user's worker and returns the
+// canonical spelling. The resolution runs as the user (INV-2), so a component
+// the user cannot traverse is refused by the kernel there rather than resolved
+// around in the root front-end. It passes no descriptor, so the ordinary RPC
+// path carries it in both modes.
+func (p *Pool) Resolve(ctx context.Context, who backend.Principal, path string, followLeaf bool) (string, error) {
+	c, err := p.acquire(ctx, who)
+	if err != nil {
+		return "", err
+	}
+	defer p.release(c)
+	f, _, err := p.call(ctx, c, wproto.OpResolve, wproto.ResolveReq{
+		Path:       []byte(path),
+		FollowLeaf: followLeaf,
+	})
+	if err != nil {
+		return "", err
+	}
+	var resp wproto.ResolveResp
+	if err := f.Unmarshal(&resp); err != nil {
+		return "", err
+	}
+	return string(resp.Path), nil
+}
+
 // Ping proves the principal's worker is alive, spawning it if needed.
 func (p *Pool) Ping(ctx context.Context, who backend.Principal) error {
 	c, err := p.acquire(ctx, who)

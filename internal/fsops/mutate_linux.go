@@ -70,8 +70,19 @@ func renameAt(fromJail fsx.Jail, fromParentRel, fromName string, toJail fsx.Jail
 	err = renameatIn(fromDir, fromName, toDir, toName, noReplace)
 	if noReplace && (errors.Is(err, syscall.ENOSYS) || errors.Is(err, syscall.EINVAL)) {
 		// renameat2/RENAME_NOREPLACE unsupported here: fall back to a pre-check
-		// then a plain renameat.
-		if _, serr := statAt(toJail, relJoin(toParentRel, toName)); serr == nil {
+		// then a plain renameat. The check is fstatat *relative to the
+		// destination parent descriptor toDir we already hold* — not a fresh walk
+		// of the destination pathname (adv round-3 finding 5). Re-walking the
+		// pathname inspected the wrong directory if the destination's parent was
+		// moved between the walk and this rename, and treated every stat error as
+		// "absent", so an EACCES or an EIO would let the rename overwrite. Only
+		// ENOENT means the destination is genuinely absent; any other error fails
+		// the rename rather than being read as room to overwrite.
+		exists, serr := destExistsAt(toDir, toName)
+		if serr != nil {
+			return &fs.PathError{Op: "statat", Path: relJoin(toParentRel, toName), Err: serr}
+		}
+		if exists {
 			return &fs.PathError{Op: "renameat", Path: relJoin(toParentRel, toName), Err: syscall.EEXIST}
 		}
 		err = renameatIn(fromDir, fromName, toDir, toName, false)
@@ -80,6 +91,30 @@ func renameAt(fromJail fsx.Jail, fromParentRel, fromName string, toJail fsx.Jail
 		return &fs.PathError{Op: "renameat", Path: relJoin(fromParentRel, fromName), Err: err}
 	}
 	return nil
+}
+
+// destExistsAt reports whether name exists directly inside the directory toDir
+// refers to, addressed by that already-held descriptor rather than by a fresh
+// walk of the pathname (adv round-3 finding 5). It is the no-overwrite rename
+// fallback's existence check, used only when renameat2(RENAME_NOREPLACE) is
+// unavailable — the atomic primary path decides the same thing in the kernel.
+//
+// The lookup is an fstatat relative to toDir: an openat with O_PATH|O_NOFOLLOW,
+// which asks the kernel for nothing but whether the name resolves and never
+// follows a symlink at the destination — a link there is an existing entry, the
+// same as renameat2 would treat it. ENOENT is the one error that means "absent,
+// go ahead"; every other error (EACCES on the lookup, a dead mount) is returned
+// so the caller fails the rename rather than overwriting on a guess.
+func destExistsAt(toDir *os.File, name string) (bool, error) {
+	fd, err := openatIn(toDir, name, oPath|syscall.O_NOFOLLOW|syscall.O_CLOEXEC)
+	if err == nil {
+		syscall.Close(fd)
+		return true, nil
+	}
+	if errors.Is(err, syscall.ENOENT) {
+		return false, nil
+	}
+	return false, err
 }
 
 // unlinkAt removes name from the directory named by parentRel, with

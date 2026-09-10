@@ -268,6 +268,45 @@ func (g *Guard) Classify(p string) string {
 	}
 }
 
+// Reasons returns the human explanations for why op on p is warned or denied —
+// the matching rules' Reason strings, the never-write reason, and the
+// mount-point note — for display in a confirmation dialog. The path itself is
+// deliberately omitted from every string, so a summary built from a
+// symlink-resolved path never discloses that resolved spelling to the client
+// (adv resolve.go / round-3 finding 2 disclosure). The result is de-duplicated
+// and empty for an ordinary path.
+func (g *Guard) Reasons(op Op, p string) []string {
+	var out []string
+	seen := map[string]bool{}
+	add := func(s string) {
+		if s == "" || seen[s] {
+			return
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	if op&writeOps != 0 {
+		if reason, hit := neverWriteReason(p); hit {
+			add(reason)
+		}
+	}
+	if op&(OpDelete|OpRename) != 0 {
+		if fn := g.mountChecker(); fn != nil && fn(p) {
+			add("this is a mount point; deleting or renaming it would unmount a volume")
+		}
+	}
+	for i := range g.rules {
+		r := &g.rules[i]
+		if !matches(r, p) {
+			continue
+		}
+		if r.Deny&op != 0 || r.Warn&op != 0 {
+			add(r.Reason)
+		}
+	}
+	return out
+}
+
 // matches applies a rule to a path with path-boundary semantics: an Exact rule
 // matches only the path itself, a prefix rule matches the path or anything
 // beneath it, never a sibling that merely shares a textual prefix.

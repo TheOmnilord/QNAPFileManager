@@ -429,6 +429,14 @@ func TestQTSRevalidationAndBinding(t *testing.T) {
 	if old.binding != qtsauth.CacheKey(qtsauth.Cred{Kind: "qtoken", User: "dev", Token: "valid"}) || old.kind != "qtoken" {
 		t.Fatal("missing binding")
 	}
+	// An administrator's session operates as root (owner decision, like File
+	// Station), which api/session reports as rootMode.
+	if !old.who.Root || !old.admin {
+		t.Fatalf("admin session is not root: root=%v admin=%v", old.who.Root, old.admin)
+	}
+	if w := request(s, "GET", "/api/session", c, nil); !strings.Contains(w.Body.String(), `"rootMode":true`) {
+		t.Fatalf("api/session should report rootMode for an admin: %s", w.Body)
+	}
 	// An app cookie alone works until the periodic verification denies its
 	// retained QTS credential. QTS's credential is never returned to the UI.
 	if w := request(s, "GET", "/api/fs/list?path=/", c, nil); w.Code != 200 {

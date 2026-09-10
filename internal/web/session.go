@@ -257,6 +257,11 @@ func (s *Server) authenticateCredential(r *http.Request, sess *session, cred qts
 	}
 	sess.who = principal(ident)
 	sess.admin, sess.note = idmap.DecideAdmin(verified.IsAdmin(), ident, s.ids, s.cfg.Auth.AdminRequiresBoth)
+	// An administrator operates as root, the way File Station does (owner
+	// decision, 2026-09-10): the worker for an admin session runs as uid 0, so
+	// it sees the whole filesystem. A non-admin keeps their own identity. The
+	// guard's protected-path confirmations still apply to a root session.
+	sess.who.Root = sess.admin
 	sess.partial = ident.Partial
 	sess.binding, sess.kind, sess.cred, sess.checked = qtsauth.CacheKey(cred), cred.Kind, cred, verified.ValidatedAt
 	if sess.note != "" {
@@ -334,6 +339,7 @@ func (s *Server) authenticateSession(w http.ResponseWriter, r *http.Request, old
 				} else {
 					old.who = principal(ident)
 					old.admin, old.note = idmap.DecideAdmin(verified.IsAdmin(), ident, s.ids, s.cfg.Auth.AdminRequiresBoth)
+					old.who.Root = old.admin
 					old.partial = ident.Partial
 					old.checked = verified.ValidatedAt
 					old.unavailableSince = time.Time{}
@@ -368,6 +374,9 @@ func principal(id idmap.Ident) backend.Principal {
 
 func (s *Server) sessionInfo(w http.ResponseWriter, r *http.Request, sess *session) {
 	v := map[string]any{"authenticated": sess != nil, "user": "", "admin": false, "rootMode": false, "uid": -1, "gid": -1, "groups": []int{}, "readOnly": s.cfg.ReadOnly, "version": s.version, "isQTS": s.isQTS(), "family": s.platform.Family, "csrf": "", "viaQTS": false}
+	if sess != nil {
+		v["rootMode"] = sess.who.Root
+	}
 	if sess != nil {
 		v["user"], v["admin"], v["uid"], v["gid"], v["groups"], v["csrf"], v["viaQTS"] = sess.who.User, sess.admin, sess.who.UID, sess.who.GID, sess.who.Groups, sess.csrf, sess.kind != ""
 		v["groupsIncomplete"] = sess.partial

@@ -136,22 +136,28 @@ func (s *Server) postSettings(w http.ResponseWriter, r *http.Request, sess *sess
 		s.guard.SetReadOnly(newVal)
 	}
 
-	// 4. Record the result durably. If even this fails, revert everything to
-	//    prevVal (captured under this same still-held lock) and refuse, so the
-	//    file, the live guard and the audit trail still agree that the change did
-	//    not take effect. A rollback save error is logged, not swallowed.
+	// 4. Record the result durably. If even this fails, revert to prevVal (captured
+	//    under this same still-held lock) and refuse. The live guard is set to
+	//    whatever value is ACTUALLY persisted, so the guard and the config can never
+	//    disagree — even under a double failure (the audit sink wedged AND the
+	//    rollback save itself failing), where newVal stays on disk and the guard is
+	//    kept at newVal to match it rather than left contradicting the file
+	//    (round-7 adv). The durable intent line from step 1 still records that a
+	//    toggle was attempted; only the audit narrative can lag the live state
+	//    (§2.6).
 	if err := auditResult("ok", "", fmt.Sprintf("readOnly=%v", newVal)); err != nil {
-		if s.guard != nil {
-			s.guard.SetReadOnly(prevVal)
-		}
+		effective := prevVal
 		if s.ConfigPath != "" {
 			c := s.cfg
 			c.ReadOnly = prevVal
 			if serr := config.Save(s.ConfigPath, c); serr != nil {
 				s.logger.Printf("settings rollback: could not restore readOnly=%v after an audit failure: %v", prevVal, serr)
-			} else {
-				s.cfg.ReadOnly = prevVal
+				effective = newVal // could not un-persist; the file still holds newVal
 			}
+		}
+		s.cfg.ReadOnly = effective
+		if s.guard != nil {
+			s.guard.SetReadOnly(effective)
 		}
 		s.fail(w, r, "audit_unavailable", "The change was refused: its audit record could not be saved.", "", err.Error())
 		return

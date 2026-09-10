@@ -230,6 +230,7 @@ func TestAuditContextCancellation(t *testing.T) {
 		{"ok", false},      // completed work: cancellation-immune
 		{"error", false},   // dispatched then failed: still a record of an attempt
 		{"partial", false}, // batch milestone: some work happened
+		{"weird", true},    // an unrecognised result defaults to request-scoped (safe)
 	}
 	for _, tc := range cases {
 		t.Run("result="+tc.result, func(t *testing.T) {

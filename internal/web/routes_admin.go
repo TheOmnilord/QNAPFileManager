@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -87,7 +88,16 @@ func (s *Server) postSettings(w http.ResponseWriter, r *http.Request, sess *sess
 		if s.auditor == nil {
 			return nil
 		}
-		return s.auditor.WriteSync(r.Context(), audit.Event{
+		// The result records the FINAL applied state of the toggle (the guard was
+		// already flipped and the file already written before "ok" is recorded), so
+		// it must survive the client disconnecting. Persist it with a
+		// cancellation-immune context: were it request-scoped, a cancel after the
+		// writer was admitted but before its fsync completed would return
+		// context.Canceled while the goroutine still durably wrote "ok", and this
+		// function would then roll the guard and file back to prevVal — leaving the
+		// durable audit trail contradicting both live values (round-5 adv 1).
+		// WriteSync's own writeSyncTimeout still bounds the wait.
+		return s.auditor.WriteSync(context.WithoutCancel(r.Context()), audit.Event{
 			Actor: sess.who.User, UID: sess.who.UID, Admin: sess.admin, Root: sess.who.Root,
 			IP: ClientIP(r), Op: "readonly", Phase: "result", Result: result, Code: code,
 			Detail: detail, ForceMilestone: true,

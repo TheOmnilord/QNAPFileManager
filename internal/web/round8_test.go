@@ -318,15 +318,86 @@ func TestBatchDeleteStopsOnContextCancel(t *testing.T) {
 	}
 	var out struct {
 		Attempted int
+		Outcome   string
 		Results   []struct{ Path string }
 	}
 	json.NewDecoder(w.Body).Decode(&out)
 	if out.Attempted >= 4 {
 		t.Fatalf("batch did not stop on cancellation: attempted=%d", out.Attempted)
 	}
+	// A batch stopped after a success but with items left unattempted must report
+	// "partial", never "ok" — a cancel must not masquerade as full success
+	// (round-5 std/adv 3).
+	if out.Outcome != "partial" {
+		t.Fatalf("truncated batch outcome %q, want partial", out.Outcome)
+	}
 	// The un-attempted items survive on disk.
 	if _, err := os.Stat(filepath.Join(b.dir, "d4")); err != nil {
 		t.Fatalf("d4 should survive a cancelled batch: %v", err)
+	}
+}
+
+// TestBatchMilestoneSurvivesCancel proves the round-5 adv-1/2 fix: a milestone
+// that records work which ALREADY happened must be persisted even though the
+// client cancelled. A big batch is cancelled after its first successful delete;
+// the loop stops, but the batch milestone (written with a cancellation-immune
+// context) must still land durably, marked "partial", so the destructive work
+// leaves an audit record instead of vanishing with the disconnected client.
+func TestBatchMilestoneSurvivesCancel(t *testing.T) {
+	s, b := fixture(t, true)
+	s.guard.SetReadOnly(false)
+	for _, name := range []string{"d1", "d2", "d3", "d4"} {
+		if err := os.WriteFile(filepath.Join(b.dir, name), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// bigStat inflates measured sizes so the batch crosses the milestone threshold.
+	s.backend = bigStat{fakeBackend: b}
+	logger, err := audit.Open(filepath.Join(t.TempDir(), "audit.jsonl"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.auditor = logger
+	c, csrf := sessionCookie(t, s)
+	body := `{"paths":[{"path":"/d1"},{"path":"/d2"},{"path":"/d3"},{"path":"/d4"}]}`
+	first := post(s, "/api/fs/delete", c, csrf, body)
+	var tok struct{ Confirm struct{ Token string } }
+	json.NewDecoder(first.Body).Decode(&tok)
+	if tok.Confirm.Token == "" {
+		t.Fatal("no batch confirmation token")
+	}
+	confirmed := `{"paths":[{"path":"/d1"},{"path":"/d2"},{"path":"/d3"},{"path":"/d4"}],"confirm":"` + tok.Confirm.Token + `"}`
+
+	ctx, cancel := context.WithCancel(context.Background())
+	s.mutator = &cancelAfterFirst{fakeBackend: b, cancel: cancel}
+	r := httptest.NewRequest("POST", "/api/fs/delete", strings.NewReader(confirmed)).WithContext(ctx)
+	r.AddCookie(c)
+	r.Header.Set("X-QFM-CSRF", csrf)
+	r.Header.Set("Origin", "http://example.com")
+	r.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, r)
+	if w.Code != 200 {
+		t.Fatalf("status %d", w.Code)
+	}
+	if err := logger.Close(); err != nil {
+		t.Fatal(err)
+	}
+	events, err := logger.Tail(200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, e := range events {
+		if e.Op == "delete" && e.Phase == "result" && strings.Contains(e.Detail, "batch delete:") {
+			found = true
+			if e.Result != "partial" {
+				t.Fatalf("batch milestone Result %q, want partial", e.Result)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("batch milestone lost after client cancellation; a completed deletion left no durable record")
 	}
 }
 

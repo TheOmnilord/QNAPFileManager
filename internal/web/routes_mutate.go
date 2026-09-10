@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -199,7 +200,19 @@ func (s *Server) writeAudit(sess *session, r *http.Request, m mutation, phase, r
 	// any forced milestone are durable.
 	durable := phase == "intent" || milestone || (result == "denied" && code != "confirm_required")
 	if durable {
-		return s.auditor.WriteSync(r.Context(), ev)
+		// A milestone that records a mutation which ALREADY happened (result
+		// ok/error/partial) must survive the client disconnecting: persist it with
+		// a cancellation-immune context, or a cancel right after a successful large
+		// delete would discard the only durable proof the destructive work occurred
+		// (round-5 adv 2). WriteSync's own writeSyncTimeout still bounds the wait.
+		// Intent (recorded before any work) and denials (no work happened) stay
+		// request-scoped, so a cancelled batch still stops promptly and a wedged
+		// sink cannot stall a live request (round-4 adv 4).
+		wctx := r.Context()
+		if milestone && result != "denied" {
+			wctx = context.WithoutCancel(r.Context())
+		}
+		return s.auditor.WriteSync(wctx, ev)
 	}
 	s.auditor.Write(ev)
 	return nil
@@ -880,24 +893,31 @@ func (s *Server) deleteBatch(w http.ResponseWriter, r *http.Request, sess *sessi
 		}
 		results = append(results, res)
 	}
-	// Overall outcome from what actually happened (adv 6): all succeeded → "ok",
-	// none succeeded → "error", a mix (or a batch stopped partway) → "partial".
+	// Overall outcome from what actually happened. A batch stopped partway (a
+	// cancelled context or an audit outage broke the loop) leaves items neither
+	// tried nor deleted: those UNATTEMPTED targets must count against completion,
+	// or a cancel right after the first success would masquerade as a full "ok"
+	// (round-5 std/adv 3). So: none succeeded → "error"; any failure OR any target
+	// left unattempted → "partial"; "ok" only when every requested item succeeded.
 	attempted := len(results)
+	unattempted := len(paths) - attempted
 	outcome := "ok"
 	switch {
 	case succeeded == 0:
 		outcome = "error"
-	case failed > 0:
+	case failed > 0 || unattempted > 0:
 		outcome = "partial"
 	}
 	// A large batch is mirrored to QuLog as one milestone whose Result is the TRUE
-	// outcome — "error" when all failed, "partial" when some failed, "ok" only when
-	// all succeeded — matching the HTTP response and Detail, never a blanket "ok"
-	// for a mostly-failed batch (adv 5/6 / standard P2). The totals are the actual
-	// succeeded ones.
+	// outcome — "error" when all failed, "partial" when some failed OR the batch
+	// was stopped partway, "ok" only when every requested item succeeded — matching
+	// the HTTP response, never a blanket "ok" for a mostly-failed or truncated
+	// batch (round-5 std/adv 3 / round-4 adv 5,6). The denominator is the REQUESTED
+	// count (len(paths)), so a truncated batch reads "1 of 100 (partial)", not
+	// "1 of 1 (ok)"; the byte/file totals are the actual succeeded ones.
 	if big {
 		bm := mutation{op: "delete", files: int64(succeeded), bytes: succeededBytes}
-		s.writeAudit(sess, r, bm, "result", outcome, "", fmt.Sprintf("batch delete: %d of %d items, %d bytes (%s)", succeeded, attempted, succeededBytes, outcome), true)
+		s.writeAudit(sess, r, bm, "result", outcome, "", fmt.Sprintf("batch delete: %d of %d items, %d bytes (%s)", succeeded, len(paths), succeededBytes, outcome), true)
 	}
 	writeJSON(w, map[string]any{"results": results, "outcome": outcome, "attempted": attempted, "succeeded": succeeded, "failed": failed})
 }

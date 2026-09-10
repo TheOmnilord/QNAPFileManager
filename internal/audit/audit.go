@@ -81,11 +81,22 @@ type Logger struct {
 
 	ch      chan Event
 	done    chan struct{}
-	dropped int64 // atomic
+	dropped int64 // atomic: events lost to a full queue (overflow)
+
+	// writeErrors counts sink write failures (disk full, I/O error): a distinct
+	// failure mode from a queue-overflow drop. milestoneDrops counts milestones
+	// that could not be mirrored to QuLog. Both are atomic.
+	writeErrors    int64
+	milestoneDrops int64
 
 	// logFn mirrors a milestone to QuLog. It is a field so tests can replace
 	// it and avoid exec'ing /sbin/log_tool.
 	logFn func(qnap.Severity, string) error
+
+	// errLog reports a sink failure somewhere other than the failing file
+	// itself (writing the failure to the same file would only fail again). It
+	// defaults to stderr; tests replace it to capture the notice.
+	errLog func(string)
 
 	mu     sync.RWMutex // guards closed / channel send vs. Close
 	closed bool
@@ -94,8 +105,9 @@ type Logger struct {
 	// hold it to freeze the drain and prove Write drops instead of blocking.
 	drainMu sync.Mutex
 
-	lastReported int64
-	lastReportAt time.Time
+	lastReported   int64
+	lastReportAt   time.Time
+	lastWriteErrAt time.Time // rate-limits the sink-failure notice (drain only)
 }
 
 // Open prepares the JSON-lines audit log at path (mode 0600, rotated at 8 MiB
@@ -115,6 +127,7 @@ func Open(path string, qulog bool) (*Logger, error) {
 		logFn: func(sev qnap.Severity, msg string) error {
 			return qnap.Log(context.Background(), sev, msg)
 		},
+		errLog: func(msg string) { fmt.Fprintln(os.Stderr, "qfm audit: "+msg) },
 	}
 	go l.drain()
 	return l, nil
@@ -146,6 +159,15 @@ func (l *Logger) Write(ev Event) {
 // Dropped returns how many events have been dropped due to buffer overflow.
 func (l *Logger) Dropped() int64 { return atomic.LoadInt64(&l.dropped) }
 
+// WriteErrors returns how many events failed to reach the sink (disk full, I/O
+// error). It is distinct from Dropped: an overflow drop never reached the drain,
+// while a write error means the drain could not persist a dequeued event.
+func (l *Logger) WriteErrors() int64 { return atomic.LoadInt64(&l.writeErrors) }
+
+// MilestoneDrops returns how many milestone events could not be mirrored to
+// QuLog. The audit line still lands in the file; only the QuLog mirror was lost.
+func (l *Logger) MilestoneDrops() int64 { return atomic.LoadInt64(&l.milestoneDrops) }
+
 // Close stops the drain, flushing every queued event, and closes the file.
 func (l *Logger) Close() error {
 	l.mu.Lock()
@@ -175,18 +197,39 @@ func (l *Logger) drain() {
 	l.drainMu.Unlock()
 }
 
-// emit writes one event as a JSON line and, for a milestone, mirrors it.
+// emit writes one event as a JSON line and, for a milestone, mirrors it. A sink
+// write failure and a dropped milestone mirror are both counted and surfaced
+// (adv 10) rather than silently swallowed.
 func (l *Logger) emit(ev Event) {
 	b, err := json.Marshal(ev)
 	if err != nil {
 		return
 	}
 	b = append(b, '\n')
-	_, _ = l.w.Write(b)
+	if _, err := l.w.Write(b); err != nil {
+		n := atomic.AddInt64(&l.writeErrors, 1)
+		l.reportWriteErr(err, n)
+	}
 
 	if l.qulog && l.logFn != nil && isMilestone(ev) {
-		_ = l.logFn(severity(ev), message(ev))
+		if err := l.logFn(severity(ev), message(ev)); err != nil {
+			n := atomic.AddInt64(&l.milestoneDrops, 1)
+			l.errLog(fmt.Sprintf("milestone not mirrored to QuLog (%d total): %v", n, err))
+		}
 	}
+}
+
+// reportWriteErr surfaces a sink write failure through errLog, rate-limited to
+// dropReportInterval so a run of failures does not itself flood stderr. It runs
+// under drainMu (the drain goroutine's serial section), so lastWriteErrAt needs
+// no further guard.
+func (l *Logger) reportWriteErr(err error, total int64) {
+	now := time.Now()
+	if !l.lastWriteErrAt.IsZero() && now.Sub(l.lastWriteErrAt) < dropReportInterval {
+		return
+	}
+	l.lastWriteErrAt = now
+	l.errLog(fmt.Sprintf("sink write failed (%d total): %v", total, err))
 }
 
 // reportDropped periodically writes a synthetic line noting how many events

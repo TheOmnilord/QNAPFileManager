@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -72,6 +73,29 @@ func (s *Server) mutationsReady(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
+// auditAuthDenied records a mutation rejected at the authentication gate — a
+// failed CSRF or Origin check on an unsafe request — as a denial (adv 10). It is
+// a milestone (isMilestone fires on any denial), so a burst of forged requests
+// is visible in QuLog. A nil session or auditor makes it a no-op.
+func (s *Server) auditAuthDenied(r *http.Request, sess *session, code, detail string) {
+	if s.auditor == nil || sess == nil {
+		return
+	}
+	s.auditor.Write(audit.Event{
+		Actor:  sess.who.User,
+		UID:    sess.who.UID,
+		Admin:  sess.admin,
+		Root:   sess.who.Root,
+		IP:     ClientIP(r),
+		Op:     "auth",
+		Path:   r.URL.Path,
+		Phase:  "result",
+		Result: "denied",
+		Code:   code,
+		Detail: detail,
+	})
+}
+
 // mutation carries the identity of one audited operation.
 type mutation struct {
 	op   string // "mkdir" | "rename" | "delete"
@@ -111,7 +135,7 @@ func (s *Server) writeAudit(sess *session, r *http.Request, m mutation, phase, r
 // tokenPaths and m.op identify a confirmation token; extraConfirm forces the
 // confirm flow for a scale threshold (guard.NeedsConfirm) even when the path
 // rules alone would allow the op.
-func (s *Server) authorize(w http.ResponseWriter, r *http.Request, sess *session, guardErr error, extraConfirm bool, m mutation, respPath string, tokenPaths []string, confirm string, summary guard.Summary) bool {
+func (s *Server) authorize(w http.ResponseWriter, r *http.Request, sess *session, guardErr error, extraConfirm bool, m mutation, respPath string, tokenPaths []string, ordered bool, confirm string, summary guard.Summary) bool {
 	switch {
 	case errors.Is(guardErr, guard.ErrReadOnly):
 		s.writeAudit(sess, r, m, "result", "denied", "read_only", guardErr.Error(), false)
@@ -122,14 +146,14 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request, sess *session
 		writeError(w, http.StatusForbidden, "protected", guardErr.Error(), respPath, m.op, guardErr.Error())
 		return false
 	case errors.Is(guardErr, guard.ErrConfirmRequired) || extraConfirm:
-		if confirm != "" && s.guard.Redeem(confirm, m.op, tokenPaths) == nil {
+		if confirm != "" && s.guard.Redeem(confirm, m.op, tokenPaths, ordered) == nil {
 			return true
 		}
 		message := "This change needs confirmation."
 		if guardErr != nil {
 			message = guardErr.Error()
 		}
-		token, exp := s.guard.Issue(m.op, summary, tokenPaths)
+		token, exp := s.guard.Issue(m.op, summary, tokenPaths, ordered)
 		writeConfirmRequired(w, m.op, respPath, message, token, exp, summary)
 		return false
 	case guardErr != nil:
@@ -185,17 +209,33 @@ func (s *Server) mkdir(w http.ResponseWriter, r *http.Request, sess *session) {
 		s.fail(w, r, "bad_request", "Supply the parent directory as dir or dirB64.", "", err.Error())
 		return
 	}
+	// parents:true would create intermediate directories the guard never sees,
+	// bypassing the /share RAM-disk ban and per-intermediate protection
+	// (standard 4 / adv 6). The UI only ever creates a single folder, so M1
+	// refuses it outright; guarding every intermediate is deferred to a later
+	// milestone.
+	if body.Parents {
+		s.fail(w, r, "bad_request", "Creating intermediate parent directories is not supported.", dir, "parents is not allowed in M1")
+		return
+	}
 	if err := fsx.ValidName(body.Name); err != nil {
 		s.fail(w, r, "bad_request", "Supply a valid folder name.", dir, err.Error())
 		return
 	}
 	target := fsx.Join(dir, body.Name)
 	m := mutation{op: "mkdir", path: target}
-	// OpCreate is checked against the parent directory: "may I create something
-	// inside dir?" (guard.go). That is what catches the /share RAM disk and the
-	// never-write regions.
-	guardErr := s.guard.Check(guard.OpCreate, dir)
-	if !s.authorize(w, r, sess, guardErr, false, m, target, []string{target}, body.Confirm, guard.Summary{Files: 1}) {
+	// The worker resolves parent symlinks before it creates, so guard on the
+	// resolved parent, not the spelling the client sent (standard 1 / adv 1). dir
+	// already exists, so resolve it fully. OpCreate is checked against the parent
+	// directory ("may I create inside resolvedDir?"), which catches the /share
+	// RAM disk and the never-write regions; a second OpCreate on the resolved
+	// target catches an entry-specific protection such as a ".zfs" name (adv 6).
+	resolvedDir := resolveForGuard(s.Root, dir, true)
+	guardErr := worstGuard(
+		s.guard.Check(guard.OpCreate, resolvedDir),
+		s.guard.Check(guard.OpCreate, fsx.Join(resolvedDir, body.Name)),
+	)
+	if !s.authorize(w, r, sess, guardErr, false, m, target, []string{target}, false, body.Confirm, guard.Summary{Files: 1}) {
 		return
 	}
 	s.writeAudit(sess, r, m, "intent", "", "", "", false)
@@ -261,10 +301,35 @@ func (s *Server) rename(w http.ResponseWriter, r *http.Request, sess *session) {
 		return
 	}
 	m := mutation{op: "rename", path: from, dst: to}
-	// Renaming touches the source (OpRename) and creates at the destination's
-	// parent (OpCreate). The worst verdict of the two governs.
-	guardErr := worstGuard(s.guard.Check(guard.OpRename, from), s.guard.Check(guard.OpCreate, fsx.Parent(to)))
-	if !s.authorize(w, r, sess, guardErr, false, m, from, []string{from, to}, body.Confirm, guard.Summary{Files: 1}) {
+	// The worker resolves parent symlinks before it renames, so guard on the
+	// resolved paths, keeping each final component unresolved: a rename operates
+	// on the named entry, not its symlink target (standard 1 / adv 1).
+	guardFrom := resolveForGuard(s.Root, from, false)
+	guardTo := resolveForGuard(s.Root, to, false)
+	// A rename removes the source entry from its old location and creates one at
+	// the destination — and, with overwrite, replaces whatever is already there.
+	// Guard every one of those, not just the destination's parent (standard 2 /
+	// adv 2): OpRename and OpDelete on the source (moving a protected entry out),
+	// OpCreate on the destination's parent, and OpDelete on the destination when
+	// overwrite is set and the destination exists (replacing a protected entry or
+	// a device node such as /dev/null). The worst verdict governs.
+	checks := []error{
+		s.guard.Check(guard.OpRename, guardFrom),
+		s.guard.Check(guard.OpDelete, guardFrom),
+		s.guard.Check(guard.OpCreate, fsx.Parent(guardTo)),
+	}
+	if body.Overwrite {
+		if _, statErr := s.backend.Stat(r.Context(), sess.who, to); statErr == nil {
+			checks = append(checks, s.guard.Check(guard.OpDelete, guardTo))
+		}
+	}
+	guardErr := worstGuard(checks...)
+	// The token binds an ordered, structured descriptor — direction and the
+	// overwrite flag — so a token issued for A→B does not authorise B→A or a
+	// switch to overwrite:true (adv 5). Issue and Redeem build the identical
+	// descriptor from the request.
+	tokenParts := renameTokenParts(from, to, body.Overwrite)
+	if !s.authorize(w, r, sess, guardErr, false, m, from, tokenParts, true, body.Confirm, guard.Summary{Files: 1}) {
 		return
 	}
 	s.writeAudit(sess, r, m, "intent", "", "", "", false)
@@ -273,6 +338,14 @@ func (s *Server) rename(w http.ResponseWriter, r *http.Request, sess *session) {
 		return
 	}
 	writeJSON(w, map[string]any{"ok": true})
+}
+
+// renameTokenParts builds the ordered, structured descriptor a rename token
+// binds: the source, the destination and the overwrite flag, each tagged with
+// its role. Because the parts are ordered (not a sorted multiset), a token for
+// one direction or overwrite value cannot be redeemed for another.
+func renameTokenParts(from, to string, overwrite bool) []string {
+	return []string{"from=" + from, "to=" + to, "overwrite=" + strconv.FormatBool(overwrite)}
 }
 
 // worstGuard reduces several guard.Check results to the single most severe one,
@@ -357,8 +430,23 @@ func (s *Server) delete(w http.ResponseWriter, r *http.Request, sess *session) {
 // mutator's mapped error otherwise, or {ok:true}.
 func (s *Server) deleteSingle(w http.ResponseWriter, r *http.Request, sess *session, p, confirm string) {
 	m := mutation{op: "delete", path: p}
-	guardErr := s.guard.Check(guard.OpDelete, p)
-	if !s.authorize(w, r, sess, guardErr, false, m, p, []string{p}, confirm, guard.Summary{Files: 1}) {
+	// Delete removes the link itself, so resolve only the parent and keep the
+	// final component (standard 1 / adv 1).
+	guardPath := resolveForGuard(s.Root, p, false)
+	// Stat the target as the user to measure it: a multi-GiB permanent delete
+	// must cross the byte threshold and demand confirmation (adv 9). A stat
+	// failure (gone, unreadable) simply skips the scale check; the guard's path
+	// rules and the worker's own error still stand.
+	summary := guard.Summary{Files: 1}
+	extraConfirm := false
+	if e, statErr := s.backend.Stat(r.Context(), sess.who, p); statErr == nil {
+		summary.Bytes = e.Size
+		if guard.NeedsConfirm(guard.OpDelete, guardPath, 1, e.Size) {
+			extraConfirm = true
+		}
+	}
+	guardErr := s.guard.Check(guard.OpDelete, guardPath)
+	if !s.authorize(w, r, sess, guardErr, extraConfirm, m, p, []string{p}, false, confirm, summary) {
 		return
 	}
 	s.writeAudit(sess, r, m, "intent", "", "", "", false)
@@ -371,30 +459,51 @@ func (s *Server) deleteSingle(w http.ResponseWriter, r *http.Request, sess *sess
 
 // deleteBatch deletes several items sequentially and returns a per-item result
 // array (partial success). Read-only mode refuses the whole batch up front;
-// otherwise each item's guard verdict and kernel error are reported in place,
-// and each item is audited. Scale alone (more than 100 items) demands one
+// otherwise each item is re-checked immediately before its own dispatch, so a
+// read-only toggle or a protected path stops that item (standard 3 / adv 7).
+// Scale (more than 100 items or more than 1 GiB) or any warn path demands one
 // confirmation token covering the whole set.
 func (s *Server) deleteBatch(w http.ResponseWriter, r *http.Request, sess *session, paths []string, confirm string) {
-	// Global read-only blocks everything; answer once rather than per item.
+	// Global read-only blocks everything; answer once rather than per item. The
+	// per-item loop re-checks read-only too, so a toggle mid-batch still stops
+	// the remaining dispatches.
 	if s.guard.ReadOnly() {
 		m := mutation{op: "delete"}
 		s.writeAudit(sess, r, m, "result", "denied", "read_only", "read-only mode", false)
 		writeError(w, http.StatusForbidden, "read_only", "Read-only mode is on. Turn it off in Settings to make changes.", "", "delete", "")
 		return
 	}
-	// Decide whether the batch as a whole needs a confirmation token: a warn
-	// path anywhere, or the scale threshold.
-	needConfirm := guard.NeedsConfirm(guard.OpDelete, "", len(paths), 0)
-	for _, p := range paths {
-		if errors.Is(s.guard.Check(guard.OpDelete, p), guard.ErrConfirmRequired) {
+	// Resolve each item's parent once (the leaf stays, as delete removes the link
+	// itself) and guard on the resolved path (standard 1 / adv 1). Measure the
+	// items as the user so the byte threshold sees the real size (adv 9). Decide
+	// whether the batch as a whole needs a confirmation token: a warn path
+	// anywhere, or the scale/byte threshold.
+	resolved := make([]string, len(paths))
+	var totalBytes int64
+	for i, p := range paths {
+		resolved[i] = resolveForGuard(s.Root, p, false)
+		if e, statErr := s.backend.Stat(r.Context(), sess.who, p); statErr == nil {
+			totalBytes += e.Size
+		}
+	}
+	needConfirm := guard.NeedsConfirm(guard.OpDelete, "", len(paths), totalBytes)
+	for _, rp := range resolved {
+		if errors.Is(s.guard.Check(guard.OpDelete, rp), guard.ErrConfirmRequired) {
 			needConfirm = true
 			break
 		}
 	}
+	// tokenRedeemed records whether a valid batch token was spent for this exact
+	// set of paths. Only then may a warn-class item proceed in the loop below; a
+	// missing or invalid token turns the whole batch into a confirmation demand.
+	tokenRedeemed := false
 	if needConfirm {
-		if confirm == "" || s.guard.Redeem(confirm, "delete", paths) != nil {
-			token, exp := s.guard.Issue("delete", guard.Summary{Files: int64(len(paths))}, paths)
-			writeConfirmRequired(w, "delete", "", fmt.Sprintf("Deleting %d items needs confirmation.", len(paths)), token, exp, guard.Summary{Files: int64(len(paths))})
+		summary := guard.Summary{Files: int64(len(paths)), Bytes: totalBytes}
+		if confirm != "" && s.guard.Redeem(confirm, "delete", paths, false) == nil {
+			tokenRedeemed = true
+		} else {
+			token, exp := s.guard.Issue("delete", summary, paths, false)
+			writeConfirmRequired(w, "delete", "", fmt.Sprintf("Deleting %d items needs confirmation.", len(paths)), token, exp, summary)
 			return
 		}
 	}
@@ -405,14 +514,36 @@ func (s *Server) deleteBatch(w http.ResponseWriter, r *http.Request, sess *sessi
 		Code    string `json:"code,omitempty"`
 	}
 	results := make([]itemResult, 0, len(paths))
-	for _, p := range paths {
+	for i, p := range paths {
 		m := mutation{op: "delete", path: p}
 		res := itemResult{Path: p}
-		// A protected item is denied in place; confirmation was already handled
-		// at the batch level, so a warn item may proceed here.
-		if err := s.guard.Check(guard.OpDelete, p); errors.Is(err, guard.ErrProtected) {
+		// Re-check every item immediately before its own dispatch and honour every
+		// guard verdict, not just ErrProtected: an administrator who enabled
+		// read-only mid-batch must stop writes here, and a warn item may proceed
+		// only because the batch token was actually redeemed for this set.
+		err := s.guard.Check(guard.OpDelete, resolved[i])
+		switch {
+		case errors.Is(err, guard.ErrReadOnly):
+			s.writeAudit(sess, r, m, "result", "denied", "read_only", err.Error(), false)
+			res.Code = "read_only"
+			results = append(results, res)
+			continue
+		case errors.Is(err, guard.ErrProtected):
 			s.writeAudit(sess, r, m, "result", "denied", "protected", err.Error(), false)
 			res.Code = "protected"
+			results = append(results, res)
+			continue
+		case errors.Is(err, guard.ErrConfirmRequired):
+			if !tokenRedeemed {
+				s.writeAudit(sess, r, m, "result", "denied", "confirm_required", err.Error(), false)
+				res.Code = "confirm_required"
+				results = append(results, res)
+				continue
+			}
+		case err != nil:
+			code := fsx.Code(err)
+			s.writeAudit(sess, r, m, "result", "denied", code, err.Error(), false)
+			res.Code = code
 			results = append(results, res)
 			continue
 		}

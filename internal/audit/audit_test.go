@@ -2,6 +2,7 @@ package audit
 
 import (
 	"encoding/base64"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -205,6 +206,67 @@ func TestNonUTF8Path(t *testing.T) {
 	}
 	if string(dec) != raw {
 		t.Fatalf("round-trip mismatch: %q != %q", dec, raw)
+	}
+}
+
+// TestMilestoneDropSurfaced proves the adv 10 fix: a milestone whose QuLog
+// mirror fails is counted and surfaced through errLog, not silently swallowed.
+// The audit line itself still lands in the file.
+func TestMilestoneDropSurfaced(t *testing.T) {
+	l, _ := openTest(t, true)
+	l.logFn = func(qnap.Severity, string) error { return errors.New("log_tool unavailable") }
+	var mu sync.Mutex
+	var notices []string
+	l.errLog = func(msg string) { mu.Lock(); notices = append(notices, msg); mu.Unlock() }
+
+	l.Write(Event{Op: "chown", Path: "/data/x", Phase: "result", Result: "ok"}) // a milestone
+	if err := l.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if l.MilestoneDrops() != 1 {
+		t.Fatalf("MilestoneDrops = %d, want 1", l.MilestoneDrops())
+	}
+	mu.Lock()
+	got := len(notices)
+	mu.Unlock()
+	if got == 0 {
+		t.Fatal("a dropped milestone was not surfaced through errLog")
+	}
+	// The audit line still made it to the file.
+	evs, err := l.Tail(1)
+	if err != nil || len(evs) != 1 || evs[0].Op != "chown" {
+		t.Fatalf("audit line missing after milestone drop: %v %+v", err, evs)
+	}
+}
+
+// TestSinkWriteFailureSurfaced proves the adv 10 fix: a sink write failure is
+// counted (distinct from a queue-overflow drop) and surfaced through errLog.
+func TestSinkWriteFailureSurfaced(t *testing.T) {
+	l, _ := openTest(t, false)
+	var mu sync.Mutex
+	var notices []string
+	l.errLog = func(msg string) { mu.Lock(); notices = append(notices, msg); mu.Unlock() }
+	// Close the underlying sink so every subsequent write fails, then drive one
+	// event through emit directly (deterministic, no drain timing).
+	if err := l.w.Close(); err != nil {
+		t.Fatalf("closing sink: %v", err)
+	}
+	l.emit(Event{Op: "delete", Path: "/data/x", Phase: "result", Result: "ok"})
+
+	if l.WriteErrors() != 1 {
+		t.Fatalf("WriteErrors = %d, want 1", l.WriteErrors())
+	}
+	if l.Dropped() != 0 {
+		t.Fatalf("Dropped = %d, want 0 (a write error is not an overflow drop)", l.Dropped())
+	}
+	mu.Lock()
+	got := len(notices)
+	mu.Unlock()
+	if got == 0 {
+		t.Fatal("a sink write failure was not surfaced through errLog")
+	}
+	if err := l.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
 	}
 }
 

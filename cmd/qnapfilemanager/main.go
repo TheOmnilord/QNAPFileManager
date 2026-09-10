@@ -362,6 +362,10 @@ func runServe(args []string, stderr io.Writer) error {
 	frontend := web.New(cfg, poolBackend{b}, verifier, ids, plat, pinned, version, logger, g, auditor, nil)
 	frontend.ConfigPath = o.configPath
 	frontend.AuditPath = auditPath
+	// The guard resolves parent symlinks through this same jail mapping before a
+	// mutation (resolveForGuard). The zero Root production uses is the identity
+	// mapping; a -jail dev loop passes its own.
+	frontend.Root = root
 	srv.frontend = frontend.Handler()
 	return srv.run(context.Background())
 }

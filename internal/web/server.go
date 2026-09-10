@@ -18,6 +18,7 @@ import (
 	"qnapfilemanager/internal/audit"
 	"qnapfilemanager/internal/backend"
 	"qnapfilemanager/internal/config"
+	"qnapfilemanager/internal/fsx"
 	"qnapfilemanager/internal/guard"
 	"qnapfilemanager/internal/idmap"
 	"qnapfilemanager/internal/platform"
@@ -48,7 +49,13 @@ type Server struct {
 	// file /api/audit/export streams. Both are set by the caller after New.
 	ConfigPath string
 	AuditPath  string
-	cfgMu      sync.Mutex // serialises read-only toggles and their persistence
+	// Root is the -jail API↔OS mapping the guard uses to resolve parent
+	// symlinks before a mutation (resolveForGuard). The zero value is the
+	// identity mapping production uses; a jailed dev loop or a test sets it so
+	// EvalSymlinks lands inside the jail. INV-1 permits this front-end symlink
+	// resolution (PLAN.md: Lstat/EvalSymlinks/statfs/mountinfo are guard work).
+	Root  fsx.Root
+	cfgMu sync.Mutex // serialises read-only toggles and their persistence
 
 	mu           sync.Mutex
 	sessions     map[string]*session
@@ -277,10 +284,13 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	case "/api/fs/delete":
 		s.delete(w, r, sess)
 	case "/api/settings":
-		if r.Method == http.MethodGet {
-			s.getSettings(w, r, sess)
-		} else {
+		// GET and HEAD are reads; only POST mutates. A HEAD must never reach
+		// postSettings — Go's decoder would apply a HEAD body without CSRF or an
+		// Origin check (adv 5).
+		if r.Method == http.MethodPost {
 			s.postSettings(w, r, sess)
+		} else {
+			s.getSettings(w, r, sess)
 		}
 	case "/api/audit":
 		s.auditTail(w, r, sess)

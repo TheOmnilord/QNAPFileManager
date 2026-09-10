@@ -34,6 +34,15 @@ func (s *Server) getSettings(w http.ResponseWriter, r *http.Request, sess *sessi
 // become possible on a root daemon, so it is admin-only and always audited as a
 // milestone (mirrored to QuLog). The new value drives the guard immediately and
 // is persisted to the config file when one is known.
+//
+// PLAN decision 7 called for a password challenge before read-only may be
+// disabled. That decision predates the QTS-session identity model (decision 3),
+// under which this app has no password of its own — an admin is authenticated by
+// their live QTS desktop session, not by a credential we hold. There is nothing
+// to re-challenge against, so the deliberate deviation here is: admin session +
+// CSRF + Origin + a forced milestone audit line gate the toggle instead. A
+// break-glass password exists only on the separate TLS listener (decision 3),
+// not on this route.
 func (s *Server) postSettings(w http.ResponseWriter, r *http.Request, sess *session) {
 	if !s.requireAdmin(w, r, sess) {
 		return
@@ -50,25 +59,34 @@ func (s *Server) postSettings(w http.ResponseWriter, r *http.Request, sess *sess
 	}
 	newVal := *body.ReadOnly
 
-	// Persist first, then flip the live guard, so a save failure leaves the
-	// running state and the file agreeing. Serialised so two toggles cannot
-	// interleave their read-modify-write of the config.
+	// Persist and flip the live guard under one hold of cfgMu, so the file and
+	// the running guard can never disagree: two concurrent toggles cannot save in
+	// one order and apply in the reverse (standard 5 / adv 8). A save failure
+	// leaves both the file and the guard untouched.
+	s.cfgMu.Lock()
+	var saveErr error
 	if s.ConfigPath != "" {
-		s.cfgMu.Lock()
 		c := s.cfg
 		c.ReadOnly = newVal
-		err := config.Save(s.ConfigPath, c)
-		if err == nil {
+		if saveErr = config.Save(s.ConfigPath, c); saveErr == nil {
 			s.cfg.ReadOnly = newVal
 		}
-		s.cfgMu.Unlock()
-		if err != nil {
-			s.fail(w, r, "internal", "The setting could not be saved.", "", err.Error())
-			return
-		}
 	}
-	if s.guard != nil {
+	if saveErr == nil && s.guard != nil {
 		s.guard.SetReadOnly(newVal)
+	}
+	s.cfgMu.Unlock()
+	if saveErr != nil {
+		// A failed safety-setting change is itself audit-worthy (adv 10).
+		if s.auditor != nil {
+			s.auditor.Write(audit.Event{
+				Actor: sess.who.User, UID: sess.who.UID, Admin: sess.admin, Root: sess.who.Root,
+				IP: ClientIP(r), Op: "readonly", Phase: "result", Result: "error", Code: "internal",
+				Detail: fmt.Sprintf("save failed: %v", saveErr), ForceMilestone: true,
+			})
+		}
+		s.fail(w, r, "internal", "The setting could not be saved.", "", saveErr.Error())
+		return
 	}
 	if s.auditor != nil {
 		s.auditor.Write(audit.Event{

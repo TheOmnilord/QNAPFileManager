@@ -274,6 +274,9 @@ func (s *Server) authenticateSession(w http.ResponseWriter, r *http.Request, old
 	// CSRF is immutable and bound to this session. Reject before waiting for
 	// its lock or admitting any forced QTS revalidation.
 	if !safeMethod(r.Method) && !validCSRF(r, old.csrf) {
+		// Audit the rejected mutation before returning: a forged or stale
+		// unsafe request must leave a denial line, not vanish silently (adv 10).
+		s.auditAuthDenied(r, old, "csrf", "CSRF or Origin check failed")
 		return nil, errCSRF
 	}
 	// Include requests that converged on this session during insertion too.

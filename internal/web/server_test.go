@@ -162,7 +162,17 @@ func fixture(t *testing.T, pinned bool) (*Server, *fakeBackend) {
 	}
 	// A real guard so the mutation routes are exercised; the fakeBackend is
 	// auto-detected as the Mutator by New.
-	return New(config.Default(), b, nil, nil, nil, p, "test", nil, guard.New("", false), nil, nil), b
+	srv := New(config.Default(), b, nil, nil, nil, p, "test", nil, guard.New("", false), nil, nil)
+	// Root maps API paths into the same temp dir the fakeBackend serves, so
+	// resolveForGuard's EvalSymlinks lands inside the fixture (matching the
+	// worker's own symlink resolution).
+	if root, err := fsx.NewRoot(b.dir); err == nil {
+		srv.Root = root
+		// resolveForGuard may open the jail handle (CanonicalAlias); close it
+		// before t.TempDir's own cleanup so Windows can remove the directory.
+		t.Cleanup(func() { _ = root.Close() })
+	}
+	return srv, b
 }
 func request(s *Server, method, target string, cookie *http.Cookie, headers map[string]string) *httptest.ResponseRecorder {
 	r := httptest.NewRequest(method, target, nil)

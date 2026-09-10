@@ -59,63 +59,92 @@ func (s *Server) postSettings(w http.ResponseWriter, r *http.Request, sess *sess
 	}
 	newVal := *body.ReadOnly
 
-	// Persist and flip the live guard under one hold of cfgMu, so the file and
-	// the running guard can never disagree: two concurrent toggles cannot save in
-	// one order and apply in the reverse (standard 5 / adv 8). A save failure
-	// leaves both the file and the guard untouched.
+	// The ENTIRE read-only transition is serialised under cfgMu and the lock is
+	// never released mid-transition (standard P1 / adv 1/8). The order is fixed:
+	//
+	//  1. record the toggle INTENT durably, BEFORE any write becomes possible;
+	//  2. persist the new value (config.Save);
+	//  3. apply it to the live guard;
+	//  4. record the result durably.
+	//
+	// So the moment writes become possible on a root daemon can never precede a
+	// durable record of it (a crash in between still leaves the intent), and two
+	// concurrent admin toggles cannot interleave: whichever takes the lock runs the
+	// whole transition to completion before the other begins, so the persisted
+	// value, the live guard and the audited result always agree. Rollback (step 4
+	// failure) uses prevVal captured inside this same held lock — never a stale
+	// snapshot read after the lock was dropped — and reports its own persistence
+	// error rather than ignoring it.
 	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+
 	prevVal := s.cfg.ReadOnly
-	var saveErr error
-	if s.ConfigPath != "" {
-		c := s.cfg
-		c.ReadOnly = newVal
-		if saveErr = config.Save(s.ConfigPath, c); saveErr == nil {
-			s.cfg.ReadOnly = newVal
+	if s.guard != nil {
+		prevVal = s.guard.ReadOnly()
+	}
+
+	auditResult := func(result, code, detail string) error {
+		if s.auditor == nil {
+			return nil
 		}
-	}
-	if saveErr == nil && s.guard != nil {
-		s.guard.SetReadOnly(newVal)
-	}
-	s.cfgMu.Unlock()
-	if saveErr != nil {
-		// A failed safety-setting change is itself audit-worthy (adv 10) and a
-		// milestone, so write it durably rather than on the drop-on-overflow queue.
-		if s.auditor != nil {
-			s.auditor.WriteSync(audit.Event{
-				Actor: sess.who.User, UID: sess.who.UID, Admin: sess.admin, Root: sess.who.Root,
-				IP: ClientIP(r), Op: "readonly", Phase: "result", Result: "error", Code: "internal",
-				Detail: fmt.Sprintf("save failed: %v", saveErr), ForceMilestone: true,
-			})
-		}
-		s.fail(w, r, "internal", "The setting could not be saved.", "", saveErr.Error())
-		return
-	}
-	if s.auditor != nil {
-		// The moment writes become possible on a root daemon is a milestone that a
-		// crash must not lose, so it must be DURABLY recorded before the toggle is
-		// acknowledged (adv 1 / standard P1). If the durable write fails, revert the
-		// toggle — restoring both the live guard and the persisted file to prevVal —
-		// and refuse, rather than leaving writes possible with no record of when.
-		if err := s.auditor.WriteSync(audit.Event{
+		return s.auditor.WriteSync(r.Context(), audit.Event{
 			Actor: sess.who.User, UID: sess.who.UID, Admin: sess.admin, Root: sess.who.Root,
-			IP: ClientIP(r), Op: "readonly", Phase: "result", Result: "ok",
+			IP: ClientIP(r), Op: "readonly", Phase: "result", Result: result, Code: code,
+			Detail: detail, ForceMilestone: true,
+		})
+	}
+
+	// 1. Durably record the INTENT before enabling any write. If it cannot be
+	//    persisted, refuse and change nothing (adv 1).
+	if s.auditor != nil {
+		if err := s.auditor.WriteSync(r.Context(), audit.Event{
+			Actor: sess.who.User, UID: sess.who.UID, Admin: sess.admin, Root: sess.who.Root,
+			IP: ClientIP(r), Op: "readonly", Phase: "intent",
 			Detail: fmt.Sprintf("readOnly=%v", newVal), ForceMilestone: true,
 		}); err != nil {
-			s.cfgMu.Lock()
-			if s.guard != nil {
-				s.guard.SetReadOnly(prevVal)
-			}
-			if s.ConfigPath != "" {
-				c := s.cfg
-				c.ReadOnly = prevVal
-				if config.Save(s.ConfigPath, c) == nil {
-					s.cfg.ReadOnly = prevVal
-				}
-			}
-			s.cfgMu.Unlock()
 			s.fail(w, r, "audit_unavailable", "The change was refused: its audit record could not be saved.", "", err.Error())
 			return
 		}
+	}
+
+	// 2. Persist. Nothing is applied yet, so a save failure leaves the live guard
+	//    and the file untouched; record the failure durably (adv 10) and refuse.
+	if s.ConfigPath != "" {
+		c := s.cfg
+		c.ReadOnly = newVal
+		if err := config.Save(s.ConfigPath, c); err != nil {
+			_ = auditResult("error", "internal", fmt.Sprintf("save failed: %v", err))
+			s.fail(w, r, "internal", "The setting could not be saved.", "", err.Error())
+			return
+		}
+		s.cfg.ReadOnly = newVal
+	}
+
+	// 3. Apply to the live guard, now that the intent is durable and the file
+	//    written.
+	if s.guard != nil {
+		s.guard.SetReadOnly(newVal)
+	}
+
+	// 4. Record the result durably. If even this fails, revert everything to
+	//    prevVal (captured under this same still-held lock) and refuse, so the
+	//    file, the live guard and the audit trail still agree that the change did
+	//    not take effect. A rollback save error is logged, not swallowed.
+	if err := auditResult("ok", "", fmt.Sprintf("readOnly=%v", newVal)); err != nil {
+		if s.guard != nil {
+			s.guard.SetReadOnly(prevVal)
+		}
+		if s.ConfigPath != "" {
+			c := s.cfg
+			c.ReadOnly = prevVal
+			if serr := config.Save(s.ConfigPath, c); serr != nil {
+				s.logger.Printf("settings rollback: could not restore readOnly=%v after an audit failure: %v", prevVal, serr)
+			} else {
+				s.cfg.ReadOnly = prevVal
+			}
+		}
+		s.fail(w, r, "audit_unavailable", "The change was refused: its audit record could not be saved.", "", err.Error())
+		return
 	}
 	writeJSON(w, map[string]any{"readOnly": newVal})
 }

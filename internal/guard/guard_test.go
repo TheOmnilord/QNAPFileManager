@@ -2,10 +2,37 @@ package guard
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"qnapfilemanager/internal/fsx"
 )
+
+// TestReasonsArePathFree proves the adv-2 fix: no guard reason (never-write,
+// mount point, or rule table) contains a filesystem path — a "/" — so a reason
+// built from a symlink-resolved path can be surfaced to the client without ever
+// disclosing that resolved spelling.
+func TestReasonsArePathFree(t *testing.T) {
+	g := New("/share/CACHEDEV1_DATA/.qpkg/QNAPFileManager", true)
+	g.SetMountPointChecker(func(p string) bool { return p == "/share/CACHEDEV1_DATA" })
+	paths := []string{
+		"/proc/1/mem", "/sys/class", "/x/.zfs/snap", "/share/new",
+		"/etc/config/smb.conf", "/mnt/HDA_ROOT/.config/x",
+		"/dev/sda", "/share/CACHEDEV1_DATA",
+		"/share/CACHEDEV1_DATA/.qpkg/QNAPFileManager/config/config.json",
+		"/share/CACHEDEV1_DATA/.qpkg/QNAPFileManager/logs/audit.jsonl",
+	}
+	ops := []Op{OpRead, OpTraverse, OpCreate, OpWrite, OpDelete, OpRename, OpChmod, OpChown}
+	for _, p := range paths {
+		for _, op := range ops {
+			for _, reason := range g.Reasons(op, p) {
+				if strings.Contains(reason, "/") {
+					t.Errorf("Reasons(%v, %q) reason contains a path: %q", op, p, reason)
+				}
+			}
+		}
+	}
+}
 
 // The eight ops, in a fixed column order the golden matrix relies on.
 var matrixOps = []struct {

@@ -1,6 +1,7 @@
 package audit
 
 import (
+	"context"
 	"encoding/base64"
 	"errors"
 	"os"
@@ -209,6 +210,46 @@ func TestNonUTF8Path(t *testing.T) {
 	}
 }
 
+// TestWriteSyncNotGatedBySlowMirror proves the standard P2 fix: a wedged QuLog
+// mirror must not turn a successfully fsynced intent into a false ErrSyncTimeout.
+// The mirror is made to block well past WriteSync's own 2s timeout; WriteSync must
+// still return nil promptly because the line is already durable, and the event
+// must be readable from the file without waiting for the mirror.
+func TestWriteSyncNotGatedBySlowMirror(t *testing.T) {
+	l, _ := openTest(t, true)
+	release := make(chan struct{})
+	l.logFn = func(qnap.Severity, string) error { <-release; return nil }
+
+	start := time.Now()
+	err := l.WriteSync(context.Background(), Event{Op: "readonly", Phase: "result", Result: "ok", ForceMilestone: true})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("WriteSync returned %v despite a durable write; a slow mirror must not fail it", err)
+	}
+	if elapsed > writeSyncTimeout {
+		t.Fatalf("WriteSync took %v; the mirror gated the durable ack", elapsed)
+	}
+	evs, err := l.Tail(10)
+	if err != nil {
+		t.Fatalf("Tail: %v", err)
+	}
+	var found bool
+	for _, e := range evs {
+		if e.Op == "readonly" && e.Phase == "result" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("milestone not durable in the file while the mirror was still blocked")
+	}
+	// Release the mirror so the writer goroutine finishes and Close can shut the
+	// file cleanly (Windows cannot remove a file that is still open).
+	close(release)
+	if err := l.Close(); err != nil {
+		t.Fatalf("Close after releasing the mirror: %v", err)
+	}
+}
+
 // TestMilestoneDropSurfaced proves the adv 10 fix: a milestone whose QuLog
 // mirror fails is counted and surfaced through errLog, not silently swallowed.
 // The audit line itself still lands in the file.
@@ -299,7 +340,7 @@ func TestFileMode0600(t *testing.T) {
 func TestWriteSyncDurable(t *testing.T) {
 	l, rec := openTest(t, true)
 	defer l.Close()
-	l.WriteSync(Event{Actor: "alice", UID: 1000, Op: "delete", Path: "/x", Phase: "intent"})
+	l.WriteSync(context.Background(), Event{Actor: "alice", UID: 1000, Op: "delete", Path: "/x", Phase: "intent"})
 	// Readable immediately, with no Close in between.
 	evs, err := l.Tail(10)
 	if err != nil {
@@ -314,8 +355,14 @@ func TestWriteSyncDurable(t *testing.T) {
 	if !found {
 		t.Fatalf("WriteSync event not durable before Close: %d events", len(evs))
 	}
-	// A forced milestone written synchronously is mirrored to QuLog.
-	l.WriteSync(Event{Op: "readonly", Phase: "result", Result: "ok", ForceMilestone: true})
+	// A forced milestone written synchronously is mirrored to QuLog. The mirror
+	// runs best-effort AFTER WriteSync has acknowledged durability (standard P2),
+	// so it is observed with a short bounded wait rather than assumed synchronous.
+	l.WriteSync(context.Background(), Event{Op: "readonly", Phase: "result", Result: "ok", ForceMilestone: true})
+	deadline := time.Now().Add(2 * time.Second)
+	for rec.count() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
 	if rec.count() == 0 {
 		t.Fatal("WriteSync milestone not mirrored to QuLog")
 	}
@@ -330,7 +377,7 @@ func TestWriteSyncReturnsErrorOnSinkFailure(t *testing.T) {
 	if err := l.w.Close(); err != nil { // sink now refuses writes
 		t.Fatalf("closing sink: %v", err)
 	}
-	if err := l.WriteSync(Event{Op: "delete", Path: "/x", Phase: "intent"}); err == nil {
+	if err := l.WriteSync(context.Background(), Event{Op: "delete", Path: "/x", Phase: "intent"}); err == nil {
 		t.Fatal("WriteSync returned nil despite a failing sink")
 	}
 }
@@ -342,9 +389,56 @@ func TestWriteSyncOnClosedLogger(t *testing.T) {
 	if err := l.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if err := l.WriteSync(Event{Op: "delete", Path: "/x", Phase: "intent"}); err == nil {
+	if err := l.WriteSync(context.Background(), Event{Op: "delete", Path: "/x", Phase: "intent"}); err == nil {
 		t.Fatal("WriteSync on a closed logger returned nil, want an error")
 	}
+}
+
+// TestWriteSyncReturnsOnContextCancel proves the adv 4 fix: once the caller's
+// context is cancelled, WriteSync returns promptly with the context error rather
+// than spending the full writeSyncTimeout on a record no one is waiting for. The
+// drain is frozen so the durable write cannot complete on its own.
+func TestWriteSyncReturnsOnContextCancel(t *testing.T) {
+	l, _ := openTest(t, false)
+	defer l.Close()
+	l.drainMu.Lock() // freeze the write goroutine inside emitSync's drainMu.Lock
+	defer l.drainMu.Unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { time.Sleep(20 * time.Millisecond); cancel() }()
+	start := time.Now()
+	err := l.WriteSync(ctx, Event{Op: "delete", Path: "/x", Phase: "intent"})
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("WriteSync did not return promptly on cancel: %v", elapsed)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("WriteSync err = %v, want context.Canceled", err)
+	}
+}
+
+// TestCloseReturnsWithinBoundWhenWedged proves the adv 4 fix: a wedged
+// write/fsync holding drainMu cannot hang Close forever; Close returns
+// ErrCloseTimeout within its (here shortened) bound. The drain is frozen so it
+// never finishes and l.done never closes.
+func TestCloseReturnsWithinBoundWhenWedged(t *testing.T) {
+	l, _ := openTest(t, false)
+	l.closeTimeout = 150 * time.Millisecond
+	l.drainMu.Lock()
+	l.Write(Event{Op: "delete", Path: "/x", Phase: "result", Result: "ok"})
+	time.Sleep(20 * time.Millisecond) // let the drain dequeue and block on drainMu
+	start := time.Now()
+	err := l.Close()
+	elapsed := time.Since(start)
+	l.drainMu.Unlock()
+	if !errors.Is(err, ErrCloseTimeout) {
+		t.Fatalf("Close err = %v, want ErrCloseTimeout", err)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("Close did not return within its bound: %v", elapsed)
+	}
+	// Let the now-unfrozen drain finish, then release the file so TempDir cleanup
+	// (Windows especially) can remove it: Close left the sink open on timeout.
+	time.Sleep(50 * time.Millisecond)
+	_ = l.w.Close()
 }
 
 // TestConfirmChallengeNotMilestone proves a routine confirmation challenge

@@ -45,6 +45,12 @@ const dropReportInterval = 5 * time.Second
 // cannot stall a mutation.
 const writeSyncTimeout = 2 * time.Second
 
+// closeDrainTimeout bounds how long Close waits for the drain goroutine and any
+// admitted durable writers to finish before it gives up (adv 4). A wedged
+// write/fsync holding drainMu must never hang shutdown forever; Close reports
+// the timeout rather than blocking indefinitely.
+const closeDrainTimeout = 5 * time.Second
+
 // syncWriters bounds the number of concurrent durable writers. A wedged sink
 // can hold at most this many goroutines, rather than one per call (adv 1): once
 // all slots are held by stuck writes, further WriteSync calls fail closed on the
@@ -124,6 +130,11 @@ type Logger struct {
 	// hold it to freeze the drain and prove Write drops instead of blocking.
 	drainMu sync.Mutex
 
+	// closeTimeout bounds Close's wait for the drain and admitted durable
+	// writers (adv 4). Defaults to closeDrainTimeout; tests shorten it so a
+	// deliberately wedged sink proves Close returns within its bound.
+	closeTimeout time.Duration
+
 	lastReported   int64
 	lastReportAt   time.Time
 	lastWriteErrAt time.Time // rate-limits the sink-failure notice (drain only)
@@ -147,7 +158,8 @@ func Open(path string, qulog bool) (*Logger, error) {
 		logFn: func(sev qnap.Severity, msg string) error {
 			return qnap.Log(context.Background(), sev, msg)
 		},
-		errLog: func(msg string) { fmt.Fprintln(os.Stderr, "qfm audit: "+msg) },
+		errLog:       func(msg string) { fmt.Fprintln(os.Stderr, "qfm audit: "+msg) },
+		closeTimeout: closeDrainTimeout,
 	}
 	go l.drain()
 	return l, nil
@@ -190,20 +202,31 @@ func (l *Logger) Write(ev Event) {
 // failure and refuses the operation (adv 1).
 var ErrSyncTimeout = errors.New("audit: durable write timed out")
 
+// ErrCloseTimeout is returned by Close when the drain and admitted durable
+// writers did not finish within closeTimeout, so a wedged write/fsync could not
+// hang shutdown forever (adv 4). The failure is also surfaced through errLog.
+var ErrCloseTimeout = errors.New("audit: close timed out draining the sink")
+
 // WriteSync writes ev straight to the sink AND fsyncs it, synchronously,
 // returning nil only once it is durably persisted. It is the path for the lines
 // a crash must not lose: a mutation's INTENT line, written before the work is
 // dispatched, and every milestone (a denial, a read-only toggle, a large
 // delete). Ordinary result lines stay on the async Write path.
 //
-// Admission is bounded by syncSem, so a wedged sink holds at most syncWriters
-// goroutines rather than one per call (adv 1). The actual write+fsync runs on a
-// worker goroutine that owns its semaphore slot until it finishes, so a stuck
-// write cannot be abandoned back into the pool; WriteSync itself stops waiting
-// after writeSyncTimeout and returns ErrSyncTimeout. On a closed logger it
+// It observes ctx: once the caller's request is cancelled or times out, WriteSync
+// returns ctx.Err() promptly rather than spending the full writeSyncTimeout on a
+// record no one is waiting for any more (adv 4). Admission is bounded by syncSem,
+// so a wedged sink holds at most syncWriters goroutines rather than one per call
+// (adv 1). The actual write+fsync runs on a worker goroutine that owns its
+// semaphore slot until it finishes, so a stuck write cannot be abandoned back
+// into the pool; WriteSync itself stops waiting after writeSyncTimeout and
+// returns ErrSyncTimeout, or sooner on ctx cancellation. On a closed logger it
 // returns os.ErrClosed. The write runs under drainMu, serialised with the drain
 // goroutine so the two never interleave on the file.
-func (l *Logger) WriteSync(ev Event) error {
+func (l *Logger) WriteSync(ctx context.Context, ev Event) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	ev = l.prepare(ev)
 	l.mu.RLock()
 	if l.closed {
@@ -223,6 +246,9 @@ func (l *Logger) WriteSync(ev Event) error {
 	// finishes, so at most syncWriters durable writes exist at once.
 	select {
 	case l.syncSem <- struct{}{}:
+	case <-ctx.Done():
+		l.syncWG.Done()
+		return ctx.Err()
 	case <-l.done:
 		l.syncWG.Done()
 		return os.ErrClosed
@@ -238,12 +264,23 @@ func (l *Logger) WriteSync(ev Event) error {
 		l.drainMu.Lock()
 		err := l.emitSync(ev)
 		l.drainMu.Unlock()
+		// Acknowledge durability BEFORE mirroring: the line is fsynced, so the
+		// caller may proceed. The QuLog mirror then runs best-effort, outside
+		// drainMu and off the ack path, still holding this syncSem slot so a
+		// wedged QuLog is bounded to syncWriters goroutines (standard P2).
 		res <- err
+		if err == nil {
+			l.mirror(ev)
+		}
 	}()
 
 	select {
 	case err := <-res:
 		return err
+	case <-ctx.Done():
+		// The write goroutine keeps its slot until it finishes (so a stuck write
+		// is not abandoned back into the pool); the caller simply stops waiting.
+		return ctx.Err()
 	case <-timer.C:
 		return ErrSyncTimeout
 	}
@@ -261,7 +298,11 @@ func (l *Logger) WriteErrors() int64 { return atomic.LoadInt64(&l.writeErrors) }
 // QuLog. The audit line still lands in the file; only the QuLog mirror was lost.
 func (l *Logger) MilestoneDrops() int64 { return atomic.LoadInt64(&l.milestoneDrops) }
 
-// Close stops the drain, flushing every queued event, and closes the file.
+// Close stops the drain, flushing every queued event, and closes the file. The
+// wait for the drain and admitted durable writers is bounded by closeTimeout: a
+// wedged write/fsync holding drainMu must not hang shutdown forever (adv 4). On
+// timeout Close surfaces the failure through errLog, returns ErrCloseTimeout, and
+// leaves the file open rather than closing a sink a writer may still be inside.
 func (l *Logger) Close() error {
 	l.mu.Lock()
 	if l.closed {
@@ -272,12 +313,28 @@ func (l *Logger) Close() error {
 	close(l.ch)
 	l.mu.Unlock()
 
-	<-l.done
-	// Join the admitted durable writers before closing the file, so an in-flight
-	// WriteSync cannot write into a closed sink (adv 1). The drain has finished
-	// and released drainMu, so a writer blocked on it now proceeds.
-	l.syncWG.Wait()
-	return l.w.Close()
+	timeout := l.closeTimeout
+	if timeout <= 0 {
+		timeout = closeDrainTimeout
+	}
+	// Join the drain goroutine and the admitted durable writers before closing the
+	// file, so an in-flight WriteSync cannot write into a closed sink (adv 1) — but
+	// under a bound, so a wedged fsync cannot block Close indefinitely (adv 4).
+	drained := make(chan struct{})
+	go func() {
+		<-l.done
+		l.syncWG.Wait()
+		close(drained)
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-drained:
+		return l.w.Close()
+	case <-timer.C:
+		l.errLog("close timed out draining the audit sink; some events may be unflushed and the file is left open")
+		return ErrCloseTimeout
+	}
 }
 
 func (l *Logger) drain() {
@@ -287,6 +344,9 @@ func (l *Logger) drain() {
 		l.emit(ev)
 		l.reportDropped(false)
 		l.drainMu.Unlock()
+		// Mirror outside drainMu so a slow QuLog cannot hold the sink lock and
+		// stall the drain of the next event (standard P2).
+		l.mirror(ev)
 	}
 	// Final pass: record any drops that accumulated after the last notice.
 	l.drainMu.Lock()
@@ -294,9 +354,10 @@ func (l *Logger) drain() {
 	l.drainMu.Unlock()
 }
 
-// emit writes one event as a JSON line and, for a milestone, mirrors it. A sink
-// write failure and a dropped milestone mirror are both counted and surfaced
-// (adv 10) rather than silently swallowed.
+// emit writes one event as a JSON line. A sink write failure is counted and
+// surfaced (adv 10) rather than silently swallowed. The QuLog mirror is NOT done
+// here: callers invoke mirror(ev) separately, OUTSIDE drainMu, so a slow QuLog
+// (qnap.Log has its own 10s timeout) cannot hold the sink lock (standard P2).
 func (l *Logger) emit(ev Event) {
 	b, err := json.Marshal(ev)
 	if err != nil {
@@ -307,21 +368,30 @@ func (l *Logger) emit(ev Event) {
 		n := atomic.AddInt64(&l.writeErrors, 1)
 		l.reportWriteErr(err, n)
 	}
+}
 
-	if l.qulog && l.logFn != nil && isMilestone(ev) {
-		if err := l.logFn(severity(ev), message(ev)); err != nil {
-			n := atomic.AddInt64(&l.milestoneDrops, 1)
-			l.errLog(fmt.Sprintf("milestone not mirrored to QuLog (%d total): %v", n, err))
-		}
+// mirror best-effort-copies a milestone to QuLog. It is deliberately called
+// OUTSIDE drainMu and, on the durable path, AFTER the caller has been told the
+// write is persisted (standard P2): qnap.Log blocks up to 10s, and that latency
+// must never hold the sink lock, stall the async drain, or turn a successfully
+// fsynced intent into a false ErrSyncTimeout. A dropped mirror is counted and
+// surfaced (adv 10); the audit line itself is already on disk regardless.
+func (l *Logger) mirror(ev Event) {
+	if !l.qulog || l.logFn == nil || !isMilestone(ev) {
+		return
+	}
+	if err := l.logFn(severity(ev), message(ev)); err != nil {
+		n := atomic.AddInt64(&l.milestoneDrops, 1)
+		l.errLog(fmt.Sprintf("milestone not mirrored to QuLog (%d total): %v", n, err))
 	}
 }
 
 // emitSync writes one event as a JSON line and fsyncs it, returning an error if
 // either the write or the fsync fails. It is the durable counterpart of emit,
 // used by WriteSync so an acknowledged intent line is truly on stable storage,
-// not merely in the OS page cache (adv 1 / standard P1). A milestone-mirror
-// failure does not fail the durable write — the audit line is already persisted;
-// the mirror miss is counted and surfaced exactly as in emit.
+// not merely in the OS page cache (adv 1 / standard P1). It does NOT mirror to
+// QuLog: the caller acknowledges durability first and then calls mirror(ev)
+// outside drainMu (standard P2), so the 10s QuLog path never gates the ack.
 func (l *Logger) emitSync(ev Event) error {
 	b, err := json.Marshal(ev)
 	if err != nil {
@@ -337,12 +407,6 @@ func (l *Logger) emitSync(ev Event) error {
 		n := atomic.AddInt64(&l.writeErrors, 1)
 		l.reportWriteErr(err, n)
 		return err
-	}
-	if l.qulog && l.logFn != nil && isMilestone(ev) {
-		if err := l.logFn(severity(ev), message(ev)); err != nil {
-			n := atomic.AddInt64(&l.milestoneDrops, 1)
-			l.errLog(fmt.Sprintf("milestone not mirrored to QuLog (%d total): %v", n, err))
-		}
 	}
 	return nil
 }

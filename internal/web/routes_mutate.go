@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -90,7 +89,7 @@ func (s *Server) auditAuthDenied(r *http.Request, sess *session, code, detail st
 	who, admin := sess.who, sess.admin
 	sess.mu.Unlock()
 	// A rejected unsafe request is a denial milestone; write it durably (adv 10).
-	s.auditor.WriteSync(audit.Event{
+	s.auditor.WriteSync(r.Context(), audit.Event{
 		Actor:          who.User,
 		UID:            who.UID,
 		Admin:          admin,
@@ -125,7 +124,7 @@ func (s *Server) auditUnauthenticated(r *http.Request, code, detail string) {
 	if s.auditor == nil {
 		return
 	}
-	s.auditor.WriteSync(audit.Event{
+	s.auditor.WriteSync(r.Context(), audit.Event{
 		IP:             ClientIP(r),
 		Op:             "auth",
 		Path:           r.URL.Path,
@@ -137,66 +136,34 @@ func (s *Server) auditUnauthenticated(r *http.Request, code, detail string) {
 	})
 }
 
-// mutation carries the identity of one audited operation.
+// mutation carries the identity of one audited operation. Every path it holds is
+// the REQUESTED (client-named) spelling; the resolved (symlink-hardened) spelling
+// used for the guard and the worker dispatch is deliberately NOT stored here, so
+// nothing that reaches the client JSON or the audit log can echo it.
+//
+// Client-facing errors are built from the error CODE (fsx.Code) plus the
+// requested path alone (disclosureFree, below); a worker or resolve error — which
+// may contain the resolved absolute OR relative path — is kept only in the
+// server-side log, never in the client "detail" or the audit Detail (adv 2). This
+// replaces the earlier fragile string-substitution approach, which could
+// double-map a resolved spelling back into its own output.
 type mutation struct {
 	op    string // "mkdir" | "rename" | "delete"
 	path  string // primary audited path (the REQUESTED spelling, client-facing)
 	dst   string // destination, for rename (requested spelling)
 	files int64  // measured file count, for a large-delete milestone (adv 10)
 	bytes int64  // measured byte total, for a large-delete milestone (adv 10)
-	// subs maps a resolved-path spelling to the requested path it must be
-	// reported as. The guard is checked on the symlink-resolved path for policy,
-	// but a verdict or worker error must never echo the resolved target back to
-	// the client: root can resolve locations the caller cannot name, which would
-	// make the guard a resolution oracle (adv resolve.go). clean() rewrites every
-	// resolved spelling to its requested counterpart before anything reaches the
-	// client or the audit log.
-	subs map[string]string
 }
 
-// clean rewrites any resolved-path spelling in msg to the requested path it
-// stands for, so neither a guard verdict nor a worker error reveals a
-// user-resolved target (adv resolve.go / round-3 finding 2 disclosure). A worker
-// error string may carry the resolved path either absolute ("/etc/config/file")
-// or relative ("etc/config/file"), so both spellings are rewritten. A nil or
-// identity subs map is a no-op. The longest resolved keys are rewritten first so
-// a parent-prefix mapping cannot pre-empt a more specific one.
-func (m mutation) clean(msg string) string {
-	if len(m.subs) == 0 {
-		return msg
+// logRaw records a worker/resolve/guard error verbatim in the SERVER-SIDE log
+// only (adv 2). The raw text can name a symlink-resolved target the caller could
+// not otherwise reach, so it must never travel to the client JSON or the audit
+// file — only here, where an operator investigating a failure can see it.
+func (s *Server) logRaw(r *http.Request, op, requested string, err error) {
+	if err == nil {
+		return
 	}
-	keys := make([]string, 0, len(m.subs))
-	for resolved := range m.subs {
-		keys = append(keys, resolved)
-	}
-	sort.Slice(keys, func(i, j int) bool { return len(keys[i]) > len(keys[j]) })
-	for _, resolved := range keys {
-		requested := m.subs[resolved]
-		if resolved == "" || resolved == requested {
-			continue
-		}
-		msg = strings.ReplaceAll(msg, resolved, requested)
-		// A relative spelling (no leading slash) can appear in a worker error,
-		// e.g. "etc/config/file" for /etc/config/file; rewrite it to the requested
-		// path's relative spelling too.
-		relResolved := strings.TrimPrefix(resolved, "/")
-		relRequested := strings.TrimPrefix(requested, "/")
-		if relResolved != "" && relResolved != resolved {
-			msg = strings.ReplaceAll(msg, relResolved, relRequested)
-		}
-	}
-	return msg
-}
-
-// addParentSub records the resolved→requested mapping for the parent directories
-// of a resolved/requested pair, so a guard verdict or worker error naming an
-// operation's parent (an OpCreate on the destination's parent, say) is rewritten
-// to the requested spelling too (adv 3 disclosure).
-func addParentSub(subs map[string]string, resolved, requested string) {
-	rp, qp := fsx.Parent(resolved), fsx.Parent(requested)
-	if rp != qp {
-		subs[rp] = qp
-	}
+	s.logger.Printf("mutation ip=%q op=%q path=%q raw error: %v", ClientIP(r), op, requested, err)
 }
 
 // writeAudit records one phase of a mutation. Durable lines — the pre-dispatch
@@ -221,7 +188,7 @@ func (s *Server) writeAudit(sess *session, r *http.Request, m mutation, phase, r
 		Phase:          phase,
 		Result:         result,
 		Code:           code,
-		Detail:         m.clean(detail),
+		Detail:         detail, // callers pass a PATH-FREE detail (adv 2); never a raw error
 		Files:          m.files,
 		Bytes:          m.bytes,
 		ForceMilestone: milestone,
@@ -232,7 +199,7 @@ func (s *Server) writeAudit(sess *session, r *http.Request, m mutation, phase, r
 	// any forced milestone are durable.
 	durable := phase == "intent" || milestone || (result == "denied" && code != "confirm_required")
 	if durable {
-		return s.auditor.WriteSync(ev)
+		return s.auditor.WriteSync(r.Context(), ev)
 	}
 	s.auditor.Write(ev)
 	return nil
@@ -262,13 +229,16 @@ func (s *Server) auditIntent(w http.ResponseWriter, r *http.Request, sess *sessi
 func (s *Server) authorize(w http.ResponseWriter, r *http.Request, sess *session, guardErr error, extraConfirm bool, m mutation, respPath string, tokenPaths []string, ordered bool, confirm string, summary guard.Summary) bool {
 	switch {
 	case errors.Is(guardErr, guard.ErrReadOnly):
-		s.writeAudit(sess, r, m, "result", "denied", "read_only", m.clean(guardErr.Error()), false)
+		s.writeAudit(sess, r, m, "result", "denied", "read_only", "read-only mode", false)
 		writeError(w, http.StatusForbidden, "read_only", "Read-only mode is on. Turn it off in Settings to make changes.", respPath, m.op, "")
 		return false
 	case errors.Is(guardErr, guard.ErrProtected):
-		msg := m.clean(guardErr.Error())
-		s.writeAudit(sess, r, m, "result", "denied", "protected", msg, false)
-		writeError(w, http.StatusForbidden, "protected", msg, respPath, m.op, "")
+		// The guard error names the (possibly symlink-resolved) path, so keep it in
+		// the server log only; the client gets a generic, path-free message plus the
+		// requested path it named (adv 2). The audit Detail is path-free too.
+		s.logRaw(r, m.op, respPath, guardErr)
+		s.writeAudit(sess, r, m, "result", "denied", "protected", "protected path", false)
+		writeError(w, http.StatusForbidden, "protected", "This location is protected and cannot be changed.", respPath, m.op, "")
 		return false
 	case errors.Is(guardErr, guard.ErrConfirmRequired) || extraConfirm:
 		if confirm != "" {
@@ -283,18 +253,17 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request, sess *session
 			// No token yet: a routine challenge, recorded but not a QuLog milestone.
 			s.writeAudit(sess, r, m, "result", "denied", "confirm_required", "confirmation required", false)
 		}
-		message := "This change needs confirmation."
-		if guardErr != nil {
-			message = m.clean(guardErr.Error())
-		}
+		// A generic, path-free message; the summary already carries the guard's
+		// path-free reasons (guard.Reasons), so the client can explain why without a
+		// resolved spelling ever appearing (adv 2).
 		token, exp := s.guard.Issue(m.op, summary, tokenPaths, ordered)
-		writeConfirmRequired(w, m.op, respPath, message, token, exp, summary)
+		writeConfirmRequired(w, m.op, respPath, "This change needs confirmation.", token, exp, summary)
 		return false
 	case guardErr != nil:
 		code := fsx.Code(guardErr)
-		detail := m.clean(guardErr.Error())
-		s.writeAudit(sess, r, m, "result", "denied", code, detail, false)
-		writeError(w, statusCode(code), code, "The change could not be completed.", respPath, m.op, detail)
+		s.logRaw(r, m.op, respPath, guardErr)
+		s.writeAudit(sess, r, m, "result", "denied", code, "", false)
+		writeError(w, statusCode(code), code, "The change could not be completed.", respPath, m.op, "")
 		return false
 	}
 	return true
@@ -321,10 +290,12 @@ func writeConfirmRequired(w http.ResponseWriter, op, path, message, token string
 func (s *Server) finish(w http.ResponseWriter, r *http.Request, sess *session, m mutation, err error, milestone bool) bool {
 	if err != nil {
 		code := fsx.Code(err)
-		detail := m.clean(err.Error())
-		s.writeAudit(sess, r, m, "result", "error", code, detail, milestone)
-		msg := backendMessage(code)
-		s.fail(w, r, code, msg, m.path, detail)
+		// The worker error can name the dispatched (resolved) path, so it goes to
+		// the server log only; the client sees the code, a generic message and the
+		// REQUESTED path (adv 2). The audit Detail stays path-free (Code carries it).
+		s.logRaw(r, m.op, m.path, err)
+		s.writeAudit(sess, r, m, "result", "error", code, "", milestone)
+		s.fail(w, r, code, backendMessage(code), m.path, "")
 		return false
 	}
 	s.writeAudit(sess, r, m, "result", "ok", "", "", milestone)
@@ -341,7 +312,11 @@ func (s *Server) finish(w http.ResponseWriter, r *http.Request, sess *session, m
 // leaks.
 func (s *Server) failResolve(w http.ResponseWriter, r *http.Request, requested string, err error) {
 	code := fsx.Code(err)
-	s.fail(w, r, code, backendMessage(code), requested, err.Error())
+	// The resolve error can name an ancestor along the resolved path (an openat
+	// failure), so keep it in the server log only; the client sees the code and
+	// the REQUESTED path alone (adv 2).
+	s.logRaw(r, "resolve", requested, err)
+	s.fail(w, r, code, backendMessage(code), requested, "")
 }
 
 // backendMessage is the plain-language message for a backend error code, shared
@@ -405,7 +380,7 @@ func (s *Server) mkdir(w http.ResponseWriter, r *http.Request, sess *session) {
 		return
 	}
 	resolvedTarget := fsx.Join(resolvedDir, body.Name)
-	m := mutation{op: "mkdir", path: target, subs: map[string]string{resolvedDir: dir, resolvedTarget: target}}
+	m := mutation{op: "mkdir", path: target}
 	// Resolution can also *erase* a protected prefix — a protected root that is
 	// itself a symlink, /etc/config -> /ordinary/config (adv 1a) — so the requested
 	// spelling is guarded too and the stricter verdict governs (worstGuard).
@@ -507,13 +482,7 @@ func (s *Server) rename(w http.ResponseWriter, r *http.Request, sess *session) {
 		s.failResolve(w, r, to, rerr)
 		return
 	}
-	m := mutation{op: "rename", path: from, dst: to, subs: map[string]string{guardFrom: from, guardTo: to}}
-	// The guard also names each operation's parent (an OpCreate on the
-	// destination's parent), so map the resolved parents back to the requested
-	// spelling too — otherwise a resolved destination parent (/etc/config for a
-	// requested /alias/new) would surface in a verdict or worker error (adv 3).
-	addParentSub(m.subs, guardFrom, from)
-	addParentSub(m.subs, guardTo, to)
+	m := mutation{op: "rename", path: from, dst: to}
 	// A rename removes the source entry from its old location and creates one at
 	// the destination — and, with overwrite, replaces whatever is already there.
 	// Guard every one of those, not just the destination's parent (standard 2 /
@@ -534,17 +503,17 @@ func (s *Server) rename(w http.ResponseWriter, r *http.Request, sess *session) {
 		s.guard.Check(guard.OpCreate, guardTo),
 	}
 	if body.Overwrite {
-		// Replacing the destination is an OpDelete on it. Check it whenever the
-		// destination exists — and, when its existence cannot be determined (a Stat
-		// error that is not "gone"), FAIL CLOSED and check it anyway (standard 2 /
-		// adv 2), rather than silently skipping the replacement guard.
-		_, statErr := s.backend.Stat(r.Context(), sess.who, to)
-		if statErr == nil || fsx.Code(statErr) != "not_found" {
-			checks = append(checks,
-				s.guard.Check(guard.OpDelete, to),
-				s.guard.Check(guard.OpDelete, guardTo),
-			)
-		}
+		// Replacing the destination is an OpDelete on it. The guard is a POLICY
+		// check on the path, not on current existence, so run it ALWAYS when
+		// overwrite is requested — regardless of whether the destination exists
+		// right now (adv 3). The earlier not_found short-circuit let a rename with
+		// overwrite:true replace an entry created after a Stat (a TOCTOU) even where
+		// the destination's own delete policy forbids it (e.g. /dev/example). The
+		// worst verdict over both the requested and the resolved spelling governs.
+		checks = append(checks,
+			s.guard.Check(guard.OpDelete, to),
+			s.guard.Check(guard.OpDelete, guardTo),
+		)
 	}
 	guardErr := worstGuard(checks...)
 	// The token binds an ordered, structured descriptor — direction and the
@@ -693,7 +662,7 @@ func (s *Server) deleteSingle(w http.ResponseWriter, r *http.Request, sess *sess
 		s.failResolve(w, r, p, rerr)
 		return
 	}
-	m := mutation{op: "delete", path: p, files: 1, subs: map[string]string{guardPath: p}}
+	m := mutation{op: "delete", path: p, files: 1}
 	// Stat the target as the user to measure it. A stat failure (gone, unreadable)
 	// simply leaves the size at zero; the guard's path rules and the worker's own
 	// error still stand.
@@ -822,13 +791,22 @@ func (s *Server) deleteBatch(w http.ResponseWriter, r *http.Request, sess *sessi
 	var succeeded, failed int
 	var succeededBytes int64
 	for i, p := range paths {
-		m := mutation{op: "delete", path: p, subs: map[string]string{resolved[i]: p}}
+		// Stop promptly if the request has been cancelled or its deadline passed,
+		// rather than grinding through the rest of a large batch after the caller
+		// is gone (adv 4). The remaining items are simply not attempted.
+		if ctxErr := r.Context().Err(); ctxErr != nil {
+			break
+		}
+		m := mutation{op: "delete", path: p}
 		res := itemResult{Path: p}
 		// An item whose path could not be resolved as the user (finding 2) is
-		// reported with the kernel's own code and never dispatched.
+		// reported with the kernel's own code and never dispatched. The raw resolve
+		// error can name a resolved ancestor, so it stays in the server log; the
+		// audit Detail is path-free (adv 2).
 		if resolveErr[i] != nil {
 			code := fsx.Code(resolveErr[i])
-			s.writeAudit(sess, r, m, "result", "denied", code, m.clean(resolveErr[i].Error()), false)
+			s.logRaw(r, "delete", p, resolveErr[i])
+			s.writeAudit(sess, r, m, "result", "denied", code, "", false)
 			res.Code = code
 			failed++
 			results = append(results, res)
@@ -845,20 +823,21 @@ func (s *Server) deleteBatch(w http.ResponseWriter, r *http.Request, sess *sessi
 		)
 		switch {
 		case errors.Is(err, guard.ErrReadOnly):
-			s.writeAudit(sess, r, m, "result", "denied", "read_only", m.clean(err.Error()), false)
+			s.writeAudit(sess, r, m, "result", "denied", "read_only", "read-only mode", false)
 			res.Code = "read_only"
 			failed++
 			results = append(results, res)
 			continue
 		case errors.Is(err, guard.ErrProtected):
-			s.writeAudit(sess, r, m, "result", "denied", "protected", m.clean(err.Error()), false)
+			s.logRaw(r, "delete", p, err)
+			s.writeAudit(sess, r, m, "result", "denied", "protected", "protected path", false)
 			res.Code = "protected"
 			failed++
 			results = append(results, res)
 			continue
 		case errors.Is(err, guard.ErrConfirmRequired):
 			if !tokenRedeemed {
-				s.writeAudit(sess, r, m, "result", "denied", "confirm_required", m.clean(err.Error()), false)
+				s.writeAudit(sess, r, m, "result", "denied", "confirm_required", "confirmation required", false)
 				res.Code = "confirm_required"
 				failed++
 				results = append(results, res)
@@ -866,7 +845,8 @@ func (s *Server) deleteBatch(w http.ResponseWriter, r *http.Request, sess *sessi
 			}
 		case err != nil:
 			code := fsx.Code(err)
-			s.writeAudit(sess, r, m, "result", "denied", code, m.clean(err.Error()), false)
+			s.logRaw(r, "delete", p, err)
+			s.writeAudit(sess, r, m, "result", "denied", code, "", false)
 			res.Code = code
 			failed++
 			results = append(results, res)
@@ -874,16 +854,22 @@ func (s *Server) deleteBatch(w http.ResponseWriter, r *http.Request, sess *sessi
 		}
 		// The item's intent must be durably recorded before its dispatch; if it
 		// cannot be, refuse this item rather than deleting without a record (adv 1).
+		// A failure here is a persistent audit outage (or a cancelled context, which
+		// WriteSync now observes), so STOP the batch rather than spending up to the
+		// per-call timeout on every one of a thousand remaining items (adv 4).
 		if aerr := s.writeAudit(sess, r, m, "intent", "", "", "", false); aerr != nil {
 			res.Code = "audit_unavailable"
 			failed++
 			results = append(results, res)
-			continue
+			break
 		}
 		// Dispatch against the resolved path (adv 1b); residual race noted in §2.0.
+		// A worker error can name the resolved path, so log it server-side only and
+		// keep the audit Detail path-free (adv 2).
 		if err := s.mutator.Delete(r.Context(), sess.who, resolved[i]); err != nil {
 			code := fsx.Code(err)
-			s.writeAudit(sess, r, m, "result", "error", code, m.clean(err.Error()), false)
+			s.logRaw(r, "delete", p, err)
+			s.writeAudit(sess, r, m, "result", "error", code, "", false)
 			res.Code = code
 			failed++
 		} else {
@@ -895,7 +881,8 @@ func (s *Server) deleteBatch(w http.ResponseWriter, r *http.Request, sess *sessi
 		results = append(results, res)
 	}
 	// Overall outcome from what actually happened (adv 6): all succeeded → "ok",
-	// none succeeded → "error", a mix → "partial".
+	// none succeeded → "error", a mix (or a batch stopped partway) → "partial".
+	attempted := len(results)
 	outcome := "ok"
 	switch {
 	case succeeded == 0:
@@ -903,16 +890,14 @@ func (s *Server) deleteBatch(w http.ResponseWriter, r *http.Request, sess *sessi
 	case failed > 0:
 		outcome = "partial"
 	}
-	// A large batch is mirrored to QuLog as one milestone carrying the ACTUAL
-	// succeeded totals and outcome, not the requested totals (adv 6 / adv 10 /
-	// standard P2).
+	// A large batch is mirrored to QuLog as one milestone whose Result is the TRUE
+	// outcome — "error" when all failed, "partial" when some failed, "ok" only when
+	// all succeeded — matching the HTTP response and Detail, never a blanket "ok"
+	// for a mostly-failed batch (adv 5/6 / standard P2). The totals are the actual
+	// succeeded ones.
 	if big {
 		bm := mutation{op: "delete", files: int64(succeeded), bytes: succeededBytes}
-		result := "ok"
-		if succeeded == 0 {
-			result = "error"
-		}
-		s.writeAudit(sess, r, bm, "result", result, "", fmt.Sprintf("batch delete: %d of %d items, %d bytes (%s)", succeeded, len(paths), succeededBytes, outcome), true)
+		s.writeAudit(sess, r, bm, "result", outcome, "", fmt.Sprintf("batch delete: %d of %d items, %d bytes (%s)", succeeded, attempted, succeededBytes, outcome), true)
 	}
-	writeJSON(w, map[string]any{"results": results, "outcome": outcome, "attempted": len(paths), "succeeded": succeeded, "failed": failed})
+	writeJSON(w, map[string]any{"results": results, "outcome": outcome, "attempted": attempted, "succeeded": succeeded, "failed": failed})
 }

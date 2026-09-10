@@ -323,17 +323,17 @@ func matches(r *Rule, p string) bool {
 // /proc and /sys are matched as whole-path prefixes. Writes to any of these
 // fail in the kernel anyway (EROFS/EPERM); the guard just makes the refusal
 // honest and early.
+// The reasons are deliberately PATH-FREE: they carry no filesystem path (not
+// even "/proc" or ".zfs"), so a reason built from a symlink-resolved path can be
+// surfaced to the client without disclosing that resolved spelling (adv 2).
 func neverWriteReason(p string) (string, bool) {
-	if fsx.IsWithin(p, "/proc") {
-		return "/proc is a kernel interface", true
-	}
-	if fsx.IsWithin(p, "/sys") {
-		return "/sys is a kernel interface", true
+	if fsx.IsWithin(p, "/proc") || fsx.IsWithin(p, "/sys") {
+		return "a kernel pseudo-filesystem", true
 	}
 	// Walk the components looking for ".zfs".
 	for _, el := range splitComponents(p) {
 		if el == ".zfs" {
-			return ".zfs is a read-only ZFS snapshot directory", true
+			return "a read-only ZFS snapshot directory", true
 		}
 	}
 	return "", false

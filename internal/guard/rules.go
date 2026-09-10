@@ -50,7 +50,7 @@ func defaultRules(installDir string, shareIsRAM bool) []Rule {
 		rules = append(rules, Rule{
 			Prefix: "/share",
 			Deny:   OpCreate,
-			Reason: "folders directly under /share live on the NAS system RAM disk and are lost on reboot",
+			Reason: "the NAS system RAM disk, where files are lost on reboot",
 			Exact:  true,
 		})
 	}

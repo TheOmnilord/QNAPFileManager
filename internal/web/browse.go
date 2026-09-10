@@ -13,8 +13,36 @@ import (
 	"strings"
 
 	"qnapfilemanager/internal/fsx"
+	"qnapfilemanager/internal/guard"
 	"qnapfilemanager/internal/platform"
 )
+
+// guardRead enforces the guard's READ denials on the REQUESTED (cleaned) path
+// before a read handler dispatches, so the file manager's own installation
+// config (which holds the break-glass password hash) and its logs (the audit
+// trail) — declared as OpRead|OpTraverse denials in guard/rules.go — cannot be
+// read back through the ordinary list/stat/text/download endpoints (standard P2).
+// Any guard denial maps to 403 protected. A nil guard (read-only fixtures) is a
+// no-op, and on a normal path Check(OpRead/OpTraverse) returns nil, so ordinary
+// reads are untouched.
+//
+// Reads deliberately check the requested path ONLY — no Resolve round-trip — so
+// the read path stays fast. Alias-bypass on reads (reaching a protected read
+// region through a symlink whose resolved target the requested spelling hides) is
+// an ACCEPTED low-severity residual: only a root-admin session runs as a
+// principal that could open those files at all, and a root admin can read them
+// over SSH regardless, so this closes no access a root admin does not already
+// have. See PLAN.md (accepted safety residuals, M1).
+func (s *Server) guardRead(w http.ResponseWriter, r *http.Request, p string, op guard.Op) bool {
+	if s.guard == nil {
+		return true
+	}
+	if err := s.guard.Check(op, p); err != nil {
+		s.fail(w, r, "protected", "This location is protected and cannot be read.", p, "")
+		return false
+	}
+	return true
+}
 
 func requestPath(r *http.Request) (string, error) {
 	q := r.URL.Query()
@@ -72,6 +100,9 @@ func boolQuery(r *http.Request, key string) (bool, error) {
 func (s *Server) list(w http.ResponseWriter, r *http.Request, sess *session) {
 	p, ok := s.path(w, r)
 	if !ok {
+		return
+	}
+	if !s.guardRead(w, r, p, guard.OpTraverse) {
 		return
 	}
 	max := s.cfg.Limits.ListMax
@@ -132,6 +163,9 @@ func (s *Server) stat(w http.ResponseWriter, r *http.Request, sess *session) {
 	if !ok {
 		return
 	}
+	if !s.guardRead(w, r, p, guard.OpRead) {
+		return
+	}
 	entry, err := s.backend.Stat(r.Context(), sess.who, p)
 	if err != nil {
 		s.backendError(w, r, p, err)
@@ -182,6 +216,9 @@ func (s *Server) roots(w http.ResponseWriter, r *http.Request, sess *session) {
 func (s *Server) download(w http.ResponseWriter, r *http.Request, sess *session) {
 	p, ok := s.path(w, r)
 	if !ok {
+		return
+	}
+	if !s.guardRead(w, r, p, guard.OpRead) {
 		return
 	}
 	f, e, err := s.backend.OpenRead(r.Context(), sess.who, p)
@@ -265,6 +302,9 @@ func (r downloadReader) Read(p []byte) (int, error) {
 func (s *Server) text(w http.ResponseWriter, r *http.Request, sess *session) {
 	p, ok := s.path(w, r)
 	if !ok {
+		return
+	}
+	if !s.guardRead(w, r, p, guard.OpRead) {
 		return
 	}
 	limit := s.cfg.Limits.MaxTextBytes

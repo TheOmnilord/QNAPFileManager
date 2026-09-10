@@ -215,6 +215,35 @@ func TestRenameOverwriteProtectedDestNotExisting(t *testing.T) {
 // TestBatchMilestoneResultReflectsOutcome proves the adv-5/6 fix: a large batch
 // where some items fail records a milestone whose Result is "partial", matching
 // the HTTP response, not a blanket "ok".
+// TestAuditContextCancellation proves the round-6 fix: only a record of work
+// that already happened (result ok/error/partial) is made cancellation-immune;
+// an intent line (empty result) and a denial stay request-scoped, so a cancelled
+// request cannot be forced to wait the full audit timeout on a wedged sink before
+// any destructive work has happened (round-4 adv 4 / round-6 std+adv).
+func TestAuditContextCancellation(t *testing.T) {
+	cases := []struct {
+		result     string
+		stillBound bool // true => the returned context must still observe the cancel
+	}{
+		{"", true},         // intent (pre-work): must stay cancellable
+		{"denied", true},   // no work happened: must stay cancellable
+		{"ok", false},      // completed work: cancellation-immune
+		{"error", false},   // dispatched then failed: still a record of an attempt
+		{"partial", false}, // batch milestone: some work happened
+	}
+	for _, tc := range cases {
+		t.Run("result="+tc.result, func(t *testing.T) {
+			parent, cancel := context.WithCancel(context.Background())
+			ctx := auditContext(parent, tc.result)
+			cancel()
+			bound := ctx.Err() != nil
+			if bound != tc.stillBound {
+				t.Fatalf("result=%q: context bound to request cancel = %v, want %v", tc.result, bound, tc.stillBound)
+			}
+		})
+	}
+}
+
 func TestBatchMilestoneResultReflectsOutcome(t *testing.T) {
 	s, b := fixture(t, true)
 	s.guard.SetReadOnly(false)

@@ -167,6 +167,27 @@ func (s *Server) logRaw(r *http.Request, op, requested string, err error) {
 	s.logger.Printf("mutation ip=%q op=%q path=%q raw error: %v", ClientIP(r), op, requested, err)
 }
 
+// auditContext picks the context for a durable audit write. A record of work
+// that ALREADY happened — a result of ok, error, or partial — is persisted with
+// a cancellation-immune context, so a client disconnecting after a successful
+// (or partly successful) mutation cannot discard the only durable proof it
+// occurred, nor turn a landed durable write into a false context.Canceled
+// (round-5 adv 1/2). WriteSync's own writeSyncTimeout still bounds the wait, so
+// dropping the deadline does not risk an unbounded block. Everything else — the
+// pre-work intent line (empty result) and denials (result "denied", no work
+// happened) — stays request-scoped, so a cancelled request or batch stops
+// promptly and a wedged sink cannot stall a live request (round-4 adv 4 /
+// round-6 std+adv). The predicate keys on the RESULT value precisely so a
+// milestone INTENT (milestone==true, result=="") is not swept in.
+func auditContext(reqCtx context.Context, result string) context.Context {
+	switch result {
+	case "ok", "error", "partial":
+		return context.WithoutCancel(reqCtx)
+	default:
+		return reqCtx
+	}
+}
+
 // writeAudit records one phase of a mutation. Durable lines — the pre-dispatch
 // intent, any real denial, and any milestone — take the synchronous sink path so
 // a crash cannot lose them (adv 10); a routine confirmation challenge and an
@@ -208,11 +229,7 @@ func (s *Server) writeAudit(sess *session, r *http.Request, m mutation, phase, r
 		// Intent (recorded before any work) and denials (no work happened) stay
 		// request-scoped, so a cancelled batch still stops promptly and a wedged
 		// sink cannot stall a live request (round-4 adv 4).
-		wctx := r.Context()
-		if milestone && result != "denied" {
-			wctx = context.WithoutCancel(r.Context())
-		}
-		return s.auditor.WriteSync(wctx, ev)
+		return s.auditor.WriteSync(auditContext(r.Context(), result), ev)
 	}
 	s.auditor.Write(ev)
 	return nil

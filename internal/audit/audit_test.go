@@ -243,6 +243,40 @@ func TestNonUTF8Dst(t *testing.T) {
 	}
 }
 
+// TestNonUTF8EtcConfigStillMirrors proves the round-13 fix: moving a non-UTF-8
+// path or destination to its base64 companion must NOT lose milestone
+// classification — a rename/write to a non-UTF-8 path under /etc/config is still
+// a milestone and still mirrored to QuLog. Before the fix, prepare cleared
+// Path/Dst before isMilestone/severity read them, dropping the mirror.
+func TestNonUTF8EtcConfigStillMirrors(t *testing.T) {
+	cases := []struct {
+		name string
+		ev   Event
+	}{
+		{"dst", Event{Op: "rename", Path: "/data/src", Dst: "/etc/config/\xffcfg", Phase: "result", Result: "ok"}},
+		{"path", Event{Op: "write", Path: "/etc/config/\xffcfg", Phase: "result", Result: "ok"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			l, rec := openTest(t, true)
+			// prepare runs classification on the cleared event; assert it via the
+			// mirror (rec) after a synchronous durable write.
+			if err := l.WriteSync(context.Background(), tc.ev); err != nil {
+				t.Fatalf("WriteSync: %v", err)
+			}
+			deadline := time.Now().Add(2 * time.Second)
+			for rec.count() == 0 && time.Now().Before(deadline) {
+				time.Sleep(5 * time.Millisecond)
+			}
+			if rec.count() == 0 {
+				t.Fatal("a non-UTF-8 /etc/config milestone was not mirrored to QuLog")
+			}
+			l.closeTimeout = time.Second
+			_ = l.Close()
+		})
+	}
+}
+
 // TestWriteSyncNotGatedBySlowMirror proves the standard P2 fix: a wedged QuLog
 // mirror must not turn a successfully fsynced intent into a false ErrSyncTimeout.
 // The mirror is made to block well past WriteSync's own 2s timeout; WriteSync must

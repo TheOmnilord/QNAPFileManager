@@ -521,7 +521,7 @@ func isMilestone(ev Event) bool {
 	if isDelete(ev.Op) && (ev.Files > bigDeleteFiles || ev.Bytes > bigDeleteBytes) {
 		return true
 	}
-	if underEtcConfig(ev.Path) || underEtcConfig(ev.Dst) {
+	if underEtcConfig(effPath(ev.Path, ev.PathB64)) || underEtcConfig(effPath(ev.Dst, ev.DstB64)) {
 		return true
 	}
 	return false
@@ -533,6 +533,22 @@ func isDelete(op string) bool {
 
 func underEtcConfig(p string) bool {
 	return p == "/etc/config" || strings.HasPrefix(p, "/etc/config/")
+}
+
+// effPath returns the path bytes to CLASSIFY on: the plain field, or the decoded
+// base64 companion when prepare() moved a non-UTF-8 value there and cleared the
+// plain field. Milestone and severity classification must see the real bytes, or
+// a rename/write to a non-UTF-8 path under /etc/config would silently lose its
+// QuLog milestone mirroring (round-13). JSON fidelity is handled separately by
+// the b64 companions; this is only for the in-process prefix tests.
+func effPath(plain, b64 string) string {
+	if plain != "" || b64 == "" {
+		return plain
+	}
+	if dec, err := base64.StdEncoding.DecodeString(b64); err == nil {
+		return string(dec)
+	}
+	return plain
 }
 
 // severity maps an event to a QuLog level: failures are errors, denials and
@@ -548,7 +564,7 @@ func severity(ev Event) qnap.Severity {
 	switch {
 	case ev.Op == "chown", ev.Op == "claim",
 		isDelete(ev.Op) && (ev.Files > bigDeleteFiles || ev.Bytes > bigDeleteBytes),
-		underEtcConfig(ev.Path) || underEtcConfig(ev.Dst):
+		underEtcConfig(effPath(ev.Path, ev.PathB64)) || underEtcConfig(effPath(ev.Dst, ev.DstB64)):
 		return qnap.Warning
 	}
 	return qnap.Info

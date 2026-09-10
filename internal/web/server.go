@@ -94,7 +94,35 @@ func (s *Server) Handler() http.Handler {
 		mux.Handle("/", inner)
 		h = mux
 	}
-	return s.security(h)
+	return s.security(collapseLeadingSlashes(h))
+}
+
+// collapseLeadingSlashes rewrites "//app.css" to "/app.css" before routing.
+//
+// QTS's reverse proxy strips QPKG_PROXY_PATH and joins its target
+// "http://127.0.0.1:8770/" with what is left of the request path, so
+// "/qnapfilemanager/app.css" reaches this daemon as "//app.css". Left alone,
+// http.ServeMux cleans that path and answers a 307 to "/app.css"; the proxy
+// rewrites the Location back to "/qnapfilemanager/app.css", the browser
+// follows it, and the loop repeats — observed on QTS 5.2.9 and QuTS hero alike
+// as a shell with no stylesheet, no script and every API call looping. Only
+// the bare "/qnapfilemanager" survived, because it forwards as "/". The doubled
+// slash is an artefact of the join, not a path the client asked for, so it is
+// normalised here instead of redirected.
+func collapseLeadingSlashes(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "//") {
+			r2 := r.Clone(r.Context())
+			u := *r.URL
+			u.Path = "/" + strings.TrimLeft(u.Path, "/")
+			if u.RawPath != "" {
+				u.RawPath = "/" + strings.TrimLeft(u.RawPath, "/")
+			}
+			r2.URL = &u
+			r = r2
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) serve(w http.ResponseWriter, r *http.Request) {

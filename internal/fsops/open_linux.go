@@ -285,7 +285,12 @@ func openFinal(rt *os.Root, rel string) (*os.File, error) {
 // O_NOFOLLOW is the rule openFinal keeps for the same reason: resolve() has
 // already followed every link on this path, so a symlink standing here is one
 // that appeared underneath us, and ELOOP says so rather than following it.
-func openDir(rt *os.Root, rel string) (*os.File, error) {
+//
+// osName is the directory's full OS path, used only to name the *os.File:
+// DirEntry.Info lstat's f.Name()+"/"+entry, so a jail-relative name would be
+// resolved against the process working directory and every entry would look
+// unlinked (the round-eight CI failure: every Linux listing came back empty).
+func openDir(rt *os.Root, rel, osName string) (*os.File, error) {
 	dir, base := splitFinal(rel)
 	if base == "" || base == "." || base == ".." {
 		// The jail base itself, or a name openat cannot address on its own.
@@ -306,7 +311,7 @@ func openDir(rt *os.Root, rel string) (*os.File, error) {
 	}
 	// A real O_RDONLY descriptor, so os.File.ReadDir reads it with getdents the
 	// way it reads any directory opened through os.Open.
-	return os.NewFile(uintptr(fd), rel), nil
+	return os.NewFile(uintptr(fd), osName), nil
 }
 
 // checkTraversable asks the kernel whether this process may search dir, and

@@ -375,7 +375,8 @@ func List(ctx context.Context, r fsx.Root, plat *platform.Platform, dir string, 
 	if err := ctx.Err(); err != nil {
 		return fsx.Listing{}, err
 	}
-	f, err := openDir(tg.rt, tg.rel)
+	osDir, _ := r.OS(tg.api) // names the handle and keys the mount table; never a syscall path
+	f, err := openDir(tg.rt, tg.rel, osDir)
 	if err != nil {
 		// O_DIRECTORY reports "this is not a directory" as ENOTDIR, which the
 		// API vocabulary spells bad_request. An lstat tells that apart from a
@@ -400,7 +401,6 @@ func List(ctx context.Context, r fsx.Root, plat *platform.Platform, dir string, 
 
 	shareDir := clean == "/share"
 	volRoots := volumeRootNames(plat, shareDir)
-	osDir, _ := r.OS(tg.api) // for the mount table only; never for a syscall
 	mounts := childMountPoints(plat, osDir)
 	ids := IDMap()
 

@@ -12,7 +12,7 @@ import "os"
 // where Linux now asks only for search. Stricter than the kernel rather than
 // looser, and for the same reason statAt gives: this platform is the Windows
 // dev box, whose ACLs have no "search but not read" shape to get wrong.
-func openDir(rt *os.Root, rel string) (*os.File, error) {
+func openDir(rt *os.Root, rel, _ string) (*os.File, error) {
 	return rt.OpenFile(rel, os.O_RDONLY, 0)
 }
 

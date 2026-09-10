@@ -94,3 +94,24 @@ then `qbuild --root /Tailscale --build-arch $ARCH --build-dir /out`). GitBackup 
 - Recycle bin: `@Recycle` inside each shared folder is maintained by File Station/Samba logic with a private metadata store; a direct `rename` into it will not restore correctly, so the app needs its own trash.
 - Unsigned QPKGs install through App Center's *Install Manually* with a warning; on newer firmware the setting "Allow installation of applications without a valid digital signature" must be on.
 - Architectures: `x86_64` and `arm_64` (aarch64); 32-bit ARM models are not targeted.
+
+## 5. Verified on real hardware (2026-09-10)
+
+Two units: a QuTS hero NAS at 192.168.1.99 (firmware 5.2.9, x86_64, install path `/share/ZFS530_DATA/.qpkg/QNAPFileManager`)
+and a QTS NAS (also 5.2.x). Both behave identically for the points below.
+
+- `QPKG_DESKTOP_APP="1"` with `QPKG_USE_PROXY="1"` opens the app as a window inside the QTS desktop with the package's
+  display name as the title. App Center writes `WebUI = /qnapfilemanager/` and `Proxy_Path = /qnapfilemanager` into
+  `/etc/config/qpkg.conf` (also mirrored at `/mnt/HDA_ROOT/.config/qpkg.conf`); no Apache file under `/etc/config/apache`
+  mentions the package, so the proxy is driven from `qpkg.conf` directly.
+- **The proxy strips the prefix and joins with a doubled slash**: `/qnapfilemanager/app.css` reaches the daemon as
+  `//app.css`; the bare `/qnapfilemanager` reaches it as `/`. Responses' `Location` headers are rewritten back under the
+  prefix (ProxyPassReverse-style). Go's `http.ServeMux` cleans `//app.css` and answers 307, which produced an infinite
+  redirect loop until `collapseLeadingSlashes` normalised the path (commit ce1f266).
+- The proxy forwards on both `http://<nas>:8080/qnapfilemanager` and `https://<nas>/qnapfilemanager`.
+- QTS adds its own `Content-Security-Policy: script-src 'self' 'unsafe-inline' 'unsafe-eval'; object-src 'self';
+  worker-src 'self' blob:` header to proxied responses; the app's stricter CSP is delivered alongside it and both apply.
+- `getcfg System Version` prints `5.2.9` on hero (no `h` prefix); `Web Access Port` is 8080; `ps` shows the root daemon as
+  user `admin` (uid 0). A non-root SSH user cannot read the package's 0700 `logs/` directory: use `sudo`.
+- Still unverified: cookie names and attributes inside the desktop window, `authLogin.cgi` validation fields,
+  forwarded headers set by the proxy.

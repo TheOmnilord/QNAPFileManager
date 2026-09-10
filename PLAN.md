@@ -91,8 +91,8 @@ Ordering: `platform` before `fsops`; `workerpool` before any write path; `idmap.
 
 ## Must verify on the real NAS (QTS and hero; blocks M1 sign-off)
 
-1. The Apache rule QTS writes for `QPKG_PROXY_PATH`, whether it strips the prefix, and which forwarded headers it sets.
-2. Whether App Center accepts `QPKG_WEB_PORT` bound to `127.0.0.1`, and whether `QPKG_DESKTOP_APP=1` with the proxy opens a desktop window; the resulting iframe URL.
+1. ~~The Apache rule QTS writes for `QPKG_PROXY_PATH`, whether it strips the prefix~~ Verified 2026-09-10: the prefix is stripped and the remainder is joined with a doubled slash (see docs/research/qts-integration-facts.md §5). Still open: which forwarded headers it sets.
+2. ~~Whether App Center accepts `QPKG_WEB_PORT` bound to `127.0.0.1`, and whether `QPKG_DESKTOP_APP=1` with the proxy opens a desktop window~~ Verified 2026-09-10: both work on QTS and QuTS hero. Still open: the exact iframe URL.
 3. `QPKG_VISIBLE` semantics and whether non-admins need an App Center app permission to see the tile.
 4. Cookie names and attributes (`NAS_USER`, `qtoken`, `NAS_SID`; `Secure`, `SameSite`, `Path`).
 5. Whether `authLogin.cgi` validation returns `username` (gates the `sid` path) and `isAdmin` (gates admin over SSO); rate limiting or QuLog noise per call; QuFirewall on loopback.

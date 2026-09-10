@@ -257,8 +257,36 @@ func (s *Server) static(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, "not_found", "No such asset.", "", "")
 		return
 	}
+	if name == "index.html" {
+		data = s.shellWithBase(data)
+	}
 	w.Header().Set("Content-Type", ct)
 	if r.Method != "HEAD" {
 		_, _ = w.Write(data)
 	}
+}
+
+// basePath is the absolute path every asset and API URL is built under:
+// QPKG_PROXY_PATH plus a slash behind the QTS proxy, "/" otherwise.
+func (s *Server) basePath() string {
+	return strings.TrimSuffix(s.cfg.Web.ProxyPrefix, "/") + "/"
+}
+
+// shellWithBase rewrites the shell's two asset references to absolute URLs
+// under basePath and injects that base for the scripts.
+//
+// The QTS desktop opens the app at the bare proxy path, "/qnapfilemanager"
+// with no trailing slash (seen in the browser's network tab on the first
+// hardware test): a relative "app.css" then resolves to "/app.css" on the QTS
+// origin, outside the proxy, and QTS answers its own 404. Absolute URLs under
+// the configured prefix hold whatever the document URL looks like, and they
+// still work on the loopback port, where the mux serves the prefix too. The
+// base travels as a meta element rather than <base>, which the CSP forbids.
+func (s *Server) shellWithBase(shell []byte) []byte {
+	base := s.basePath()
+	out := string(shell)
+	out = strings.Replace(out, `href="app.css"`, `href="`+base+`app.css"`, 1)
+	out = strings.Replace(out, `src="js/app.js"`, `src="`+base+`js/app.js"`, 1)
+	out = strings.Replace(out, `<meta charset="utf-8">`, `<meta charset="utf-8"><meta name="qfm-base" content="`+base+`">`, 1)
+	return []byte(out)
 }

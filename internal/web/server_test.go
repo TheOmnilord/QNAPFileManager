@@ -216,9 +216,15 @@ func TestStaticShellWithInvalidSession(t *testing.T) {
 					{"/js/app.js", "js/app.js", "text/javascript"},
 				} {
 					w := request(s, "GET", prefix+asset.path, cookie, headers)
-					want, err := assets.ReadFile("static/" + asset.name)
+					raw, err := assets.ReadFile("static/" + asset.name)
 					if err != nil {
 						t.Fatal(err)
+					}
+					want := raw
+					if asset.name == "index.html" {
+						// The shell is the one asset served with the base injected;
+						// it must still carry no session data (checked below).
+						want = s.shellWithBase(raw)
 					}
 					if w.Code != http.StatusOK || !strings.HasPrefix(w.Header().Get("Content-Type"), asset.ct) || w.Body.String() != string(want) {
 						t.Fatalf("public asset %s: %d %s", prefix+asset.path, w.Code, w.Body)

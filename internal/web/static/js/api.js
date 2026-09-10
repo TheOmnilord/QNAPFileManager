@@ -19,7 +19,11 @@ export function signInNotice() {
  $('#ctxMenu').replaceChildren(); $('#ctxMenu').hidden = true;
  connectionNotice('Sign in to QTS to continue','Your session has ended. Sign in on the QTS desktop, then retry here.');
 }
-export function apiURL(endpoint,params={}) { return endpoint + (Object.keys(params).length ? '?' + new URLSearchParams(params) : ''); }
+// The server injects the absolute base ("/qnapfilemanager/" behind the QTS
+// proxy, "/" otherwise): the QTS desktop opens the app at the bare proxy path,
+// so a relative "api/..." would resolve outside the proxy and hit QTS's 404.
+const base = (typeof document !== 'undefined' && document.querySelector('meta[name="qfm-base"]')?.content) || '';
+export function apiURL(endpoint,params={}) { return base + endpoint + (Object.keys(params).length ? '?' + new URLSearchParams(params) : ''); }
 export async function api(endpoint,params={},options={}) {
  const valid=sessionGuard();
  const headers = new Headers(options.headers);

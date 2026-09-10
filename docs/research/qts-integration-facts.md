@@ -104,10 +104,11 @@ and a QTS NAS (also 5.2.x). Both behave identically for the points below.
   display name as the title. App Center writes `WebUI = /qnapfilemanager/` and `Proxy_Path = /qnapfilemanager` into
   `/etc/config/qpkg.conf` (also mirrored at `/mnt/HDA_ROOT/.config/qpkg.conf`); no Apache file under `/etc/config/apache`
   mentions the package, so the proxy is driven from `qpkg.conf` directly.
-- **The proxy strips the prefix and joins with a doubled slash**: `/qnapfilemanager/app.css` reaches the daemon as
-  `//app.css`; the bare `/qnapfilemanager` reaches it as `/`. Responses' `Location` headers are rewritten back under the
-  prefix (ProxyPassReverse-style). Go's `http.ServeMux` cleans `//app.css` and answers 307, which produced an infinite
-  redirect loop until `collapseLeadingSlashes` normalised the path (commit ce1f266).
+- **The proxy keeps the prefix and joins with a doubled slash**: the target is `http://127.0.0.1:8770/qnapfilemanager/`, so
+  `/qnapfilemanager/app.css` reaches the daemon as `/qnapfilemanager//app.css` and the bare `/qnapfilemanager` as
+  `/qnapfilemanager/`. Go's `http.ServeMux` cleans the doubled slash and answers 307 to the cleaned path, which is the URL
+  the browser already asked for: an infinite loop until every doubled slash was collapsed before routing (commits ce1f266
+  and its follow-up). The desktop opens the app at the bare path, so the shell must use absolute URLs under the prefix.
 - The proxy forwards on both `http://<nas>:8080/qnapfilemanager` and `https://<nas>/qnapfilemanager`.
 - QTS adds its own `Content-Security-Policy: script-src 'self' 'unsafe-inline' 'unsafe-eval'; object-src 'self';
   worker-src 'self' blob:` header to proxied responses; the app's stricter CSP is delivered alongside it and both apply.

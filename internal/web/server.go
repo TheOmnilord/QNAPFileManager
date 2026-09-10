@@ -94,35 +94,43 @@ func (s *Server) Handler() http.Handler {
 		mux.Handle("/", inner)
 		h = mux
 	}
-	return s.security(collapseLeadingSlashes(h))
+	return s.security(collapseDoubleSlashes(h))
 }
 
-// collapseLeadingSlashes rewrites "//app.css" to "/app.css" before routing.
+// collapseDoubleSlashes rewrites "/qnapfilemanager//app.css" to
+// "/qnapfilemanager/app.css" before routing.
 //
-// QTS's reverse proxy strips QPKG_PROXY_PATH and joins its target
-// "http://127.0.0.1:8770/" with what is left of the request path, so
-// "/qnapfilemanager/app.css" reaches this daemon as "//app.css". Left alone,
-// http.ServeMux cleans that path and answers a 307 to "/app.css"; the proxy
-// rewrites the Location back to "/qnapfilemanager/app.css", the browser
-// follows it, and the loop repeats — observed on QTS 5.2.9 and QuTS hero alike
-// as a shell with no stylesheet, no script and every API call looping. Only
-// the bare "/qnapfilemanager" survived, because it forwards as "/". The doubled
-// slash is an artefact of the join, not a path the client asked for, so it is
-// normalised here instead of redirected.
-func collapseLeadingSlashes(next http.Handler) http.Handler {
+// QTS's reverse proxy joins its target "http://127.0.0.1:8770/qnapfilemanager/"
+// with the remainder of the request path, so "/qnapfilemanager/app.css" reaches
+// this daemon as "/qnapfilemanager//app.css" (and the bare "/qnapfilemanager"
+// as "/qnapfilemanager/", which is why the shell alone loaded). Left alone,
+// http.ServeMux cleans the doubled slash and answers a 307 to the cleaned path,
+// which is the very URL the browser asked for, so it loops forever — observed
+// on QTS 5.2.9 and QuTS hero alike as a shell with no stylesheet and no
+// script. The doubled slash is an artefact of the join, not something the
+// client asked for, so it is normalised here instead of redirected. Every
+// run of slashes anywhere in the path collapses; no filename can contain one.
+func collapseDoubleSlashes(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "//") {
+		if strings.Contains(r.URL.Path, "//") {
 			r2 := r.Clone(r.Context())
 			u := *r.URL
-			u.Path = "/" + strings.TrimLeft(u.Path, "/")
+			u.Path = squeezeSlashes(u.Path)
 			if u.RawPath != "" {
-				u.RawPath = "/" + strings.TrimLeft(u.RawPath, "/")
+				u.RawPath = squeezeSlashes(u.RawPath)
 			}
 			r2.URL = &u
 			r = r2
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func squeezeSlashes(p string) string {
+	for strings.Contains(p, "//") {
+		p = strings.ReplaceAll(p, "//", "/")
+	}
+	return p
 }
 
 func (s *Server) serve(w http.ResponseWriter, r *http.Request) {

@@ -950,6 +950,11 @@ func (p *Pool) spawn(ctx context.Context, who backend.Principal) (*client, error
 		c, err = p.spawnProcess(who)
 	}
 	if err != nil {
+		// A fork/exec failure (a non-root worker that cannot traverse the
+		// install tree or execute the binary) is otherwise invisible: the
+		// caller only sees the mapped error code. Name it here so the reason
+		// is in the log the first time, not after a round trip.
+		p.opts.Logger.Printf("workerpool: could not start the worker for %s (uid %d): %v", who.Key(), who.UID, err)
 		return nil, err
 	}
 	go c.readLoop(p.opts.Logger)

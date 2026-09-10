@@ -45,6 +45,17 @@ start)
         exit 0
     fi
     mkdir -p "$QPKG_ROOT/logs" "$QPKG_ROOT/config"
+    # The daemon starts as root and forks one worker per signed-in user, each
+    # dropping to that user's uid and re-execing this binary. The kernel then
+    # checks exec permission and every path component against that non-root uid,
+    # so the install tree must be traversable and the binary executable by all
+    # — App Center creates the tree owner-only (0755), which denied every
+    # worker and made browsing fail with "permission" then "internal". Open
+    # traversal (o+x, not read) on the tree and read+exec on the binary; the
+    # config dir stays 0700 so nothing under it is exposed.
+    chmod a+x "$QPKG_ROOT" "$QPKG_ROOT/bin" "$QPKG_ROOT/libexec" 2>/dev/null
+    chmod a+rx "$QPKG_ROOT/bin/qnapfilemanager" 2>/dev/null
+    chmod 700 "$QPKG_ROOT/config" 2>/dev/null
     # App Center may invoke this script from a directory that no longer
     # exists; give the daemon a valid cwd.
     cd "$QPKG_ROOT" || exit 1

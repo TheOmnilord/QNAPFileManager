@@ -98,6 +98,7 @@ func Run(ctx context.Context, rw io.ReadWriter, o Options) error {
 		opts:     o,
 		sem:      make(chan struct{}, o.MaxConcurrent),
 		inflight: map[uint64]context.CancelFunc{},
+		jobs:     map[string]context.CancelFunc{},
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -128,6 +129,15 @@ type session struct {
 	// across a handler or a write.
 	inflightMu sync.Mutex
 	inflight   map[uint64]context.CancelFunc
+
+	// jobs holds one cancel function per running job, keyed by the JobID the
+	// front-end chose (identity plan §2.5). It is separate from inflight
+	// because the two identifiers are: a job outlives any single frame, and the
+	// front-end's jobs.Manager knows the job by its own id long after it has
+	// forgotten which request frame started it. Guarded by jobsMu, which is
+	// never held across a handler or a write.
+	jobsMu sync.Mutex
+	jobs   map[string]context.CancelFunc
 
 	// fatalOnce/fatalErr record the first unrecoverable transport failure.
 	fatalOnce sync.Once
@@ -183,6 +193,33 @@ func (s *session) cancelRequest(id uint64) {
 	s.inflightMu.Lock()
 	cancel := s.inflight[id]
 	s.inflightMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// beginJob registers a running job's cancel function under its JobID.
+func (s *session) beginJob(id string, cancel context.CancelFunc) {
+	s.jobsMu.Lock()
+	s.jobs[id] = cancel
+	s.jobsMu.Unlock()
+}
+
+// endJob unregisters a job that has finished. The job's own defer cancels its
+// context; this only drops the name.
+func (s *session) endJob(id string) {
+	s.jobsMu.Lock()
+	delete(s.jobs, id)
+	s.jobsMu.Unlock()
+}
+
+// cancelJob stops a running job by its JobID. An id that is not running is not
+// an error, for the same reason cancelRequest's is not: the job finishing and
+// the user pressing cancel race by nature.
+func (s *session) cancelJob(id string) {
+	s.jobsMu.Lock()
+	cancel := s.jobs[id]
+	s.jobsMu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
@@ -381,6 +418,9 @@ func (s *session) cancel(f wproto.Frame) {
 	if req.ReqID != 0 {
 		s.cancelRequest(req.ReqID)
 	}
+	if req.JobID != "" {
+		s.cancelJob(req.JobID)
+	}
 	s.replyOK(f.ID, nil)
 }
 
@@ -434,6 +474,10 @@ func (s *session) dispatch(ctx context.Context, f wproto.Frame) {
 		s.delete(ctx, f)
 	case wproto.OpOpenRead:
 		s.openRead(ctx, f)
+	case wproto.OpJob:
+		s.runJob(ctx, f)
+	case wproto.OpTrashList:
+		s.trashList(ctx, f)
 	default:
 		s.replyErr(f.ID, fmt.Errorf("the %q operation is not implemented by this worker: %w", f.Op, fsx.ErrUnsupported), nil)
 	}

@@ -306,6 +306,31 @@ func (c *client) deliver(f wproto.Frame, files []*os.File, terminal bool, logger
 		default:
 			// The caller is not reading (a job's progress frames outran it).
 		}
+		if terminal {
+			// A terminal frame is the one thing that must never be dropped. A
+			// job's caller is waiting for exactly this frame, and the id has
+			// just been taken out of the table above, so a drop here would be a
+			// call that waits for a reply which has already come and gone —
+			// until the context or the worker's death ended it, long after the
+			// job itself had finished. Room is made by discarding the oldest
+			// buffered frame instead, which is a superseded Prog or a Warn: the
+			// two the contract explicitly allows to be lost, because the
+			// terminal JobResult folds the warning count in (wproto.JobResult).
+			// Only deliver (one goroutine) and fail (after clearing the table)
+			// ever send here, and a reader only makes more room, so one slot is
+			// enough.
+			select {
+			case dropped := <-p.ch:
+				closeAll(dropped.files)
+			default:
+			}
+			select {
+			case p.ch <- result{f: f, files: files}:
+				c.mu.Unlock()
+				return
+			default:
+			}
+		}
 	}
 	c.mu.Unlock()
 

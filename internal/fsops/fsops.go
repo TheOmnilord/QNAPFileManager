@@ -492,6 +492,24 @@ func relJoin(dir, name string) string {
 	return dir + "/" + name
 }
 
+// splitFinal splits a root-relative slash path into the directory to open and
+// the final component to open inside it. A path with no separator lives in the
+// root itself, which os.Root spells ".".
+//
+// It lives here rather than beside the openat helpers that were its first
+// callers (open_linux.go) because the recursive walk needs it on every platform
+// and there is nothing platform-specific about splitting a slash path.
+func splitFinal(rel string) (dir, base string) {
+	if i := strings.LastIndexByte(rel, '/'); i >= 0 {
+		dir, base = rel[:i], rel[i+1:]
+		if dir == "" {
+			dir = "."
+		}
+		return dir, base
+	}
+	return ".", rel
+}
+
 // apiOf renders resolved components as an API path.
 func apiOf(parts []string) string {
 	if len(parts) == 0 {

@@ -511,20 +511,6 @@ func checkTraversable(j fsx.Jail, dir string) error {
 	return nil
 }
 
-// splitFinal splits a root-relative slash path into the directory to open and
-// the final component to open inside it. A path with no separator lives in the
-// root itself, which os.Root spells ".".
-func splitFinal(rel string) (dir, base string) {
-	if i := strings.LastIndexByte(rel, '/'); i >= 0 {
-		dir, base = rel[:i], rel[i+1:]
-		if dir == "" {
-			dir = "."
-		}
-		return dir, base
-	}
-	return ".", rel
-}
-
 // clearNonblock puts a descriptor opened with O_NONBLOCK back into blocking
 // mode, so the streaming read above behaves like every other file read. It is
 // called only after fstat has proved the file is regular; a regular file is

@@ -432,6 +432,171 @@ func TestEnsureDoesNotRetryAProvenanceRefusal(t *testing.T) {
 	}
 }
 
+// TestEnsureBoundsPublicationsAcrossAMixedSequence is the round-5 review: the
+// budget belongs to EVERY publication, not only to the stale ones.
+//
+// The two bounds used to be enforced in separate places — maxPublishAttempts by
+// the errStale branch and a single extra pass by raced — and neither one knew
+// what the other had spent. So a MIXED sequence slipped between them. Two stale
+// refusals spend the publication budget; the third publication then loses the
+// race at step (e), and the winner is gone again by the time the next pass looks
+// for it (published and withdrawn, or never durable), so the lookup falls
+// through to the creation path with the budget already spent and root created a
+// FOURTH temporary directory. The same hole ran the other way round: the single
+// extra pass a lost race is allowed became another publication when it came back
+// stale.
+//
+// The fix is one check in front of every publication, so the subtests below
+// count publications — one pinned temporary name is consumed per publish, which
+// is one mkdirat — rather than passes. The lookup is still allowed on every
+// pass: that is how a winner is adopted, and only the publication is budgeted.
+func TestEnsureBoundsPublicationsAcrossAMixedSequence(t *testing.T) {
+	// eexist is what renameat2(RENAME_NOREPLACE) reports when somebody else
+	// already published the trash directory (step (e), errPublishedFirst).
+	eexist := func() error { return &fs.PathError{Op: "renameat", Path: DirName, Err: syscall.EEXIST} }
+	distinct := func(t *testing.T, names []string) {
+		t.Helper()
+		seen := make(map[string]bool, len(names))
+		for _, n := range names {
+			if seen[n] {
+				t.Errorf("the temporary name %q was used twice: a retry publishes a new directory, it does not repair a name", n)
+			}
+			seen[n] = true
+		}
+	}
+
+	t.Run("stale, stale, then a lost race whose winner vanished", func(t *testing.T) {
+		root := tempMount(t)
+		plat := storageAt(t, root)
+		names := pinTempNameSeries(t)
+		// The first two publications are refused for their TIMESTAMP alone: the
+		// reference is read an hour behind the inode the mkdirat then really does
+		// create, which is the stall R4-1 is about. Nothing is substituted, so each
+		// one is cleaned up and retried.
+		pinNow(t, -time.Hour, -time.Hour)
+		lines := pinLogf(t)
+		// The third publication is fresh and so reaches step (e), where the name is
+		// already taken — and nothing is left at it, so the next pass's lookup finds
+		// no winner to adopt and arrives at the creation path with the budget spent.
+		renames := 0
+		pinPublishRename(t, func(*os.File, string, string) error {
+			renames++
+			return eexist()
+		})
+
+		dir, created, err := Ensure(plat, filepath.Join(root, "Public"))
+		if !errors.Is(err, ErrUnsafeTrash) {
+			t.Fatalf("Ensure = %q,%v,%v — want ErrUnsafeTrash once the publication budget is spent", dir, created, err)
+		}
+		if len(*names) != maxPublishAttempts {
+			t.Fatalf("publications = %d (%v), want %d: a mixed sequence must not start a fourth temporary directory",
+				len(*names), *names, maxPublishAttempts)
+		}
+		distinct(t, *names)
+		if renames != 1 {
+			t.Errorf("step (e) was reached %d times, want once: the first two attempts must fail in the provenance check", renames)
+		}
+		if !strings.Contains(err.Error(), "permitted publication attempts") {
+			t.Errorf("the refusal is not the spent-budget one, so the two bounds are still being counted apart: %v", err)
+		}
+		if _, serr := os.Lstat(filepath.Join(root, DirName)); !errors.Is(serr, fs.ErrNotExist) {
+			t.Errorf("something was published as the trash directory: %v", serr)
+		}
+		if rest := leftovers(t, root); len(rest) != 0 {
+			t.Errorf("the mount root still holds %v: a refused attempt left a temporary directory behind", rest)
+		}
+		if len(*lines) != 3 {
+			t.Fatalf("Logf lines = %v, want three: two stale retries and the lost race", *lines)
+		}
+		for i, line := range (*lines)[:2] {
+			if !strings.Contains(line, "under a new name") {
+				t.Errorf("Logf line %d is not the stale retry: %q", i, line)
+			}
+		}
+		if line := (*lines)[2]; !strings.Contains(line, "published the trash directory first") {
+			t.Errorf("the lost race was not logged: %q", line)
+		}
+	})
+
+	t.Run("a lost race followed by stale results", func(t *testing.T) {
+		root := tempMount(t)
+		plat := storageAt(t, root)
+		names := pinTempNameSeries(t)
+		// The first publication is fresh and loses the race; the extra pass raced
+		// buys then comes back stale, which used to stretch that one pass into an
+		// unbounded run of publications.
+		pinNow(t, 0, -time.Hour, -time.Hour)
+		lines := pinLogf(t)
+		renames := 0
+		pinPublishRename(t, func(*os.File, string, string) error {
+			renames++
+			return eexist()
+		})
+
+		dir, created, err := Ensure(plat, filepath.Join(root, "Public"))
+		if !errors.Is(err, ErrUnsafeTrash) {
+			t.Fatalf("Ensure = %q,%v,%v — want ErrUnsafeTrash", dir, created, err)
+		}
+		if len(*names) != maxPublishAttempts {
+			t.Fatalf("publications = %d (%v), want at most %d: the extra pass after a lost race is still budgeted",
+				len(*names), *names, maxPublishAttempts)
+		}
+		distinct(t, *names)
+		if renames != 1 {
+			t.Errorf("step (e) was reached %d times, want once: only the first attempt was fresh", renames)
+		}
+		if _, serr := os.Lstat(filepath.Join(root, DirName)); !errors.Is(serr, fs.ErrNotExist) {
+			t.Errorf("something was published as the trash directory: %v", serr)
+		}
+		if rest := leftovers(t, root); len(rest) != 0 {
+			t.Errorf("the mount root still holds %v: a refused attempt left a temporary directory behind", rest)
+		}
+		if len(*lines) != 2 {
+			t.Fatalf("Logf lines = %v, want two: the lost race and the one stale retry that was still affordable", *lines)
+		}
+		if line := (*lines)[0]; !strings.Contains(line, "published the trash directory first") {
+			t.Errorf("the lost race was not logged: %q", line)
+		}
+		if line := (*lines)[1]; !strings.Contains(line, "under a new name") {
+			t.Errorf("Logf line 1 is not the stale retry: %q", line)
+		}
+	})
+
+	t.Run("the third publication is still allowed to succeed", func(t *testing.T) {
+		// The other side of the check, and the off-by-one it could have introduced:
+		// the budget is tested BEFORE the counter is incremented, so two stale
+		// refusals must still leave the third publication — the last permitted one —
+		// free to succeed. A slow filesystem is not a failed delete.
+		root := tempMount(t)
+		plat := storageAt(t, root)
+		names := pinTempNameSeries(t)
+		pinNow(t, -time.Hour, -time.Hour)
+		lines := pinLogf(t)
+
+		dir, created, err := Ensure(plat, filepath.Join(root, "Public"))
+		if err != nil || !created {
+			t.Fatalf("Ensure = %q,%v,%v — the last permitted publication must still be allowed", dir, created, err)
+		}
+		if len(*names) != maxPublishAttempts {
+			t.Fatalf("publications = %d (%v), want %d: the third name is the one that published", len(*names), *names, maxPublishAttempts)
+		}
+		distinct(t, *names)
+		fi, serr := os.Lstat(dir)
+		if serr != nil {
+			t.Fatal(serr)
+		}
+		if !fi.IsDir() || fi.Mode().Perm() != 0o777 || fi.Mode()&fs.ModeSticky == 0 {
+			t.Errorf("mode = %v, want a sticky 1777 directory", fi.Mode())
+		}
+		if rest := leftovers(t, root); len(rest) != 0 {
+			t.Errorf("the mount root still holds %v: a stale attempt was not cleaned up before the retry", rest)
+		}
+		if len(*lines) != 2 {
+			t.Errorf("Logf lines = %v, want two: each retry is worth a line in the daemon log", *lines)
+		}
+	})
+}
+
 // TestEnsureLogsALeftoverWhenAnotherPublisherWins is R4-2.
 //
 // The two halves of this situation used to cancel each other out. The cleanup

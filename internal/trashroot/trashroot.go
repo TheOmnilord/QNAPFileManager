@@ -260,6 +260,19 @@ func Ensure(plat *platform.Platform, osPath string) (trashDir string, created bo
 			return "", false, fmt.Errorf("checking %s: %w", dir, lerr)
 		}
 
+		// One budget for EVERY publication, whichever branch led here (round-5
+		// review): the stale branch below enforces it for a run of stale results,
+		// but a mix — stale, stale, then a lost race whose winner vanished before
+		// the lookup above — reached this point with the budget already spent and
+		// started a fourth temporary directory, and a stale result on the single
+		// extra pass after a lost race stretched that pass into another
+		// publication. The lookup above is still allowed on every pass (it is
+		// how a winner is adopted); only the publication is budgeted.
+		if publishes >= maxPublishAttempts {
+			return "", false, fmt.Errorf("%s: the %d permitted publication attempts were used up by stale results "+
+				"and lost races at the mount root, which is a churning or stalled filesystem rather than a "+
+				"substitution — but at this point the two cannot be told apart: %w", dir, publishes, ErrUnsafeTrash)
+		}
 		publishes++
 		switch err := publish(rootFD, root, dir); {
 		case err == nil:

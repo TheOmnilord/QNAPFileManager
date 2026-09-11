@@ -27,10 +27,12 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path"
 	"syscall"
+	"time"
 
 	"qnapfilemanager/internal/platform"
 )
@@ -67,10 +69,30 @@ const tempPrefix = DirName + ".tmp-"
 // would be one anybody could fill.
 const tempMode = os.FileMode(0o700)
 
+// tempMaxAge is how far the temporary directory's mtime may sit from the
+// mkdirat that made it (R3-BA1, round-3 backend review).
+//
+// It is the one question a substituted directory cannot answer. A rename does
+// NOT refresh an inode's mtime, and an unprivileged attacker cannot set the
+// mtime of a root-owned directory (utimensat needs ownership or CAP_FOWNER), so
+// any pre-existing directory slid into the temporary name carries the timestamp
+// of whenever it was really made — minutes, days or years ago — while the one
+// this process just created carries now. Five seconds is slack for a coarse
+// filesystem timestamp granularity and a loaded NAS, not a design margin: the
+// whole window between the mkdirat and the fstat is a handful of syscalls.
+const tempMaxAge = 5 * time.Second
+
 // newTempName invents the unpublished name. It is a variable so this package's
 // own tests can pin it and pre-plant something at it — the substitution B3 is
 // about — the same reason wantOwner is one. Production never assigns to it.
 var newTempName = randomTempName
+
+// publishRename is step (e), the no-replace rename. It is a variable for the
+// same reason newTempName is: R3-BA2 is about what the FAILURE path does after
+// the provenance check has passed, and the instant just before the publication
+// fails is the only place a test can stand to simulate the attacker's rename at
+// the mount root. Production never assigns to it.
+var publishRename = renameNoReplaceIn
 
 func randomTempName() (string, error) {
 	var b [8]byte
@@ -202,19 +224,24 @@ func Ensure(plat *platform.Platform, osPath string) (trashDir string, created bo
 //	    to the held mount-root descriptor — nobody can be waiting at a name
 //	    nobody can predict, and nobody but us may write in a 0700 one;
 //	(b) openat that name O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC;
-//	(c) fstat the descriptor and demand what only a directory THIS PROCESS just
-//	    made can show: a directory, owned by uid 0, permission bits of exactly
-//	    0700, and a link count of 2 (empty). A non-root user cannot produce a
-//	    root-owned directory at all, and no pre-existing directory worth
-//	    substituting — @Recycle, a share — is both 0700 and empty;
+//	(c) fstat the descriptor and READ the directory through it, demanding what
+//	    only a directory THIS PROCESS just made can show: a directory, owned by
+//	    uid 0, permission bits of exactly 0700, genuinely empty, and with an
+//	    mtime within tempMaxAge of the mkdirat (see provenance — R3-BA1);
 //	(d) fchmod THROUGH that descriptor to 1777, then fstat it again, because
 //	    what the kernel actually did is the only thing that counts (INV-2);
 //	(e) renameat2 the temporary name onto ".@qfm_trash" with RENAME_NOREPLACE,
 //	    so the kernel decides the race: either the name was free and we own it,
 //	    or it was taken and errPublishedFirst sends the caller back to validate
 //	    what is there;
-//	(f) anything that fails removes the temporary directory again (AT_REMOVEDIR),
-//	    so a refusal leaves no litter on the volume.
+//	(f) anything that fails removes the temporary directory again (AT_REMOVEDIR)
+//	    — but ONLY the inode provenance proved was ours, re-identified on a fresh
+//	    O_NOFOLLOW open (R3-BA2). The old cleanup removed the temporary PATHNAME,
+//	    which an attacker who can rename at the mount root could by then have
+//	    pointed at an unrelated empty directory of their choosing, making a failed
+//	    publication into a root-mode rmdir primitive. Litter is the lesser evil,
+//	    so an identity that no longer matches leaves everything alone and says so
+//	    in the error the caller logs.
 //
 // The rename names both ends, so the last word goes back to a descriptor: the
 // published name is re-opened and put through usable(). An attacker who managed
@@ -222,7 +249,7 @@ func Ensure(plat *platform.Platform, osPath string) (trashDir string, created bo
 // root-owned sticky directory to survive that, which is the one thing an
 // unprivileged attacker cannot do — and a failure there is ErrUnsafeTrash, never
 // a repair.
-func publish(rootFD *os.File, root, dir string) error {
+func publish(rootFD *os.File, root, dir string) (retErr error) {
 	name, err := newTempName()
 	if err != nil {
 		return fmt.Errorf("naming a temporary directory in %s: %w", root, err)
@@ -232,6 +259,10 @@ func publish(rootFD *os.File, root, dir string) error {
 	// (a) 0700, and 0777 only once the directory is proved to be ours: the mode
 	// the trash ends up with is exactly the mode that makes it interesting to an
 	// attacker, so it is applied as late as possible and through a descriptor.
+	//
+	// createdAt is read immediately before the mkdirat and is the reference the
+	// mtime freshness rule is measured against (R3-BA1).
+	createdAt := time.Now()
 	switch merr := mkdirIn(rootFD, name, 0o700); {
 	case merr == nil:
 	case errors.Is(merr, fs.ErrExist):
@@ -245,20 +276,36 @@ func publish(rootFD *os.File, root, dir string) error {
 		return fmt.Errorf("creating %s: %w", tmp, merr)
 	}
 	published := false
+	// made is the identity of the directory provenance accepted, and it is the
+	// ONLY thing the cleanup below is allowed to remove (R3-BA2).
+	var made os.FileInfo
 	defer func() {
 		// (f)
-		if !published {
-			_ = removeDirIn(rootFD, name)
+		if published {
+			return
 		}
+		if removeIfStillOurs(rootFD, name, made) || retErr == nil {
+			// retErr == nil is unreachable — every path that leaves published
+			// false returns an error — but a %w of nil would turn a bug here into
+			// a nonsense error rather than a loud one.
+			return
+		}
+		// Nothing was removed, because nothing at that name could be proved to be
+		// the directory this process made. The caller logs this error verbatim
+		// server-side (ensureTrashRoots → logRaw), which is where an operator
+		// finding an abandoned .@qfm_trash.tmp-* on a volume learns why.
+		retErr = fmt.Errorf("%w (the temporary directory %s could not be proved to be ours and was left in place; "+
+			"a rename at the mount root may have replaced it)", retErr, tmp)
 	}()
 
 	// (b), (c), (d)
-	if err := prepare(rootFD, name, tmp); err != nil {
+	made, err = prepare(rootFD, name, tmp, createdAt)
+	if err != nil {
 		return err
 	}
 
 	// (e)
-	switch rerr := renameNoReplaceIn(rootFD, name, DirName); {
+	switch rerr := publishRename(rootFD, name, DirName); {
 	case rerr == nil:
 		published = true
 	case errors.Is(rerr, fs.ErrExist):
@@ -278,24 +325,97 @@ func publish(rootFD *os.File, root, dir string) error {
 	return err
 }
 
-// prepare is steps (b), (c) and (d) of the publication: the temporary directory
-// is opened, proved to be the one this process just made, given the trash mode
-// through its own descriptor, and re-examined.
+// removeIfStillOurs is the cleanup half of R3-BA2, and it reports whether it
+// removed anything.
 //
-// Nothing here is asked of a pathname. The openat is relative to the held
-// mount-root descriptor and every question afterwards is an fstat of the
-// descriptor that openat returned, so a name swapped in behind us describes a
-// different object that this function never touches.
-func prepare(rootFD *os.File, name, tmp string) error {
+// made is what the provenance check accepted, or nil if the publication never
+// got that far — and a nil made removes NOTHING: the inode standing at that name
+// was never proved to be this process's, so a root-mode rmdir of it is a
+// primitive handed to whoever can rename at the mount root, not a tidy-up.
+//
+// Even with a made in hand the name is re-opened O_NOFOLLOW and fstat'd, and the
+// removal happens only if it is still the same (dev, ino). That still leaves the
+// width of the unlinkat itself, which no pathname-based removal on Linux can
+// close (PLAN.md §2.7) — but by then the attacker has to win a race whose prize
+// is the deletion of an empty directory they already control.
+func removeIfStillOurs(rootFD *os.File, name string, made os.FileInfo) bool {
+	if made == nil {
+		return false
+	}
 	d, err := openDirIn(rootFD, name)
 	if err != nil {
-		return fmt.Errorf("verifying %s: %w", tmp, err)
+		// ENOENT: somebody already took it away. Anything else: not a directory
+		// we may touch. Either way there is nothing of ours to remove.
+		return false
+	}
+	fi, serr := d.Stat()
+	d.Close()
+	if serr != nil || !os.SameFile(made, fi) {
+		return false
+	}
+	return removeDirIn(rootFD, name) == nil
+}
+
+// prepare is steps (b), (c) and (d) of the publication: the temporary directory
+// is opened, proved to be the one this process just made, given the trash mode
+// through its own descriptor, and re-examined. It returns the FileInfo
+// provenance accepted, which is the identity the failure cleanup re-checks
+// before it removes anything (R3-BA2).
+//
+// Nothing here is asked of a pathname. The openat is relative to the held
+// mount-root descriptor and every question afterwards is an fstat or a readdir
+// of the descriptor that openat returned, so a name swapped in behind us
+// describes a different object that this function never touches.
+func prepare(rootFD *os.File, name, tmp string, createdAt time.Time) (os.FileInfo, error) {
+	d, err := openDirIn(rootFD, name)
+	if err != nil {
+		return nil, fmt.Errorf("verifying %s: %w", tmp, err)
 	}
 	defer d.Close()
 	fi, err := d.Stat()
 	if err != nil {
-		return fmt.Errorf("checking %s: %w", tmp, err)
+		return nil, fmt.Errorf("checking %s: %w", tmp, err)
 	}
+	if err := provenance(d, tmp, fi, createdAt); err != nil {
+		return nil, err
+	}
+	if err := applyMode(d, tmp, Mode); err != nil {
+		return nil, fmt.Errorf("setting %s to 1777: %w", tmp, err)
+	}
+	// The re-fstat is not ceremony: a filesystem that silently drops the sticky
+	// bit must not be handed other people's deleted files.
+	if err := usable(tmp, d); err != nil {
+		return nil, err
+	}
+	return fi, nil
+}
+
+// provenance is step (c): the four questions asked of the temporary directory's
+// own descriptor before a root fchmod is aimed at it.
+//
+// The original shape asked for owner 0, perm 0700 and a link count of 2, and the
+// round-3 backend review (R3-BA1) took that apart: nlink == 2 is also true of a
+// directory full of REGULAR FILES, and any root-owned 0700 empty directory made
+// by some other root process on the volume passes all three. An attacker who can
+// rename at the mount root and who learns the random temporary name could then
+// move ours aside and put such a directory in its place, and root would fchmod
+// it to 1777 and adopt it as the trash. So two of the three are replaced:
+//
+//   - emptiness is READ, not inferred. The directory is read through the held
+//     descriptor and must yield nothing at all (Readdirnames omits "." and
+//     ".."), which no directory holding files of any kind can survive;
+//   - freshness is demanded. A rename does not refresh an inode's mtime and an
+//     unprivileged attacker cannot set the mtime of a root-owned directory, so a
+//     substituted directory carries whenever it was really created while ours
+//     carries the instant of the mkdirat a few syscalls ago (tempMaxAge).
+//
+// Owner and permission bits stay exactly as they were: uid 0 (a non-root user
+// cannot produce a root-owned directory at all) and precisely 0700.
+//
+// What is left after this is written up as PLAN.md §2.7, because it cannot be
+// closed by checking harder: creation by PATHNAME inside a directory the
+// attacker can rename in is not atomic on Linux.
+func provenance(d *os.File, tmp string, fi os.FileInfo, createdAt time.Time) error {
 	if fi.Mode()&fs.ModeSymlink != 0 || !fi.IsDir() {
 		return fmt.Errorf("%s is not a directory: %w", tmp, ErrUnsafeTrash)
 	}
@@ -313,19 +433,22 @@ func prepare(rootFD *os.File, name, tmp string) error {
 				tmp, uint32(tempMode.Perm()), uint32(perm), ErrUnsafeTrash)
 		}
 	}
-	if n, ok := nlinkOf(fi); ok && n != 2 {
-		// A directory with "." and its parent's entry and nothing else. Anything
-		// an attacker would gain by substituting a REAL directory here — a share,
-		// @Recycle — has subdirectories, and therefore more links.
-		return fmt.Errorf("%s has %d links rather than the 2 of the empty directory this process made: %w",
-			tmp, n, ErrUnsafeTrash)
+	// Emptiness, read through the descriptor (R3-BA1). One name is enough: a
+	// directory this process created a moment ago inside a 0700 it alone may
+	// write has nothing in it, so the first entry is already a refusal.
+	switch names, rerr := d.Readdirnames(1); {
+	case rerr != nil && !errors.Is(rerr, io.EOF):
+		return fmt.Errorf("reading %s: %w", tmp, rerr)
+	case len(names) > 0:
+		return fmt.Errorf("%s already holds entries, so it is not the empty directory this process made: %w",
+			tmp, ErrUnsafeTrash)
 	}
-	if err := applyMode(d, tmp, Mode); err != nil {
-		return fmt.Errorf("setting %s to 1777: %w", tmp, err)
+	// Freshness (R3-BA1).
+	if age := createdAt.Sub(fi.ModTime()); age > tempMaxAge || age < -tempMaxAge {
+		return fmt.Errorf("%s was last modified %v from the mkdirat that created it, which is more than %v, "+
+			"so it is not the directory this process made: %w", tmp, age, tempMaxAge, ErrUnsafeTrash)
 	}
-	// The re-fstat is not ceremony: a filesystem that silently drops the sticky
-	// bit must not be handed other people's deleted files.
-	return usable(tmp, d)
+	return nil
 }
 
 // usable decides whether the directory a descriptor refers to may serve as the

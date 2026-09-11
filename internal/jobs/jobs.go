@@ -444,8 +444,17 @@ func (m *Manager) run(ctx context.Context, cancel context.CancelFunc, e *entry, 
 	m.leaveQueue(class)
 
 	now := m.now()
-	if !e.start(now) {
-		// Cancelled in the instant between taking the slot and starting.
+	// Close publishes m.closed under m.mu BEFORE it cancels anyone, and a slot
+	// held by a running job is only ever freed by that cancellation — so a
+	// queued job that wins the slot after Close began always observes closed
+	// here and ends cancelled, never done. Without this check it could take the
+	// freed slot and run its function in the gap before Close's sequential
+	// cancels reached its own context (CI, the race job: a queued job finished
+	// "done" on Close). A job that took its slot before Close began is
+	// legitimately running and is stopped through its context instead.
+	if m.isClosed() || !e.start(now) {
+		// Closed, or cancelled in the instant between taking the slot and
+		// starting: nothing ran, so nothing is partial.
 		e.finishQueued(now)
 		return
 	}
@@ -586,6 +595,16 @@ func (m *Manager) Reap() {
 // waits for the work functions to return. It gives up waiting when ctx does —
 // the daemon's shutdown has its own deadline — and says so; the goroutines it
 // could not wait for are still cancelled.
+// isClosed reports whether Close has begun. It reads m.closed under the same
+// lock Close writes it under, which is what lets run treat "closed" as a
+// happens-before fact when it decides whether a slot-winning queued job may
+// start (see run).
+func (m *Manager) isClosed() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.closed
+}
+
 func (m *Manager) Close(ctx context.Context) error {
 	m.mu.Lock()
 	m.closed = true

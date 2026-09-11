@@ -381,9 +381,11 @@ func TestTrashDisabledRefusesBeforeAnythingIsCreated(t *testing.T) {
 	}
 	c, csrf := sessionCookie(t, s)
 
+	// R3-WA1: the refusal comes on the FIRST POST, before a trash-mode token is
+	// ever issued. It used to arrive only on the redemption, so the user
+	// confirmed a move to Trash and was then asked to confirm all over again.
 	body := `{"paths":[{"path":"/a.txt"}],"mode":"trash"}`
-	env := challenge(t, s, c, csrf, "/api/jobs/delete", body)
-	resp := post(s, "/api/jobs/delete", c, csrf, withToken(body, env.Confirm.Token))
+	resp := post(s, "/api/jobs/delete", c, csrf, body)
 	if resp.StatusCode != http.StatusConflict {
 		t.Fatalf("trash delete with trash disabled: %d %s", resp.StatusCode, readBody(resp))
 	}

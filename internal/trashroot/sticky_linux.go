@@ -100,21 +100,10 @@ func ownerOf(fi fs.FileInfo) (int, bool) {
 	return int(st.Uid), true
 }
 
-// nlinkOf pulls the link count out of the stat structure behind a FileInfo
-// (B3). A directory with exactly two links is one with "." and its parent's
-// entry and nothing else: empty, and therefore too young to be anything but the
-// one this process just created.
-//
-// The field width differs by architecture — Nlink is uint64 on linux/amd64 and
-// uint32 on linux/arm64, and both are release targets — so it is converted
-// explicitly rather than assigned.
-func nlinkOf(fi fs.FileInfo) (uint64, bool) {
-	st, ok := fi.Sys().(*syscall.Stat_t)
-	if !ok || st == nil {
-		return 0, false
-	}
-	return uint64(st.Nlink), true
-}
+// There was an nlinkOf here, and B3's provenance check asked it for "exactly
+// two links, therefore empty". R3-BA1 retired it: nlink == 2 is equally true of
+// a directory holding nothing but regular files, so emptiness is now READ
+// through the descriptor instead (trashroot.provenance).
 
 // atRemoveDir is AT_REMOVEDIR, the unlinkat flag that removes a directory
 // rather than a file. It is stable across Linux architectures.

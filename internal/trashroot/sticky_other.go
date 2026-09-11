@@ -64,10 +64,12 @@ func applyMode(_ *os.File, dir string, mode fs.FileMode) error { return os.Chmod
 // ownership check is skipped rather than invented.
 func ownerOf(fs.FileInfo) (int, bool) { return 0, false }
 
-// nlinkOf has nothing to report either: there is no link count behind a Windows
-// FileInfo, so B3's "exactly two links, therefore empty" question is skipped
-// here rather than answered from a synthesised value.
-func nlinkOf(fs.FileInfo) (uint64, bool) { return 0, false }
+// There was an nlinkOf here, which had nothing to report: Windows has no link
+// count behind a FileInfo, so B3's "exactly two links, therefore empty"
+// question was simply skipped on the dev box. R3-BA1 retired it everywhere —
+// emptiness is now read through the descriptor (trashroot.provenance), which is
+// a question this platform CAN answer, so the dev box gained a check rather than
+// losing one.
 
 // removeDirIn removes the unpublished temporary directory by pathname (B3 step
 // f). There is no unlinkat here, and no AT_REMOVEDIR: os.Remove removes an

@@ -314,7 +314,9 @@ func (s *Server) submitTrashJob(w http.ResponseWriter, r *http.Request, sess *se
 		return viewOf(res), s.jobErr(m.op, tj.id, err)
 	})
 	if err != nil {
-		s.failJobSubmit(w, r, sess, m, err)
+		// R3-S2: restore and empty mint their id before the intent line too, so a
+		// refused submission is paired with that intent by the same id.
+		s.failJobSubmit(w, r, sess, m, tj.id, err)
 		return
 	}
 	s.writeJob(w, *job)

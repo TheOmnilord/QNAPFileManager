@@ -256,11 +256,24 @@ export async function deleteEntries(entries) {
 // — nothing is rolled back (design §3) — and no ids at all means there is
 // nothing this toast can honestly offer to reverse; the trash panel is then the
 // answer.
+//
+// A FAILED job is treated the same way as a cancelled one when it carries ids
+// (finding R3-WA2). A delete that moved four of five entries and then hit a
+// protected fifth ends "failed", but those four really are in Trash and the
+// terminal result names them; discarding the ids because of the state left the
+// user with a bare error and no way back short of hunting through the trash
+// panel. So the partial outcome is described and the Undo is offered for what
+// moved — safely, because /api/trash/restore re-validates every id against the
+// caller's OWN trash listing before it dispatches anything.
 export function trashOutcome(job,requested) {
  const count=value => Number(value||0).toLocaleString();
  if (!job) return {ids:[],message:`Still moving ${count(requested)} item(s) to Trash — see Operations.`};
  const ids=Array.isArray(job.result?.trashIds) ? job.result.trashIds : [];
- if (job.state==='failed') return {ids:[],message:job.error||'The items could not be moved to Trash.'};
+ if (job.state==='failed') {
+  if (!ids.length) return {ids:[],message:job.error||'The items could not be moved to Trash.'};
+  const failed=Math.max(Number(requested||0)-ids.length,0);
+  return {ids,message:`Moved ${count(ids.length)} of ${count(requested)} to Trash; ${count(failed)} failed`};
+ }
  if (job.state==='cancelled') {
   return {ids,message: ids.length
    ? `Cancelled — ${count(ids.length)} of ${count(requested)} item(s) reached Trash`

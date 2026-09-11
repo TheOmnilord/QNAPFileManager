@@ -331,12 +331,19 @@ func (p *Pool) cancelAndDrain(ctx context.Context, c *client, jobID string, pend
 			p.opts.Logger.Printf("workerpool: %s did not stop the cancelled job %s within %s; terminating the worker so the job cannot carry on mutating",
 				c.key, jobID, grace)
 			gone := workerGone(c.key, fmt.Errorf("the cancelled job %s did not stop within %s", jobID, grace))
-			// The transport goes first so nothing else is written down it, then
-			// the process itself. retire runs on its own goroutine: it waits out
-			// the signal ladder, and this caller — whose context expired a while
-			// ago — must not wait with it. The hold taken by Job is released by
-			// its own defer as usual, after this returns; retire never touches
-			// the in-flight count, so the accounting stays balanced either way.
+			// Detach FIRST, synchronously, so the pool's table no longer holds
+			// this worker by the time it becomes observably dead: closing the
+			// transport below makes the read loop mark the client dead at once,
+			// and if the table were only cleared by the retire goroutine there
+			// would be a window in which a dead worker is still this user's
+			// worker (the flaky grace-expiry test). Then the transport goes so
+			// nothing else is written down it, then the process itself. retire
+			// runs on its own goroutine: it waits out the signal ladder, and this
+			// caller — whose context expired a while ago — must not wait with it.
+			// The hold taken by Job is released by its own defer as usual, after
+			// this returns; retire never touches the in-flight count, so the
+			// accounting stays balanced either way.
+			p.detach(c)
 			_ = c.tr.Close()
 			go p.retire(c, gone)
 

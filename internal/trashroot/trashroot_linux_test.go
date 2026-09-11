@@ -6,7 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"qnapfilemanager/internal/platform"
 )
@@ -65,6 +67,16 @@ func pinTempName(t *testing.T, name string) *int {
 	}
 	t.Cleanup(func() { newTempName = prev })
 	return &calls
+}
+
+// pinPublishRename replaces step (e) for one test (R3-BA2). It is the only
+// instant at which a test can stand where the attacker does: after the temporary
+// directory has been proved to be ours and before the publication fails.
+func pinPublishRename(t *testing.T, fn func(dir *os.File, from, to string) error) {
+	t.Helper()
+	prev := publishRename
+	publishRename = fn
+	t.Cleanup(func() { publishRename = prev })
 }
 
 // leftovers lists what the mount root holds besides the published trash
@@ -152,11 +164,17 @@ func TestEnsureRefusesAPlantedTemporaryName(t *testing.T) {
 	}
 }
 
-// TestPrepareRefusesASubstitutedDirectory is step (c) on its own: the four
-// questions asked of the temporary directory's descriptor. A directory that is
-// not empty, or whose permission bits are not the 0700 it was created with, is
-// not the directory this process just made — whatever its name says — and it
-// must not be given the trash mode.
+// TestPrepareRefusesASubstitutedDirectory is step (c) on its own: the questions
+// asked of the temporary directory's descriptor before a root fchmod is aimed at
+// it. A directory that is not empty, whose permission bits are not the 0700 it
+// was created with, or whose mtime is older than the mkdirat that supposedly
+// made it, is not the directory this process just made — whatever its name says.
+//
+// The last two cases are R3-BA1's: each one passes EVERY check the round-2 shape
+// made (a directory, right owner, 0700, link count exactly 2) and is refused only
+// by a check added in round 3. "only regular files" is the hole in nlink == 2;
+// "pre-existing" is any root-owned empty 0700 directory an attacker found lying
+// around on the volume and renamed into place.
 func TestPrepareRefusesASubstitutedDirectory(t *testing.T) {
 	root := tempMount(t)
 	rootFD, err := openDirNoFollow(root)
@@ -171,8 +189,7 @@ func TestPrepareRefusesASubstitutedDirectory(t *testing.T) {
 		place func(t *testing.T, dir string)
 	}{
 		{"not empty", 0o700, func(t *testing.T, dir string) {
-			// @Recycle, a share, anything worth substituting: it has children,
-			// so its link count is not 2.
+			// @Recycle, a share, anything worth substituting: it has children.
 			if err := os.MkdirAll(filepath.Join(dir, "snapshot"), 0o700); err != nil {
 				t.Fatal(err)
 			}
@@ -188,6 +205,33 @@ func TestPrepareRefusesASubstitutedDirectory(t *testing.T) {
 				t.Fatal(err)
 			}
 		}},
+		{"only regular files", 0o700, func(t *testing.T, dir string) {
+			// R3-BA1: a directory holding nothing but files still has exactly two
+			// links, so the retired nlink test called this empty. Reading it does
+			// not.
+			if err := os.Mkdir(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "payload"), []byte("x"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"pre-existing", 0o700, func(t *testing.T, dir string) {
+			// R3-BA1: root-owned, 0700, genuinely empty — and made an hour ago, so
+			// it cannot be the one the mkdirat a few syscalls back produced. A
+			// rename does not refresh an inode's mtime, and an unprivileged
+			// attacker cannot set the mtime of a root-owned directory.
+			if err := os.Mkdir(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			old := time.Now().Add(-time.Hour)
+			if err := os.Chtimes(dir, old, old); err != nil {
+				t.Fatal(err)
+			}
+		}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -195,8 +239,14 @@ func TestPrepareRefusesASubstitutedDirectory(t *testing.T) {
 			dir := filepath.Join(root, name)
 			c.place(t, dir)
 
-			if err := prepare(rootFD, name, dir); !errors.Is(err, ErrUnsafeTrash) {
+			made, err := prepare(rootFD, name, dir, time.Now())
+			if !errors.Is(err, ErrUnsafeTrash) {
 				t.Fatalf("prepare = %v, want ErrUnsafeTrash", err)
+			}
+			if made != nil {
+				// R3-BA2: a refused directory must not be handed back as an
+				// identity the failure cleanup would then remove.
+				t.Errorf("prepare returned an identity (%v) for a directory it refused", made.Name())
 			}
 			fi, err := os.Lstat(dir)
 			if err != nil {
@@ -207,6 +257,99 @@ func TestPrepareRefusesASubstitutedDirectory(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestPrepareAcceptsTheDirectoryItJustMade is the other side of R3-BA1: the
+// freshness and emptiness rules must not refuse the real thing. It also pins
+// what prepare returns — the identity the cleanup re-checks.
+func TestPrepareAcceptsTheDirectoryItJustMade(t *testing.T) {
+	root := tempMount(t)
+	rootFD, err := openDirNoFollow(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rootFD.Close()
+
+	name := tempPrefix + "00ff00ff00ff00ff"
+	createdAt := time.Now()
+	if err := mkdirIn(rootFD, name, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	made, err := prepare(rootFD, name, filepath.Join(root, name), createdAt)
+	if err != nil {
+		t.Fatalf("prepare refused the directory it just made: %v", err)
+	}
+	fi, err := os.Lstat(filepath.Join(root, name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(made, fi) {
+		t.Error("prepare returned the identity of something other than the directory at the name")
+	}
+	if fi.Mode().Perm() != 0o777 || fi.Mode()&fs.ModeSticky == 0 {
+		t.Errorf("mode = %v, want 1777", fi.Mode())
+	}
+}
+
+// TestFailedPublishRemovesOnlyItsOwnDirectory is R3-BA2.
+//
+// The deferred cleanup used to unlinkat(AT_REMOVEDIR) the temporary PATHNAME. An
+// attacker who can rename at the mount root — which is the whole premise of B3 —
+// could point that name at an unrelated empty directory between the provenance
+// check and the failure, turning a refused publication into a root-mode rmdir of
+// a directory of their choosing. The cleanup now removes only the inode
+// provenance accepted, re-identified on a fresh O_NOFOLLOW open.
+func TestFailedPublishRemovesOnlyItsOwnDirectory(t *testing.T) {
+	fail := &fs.PathError{Op: "renameat", Path: DirName, Err: syscall.EIO}
+
+	t.Run("its own temporary directory goes away", func(t *testing.T) {
+		root := tempMount(t)
+		plat := storageAt(t, root)
+		name := tempPrefix + "1111111111111111"
+		pinTempName(t, name)
+		pinPublishRename(t, func(*os.File, string, string) error { return fail })
+
+		if _, _, err := Ensure(plat, filepath.Join(root, "Public")); err == nil {
+			t.Fatal("Ensure must report the failed publication")
+		}
+		if rest := leftovers(t, root); len(rest) != 0 {
+			t.Errorf("the mount root still holds %v: our own temporary directory was not cleaned up", rest)
+		}
+	})
+
+	t.Run("a substituted directory survives", func(t *testing.T) {
+		root := tempMount(t)
+		plat := storageAt(t, root)
+		name := tempPrefix + "2222222222222222"
+		pinTempName(t, name)
+		victim := filepath.Join(root, "victim")
+		pinPublishRename(t, func(_ *os.File, from, _ string) error {
+			// The attacker's move, at the one instant it is worth anything: our
+			// proved directory is renamed aside and an unrelated empty directory
+			// takes its name, just before the publication fails.
+			if err := os.Rename(filepath.Join(root, from), filepath.Join(root, "ours")); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(victim, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Rename(victim, filepath.Join(root, from)); err != nil {
+				t.Fatal(err)
+			}
+			return fail
+		})
+
+		_, _, err := Ensure(plat, filepath.Join(root, "Public"))
+		if err == nil {
+			t.Fatal("Ensure must report the failed publication")
+		}
+		if _, serr := os.Lstat(filepath.Join(root, name)); serr != nil {
+			t.Fatalf("the substituted directory was removed by the failure cleanup: %v", serr)
+		}
+		if !strings.Contains(err.Error(), "left in place") {
+			t.Errorf("the error does not say a temporary directory may have been left behind: %v", err)
+		}
+	})
 }
 
 // TestEnsureDoesNotRepairAPlantedTrashDirectory: something that is already at

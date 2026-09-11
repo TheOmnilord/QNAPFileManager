@@ -1021,6 +1021,19 @@ func (p *Pool) noteRestartLocked(key string, now time.Time) bool {
 // retire removes a worker from the map (if it is still the current one for its
 // key) and terminates it.
 func (p *Pool) retire(c *client, cause error) {
+	p.detach(c)
+	c.fail(cause)
+	p.stopRetiredWait(context.Background(), c)
+}
+
+// detach is retire's synchronous half: it takes c out of the pool's worker
+// table (if it is still the current worker for its key) and marks it retiring,
+// so no later acquire can hand this process to anyone. It is idempotent. A
+// caller that is about to make the client observably dead by other means —
+// cancelAndDrain closes the transport before it launches retire — must call
+// this FIRST, or a dead worker sits in the table until the retire goroutine
+// runs (the flaky grace-expiry test was that window).
+func (p *Pool) detach(c *client) {
 	p.mu.Lock()
 	if cur, ok := p.workers[c.key]; ok && cur == c {
 		delete(p.workers, c.key)
@@ -1028,8 +1041,6 @@ func (p *Pool) retire(c *client, cause error) {
 	}
 	p.retiring[c] = struct{}{}
 	p.mu.Unlock()
-	c.fail(cause)
-	p.stopRetiredWait(context.Background(), c)
 }
 
 // spawn creates one worker and completes the hello handshake, so a worker that

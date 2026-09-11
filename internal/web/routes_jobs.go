@@ -370,6 +370,15 @@ func (s *Server) recheckGuard(checks ...guardCheck) error {
 	return nil
 }
 
+// guardRefuses reports whether a guard verdict is a REFUSAL rather than a
+// request for confirmation — exactly the set of verdicts authorize answers with
+// an error instead of a token (routes_mutate.go). It exists so a refusal of our
+// own can be ordered BEHIND the guard's without restating that precedence:
+// R3-WA1's no_trash must not pre-empt read_only or protected.
+func guardRefuses(err error) bool {
+	return err != nil && !errors.Is(err, guard.ErrConfirmRequired)
+}
+
 // jobPaths decodes and cleans a job's root paths, honouring the pathB64
 // companion. It writes the error response itself and returns false on failure.
 func (s *Server) jobPaths(w http.ResponseWriter, r *http.Request, refs []pathRef) ([]string, bool) {
@@ -502,22 +511,29 @@ func (s *Server) jobDelete(w http.ResponseWriter, r *http.Request, sess *session
 	// intent line's detail.
 	m := mutation{op: "delete", path: paths[0], files: int64(len(paths)), bytes: totalBytes}
 	roots := mappedRoots(paths, resolved)
+	verdict := worstGuard(checks...)
+	// The Trash switch is a NAS-wide setting (config.Trash.Enabled). With it off,
+	// nothing may create the world-writable sticky directories decision 10
+	// describes, so a trash-mode delete is refused outright (W6).
+	//
+	// R3-WA1 moved that refusal AHEAD of authorize. Refusing after it meant the
+	// first POST minted and spent a confirmation token for a mode the daemon was
+	// never going to run: the user confirmed "move to Trash", was told there is
+	// no Trash, and had to confirm the permanent delete a second time — two
+	// dialogs and a wasted single-use token for one decision. The guard keeps
+	// precedence: a root that is protected, or a daemon in read-only mode,
+	// refuses for its own reason first, because "there is no Trash" must never be
+	// the answer to a delete that was not going to be allowed in any mode.
+	if !permanent && !s.cfg.Trash.Enabled && !guardRefuses(verdict) {
+		writeError(w, http.StatusConflict, "no_trash", "Trash is disabled on this NAS, so deleting is permanent.", paths[0], "delete", "")
+		return
+	}
 	// extraConfirm is always on: every delete, trash or permanent, is redeemed
 	// against a single-use token (decision 10).
-	if !s.authorize(w, r, sess, worstGuard(checks...), true, m, "", deleteJobTokenParts(mode, body.CrossMounts, paths), true, body.Confirm, summary) {
+	if !s.authorize(w, r, sess, verdict, true, m, "", deleteJobTokenParts(mode, body.CrossMounts, paths), true, body.Confirm, summary) {
 		return
 	}
 	if !permanent {
-		// The Trash switch is a NAS-wide setting (config.Trash.Enabled). With it
-		// off, nothing may create the world-writable sticky directories decision
-		// 10 describes — so the mode is refused HERE, before any Ensure, rather
-		// than by making the directories anyway and then dispatching a trash
-		// delete (W6). The client re-asks at grade 2, exactly as it does for a
-		// volume that has no same-device trash.
-		if !s.cfg.Trash.Enabled {
-			writeError(w, http.StatusConflict, "no_trash", "Trash is disabled on this NAS, so deleting is permanent.", paths[0], "delete", "")
-			return
-		}
 		// The trash directory has to exist before the user's worker — which has
 		// only their own permissions — can rename anything into it, so the root
 		// front-end makes it: the one sanctioned front-end filesystem write
@@ -597,7 +613,8 @@ func (s *Server) jobDelete(w http.ResponseWriter, r *http.Request, sess *session
 		return view, s.jobErr("delete", id, err)
 	})
 	if err != nil {
-		s.failJobSubmit(w, r, sess, m, err)
+		// R3-S2: the rejection names the id the intent line above already used.
+		s.failJobSubmit(w, r, sess, m, id, err)
 		return
 	}
 	s.writeJob(w, *job)
@@ -739,20 +756,28 @@ func (s *Server) jobFinishHook(who jobActor, op, id, path, detail string, force 
 }
 
 func (s *Server) auditJobFinish(who jobActor, op, id, path, detail string, force bool, j jobs.Job) {
-	result, code := jobFinishOutcome(j)
 	// The worker's own summary is the authority on what happened; the manager's
 	// live counters are the fallback for a job that never published one.
 	files, bytes, warnings := j.Files, j.Bytes, j.WarningCount
+	var skipped int64
 	var view jobResultView
 	if len(j.Result) > 0 && json.Unmarshal(j.Result, &view) == nil {
-		files, bytes = view.Files, view.Bytes
+		files, bytes, skipped = view.Files, view.Bytes, view.Skipped
 		if view.Warnings > warnings {
 			warnings = view.Warnings
 		}
 	}
+	// R3-S1: the outcome is classified from the RECONCILED counts, not from the
+	// live frame counter alone — see jobFinishOutcome.
+	result, code := jobFinishOutcome(j, warnings, skipped)
 	full := fmt.Sprintf("%s: %d item(s), %d byte(s)", detail, files, bytes)
 	if warnings > 0 {
 		full += fmt.Sprintf(", %d warning(s)", warnings)
+	}
+	if skipped > 0 {
+		// R3-S1: what the job did NOT do belongs in the line that claims what it
+		// did, so a "partial" is legible without cross-referencing the job.
+		full += fmt.Sprintf(", %d skipped", skipped)
 	}
 	switch result {
 	case "cancelled":
@@ -787,7 +812,17 @@ func jobMilestone(force bool, result string, files, bytes int64) bool {
 // GUARD caused — read-only switched on, a path that became protected while the
 // job waited in the queue (W1) — is a denial rather than an error, so the trail
 // reads the same whether the refusal came before or after the 202.
-func jobFinishOutcome(j jobs.Job) (result, code string) {
+//
+// warnings and skipped are the RECONCILED totals the caller computed, not the
+// job's live counters, and that is finding R3-S1: Job.WarningCount counts the
+// warn FRAMES that arrived, and a frame can be dropped (a slow consumer, a
+// truncated stream, a worker that summarises instead of streaming), whereas the
+// terminal JobResult carries the worker's own authoritative totals. Classifying
+// from the counter alone let a destructive job that skipped items be audited
+// "ok" — the one word the durable record must never get wrong about a delete. An
+// item the worker skipped is an item that is still there, so Skipped promotes to
+// "partial" just as a warning does, even when nothing was warned about.
+func jobFinishOutcome(j jobs.Job, warnings int, skipped int64) (result, code string) {
 	switch j.State {
 	case jobs.StateCancelled:
 		return "cancelled", fsx.Code(context.Canceled)
@@ -802,8 +837,8 @@ func jobFinishOutcome(j jobs.Job) (result, code string) {
 		}
 		return "error", code
 	default:
-		if j.WarningCount > 0 {
-			// Some items failed and were skipped; the job as a whole did not.
+		if warnings > 0 || skipped > 0 {
+			// Some items failed or were skipped; the job as a whole did not.
 			return "partial", ""
 		}
 		return "ok", ""
@@ -813,13 +848,25 @@ func jobFinishOutcome(j jobs.Job) (result, code string) {
 // failJobSubmit answers a job the manager would not take. A full queue is the
 // one the client can act on (wait and retry); everything else is the daemon's
 // own failure.
-func (s *Server) failJobSubmit(w http.ResponseWriter, r *http.Request, sess *session, m mutation, err error) {
+//
+// id is the job id the route already minted, and passing it is finding R3-S2.
+// The id is chosen BEFORE the durable intent line (W7), so a refused submission
+// leaves an intent naming "job <id>" with a result line that named no job at
+// all: the durable trail held an unclosed destructive intent that nothing could
+// be paired with. The rejection now carries the same "job <id>" detail form the
+// completion hook writes, so intent and result pair on the id whatever happened
+// to the submission.
+func (s *Server) failJobSubmit(w http.ResponseWriter, r *http.Request, sess *session, m mutation, id string, err error) {
 	code := fsx.Code(err)
 	if errors.Is(err, jobs.ErrClosed) {
 		code = "worker_gone"
 	}
 	s.logRaw(r, m.op, m.path, err)
-	s.writeAudit(sess, r, m, "result", "error", code, "", false)
+	detail := ""
+	if id != "" {
+		detail = fmt.Sprintf("job %s: not started (%s)", id, code)
+	}
+	s.writeAudit(sess, r, m, "result", "error", code, detail, false)
 	message := "The operation could not be started."
 	if code == "queue_full" {
 		message = "Too many operations are already queued. Wait for some to finish, then try again."
@@ -893,7 +940,7 @@ func (s *Server) jobSize(w http.ResponseWriter, r *http.Request, sess *session) 
 		return viewOf(res), s.jobErr("size", id, err)
 	})
 	if err != nil {
-		s.failJobSubmit(w, r, sess, mutation{op: "size"}, err)
+		s.failJobSubmit(w, r, sess, mutation{op: "size"}, id, err)
 		return
 	}
 	s.writeJob(w, *job)

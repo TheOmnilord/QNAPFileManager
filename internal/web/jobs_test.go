@@ -513,21 +513,26 @@ func TestJobMilestoneClassification(t *testing.T) {
 }
 
 func TestJobOutcomeVocabulary(t *testing.T) {
-	if result, _ := jobFinishOutcome(jobs.Job{State: jobs.StateDone, Files: 2}); result != "ok" {
+	if result, _ := jobFinishOutcome(jobs.Job{State: jobs.StateDone, Files: 2}, 0, 0); result != "ok" {
 		t.Errorf("clean job: %q", result)
 	}
-	if result, _ := jobFinishOutcome(jobs.Job{State: jobs.StateDone, Files: 2, WarningCount: 3}); result != "partial" {
+	if result, _ := jobFinishOutcome(jobs.Job{State: jobs.StateDone, Files: 2}, 3, 0); result != "partial" {
 		t.Errorf("per-item failures: %q", result)
 	}
-	if result, code := jobFinishOutcome(jobs.Job{State: jobs.StateCancelled, Files: 2}); result != "cancelled" || code != "cancelled" {
+	// R3-S1: the reconciled totals decide, so a job that streamed no warn frame
+	// at all is still partial when its terminal result skipped items.
+	if result, _ := jobFinishOutcome(jobs.Job{State: jobs.StateDone, Files: 2}, 0, 1); result != "partial" {
+		t.Errorf("skipped items: %q", result)
+	}
+	if result, code := jobFinishOutcome(jobs.Job{State: jobs.StateCancelled, Files: 2}, 0, 0); result != "cancelled" || code != "cancelled" {
 		t.Errorf("cancelled: %q %q", result, code)
 	}
-	if result, code := jobFinishOutcome(jobs.Job{State: jobs.StateFailed, ErrCode: "internal"}); result != "error" || code != "internal" {
+	if result, code := jobFinishOutcome(jobs.Job{State: jobs.StateFailed, ErrCode: "internal"}, 0, 0); result != "error" || code != "internal" {
 		t.Errorf("failure: %q %q", result, code)
 	}
 	// A guard refusal at start (W1) is a denial in the trail, not an error.
 	for _, code := range []string{"read_only", "protected"} {
-		if result, got := jobFinishOutcome(jobs.Job{State: jobs.StateFailed, ErrCode: code}); result != "denied" || got != code {
+		if result, got := jobFinishOutcome(jobs.Job{State: jobs.StateFailed, ErrCode: code}, 0, 0); result != "denied" || got != code {
 			t.Errorf("guard refusal %q: %q %q", code, result, got)
 		}
 	}

@@ -77,9 +77,22 @@ test('Undo is offered only for a job that actually reached Trash', () => {
  // Finished with no ids (an older worker, the fallback found nothing): the
  // message still reports the delete, but there is no Undo to offer.
  assert.deepEqual(trashOutcome({state:'done',result:{}},4),{ids:[],message:'Moved 4 item(s) to Trash'});
- // Failed: the job's own (code-derived) error, no Undo.
+ // Failed with nothing moved: the job's own (code-derived) error, no Undo.
  assert.deepEqual(trashOutcome({state:'failed',error:'Read-only mode is on, so the operation was refused.'},1),
   {ids:[],message:'Read-only mode is on, so the operation was refused.'});
+});
+
+test('a failed-but-partial delete still offers Undo for what reached Trash (R3-WA2)', () => {
+ // The job ended "failed" — one root was refused — but four entries really were
+ // moved and the terminal result names them. Discarding those ids left the user
+ // with a bare error and no way back; the restore endpoint re-validates every id
+ // against the caller's own trash, so offering them is safe.
+ const partial = trashOutcome({state:'failed',error:'This location is protected, so the operation was refused.',result:{trashIds:['1-a','2-b','3-c','4-d']}},5);
+ assert.deepEqual(partial.ids,['1-a','2-b','3-c','4-d']);
+ assert.equal(partial.message,'Moved 4 of 5 to Trash; 1 failed');
+ // A result that names more ids than were requested never reports a negative
+ // failure count.
+ assert.equal(trashOutcome({state:'failed',result:{trashIds:['1-a','2-b']}},1).message,'Moved 2 of 1 to Trash; 0 failed');
 });
 
 test('a cancelled delete offers Undo for the part that did reach Trash', () => {

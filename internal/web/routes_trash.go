@@ -72,8 +72,25 @@ func validTrashID(id string) bool {
 	return true
 }
 
+// trashDisabled answers the three trash routes when the NAS-wide Trash switch
+// is off (config.Trash.Enabled, PLAN.md decision 10 / finding W6). With the
+// switch off no .@qfm_trash directory may be created and none is expected to
+// exist, so listing, restoring and emptying have nothing to act on: they say so
+// plainly rather than returning an empty panel or a worker error.
+func (s *Server) trashDisabled(w http.ResponseWriter, r *http.Request, op string) bool {
+	if s.cfg.Trash.Enabled {
+		return false
+	}
+	s.logger.Printf("request ip=%q method=%s op=%q code=%s", ClientIP(r), r.Method, r.URL.Path, "no_trash")
+	writeError(w, http.StatusConflict, "no_trash", "Trash is disabled on this NAS, so deleting is permanent and there is nothing in Trash.", "", op, "")
+	return true
+}
+
 func (s *Server) trashList(w http.ResponseWriter, r *http.Request, sess *session) {
 	if !s.jobsReady(w, r) {
+		return
+	}
+	if s.trashDisabled(w, r, "trash-list") {
 		return
 	}
 	resp, err := s.jobRunner.TrashList(r.Context(), sess.who)
@@ -105,6 +122,9 @@ func (s *Server) trashList(w http.ResponseWriter, r *http.Request, sess *session
 // from a location the rules now protect cannot be written back into it.
 func (s *Server) trashRestore(w http.ResponseWriter, r *http.Request, sess *session) {
 	if !s.mutationsReady(w, r) || !s.jobsReady(w, r) {
+		return
+	}
+	if s.trashDisabled(w, r, "trash-restore") {
 		return
 	}
 	var body struct {
@@ -140,6 +160,12 @@ func (s *Server) trashRestore(w http.ResponseWriter, r *http.Request, sess *sess
 	for _, it := range resp.Items {
 		known[it.ID] = it
 	}
+	// The destinations, kept so the guard can be re-run when the job actually
+	// starts (W1) and so a worker warning can be mapped back to a path the
+	// caller already knows (W4). They are the worker's own listing of the
+	// caller's own items, so the requested and dispatched spellings are one.
+	dsts := make([]string, 0, len(body.IDs))
+	parents := make([]string, 0, len(body.IDs))
 	for _, id := range body.IDs {
 		it, ok := known[id]
 		if !ok {
@@ -153,9 +179,19 @@ func (s *Server) trashRestore(w http.ResponseWriter, r *http.Request, sess *sess
 			writeError(w, http.StatusForbidden, "protected", "That item came from a protected location and cannot be restored here.", dst, m.op, "")
 			return
 		}
+		dsts = append(dsts, dst)
+		parents = append(parents, fsx.Parent(dst))
 	}
-	detail := fmt.Sprintf("%d item(s)", len(body.IDs))
-	if err := s.writeAudit(sess, r, m, "intent", "", "", detail, false); err != nil {
+	// The correlation id is chosen before the intent line so the two phases of
+	// one restore can be paired in the durable record (W7); the intent names the
+	// destinations, which is what a restore actually changes.
+	id, err := jobs.NewID()
+	if err != nil {
+		s.fail(w, r, "internal", "The restore could not be prepared.", "", err.Error())
+		return
+	}
+	m.path = dsts[0]
+	if err := s.writeAudit(sess, r, m, "intent", "", "", jobIntentDetail(id, fmt.Sprintf("restore of %d item(s)", len(body.IDs)), dsts), false); err != nil {
 		writeError(w, http.StatusInternalServerError, "audit_unavailable", "The change was refused: its audit record could not be saved.", "", m.op, err.Error())
 		return
 	}
@@ -164,7 +200,17 @@ func (s *Server) trashRestore(w http.ResponseWriter, r *http.Request, sess *sess
 		s.fail(w, r, "internal", "The restore could not be prepared.", "", err.Error())
 		return
 	}
-	s.submitTrashJob(w, r, sess, m, jobs.KindTrashRestore, fmt.Sprintf("Restoring %d item(s) from Trash", len(body.IDs)), wproto.JobTrashRestore, reqBody, detail, false)
+	s.submitTrashJob(w, r, sess, trashJob{
+		id:        id,
+		kind:      jobs.KindTrashRestore,
+		wireKind:  wproto.JobTrashRestore,
+		title:     fmt.Sprintf("Restoring %d item(s) from Trash", len(body.IDs)),
+		body:      reqBody,
+		roots:     identityRoots(dsts),
+		checks:    []guardCheck{{op: guard.OpCreate, paths: dsts}, {op: guard.OpCreate, paths: parents}},
+		detail:    fmt.Sprintf("job %s: restore of %d item(s)", id, len(body.IDs)),
+		milestone: false,
+	}, m)
 }
 
 // trashEmpty permanently deletes everything in the caller's own trash. It is
@@ -173,6 +219,9 @@ func (s *Server) trashRestore(w http.ResponseWriter, r *http.Request, sess *sess
 // and it is always a milestone in the audit log.
 func (s *Server) trashEmpty(w http.ResponseWriter, r *http.Request, sess *session) {
 	if !s.mutationsReady(w, r) || !s.jobsReady(w, r) {
+		return
+	}
+	if s.trashDisabled(w, r, "trash-empty") {
 		return
 	}
 	var body struct {
@@ -202,7 +251,12 @@ func (s *Server) trashEmpty(w http.ResponseWriter, r *http.Request, sess *sessio
 	if !s.authorize(w, r, sess, nil, true, m, "", []string{"job=trash-empty", "uid=" + fmt.Sprint(sess.who.UID)}, true, body.Confirm, summary) {
 		return
 	}
-	detail := fmt.Sprintf("permanent, %d item(s), %d byte(s)", summary.Files, summary.Bytes)
+	id, err := jobs.NewID()
+	if err != nil {
+		s.fail(w, r, "internal", "The request could not be prepared.", "", err.Error())
+		return
+	}
+	detail := fmt.Sprintf("job %s: permanent, %d item(s), %d byte(s)", id, summary.Files, summary.Bytes)
 	if err := s.writeAudit(sess, r, m, "intent", "", "", detail, true); err != nil {
 		writeError(w, http.StatusInternalServerError, "audit_unavailable", "The change was refused: its audit record could not be saved.", "", m.op, err.Error())
 		return
@@ -212,30 +266,56 @@ func (s *Server) trashEmpty(w http.ResponseWriter, r *http.Request, sess *sessio
 		s.fail(w, r, "internal", "The request could not be prepared.", "", err.Error())
 		return
 	}
-	s.submitTrashJob(w, r, sess, m, jobs.KindTrashEmpty, "Emptying Trash", wproto.JobTrashEmpty, reqBody, detail, true)
+	// Emptying the trash has no path roots at all: there is nothing to map a
+	// worker path onto, so a per-item warning publishes its code and nothing
+	// else (jobRoots.mapPath). The start-of-job re-check is therefore only the
+	// read-only one, which recheckGuard makes first (W1).
+	s.submitTrashJob(w, r, sess, trashJob{
+		id:        id,
+		kind:      jobs.KindTrashEmpty,
+		wireKind:  wproto.JobTrashEmpty,
+		title:     "Emptying Trash",
+		body:      reqBody,
+		detail:    detail,
+		milestone: true,
+	}, m)
 }
 
-// submitTrashJob is the shared tail of restore and empty: one job, one result
-// audit line written from the job's own (cancellation-immune) context.
-func (s *Server) submitTrashJob(w http.ResponseWriter, r *http.Request, sess *session, m mutation, kind jobs.Kind, title, wireKind string, reqBody []byte, detail string, milestone bool) {
+// trashJob is one submitted trash job: what to run, what to re-check when it
+// starts, and how to describe it in the durable record.
+type trashJob struct {
+	id        string // the correlation id, chosen before the intent line (W7)
+	kind      jobs.Kind
+	wireKind  string
+	title     string
+	body      []byte
+	roots     jobRoots     // for mapping worker paths back (W4); may be empty
+	checks    []guardCheck // re-run when the job actually starts (W1)
+	detail    string
+	milestone bool
+}
+
+// submitTrashJob is the shared tail of restore and empty: one job whose result
+// line is written by the manager's completion hook, so a job cancelled before
+// it ever ran is recorded too (W2).
+func (s *Server) submitTrashJob(w http.ResponseWriter, r *http.Request, sess *session, tj trashJob, m mutation) {
 	who, actor := sess.who, jobActorOf(sess, r)
-	idCh := make(chan string, 1)
-	job, err := s.jobMgr.Submit(kind, title, jobs.Meta{Actor: who.User, UID: who.UID}, func(ctx context.Context, p *jobs.Progress) (any, error) {
-		id, ok := waitJobID(ctx, idCh)
-		if !ok {
-			return nil, ctx.Err()
+	meta := jobs.Meta{
+		ID: tj.id, Actor: who.User, UID: who.UID,
+		OnFinish: s.jobFinishHook(actor, m.op, tj.id, m.path, tj.detail, tj.milestone),
+	}
+	job, err := s.jobMgr.Submit(tj.kind, tj.title, meta, func(ctx context.Context, p *jobs.Progress) (any, error) {
+		// W1: read-only may have been turned on while this sat in the queue.
+		if derr := s.recheckGuard(tj.checks...); derr != nil {
+			return nil, derr
 		}
-		res, err := s.jobRunner.Job(ctx, who, wproto.JobReq{JobID: id, Kind: wireKind, Body: reqBody}, progressSink(p), warnSink(p))
-		s.auditJobResult(ctx, actor, m.op, id, res, err, milestone, detail)
-		if err != nil {
-			return nil, err
-		}
-		return viewOf(res), nil
+		res, err := s.jobRunner.Job(ctx, who, wproto.JobReq{JobID: tj.id, Kind: tj.wireKind, Body: tj.body}, s.progressSink(tj.roots, p), s.warnSink(tj.roots, m.op, tj.id, p))
+		// W3: the partial view travels with the error, not instead of it.
+		return viewOf(res), s.jobErr(m.op, tj.id, err)
 	})
 	if err != nil {
 		s.failJobSubmit(w, r, sess, m, err)
 		return
 	}
-	idCh <- job.ID
 	s.writeJob(w, *job)
 }

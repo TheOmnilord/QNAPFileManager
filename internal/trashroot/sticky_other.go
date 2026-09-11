@@ -3,6 +3,7 @@
 package trashroot
 
 import (
+	"errors"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -62,6 +63,33 @@ func applyMode(_ *os.File, dir string, mode fs.FileMode) error { return os.Chmod
 // ownerOf has nothing to report: Windows has no uid of this shape, so the
 // ownership check is skipped rather than invented.
 func ownerOf(fs.FileInfo) (int, bool) { return 0, false }
+
+// nlinkOf has nothing to report either: there is no link count behind a Windows
+// FileInfo, so B3's "exactly two links, therefore empty" question is skipped
+// here rather than answered from a synthesised value.
+func nlinkOf(fs.FileInfo) (uint64, bool) { return 0, false }
+
+// removeDirIn removes the unpublished temporary directory by pathname (B3 step
+// f). There is no unlinkat here, and no AT_REMOVEDIR: os.Remove removes an
+// empty directory and refuses a non-empty one, which is the same refusal.
+func removeDirIn(dir *os.File, name string) error {
+	return os.Remove(filepath.Join(dir.Name(), name))
+}
+
+// renameNoReplaceIn publishes the prepared directory under its final name (B3
+// step e). There is no renameat2 and no RENAME_NOREPLACE on the dev box, so the
+// refusal is an lstat pre-check rather than the kernel's — the TOCTOU that
+// leaves is the dev box's alone (INV-2), and on the NAS the kernel decides.
+func renameNoReplaceIn(dir *os.File, from, to string) error {
+	dst := filepath.Join(dir.Name(), to)
+	switch _, err := os.Lstat(dst); {
+	case err == nil:
+		return &fs.PathError{Op: "rename", Path: dst, Err: syscall.EEXIST}
+	case !errors.Is(err, fs.ErrNotExist):
+		return err
+	}
+	return os.Rename(filepath.Join(dir.Name(), from), dst)
+}
 
 // refuseSymlink is the stand-in for O_NOFOLLOW.
 func refuseSymlink(p string) error {

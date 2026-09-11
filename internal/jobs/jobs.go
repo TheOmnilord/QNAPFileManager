@@ -109,7 +109,29 @@ var (
 	ErrQueueFull = fmt.Errorf("too many jobs of this kind are already waiting: %w", fsx.ErrQueueFull)
 	// ErrClosed: the manager is shutting down and takes no new work.
 	ErrClosed = errors.New("the job manager is shut down")
+	// ErrDuplicateID: a caller-supplied Meta.ID is already held by this manager
+	// (M2-A round 2, finding W7). Two live jobs sharing an id would make the
+	// cancel route and the audit trail ambiguous, so the second is refused.
+	ErrDuplicateID = errors.New("jobs: a job with that id already exists")
 )
+
+// ErrCoder lets a work function name the API error code its failure maps to.
+// Without it a refusal the FRONT END made — the guard re-check a destructive
+// job runs when it starts (finding W1) — would be recorded under the generic
+// fsx spelling rather than the vocabulary the HTTP layer and the UI use
+// ("read_only"). fsx.Code remains the fallback for everything else.
+type ErrCoder interface{ ErrorCode() string }
+
+// errCode is Job.ErrCode: the work function's own code where it named one.
+func errCode(err error) string {
+	var coder ErrCoder
+	if errors.As(err, &coder) {
+		if code := coder.ErrorCode(); code != "" {
+			return code
+		}
+	}
+	return fsx.Code(err)
+}
 
 // Limits is the manager's configuration, config.Jobs in this package's own
 // vocabulary so nothing here depends on the shape of the config file.
@@ -172,6 +194,23 @@ type Meta struct {
 	// UID is the Linux uid the worker ran as. It is recorded so a job list can
 	// be filtered to its owner without re-resolving the name.
 	UID int
+	// ID, when set, is the job id to use instead of a freshly minted one
+	// (finding W7). The web layer chooses the id BEFORE it writes the durable
+	// audit INTENT line, so the intent and the result can be paired by id even
+	// after a restart or a retention sweep. It must have the shape NewID mints
+	// (16 lower-case hex characters, which is also what the /api/jobs/<id>
+	// routes accept); a duplicate live id is refused with ErrDuplicateID.
+	ID string
+	// OnFinish, when set, is called exactly ONCE for this job, on EVERY
+	// terminal transition — done, failed, cancelled while running, cancelled
+	// while still queued, and cancelled by Close at shutdown — after the state
+	// is final and after the job has released its concurrency slot (finding
+	// W2). It is the only way to observe a job that finished without its work
+	// function ever running: a job cancelled in the queue never calls fn at
+	// all, so terminal bookkeeping done inside fn (the web layer's result audit
+	// line) would simply be missing. It runs on the job's own goroutine, so
+	// Close waits for it; it must not block indefinitely. A panic is contained.
+	OnFinish func(Job)
 }
 
 // Job is one operation's public state. Every Job handed out by this package is
@@ -242,6 +281,11 @@ type entry struct {
 	// returned a wrapped error of its own rather than context.Canceled.
 	cancelRequested bool
 
+	// onFinish is Meta.OnFinish and notified is the exactly-once latch that
+	// guards it (finding W2).
+	onFinish func(Job)
+	notified bool
+
 	// rate estimator state.
 	runStart   time.Time
 	lastSample time.Time
@@ -302,16 +346,24 @@ func (m *Manager) Submit(kind Kind, title string, meta Meta, fn func(ctx context
 	if fn == nil {
 		return nil, errors.New("jobs: a job needs something to run")
 	}
-	id, err := newID()
-	if err != nil {
-		return nil, err
+	// A caller may choose the id itself, so a durable audit intent line can name
+	// the job before it is submitted (finding W7). Anything else is minted here.
+	id := meta.ID
+	if id == "" {
+		var err error
+		if id, err = NewID(); err != nil {
+			return nil, err
+		}
+	} else if !ValidID(id) {
+		return nil, fmt.Errorf("jobs: %q is not a usable job id", id)
 	}
 	class := ClassOf(kind)
 	now := m.now()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	e := &entry{
-		cancel: cancel,
+		cancel:   cancel,
+		onFinish: meta.OnFinish,
 		job: Job{
 			ID:         id,
 			Kind:       kind,
@@ -335,6 +387,15 @@ func (m *Manager) Submit(kind Kind, title string, meta Meta, fn func(ctx context
 		cancel()
 		return nil, ErrClosed
 	}
+	// Refuse a duplicate under the SAME lock that registers it, so two
+	// concurrent submits of one id cannot both pass. A finished-but-retained
+	// job still holds its id: reusing it would make /api/jobs/<id> and the
+	// audit trail ambiguous in exactly the way the id exists to prevent.
+	if _, taken := m.jobs[id]; taken {
+		m.mu.Unlock()
+		cancel()
+		return nil, fmt.Errorf("%w: %s", ErrDuplicateID, id)
+	}
 	if m.queued[class] >= m.limits.QueueDepth {
 		depth := m.queued[class]
 		m.mu.Unlock()
@@ -357,8 +418,16 @@ func (m *Manager) Submit(kind Kind, title string, meta Meta, fn func(ctx context
 }
 
 // run waits for the class's semaphore, runs the work and records the outcome.
+//
+// Every path out of this goroutine passes through finishQueued or finish, so
+// the deferred notifyFinish is the single terminal transition every job makes —
+// including the two where fn never runs at all (cancelled in the queue, closed
+// at shutdown). It is deferred AFTER the semaphore and the context, so a hook
+// that writes a durable record does not hold a concurrency slot while it does;
+// it is deferred BEFORE m.wg.Done, so Close still waits for it.
 func (m *Manager) run(ctx context.Context, cancel context.CancelFunc, e *entry, class Class, fn func(context.Context, *Progress) (any, error)) {
 	defer m.wg.Done()
+	defer m.notifyFinish(e)
 	defer cancel()
 
 	sem := m.sem[class]
@@ -397,6 +466,32 @@ func (m *Manager) call(ctx context.Context, p *Progress, fn func(context.Context
 		}
 	}()
 	return fn(ctx, p)
+}
+
+// notifyFinish runs the job's completion hook exactly once, after its state is
+// final (finding W2). The snapshot handed over is the terminal one, so a hook
+// that audits a result line sees the counts, the state and the error code the
+// caller would read from Get.
+//
+// A hook is caller code running on the daemon's own goroutine: a panic in one
+// user's completion bookkeeping must not take down a process that is root for
+// everybody else, so it is contained here the way call() contains one in fn.
+func (m *Manager) notifyFinish(e *entry) {
+	e.mu.Lock()
+	if e.notified {
+		e.mu.Unlock()
+		return
+	}
+	e.notified = true
+	hook := e.onFinish
+	if hook == nil {
+		e.mu.Unlock()
+		return
+	}
+	j := e.snapshotLocked()
+	e.mu.Unlock()
+	defer func() { _ = recover() }()
+	hook(j)
 }
 
 func (m *Manager) leaveQueue(class Class) {
@@ -580,11 +675,16 @@ func (e *entry) finish(now time.Time, res any, err error, ctxErr error) {
 		j.State = StateFailed
 		j.ETA = -1
 		j.Err = err.Error()
-		j.ErrCode = fsx.Code(err)
+		j.ErrCode = errCode(err)
 		if j.Files > 0 || j.Bytes > 0 {
 			j.Partial = true
 			j.Note = failNote(j.Files, j.FilesTotal)
 		}
+		// A failing work function may also hand back what it managed before it
+		// failed, exactly as a cancelled one does (finding W3); keeping it is
+		// the difference between "the delete failed" and "the delete failed
+		// after moving these three items to Trash".
+		e.recordResult(res)
 	}
 }
 
@@ -651,6 +751,11 @@ func (e *entry) outcome() (State, time.Time) {
 func (e *entry) snapshot() Job {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	return e.snapshotLocked()
+}
+
+// snapshotLocked is snapshot with e.mu already held.
+func (e *entry) snapshotLocked() Job {
 	j := e.job
 	j.Src = append([]string(nil), e.job.Src...)
 	j.Warnings = append([]string(nil), e.job.Warnings...)
@@ -658,12 +763,29 @@ func (e *entry) snapshot() Job {
 	return j
 }
 
-// newID is 16 hex characters from crypto/rand. A job id is quoted back by the
-// UI and used to cancel, so it is unguessable rather than sequential.
-func newID() (string, error) {
+// NewID mints a job id: 16 hex characters from crypto/rand. A job id is quoted
+// back by the UI and used to cancel, so it is unguessable rather than
+// sequential. It is exported because the web layer chooses a job's id before it
+// submits, so the durable audit intent line can name it (finding W7).
+func NewID() (string, error) {
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		return "", fmt.Errorf("jobs: generating a job id: %w", err)
 	}
 	return hex.EncodeToString(b[:]), nil
+}
+
+// ValidID reports whether id has the shape NewID mints, which is also the shape
+// the /api/jobs/<id> routes accept. A caller-supplied Meta.ID must match it, so
+// a hand-made id can never widen that route's vocabulary.
+func ValidID(id string) bool {
+	if len(id) != 16 {
+		return false
+	}
+	for _, c := range id {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }

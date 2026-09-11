@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -147,6 +146,19 @@ func withAudit(t *testing.T, s *Server) func() []audit.Event {
 		}
 	})
 	return func() []audit.Event {
+		// A job's RESULT line is written by the manager's completion hook (W2),
+		// which runs just AFTER the job's state becomes terminal — so observing
+		// the terminal state is not by itself proof the line has been written.
+		// Draining the manager is: Close waits for every job goroutine, and the
+		// hook is deferred inside it. Closing twice is harmless (the fixture's
+		// own cleanup does it too).
+		if s.jobMgr != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := s.jobMgr.Close(ctx); err != nil {
+				t.Errorf("draining the job manager: %v", err)
+			}
+			cancel()
+		}
 		if !closed {
 			if err := logger.Close(); err != nil {
 				t.Fatal(err)
@@ -480,35 +492,44 @@ func TestJobDeleteAuditsIntentAndResult(t *testing.T) {
 
 func TestJobMilestoneClassification(t *testing.T) {
 	for _, tc := range []struct {
-		name  string
-		force bool
-		res   wproto.JobResult
-		want  bool
+		name         string
+		force        bool
+		result       string
+		files, bytes int64
+		want         bool
 	}{
-		{name: "permanent delete is always a milestone", force: true, res: wproto.JobResult{Files: 1}, want: true},
-		{name: "a small trash move is not", res: wproto.JobResult{Files: 3, Bytes: 30}, want: false},
-		{name: "a hundred files is", res: wproto.JobResult{Files: 100}, want: true},
-		{name: "a gigabyte is", res: wproto.JobResult{Bytes: 1 << 30}, want: true},
-		{name: "just under either threshold is not", res: wproto.JobResult{Files: 99, Bytes: (1 << 30) - 1}, want: false},
+		{name: "permanent delete is always a milestone", force: true, result: "ok", files: 1, want: true},
+		{name: "a small trash move is not", result: "ok", files: 3, bytes: 30, want: false},
+		{name: "a hundred files is", result: "ok", files: 100, want: true},
+		{name: "a gigabyte is", result: "ok", bytes: 1 << 30, want: true},
+		{name: "just under either threshold is not", result: "ok", files: 99, bytes: (1 << 30) - 1, want: false},
+		// W1: a job the guard refused when it started is a security record.
+		{name: "a denial always is", result: "denied", want: true},
 	} {
-		if got := jobMilestone(tc.force, tc.res); got != tc.want {
+		if got := jobMilestone(tc.force, tc.result, tc.files, tc.bytes); got != tc.want {
 			t.Errorf("%s: got %v", tc.name, got)
 		}
 	}
 }
 
 func TestJobOutcomeVocabulary(t *testing.T) {
-	if result, _ := jobOutcome(wproto.JobResult{Files: 2}, nil); result != "ok" {
+	if result, _ := jobFinishOutcome(jobs.Job{State: jobs.StateDone, Files: 2}); result != "ok" {
 		t.Errorf("clean job: %q", result)
 	}
-	if result, _ := jobOutcome(wproto.JobResult{Files: 2, Warnings: 3}, nil); result != "partial" {
+	if result, _ := jobFinishOutcome(jobs.Job{State: jobs.StateDone, Files: 2, WarningCount: 3}); result != "partial" {
 		t.Errorf("per-item failures: %q", result)
 	}
-	if result, code := jobOutcome(wproto.JobResult{Files: 2}, context.Canceled); result != "cancelled" || code != "cancelled" {
+	if result, code := jobFinishOutcome(jobs.Job{State: jobs.StateCancelled, Files: 2}); result != "cancelled" || code != "cancelled" {
 		t.Errorf("cancelled: %q %q", result, code)
 	}
-	if result, _ := jobOutcome(wproto.JobResult{}, errors.New("boom")); result != "error" {
-		t.Errorf("failure: %q", result)
+	if result, code := jobFinishOutcome(jobs.Job{State: jobs.StateFailed, ErrCode: "internal"}); result != "error" || code != "internal" {
+		t.Errorf("failure: %q %q", result, code)
+	}
+	// A guard refusal at start (W1) is a denial in the trail, not an error.
+	for _, code := range []string{"read_only", "protected"} {
+		if result, got := jobFinishOutcome(jobs.Job{State: jobs.StateFailed, ErrCode: code}); result != "denied" || got != code {
+			t.Errorf("guard refusal %q: %q %q", code, result, got)
+		}
 	}
 }
 

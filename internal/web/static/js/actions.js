@@ -3,7 +3,7 @@ import {$,el,error,announce,openDialog,pathArgs,toast} from './dom.js';
 import {state,sessionGuard} from './state.js';
 import {loadList,focused,selectedOne,selectionEntries,extraActions} from './list.js';
 import {loadTree} from './tree.js';
-import {trackJob} from './jobs.js';
+import {trackJob,awaitJob,jobLive} from './jobs.js';
 
 // post sends a JSON body to a mutation route. api() attaches the CSRF header and
 // throws an Error carrying .code and, for a 409, .confirm.
@@ -223,8 +223,13 @@ export async function deleteEntries(entries) {
    if (reAsk) continue;
    if (res===null) return;
    trackJob(res.job);
-   announce(mode==='permanent' ? 'Deleting…' : 'Moving to Trash…');
-   if (mode!=='permanent') undoToast(res.job,entries.length);
+   // The 202 says the work was ACCEPTED, not done — the job may still be queued
+   // behind others — so what is said here is neutral. The success toast, and
+   // with it the Undo, waits for the job's terminal state (finding W9).
+   announce(mode==='permanent'
+    ? `Deleting ${entries.length.toLocaleString()} item(s)…`
+    : `Moving ${entries.length.toLocaleString()} item(s) to Trash…`);
+   if (mode!=='permanent') undoWhenDone(res.job,entries.length);
    return;
   } catch(err) {
    if (!valid()) return;
@@ -240,33 +245,57 @@ export async function deleteEntries(entries) {
  }
 }
 
-// undoToast offers the 15-second Undo of ui-ux §4.4.
+// trashOutcome is what a finished delete-to-trash is worth saying, and what it
+// can offer to undo. Pure, so the wording and the "no ids, no Undo" rule are
+// unit-tested rather than inferred from the DOM (finding W9).
 //
 // The ids are the job's own: the worker names the trash entries it created and
-// they reach here as result.trashIds, so the Undo restores exactly what this
+// they reach here as result.trashIds, so an Undo restores exactly what THIS
 // delete moved rather than whatever the trash panel currently holds under the
-// same original path. The job is re-read on the click — the toast is offered the
-// moment the 202 comes back, long before the work is done, so the result is
-// usually not on the job object yet — and the one already in hand is preferred
-// when it is. No ids means the job is still running (or an old worker answered
-// and the server's fallback found nothing), and then the trash panel is the
-// honest answer rather than a guess.
-function undoToast(job,count) {
- toast(`Moved ${count.toLocaleString()} item(s) to Trash`,'Undo',async () => {
-  const valid=sessionGuard();
-  try {
-   let ids=job?.result?.trashIds||[];
-   if (!ids.length) {
-    const data=await api(`api/jobs/${job.id}`);
-    if (!valid()) return;
-    ids=data.job?.result?.trashIds||[];
-   }
-   if (!ids.length) { error(new Error('Those items could not be identified for Undo. Open Trash to restore them.')); return; }
-   const res=await api('api/trash/restore',{},{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ids})});
-   if (!valid()) return;
-   trackJob(res.job);
-  } catch(err) { if (valid()) actionError(err); }
- },15000);
+// same original path. A cancelled job reports what it managed before it stopped
+// — nothing is rolled back (design §3) — and no ids at all means there is
+// nothing this toast can honestly offer to reverse; the trash panel is then the
+// answer.
+export function trashOutcome(job,requested) {
+ const count=value => Number(value||0).toLocaleString();
+ if (!job) return {ids:[],message:`Still moving ${count(requested)} item(s) to Trash — see Operations.`};
+ const ids=Array.isArray(job.result?.trashIds) ? job.result.trashIds : [];
+ if (job.state==='failed') return {ids:[],message:job.error||'The items could not be moved to Trash.'};
+ if (job.state==='cancelled') {
+  return {ids,message: ids.length
+   ? `Cancelled — ${count(ids.length)} of ${count(requested)} item(s) reached Trash`
+   : `Cancelled — nothing was moved to Trash`};
+ }
+ if (!ids.length) return {ids,message:`Moved ${count(requested)} item(s) to Trash`};
+ return {ids,message:`Moved ${count(ids.length)} item(s) to Trash`};
+}
+
+// undoRestore posts the Undo and returns the restore job. It touches no DOM, so
+// the request itself is unit-testable; runUndo is the part that paints.
+export async function undoRestore(ids) {
+ const res=await api('api/trash/restore',{},{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ids})});
+ return res.job;
+}
+
+function runUndo(ids) {
+ const valid=sessionGuard();
+ undoRestore(ids).then(job => { if (valid()) trackJob(job); }).catch(err => { if (valid()) actionError(err); });
+}
+
+// undoWhenDone offers the 15-second Undo of ui-ux §4.4 — but only once the job
+// has actually finished (finding W9). Offering it at the 202 meant the window
+// could expire while the job was still queued, and a click in the meantime
+// found no ids and reported an error; now the toast appears with the real
+// count, the real ids and a full 15 seconds to act on them.
+async function undoWhenDone(job,requested) {
+ const valid=sessionGuard();
+ try {
+  const final=jobLive(job) ? await awaitJob(job.id) : job;
+  if (!valid()) return;
+  const {ids,message}=trashOutcome(final,requested);
+  if (!ids.length) { announce(message); return; }
+  toast(message,'Undo',() => runUndo(ids),15000);
+ } catch(err) { if (valid()) actionError(err); }
 }
 
 // deleteSelection deletes the current explicit selection (toolbar/keyboard). It

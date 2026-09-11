@@ -184,6 +184,59 @@ type walker struct {
 	plat *platform.Platform
 	opts WalkOptions
 	v    Visitor
+
+	// live caches whether plat's table is the RUNNING kernel's, read once per
+	// walk because answering it copies the table (see liveTable).
+	live     bool
+	liveRead bool
+}
+
+// mutating reports whether this walk is part of an operation that CHANGES the
+// filesystem: a recursive delete (Mutating) or the bounded pre-scan that gives
+// it its denominator, which is the walk that carries ProtectWrite. Size — the
+// one read-only caller — is neither.
+//
+// B4 turns on this distinction. A mutating walk that cannot identify the mount a
+// child descriptor is on must not descend into it; a measurement may still fall
+// back to comparing devices, because the worst a wrong answer costs there is a
+// number.
+func (w *walker) mutating() bool {
+	return w.opts.Mutating || w.opts.Protect == ProtectWrite
+}
+
+// liveTable reports whether the mount table this walk consults came from the
+// running kernel (/proc/self/mountinfo) rather than from a static one built by
+// platform.FromMountinfo — the golden QTS and hero tables, and the tests
+// (PLAN.md decision 15).
+//
+// The distinction is what makes B5's fail-closed rule safe to apply. Only a live
+// table's first field is the same number statx reports as STATX_MNT_ID, so only
+// on a live table does "the kernel named this mount and the table does not list
+// it" mean anything; a static table's IDs are invented and deliberately cannot
+// collide with a running kernel's, so a descriptor can never match one and the
+// by-name lookup has to remain the answer there.
+//
+// Platform publishes the fact through Diag rather than as an accessor of its
+// own, and Diag copies the whole table, so the answer is taken once per walk and
+// only when a mount ID has actually failed to match a row.
+func (w *walker) liveTable() bool {
+	if !w.liveRead {
+		w.liveRead = true
+		w.live = liveTableOf(w.plat)
+	}
+	return w.live
+}
+
+// liveTableOf answers walker.liveTable. It is a variable for the same reason
+// identityFor is one: the property it gates (B5) can only be observed on a table
+// whose IDs are the running kernel's, and a test cannot produce one of those on
+// a dev box. Production never assigns to it.
+var liveTableOf = func(plat *platform.Platform) bool {
+	if plat == nil {
+		return false
+	}
+	live, _ := plat.Diag()["live"].(bool)
+	return live
 }
 
 func (w *walker) warn(apiPath string, err error) {
@@ -386,6 +439,17 @@ func (w *walker) openChild(parentDir *dirRef, name, childPath, parentOS string, 
 		return nil, false, err
 	}
 	childID := identityFor(child)
+	// B4: a mutating walk may not descend into a directory whose mount the
+	// kernel would not name. Without a mount ID the only question that can be
+	// asked is "same st_dev?", and a same-device BIND mount answers yes — which
+	// is precisely the boundary a delete must not cross, and precisely the shape
+	// QTS builds its share layout out of. A measurement may live with that; a
+	// recursive delete may not, so the child is visited, warned about and left.
+	if w.mutating() && unidentifiedMount(childID, parentID) {
+		child.close()
+		return nil, false, fmt.Errorf("the kernel would not name the mount %q is on, so a mutating walk left it alone: %w",
+			childPath, fsx.ErrProtected)
+	}
 	if !w.isMountPoint(childPath, childID, parentID) {
 		return child, false, nil
 	}
@@ -451,9 +515,15 @@ func (w *walker) mayCrossInto(parentOS string, parentID mountIdentity, childPath
 	if !ok {
 		return false
 	}
-	// The parent is allowed the longest-prefix answer: it is not the thing being
-	// entered, and its worst case is the zero FSCaps, which MayCross refuses.
-	parentCaps, _ := w.capsFor(parentID, parentOS, false)
+	// The parent is allowed the longest-prefix answer by NAME — it is not the
+	// thing being entered — but not a wrong answer by identity: if the kernel
+	// named its mount and the live table cannot find that mount, capsFor refuses
+	// rather than describing some other filesystem, and so does this (B5). A
+	// crossing is authorised by both halves or by neither.
+	parentCaps, ok := w.capsFor(parentID, parentOS, false)
+	if !ok {
+		return false
+	}
 	return w.plat.MayCross(parentCaps, childCaps)
 }
 
@@ -464,12 +534,42 @@ func (w *walker) mayCrossInto(parentOS string, parentID mountIdentity, childPath
 // definite answer — the child of a crossing decision — in which case a name that
 // the table does not list as a mount point is a failure rather than a
 // longest-prefix guess.
+//
+// B5 is the case in between, and it is the dangerous one. The kernel HAS named
+// the mount this descriptor is on, and the table — just refreshed — does not
+// list it. Falling through to a pathname lookup there does not answer the
+// question less precisely, it answers a DIFFERENT question: what filesystem does
+// this name lead to now, which after a rename or a fresh mount over the name may
+// be somebody else's. A crossing must never be authorised by that, so a live
+// table with no row for a known mount ID is a refusal.
+//
+// The by-name lookup survives for exactly one case, and it is stated here
+// because it is the only reason the fall-through exists at all: a STATIC table
+// (platform.FromMountinfo — the golden QTS and hero tables, and the tests,
+// PLAN.md decision 15) whose row IDs are invented and can never equal a running
+// kernel's, so no descriptor could ever match one.
 func (w *walker) capsFor(id mountIdentity, osPath string, requireMount bool) (platform.FSCaps, bool) {
 	if id.hasMnt {
 		for _, m := range w.plat.Mounts() {
 			if uint64(m.ID) == id.mnt {
-				return w.plat.For(m.MountPoint), true
+				// B7: the caps come from the matched ROW, not from
+				// For(m.MountPoint). Going back through the mount point would
+				// throw away everything the ID just established: For does a
+				// longest-prefix lookup keyed by pathname, and where two mounts
+				// are STACKED at one path — a bind mount over a share, a tmpfs
+				// over a directory, the shape QTS builds its layout out of — the
+				// only row that name can name is the topmost one. The descriptor
+				// may well be on the one underneath, and a crossing would then be
+				// authorised by the capabilities of a filesystem this walk is not
+				// in. CapsFor derives them from the row itself and touches
+				// nothing on disk; MayCross reads Storage, Network and Domain,
+				// all three of which it fills in.
+				return platform.CapsFor(m), true
 			}
+		}
+		if w.liveTable() {
+			// B5: the kernel's own mount ID, absent from the kernel's own table.
+			return platform.FSCaps{}, false
 		}
 	}
 	if requireMount && !w.plat.IsMountPointByTable(osPath) {
@@ -494,9 +594,32 @@ type mountIdentity struct {
 	hasDev bool
 }
 
+// unidentifiedMount reports that the kernel could not name the mount one of two
+// descriptors is on, where the kernel is expected to be able to (B4).
+//
+// It is the fail-closed half of F4. Without a mount ID the only comparison left
+// is st_dev, and a same-device bind mount — one device, two mounts — passes it:
+// the walk would cross a boundary it believes is not there. A measurement can
+// accept that (Size keeps the st_dev fallback); an operation that DESTROYS data
+// cannot, so a mutating walk refuses to descend rather than guess.
+//
+// This is a true corner rather than a routine path. On Linux the ID comes from
+// statx(STATX_MNT_ID) since 5.8 and, failing that, from /proc/self/fdinfo/<fd>,
+// which has printed "mnt_id:" since Linux 3.15 — so both have to be missing at
+// once (a pre-3.15 kernel, or /proc not mounted) before a mutating walk stops.
+// Off Linux there are no kernel mount IDs at all (kernelMountIDs is false there,
+// walk_other.go), the mount table is the whole answer, and the rule is not
+// applied: that is the dev box, not the kernel (INV-2).
+func unidentifiedMount(child, parent mountIdentity) bool {
+	return kernelMountIDs && (!child.hasMnt || !parent.hasMnt)
+}
+
 // differsFrom reports whether two descriptors are on different mounts. An
 // unanswerable comparison is "no": the mount table has already had its say, and
 // inventing a boundary from missing data would stop every ordinary walk.
+//
+// The st_dev fallback below is why unidentifiedMount exists (B4): it cannot see
+// a bind mount, so a mutating walk never gets this far without a mount ID.
 func (id mountIdentity) differsFrom(other mountIdentity) bool {
 	if id.hasMnt && other.hasMnt {
 		return id.mnt != other.mnt

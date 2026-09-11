@@ -21,6 +21,12 @@ package fsops
 //     and meta.json must be a regular file owned by it (F1, F8). Anything else is
 //     an untrusted trash entry and is skipped — never listed, never restored,
 //     never deleted.
+//   - Ownership is not authenticity (B1, B2). A uid-owned directory or sidecar
+//     that is group- or other-WRITABLE is one another identity can still change:
+//     the payload swapped under a valid sidecar, or the sidecar's origPath
+//     re-pointed at a destination of the attacker's choosing. So every one of
+//     those objects must also have no write bit outside its owner. The worker
+//     creates them 0700 and 0600, so its own are never refused.
 //   - The trash root itself must be a directory owned by uid 0 with the sticky
 //     bit set (F2). An attacker-owned sticky directory standing at that name is
 //     refused outright, because its owner may rename anything inside it.
@@ -277,9 +283,23 @@ func checkTrashRoot(api string, fi os.FileInfo) error {
 }
 
 // ownedDir proves, on a held descriptor, that it refers to a directory owned by
-// exactly uid (F1). It is the check every consuming path makes — on <uid>/ and
-// on each entry directory inside it — before anything in it is read, restored or
-// removed.
+// exactly uid and writable by nobody else (F1, B1). It is the check every
+// consuming path makes — on <uid>/ and on each entry directory inside it —
+// before anything in it is read, restored or removed.
+//
+// B1 is the half round 1 missed: ownership alone is not authenticity. A uid-owned
+// entry directory that is group- or other-writable is a directory somebody else
+// may write into, and writing into it is all an attacker needs — they replace the
+// payload under a sidecar that is still perfectly valid, and the owner's worker
+// (root's, for an administrator) then restores THEIR content to the destination
+// the sidecar names. The mode is therefore part of the identity: the worker
+// creates <uid>/ and every entry directory 0700 (trashEntryMode), so a legitimate
+// one always passes, and anything that does not is an untrusted entry.
+//
+// Off Linux there is no uid and no real mode behind a FileInfo — statDetail
+// reports none and a Windows directory answers 0777 — so both questions are
+// skipped there rather than answered wrongly (INV-2: this is the dev box, not
+// the kernel). The CI Linux jobs run the real thing.
 func ownedDir(d *dirRef, api string, uid int) error {
 	fi, err := d.stat()
 	if err != nil {
@@ -288,8 +308,18 @@ func ownedDir(d *dirRef, api string, uid int) error {
 	if fi.Mode()&fs.ModeSymlink != 0 || !fi.IsDir() {
 		return fmt.Errorf("%s is a %s, not a directory: %w", api, fsx.TypeString(fi.Mode()), ErrUntrustedTrash)
 	}
-	if owner, _, _, ok := statDetail(fi); ok && owner != uid {
+	owner, _, _, ok := statDetail(fi)
+	if !ok {
+		return nil
+	}
+	if owner != uid {
 		return fmt.Errorf("%s belongs to uid %d, not to uid %d: %w", api, owner, uid, ErrUntrustedTrash)
+	}
+	if perm := fi.Mode().Perm(); perm&0o022 != 0 {
+		// B1: writable by a group or by everyone. Whoever can write here can
+		// swap the payload out from under a sidecar this worker trusts.
+		return fmt.Errorf("%s is mode %#o, so somebody other than uid %d may write in it: %w",
+			api, perm, uid, ErrUntrustedTrash)
 	}
 	return nil
 }
@@ -404,6 +434,11 @@ func writeTrashMeta(entry *dirRef, m trashMeta) error {
 //     back only once the fstat has answered;
 //   - it is not a symlink, which O_NOFOLLOW settled in the kernel;
 //   - it belongs to the uid reading it;
+//   - nobody else may WRITE it (B2). A uid-owned meta.json that is group- or
+//     other-writable is a file whose origPath another identity can rewrite, and
+//     origPath is the destination a restore renames to — so a world-writable
+//     sidecar in root's own <trash>/0/ is an attacker choosing where a root
+//     worker writes. The worker creates it 0600, so a legitimate one passes;
 //   - it is no larger than maxTrashMeta, taken from the fstat rather than
 //     discovered by reading 64 KiB of somebody's choosing.
 //
@@ -420,17 +455,8 @@ func readTrashMeta(entry *dirRef, entryAPI string, uid int) (trashMeta, error) {
 	if err != nil {
 		return trashMeta{}, err
 	}
-	if !fi.Mode().IsRegular() {
-		return trashMeta{}, fmt.Errorf("%s/%s is a %s, not a regular file: %w",
-			entryAPI, trashMetaName, fsx.TypeString(fi.Mode()), ErrUntrustedTrash)
-	}
-	if owner, _, _, ok := statDetail(fi); ok && owner != uid {
-		return trashMeta{}, fmt.Errorf("%s/%s belongs to uid %d, not to uid %d: %w",
-			entryAPI, trashMetaName, owner, uid, ErrUntrustedTrash)
-	}
-	if fi.Size() > maxTrashMeta {
-		return trashMeta{}, fmt.Errorf("%s/%s is %d bytes, more than the %d a sidecar may be: %w",
-			entryAPI, trashMetaName, fi.Size(), maxTrashMeta, ErrUntrustedTrash)
+	if err := checkTrashMeta(fi, entryAPI, uid); err != nil {
+		return trashMeta{}, err
 	}
 	// Proved regular, so the descriptor is not registered with the runtime
 	// poller and the non-blocking flag can come back off for an ordinary read.
@@ -450,6 +476,79 @@ func readTrashMeta(entry *dirRef, entryAPI string, uid int) (trashMeta, error) {
 		return trashMeta{}, fmt.Errorf("%s/%s: %w", entryAPI, trashMetaName, err)
 	}
 	return m, nil
+}
+
+// checkTrashMeta is the identity half of readTrashMeta, made on the fstat of the
+// held sidecar descriptor and split out so that emptying can ask the same
+// question without parsing anything (B6).
+//
+// The four properties are the ones readTrashMeta's comment states: a regular
+// file, owned by the uid consuming it, writable by nobody else (B2), and no
+// larger than a sidecar may be. Off Linux there is no uid behind a FileInfo and
+// a mode is not the kernel's, so statDetail reports none and the middle two are
+// skipped rather than answered wrongly (INV-2).
+func checkTrashMeta(fi os.FileInfo, entryAPI string, uid int) error {
+	if !fi.Mode().IsRegular() {
+		return fmt.Errorf("%s/%s is a %s, not a regular file: %w",
+			entryAPI, trashMetaName, fsx.TypeString(fi.Mode()), ErrUntrustedTrash)
+	}
+	if owner, _, _, ok := statDetail(fi); ok {
+		if owner != uid {
+			return fmt.Errorf("%s/%s belongs to uid %d, not to uid %d: %w",
+				entryAPI, trashMetaName, owner, uid, ErrUntrustedTrash)
+		}
+		// B2: ownership is not authenticity. A sidecar anybody else may write is
+		// a sidecar anybody else may re-point at a destination of their choosing.
+		if perm := fi.Mode().Perm(); perm&0o022 != 0 {
+			return fmt.Errorf("%s/%s is mode %#o, so somebody other than uid %d may rewrite the path it names: %w",
+				entryAPI, trashMetaName, perm, uid, ErrUntrustedTrash)
+		}
+	}
+	if fi.Size() > maxTrashMeta {
+		return fmt.Errorf("%s/%s is %d bytes, more than the %d a sidecar may be: %w",
+			entryAPI, trashMetaName, fi.Size(), maxTrashMeta, ErrUntrustedTrash)
+	}
+	return nil
+}
+
+// trustedSidecar proves that an entry's EXISTING sidecar is this uid's own
+// before anything in the entry is destroyed (B6).
+//
+// It is the check emptying was missing. An entry directory belongs to this uid
+// and is 0700 — ownedDir has just said so — and yet the meta.json inside it can
+// still be somebody else's: root's own trash is <trash>/0/, a name any local
+// user may get to first, and a pre-planted entry directory can be handed over
+// with `chown` by whoever made it, or a sidecar inside a legitimate entry left
+// group-writable by a bad umask. Listing and restoring already refuse such an
+// entry (readTrashMeta makes exactly these checks), so an empty that destroyed
+// it anyway would be the one operation in this file acting on a record the rest
+// of it calls untrusted — permanently, and without the user ever having seen the
+// entry in their panel.
+//
+// A MISSING sidecar is a different thing and is deliberately NOT an error: that
+// is the orphan payload a crash between the sidecar and the rename leaves
+// behind, which nothing can list or restore, and clearing it is one of the
+// things an empty is for.
+//
+// The open is the same one readTrashMeta makes — O_RDONLY|O_NONBLOCK through the
+// held entry descriptor, with openFile adding O_NOFOLLOW|O_CLOEXEC — so a fifo
+// planted at the name returns rather than parking this worker inside open(2) and
+// a symlink is ELOOP rather than something followed. Nothing is read: the fstat
+// answers the whole question.
+func trustedSidecar(entry *dirRef, entryAPI string, uid int) error {
+	f, err := entry.openFile(trashMetaName, readSidecarFlags, 0)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	return checkTrashMeta(fi, entryAPI, uid)
 }
 
 // metaFor describes an item about to be trashed.
@@ -995,7 +1094,9 @@ func restoreOne(r fsx.Root, loc trashLoc, user, entry *dirRef, id string, uid in
 // permanent delete has.
 //
 // The validation comes first and on descriptors (F1, F2): the trash root must
-// belong to root and be sticky, and <uid>/ must belong to this uid. A <uid>/
+// belong to root and be sticky, <uid>/ must belong to this uid, and so must each
+// entry directory AND the sidecar inside it (B6) — the same entry a listing or a
+// restore would refuse is the same entry an empty leaves alone. A <uid>/
 // somebody else owns is NOT emptied — emptying it would be this worker deleting
 // another user's files on their behalf, or, for a root session, deleting
 // whatever an attacker had pre-created under the name "0" and chose to have
@@ -1165,6 +1266,17 @@ func emptyEntry(ctx context.Context, user *dirRef, userAPI, id string, uid int, 
 		res.Skipped++
 		return false, nil
 	}
+	// B6: and neither is an entry whose SIDECAR is somebody else's. The entry
+	// directory passing ownedDir says nothing about the meta.json inside it, and
+	// an entry the listing and the restore both refuse as untrusted must not be
+	// the one thing an empty quietly destroys. An entry with no sidecar at all is
+	// still emptied — that orphan is what an empty is for (trustedSidecar).
+	if err := trustedSidecar(entry, entryAPI, uid); err != nil {
+		entry.close()
+		emit.warnErr(entryAPI, err)
+		res.Skipped++
+		return false, nil
+	}
 
 	// The order F14 exists for. Everything below is reported through warnings
 	// that leave the entry exactly as listable and as restorable as it was.
@@ -1257,7 +1369,18 @@ func removeTrashTree(ctx context.Context, dir *dirRef, dirAPI, name string, fi o
 			res.Skipped++
 			return err
 		}
-		if identityFor(child).differsFrom(identityFor(dir)) {
+		childID, parentID := identityFor(child), identityFor(dir)
+		// B4: emptying the trash destroys data, so it is held to the mutating
+		// walk's rule — a child whose mount the kernel will not name is left
+		// alone rather than compared by st_dev, which a bind mount defeats.
+		if unidentifiedMount(childID, parentID) {
+			child.close()
+			err := fmt.Errorf("the kernel would not name the mount %q is on, so it was left alone: %w", itemAPI, fsx.ErrProtected)
+			emit.warnErr(itemAPI, err)
+			res.Skipped++
+			return err
+		}
+		if childID.differsFrom(parentID) {
 			child.close()
 			err := fmt.Errorf("%q is a mount point and was left alone: %w", itemAPI, fsx.ErrProtected)
 			emit.warnErr(itemAPI, err)

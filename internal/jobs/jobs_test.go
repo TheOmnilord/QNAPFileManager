@@ -832,3 +832,203 @@ func TestConcurrentProgressAndReaders(t *testing.T) {
 		})
 	}
 }
+
+// --- the completion hook and caller-supplied ids (M2-A round 2) ---------------
+
+// TestOnFinishFiresExactlyOnceOnEveryTerminalPath is finding W2: the web layer
+// audits a job's result line from this hook, so it has to fire for a job that
+// finished normally, one that failed, one cancelled while running AND one
+// cancelled while it was still queued — the last of which never runs its work
+// function at all, which is exactly how a durable delete intent used to end up
+// with no result beside it.
+func TestOnFinishFiresExactlyOnceOnEveryTerminalPath(t *testing.T) {
+	type finished struct {
+		mu   sync.Mutex
+		jobs []Job
+	}
+	for _, tc := range []struct {
+		name      string
+		fn        func(context.Context, *Progress) (any, error)
+		cancel    bool
+		wantState State
+	}{
+		{name: "done", fn: func(context.Context, *Progress) (any, error) { return nil, nil }, wantState: StateDone},
+		{name: "failed", fn: func(context.Context, *Progress) (any, error) { return nil, errors.New("boom") }, wantState: StateFailed},
+		{
+			name: "cancelled while running",
+			fn: func(ctx context.Context, _ *Progress) (any, error) {
+				<-ctx.Done()
+				return nil, ctx.Err()
+			},
+			cancel: true, wantState: StateCancelled,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, _ := newManager(t, Limits{})
+			seen := &finished{}
+			done := make(chan struct{})
+			meta := Meta{OnFinish: func(j Job) {
+				seen.mu.Lock()
+				seen.jobs = append(seen.jobs, j)
+				seen.mu.Unlock()
+				close(done)
+			}}
+			job, err := m.Submit(KindDelete, "t", meta, tc.fn)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.cancel {
+				waitState(t, m, job.ID, StateRunning)
+				m.Cancel(job.ID)
+			}
+			select {
+			case <-done:
+			case <-time.After(testWait):
+				t.Fatal("the completion hook never ran")
+			}
+			seen.mu.Lock()
+			defer seen.mu.Unlock()
+			if len(seen.jobs) != 1 {
+				t.Fatalf("hook ran %d times, want exactly once", len(seen.jobs))
+			}
+			// The snapshot is the TERMINAL one: the state is already final.
+			if got := seen.jobs[0]; got.State != tc.wantState || got.FinishedAt.IsZero() {
+				t.Fatalf("hook saw %+v, want state %s", got, tc.wantState)
+			}
+		})
+	}
+}
+
+// A job cancelled while it is still queued never calls fn — and is the whole
+// reason the hook exists.
+func TestOnFinishFiresForAJobThatNeverRan(t *testing.T) {
+	m, _ := newManager(t, Limits{Metadata: 1})
+	hold := newGate()
+	first, err := m.Submit(KindDelete, "holding the slot", Meta{}, hold.fn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hold.waitStarted(t, "the first job")
+	defer hold.open()
+	_ = first
+
+	var ran atomic.Bool
+	done := make(chan Job, 1)
+	queued, err := m.Submit(KindDelete, "queued", Meta{OnFinish: func(j Job) { done <- j }}, func(context.Context, *Progress) (any, error) {
+		ran.Store(true)
+		return nil, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, m, queued.ID, StateQueued)
+	m.Cancel(queued.ID)
+	select {
+	case j := <-done:
+		if j.State != StateCancelled || j.Partial {
+			t.Fatalf("a job cancelled in the queue: %+v", j)
+		}
+		if !strings.Contains(j.Note, "before it started") {
+			t.Fatalf("note %q", j.Note)
+		}
+	case <-time.After(testWait):
+		t.Fatal("the completion hook never ran for a job cancelled in the queue")
+	}
+	if ran.Load() {
+		t.Fatal("the work function ran for a job cancelled while queued")
+	}
+}
+
+// Close is a terminal transition too: shutdown must not lose the record.
+func TestOnFinishFiresWhenTheManagerCloses(t *testing.T) {
+	m := New(Limits{})
+	done := make(chan Job, 1)
+	if _, err := m.Submit(KindDelete, "running at shutdown", Meta{OnFinish: func(j Job) { done <- j }}, func(ctx context.Context, _ *Progress) (any, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), testWait)
+	defer cancel()
+	if err := m.Close(ctx); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	// Close waits for the hook, so by the time it returns the record is made.
+	select {
+	case j := <-done:
+		if j.State != StateCancelled {
+			t.Fatalf("state %s", j.State)
+		}
+	default:
+		t.Fatal("Close returned before the completion hook ran")
+	}
+}
+
+// A panicking hook must not take down a daemon that is root for everybody else.
+func TestAPanickingCompletionHookIsContained(t *testing.T) {
+	m, _ := newManager(t, Limits{})
+	job, err := m.Submit(KindSize, "t", Meta{OnFinish: func(Job) { panic("hook") }}, func(context.Context, *Progress) (any, error) { return nil, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, m, job.ID, StateDone)
+}
+
+// TestCallerSuppliedIDs is finding W7: the web layer chooses a job's id before
+// it writes the durable intent line, so Submit must use that id — and refuse a
+// duplicate, which would make cancellation and the audit trail ambiguous.
+func TestCallerSuppliedIDs(t *testing.T) {
+	m, _ := newManager(t, Limits{})
+	id, err := NewID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ValidID(id) {
+		t.Fatalf("NewID minted %q, which ValidID rejects", id)
+	}
+	gate := newGate()
+	job, err := m.Submit(KindDelete, "t", Meta{ID: id}, gate.fn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gate.open()
+	if job.ID != id {
+		t.Fatalf("job id %q, want the caller's %q", job.ID, id)
+	}
+	if _, err := m.Submit(KindDelete, "t", Meta{ID: id}, gate.fn); !errors.Is(err, ErrDuplicateID) {
+		t.Fatalf("duplicate id: %v", err)
+	}
+	// An id the job routes could not address is refused outright.
+	for _, bad := range []string{"nothex0123456789", "0123456789abcde", "0123456789ABCDEF", "../../etc"} {
+		if _, err := m.Submit(KindDelete, "t", Meta{ID: bad}, gate.fn); err == nil {
+			t.Errorf("Submit accepted the id %q", bad)
+		}
+	}
+}
+
+// A work function's own error code wins over the generic fsx spelling, so a
+// job the front-end guard refused when it started (finding W1) is recorded in
+// the vocabulary the HTTP layer and the UI share.
+func TestErrCoderNamesTheApiCode(t *testing.T) {
+	m, _ := newManager(t, Limits{})
+	job, err := m.Submit(KindDelete, "t", Meta{}, func(context.Context, *Progress) (any, error) {
+		return nil, codedError{code: "read_only", err: fsx.ErrReadOnly}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	final := waitState(t, m, job.ID, StateFailed)
+	if final.ErrCode != "read_only" {
+		t.Fatalf("ErrCode %q, want the work function's own code", final.ErrCode)
+	}
+}
+
+type codedError struct {
+	code string
+	err  error
+}
+
+func (e codedError) Error() string     { return "refused" }
+func (e codedError) Unwrap() error     { return e.err }
+func (e codedError) ErrorCode() string { return e.code }

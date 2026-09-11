@@ -184,6 +184,13 @@ func renameNoReplaceIn(fromDir *os.File, fromName string, toDir *os.File, toName
 	return err
 }
 
+// kernelMountIDs says the kernel here can name the mount behind a descriptor,
+// which on Linux it can: statx(STATX_MNT_ID) since 5.8, and /proc/self/fdinfo
+// since 3.15 before that. It is what lets a mutating walk fail closed when no
+// ID comes back (B4, unidentifiedMount) instead of trusting a st_dev comparison
+// a bind mount defeats.
+const kernelMountIDs = true
+
 // identityOf reads the mount identity of a held directory descriptor (F4).
 //
 // The mount ID comes first because it is the only answer that separates two

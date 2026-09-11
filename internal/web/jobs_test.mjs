@@ -1,7 +1,7 @@
 // Run with: node --test internal/web/jobs_test.mjs
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
-import {formatBytes,formatRate,formatETA,jobPercent,jobDetailLine,shouldPoll,jobLive,createPoller} from './static/js/jobs.js';
+import {formatBytes,formatRate,formatETA,jobPercent,jobDetailLine,shouldPoll,jobLive,createPoller,jobTransitions,seedJob,trackedStates} from './static/js/jobs.js';
 
 test('formatBytes reads in binary units', () => {
  assert.equal(formatBytes(0),'0 B');
@@ -93,6 +93,55 @@ test('stopping the poller cancels the pending tick', async () => {
  assert.equal(poller.running,false);
  assert.equal(timers.size(),0);
  assert.equal(calls,0);
+});
+
+// --- transitions (finding W8) -------------------------------------------------
+
+const del = (id,state) => ({id,state,kind:'delete',title:'Moving to Trash: x'});
+
+test('a job that finishes before the first poll is still a transition', () => {
+ // The 202 seeds the submitted state, so the very first listing — which already
+ // shows the job done — is a completion, not an unknown job to be skipped.
+ trackedStates.clear();
+ seedJob({id:'j1',state:'queued'});
+ const {events,refresh} = jobTransitions([del('j1','done')],trackedStates);
+ assert.equal(events.length,1);
+ assert.equal(events[0].kind,'finished');
+ assert.equal(refresh,true); // the list and the tree are reloaded
+ trackedStates.clear();
+});
+
+test('a job first observed terminal counts as finished, and is announced once', () => {
+ const seen = new Map();
+ const first = jobTransitions([del('j2','done')],seen);
+ assert.equal(first.events.length,1);
+ assert.equal(first.refresh,true);
+ // The same listing again is not a second transition.
+ assert.deepEqual(jobTransitions([del('j2','done')],seen),{events:[],refresh:false});
+});
+
+test('the priming listing only records a baseline', () => {
+ // Retained jobs from before this session opened must not announce themselves.
+ const seen = new Map();
+ assert.deepEqual(jobTransitions([del('old','done')],seen,{prime:true}),{events:[],refresh:false});
+ assert.equal(seen.get('old'),'done');
+ // A job submitted afterwards still transitions normally.
+ const out = jobTransitions([del('old','done'),del('new','running')],seen);
+ assert.equal(out.events.length,1);
+ assert.equal(out.events[0].kind,'started');
+});
+
+test('a job that leaves the listing is forgotten', () => {
+ const seen = new Map([['gone','done']]);
+ jobTransitions([],seen);
+ assert.equal(seen.size,0);
+});
+
+test('a size job finishing does not reload the file list', () => {
+ const seen = new Map([['s1','running']]);
+ const {events,refresh} = jobTransitions([{id:'s1',state:'done',kind:'size'}],seen);
+ assert.equal(events.length,1);
+ assert.equal(refresh,false);
 });
 
 test('a poll that arrives after stop does not restart the loop', async () => {

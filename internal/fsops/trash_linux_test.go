@@ -11,6 +11,123 @@ import (
 	"time"
 )
 
+// plantTrashEntry builds one trash entry by hand — the entry directory, a
+// sidecar naming a destination inside the fixture, and a payload — the way an
+// attacker who can create entries in the 1777 trash would. The modes are the
+// point of the tests below, so they are passed in rather than assumed.
+func plantTrashEntry(t *testing.T, base, api string, uid int, id string, dirMode, metaMode os.FileMode) string {
+	t.Helper()
+	entry := trashEntryDir(base, uid, id)
+	if err := os.MkdirAll(entry, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	meta := filepath.Join(entry, trashMetaName)
+	body := `{"origPath":"` + api + `/planted.txt","name":"planted.txt","type":"file"}`
+	if err := os.WriteFile(meta, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(entry, trashItemName), []byte("planted"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(meta, metaMode); err != nil {
+		t.Fatal(err)
+	}
+	// The entry directory's mode goes on last: a 0777 one still has to be
+	// writable by this test, and it is, but the order keeps the two independent.
+	if err := os.Chmod(entry, dirMode); err != nil {
+		t.Fatal(err)
+	}
+	return entry
+}
+
+// TestTrashEntryDirectoryMustNotBeWritableByOthers is B1. Round 1 established
+// that nothing is consumed that the consumer does not OWN; round 2's point is
+// that ownership is not authenticity. An entry directory that belongs to this
+// uid but is group- or other-writable is a directory somebody else can write
+// into — and writing into it is the whole attack: the payload is replaced under
+// a sidecar that is still perfectly valid, and the owner's worker (root's, for an
+// administrator) then restores the attacker's content to the path the sidecar
+// names.
+//
+// The worker creates every entry directory 0700, so a real one is never refused.
+func TestTrashEntryDirectoryMustNotBeWritableByOthers(t *testing.T) {
+	r, plat, base, api := trashFixture(t)
+	uid := selfUID()
+	const id = "1700000000-aaaa0001"
+	entry := plantTrashEntry(t, base, api, uid, id, 0o777, 0o600)
+
+	items, err := TrashList(context.Background(), r, plat, uid)
+	if err != nil {
+		t.Fatalf("TrashList: %v", err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("TrashList = %+v, want a world-writable entry directory skipped", items)
+	}
+
+	var restore jobLog
+	res, err := TrashRestore(context.Background(), r, plat, uid, []string{id}, restore.emit())
+	if err != nil {
+		t.Fatalf("TrashRestore: %v", err)
+	}
+	if res.Files != 0 || res.Skipped != 1 {
+		t.Fatalf("result = %+v, want the restore refused", res)
+	}
+	if exists(t, base, "planted.txt") {
+		t.Fatal("a directory anybody could write into chose what a worker restored")
+	}
+
+	// An empty must not destroy it either: it is not an entry this worker may
+	// consume, so it is reported and left exactly where it is.
+	var empty jobLog
+	if _, err := TrashEmpty(context.Background(), r, plat, uid, empty.emit()); err != nil {
+		t.Fatalf("TrashEmpty: %v", err)
+	}
+	if indexOf(empty.codes(), "protected") < 0 {
+		t.Errorf("warn codes = %v, want the untrusted entry reported", empty.codes())
+	}
+	if _, err := os.Lstat(filepath.Join(entry, trashItemName)); err != nil {
+		t.Errorf("the entry was emptied anyway: %v", err)
+	}
+}
+
+// TestTrashSidecarMustNotBeWritableByOthers is B2, the same lesson applied to
+// meta.json. origPath is the destination a restore renames to, so a sidecar
+// another identity may rewrite is that identity choosing where this worker
+// writes — and for an administrator's session that worker is root.
+//
+// TestTrashEmptyKeepsAnEntryWithAnUntrustedSidecar is the empty half (B6): the
+// same entry the listing and the restore refuse here is one an empty must not
+// destroy either.
+func TestTrashSidecarMustNotBeWritableByOthers(t *testing.T) {
+	r, plat, base, api := trashFixture(t)
+	uid := selfUID()
+	const id = "1700000000-aaaa0002"
+	plantTrashEntry(t, base, api, uid, id, 0o700, 0o666)
+
+	items, err := TrashList(context.Background(), r, plat, uid)
+	if err != nil {
+		t.Fatalf("TrashList: %v", err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("TrashList = %+v, want a world-writable sidecar skipped", items)
+	}
+
+	var restore jobLog
+	res, err := TrashRestore(context.Background(), r, plat, uid, []string{id}, restore.emit())
+	if err != nil {
+		t.Fatalf("TrashRestore: %v", err)
+	}
+	if res.Files != 0 || res.Skipped != 1 {
+		t.Fatalf("result = %+v, want the restore refused", res)
+	}
+	if len(restore.warns) != 1 || restore.warns[0].Code != "protected" {
+		t.Fatalf("warns = %v, want protected", restore.warns)
+	}
+	if exists(t, base, "planted.txt") {
+		t.Fatal("a sidecar anybody could rewrite chose where a worker wrote")
+	}
+}
+
 // TestTrashSidecarMustBeARegularFile is F8. meta.json lives inside a directory
 // in a 1777 tree, so it is attacker-controlled, and a fifo planted at that name
 // would park a worker goroutine inside open(2) with no writer — where no
@@ -117,6 +234,86 @@ func TestTrashSidecarMustBeOwnedByTheReader(t *testing.T) {
 	}
 	if exists(t, base, "planted.txt") {
 		t.Fatal("a sidecar owned by somebody else chose where a root worker wrote")
+	}
+}
+
+// TestTrashEmptyKeepsAnEntryWithAnUntrustedSidecar is B6.
+//
+// Round 2 taught emptying to check the entry DIRECTORY's owner and mode; the
+// sidecar inside it went unchecked, so a uid-owned entry carrying a meta.json
+// anybody may rewrite was emptied even though TrashList skips it and
+// TrashRestore refuses it. That is the one operation in the file destroying a
+// record the rest of it calls untrusted — permanently, and for an entry the user
+// was never shown.
+//
+// The orphan entry in the same trash is the control, and it is the behaviour the
+// round-1 follow-up deliberately kept: an entry with NO sidecar cannot be listed
+// or restored by anyone, so clearing it is exactly what an empty is for.
+func TestTrashEmptyKeepsAnEntryWithAnUntrustedSidecar(t *testing.T) {
+	r, plat, base, api := trashFixture(t)
+	uid := selfUID()
+	const (
+		untrusted = "1700000000-bbbb0001"
+		orphan    = "1700000000-bbbb0002"
+	)
+	entry := plantTrashEntry(t, base, api, uid, untrusted, 0o700, 0o666)
+
+	// The orphan: an entry directory and a payload, with the sidecar the crash
+	// between the two writes never got to leave behind.
+	orphanDir := trashEntryDir(base, uid, orphan)
+	if err := os.MkdirAll(orphanDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(orphanDir, trashItemName), []byte("nameless"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var empty jobLog
+	if _, err := TrashEmpty(context.Background(), r, plat, uid, empty.emit()); err != nil {
+		t.Fatalf("TrashEmpty: %v", err)
+	}
+
+	entryAPI := api + "/" + TrashDirName + "/" + itoa(uid) + "/" + untrusted
+	w, ok := empty.warnFor(entryAPI)
+	if !ok || w.Code != "protected" {
+		t.Errorf("warns = %v, want %q reported as protected", empty.warns, entryAPI)
+	}
+	for _, name := range []string{trashMetaName, trashItemName} {
+		if _, err := os.Lstat(filepath.Join(entry, name)); err != nil {
+			t.Errorf("%s of the untrusted entry was destroyed: %v", name, err)
+		}
+	}
+	if _, err := os.Lstat(orphanDir); !os.IsNotExist(err) {
+		t.Errorf("the orphan entry survived the empty (%v); an entry nobody can restore is what an empty clears", err)
+	}
+}
+
+// TestTrashEmptyKeepsAnEntryWhoseSidecarIsSomebodyElses is the ownership half of
+// B6, and it needs a second uid: only root can hand a file to somebody else. The
+// CI root job runs it.
+func TestTrashEmptyKeepsAnEntryWhoseSidecarIsSomebodyElses(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("giving a file away needs root; the CI root job runs this one")
+	}
+	r, plat, base, api := trashFixture(t)
+	uid := selfUID() // 0 here: an administrator's session, whose trash is <trash>/0/
+	const id = "1700000000-bbbb0003"
+	entry := plantTrashEntry(t, base, api, uid, id, 0o700, 0o600)
+	if err := os.Chown(filepath.Join(entry, trashMetaName), 65534, 65534); err != nil {
+		t.Skipf("cannot give the sidecar away here: %v", err)
+	}
+
+	var empty jobLog
+	if _, err := TrashEmpty(context.Background(), r, plat, uid, empty.emit()); err != nil {
+		t.Fatalf("TrashEmpty: %v", err)
+	}
+	if indexOf(empty.codes(), "protected") < 0 {
+		t.Errorf("warn codes = %v, want the foreign sidecar reported", empty.codes())
+	}
+	for _, name := range []string{trashMetaName, trashItemName} {
+		if _, err := os.Lstat(filepath.Join(entry, name)); err != nil {
+			t.Errorf("%s of an entry whose sidecar is somebody else's was destroyed: %v", name, err)
+		}
 	}
 }
 

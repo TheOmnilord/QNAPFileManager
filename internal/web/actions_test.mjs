@@ -1,7 +1,7 @@
 // Run with: node --test internal/web/actions_test.mjs
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
-import {runMutation, actionMessage, deleteGrade, PERMANENT_WARNING} from './static/js/actions.js';
+import {runMutation, actionMessage, deleteGrade, trashOutcome, undoRestore, PERMANENT_WARNING} from './static/js/actions.js';
 import {update} from './static/js/state.js';
 
 test('runMutation drives the server confirmation-token flow', async t => {
@@ -63,6 +63,44 @@ test('deleteGrade is the confirmation ladder', () => {
  assert.equal(deleteGrade({mode:'trash',summary:{warnings:['Inside a protected system path.']}}),2);
  assert.equal(deleteGrade({mode:'trash',summary:{files:101}}),2);
  assert.equal(deleteGrade({mode:'trash',summary:{bytes:(1<<30)+1}}),2);
+});
+
+// --- the Undo toast (finding W9) ---------------------------------------------
+
+test('Undo is offered only for a job that actually reached Trash', () => {
+ // Still running (or queued): nothing to undo yet, and nothing claimed.
+ assert.deepEqual(trashOutcome(null,3),{ids:[],message:'Still moving 3 item(s) to Trash — see Operations.'});
+ // Finished: the count is the worker's own ids, not what was requested.
+ const done = trashOutcome({state:'done',result:{trashIds:['1-a','2-b']}},2);
+ assert.deepEqual(done.ids,['1-a','2-b']);
+ assert.equal(done.message,'Moved 2 item(s) to Trash');
+ // Finished with no ids (an older worker, the fallback found nothing): the
+ // message still reports the delete, but there is no Undo to offer.
+ assert.deepEqual(trashOutcome({state:'done',result:{}},4),{ids:[],message:'Moved 4 item(s) to Trash'});
+ // Failed: the job's own (code-derived) error, no Undo.
+ assert.deepEqual(trashOutcome({state:'failed',error:'Read-only mode is on, so the operation was refused.'},1),
+  {ids:[],message:'Read-only mode is on, so the operation was refused.'});
+});
+
+test('a cancelled delete offers Undo for the part that did reach Trash', () => {
+ const partial = trashOutcome({state:'cancelled',result:{trashIds:['1-a']}},5);
+ assert.deepEqual(partial.ids,['1-a']);
+ assert.equal(partial.message,'Cancelled — 1 of 5 item(s) reached Trash');
+ assert.deepEqual(trashOutcome({state:'cancelled',result:{}},5),{ids:[],message:'Cancelled — nothing was moved to Trash'});
+});
+
+test('Undo restores exactly the ids the job reported', async t => {
+ t.after(() => update({session:null}));
+ const bodies=[];
+ t.mock.method(globalThis,'fetch',async (url,opts) => {
+  bodies.push({url:String(url),body:JSON.parse(opts.body)});
+  return new Response(JSON.stringify({job:{id:'0123456789abcdef',state:'queued'}}),{status:202});
+ });
+ const job = await undoRestore(['1-a','2-b']);
+ assert.equal(job.id,'0123456789abcdef');
+ assert.equal(bodies.length,1);
+ assert.match(bodies[0].url,/api\/trash\/restore$/);
+ assert.deepEqual(bodies[0].body,{ids:['1-a','2-b']});
 });
 
 test('the permanent warning is the exact sentence the server sends', () => {

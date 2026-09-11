@@ -93,6 +93,13 @@ func (d *dirRef) renameOut(fromName string, toJail fsx.Jail, toParentRel, toName
 	return renameAt(d.j, d.rel, fromName, toJail, toParentRel, toName, true)
 }
 
+// kernelMountIDs is false off Linux: there is no mount ID to ask a descriptor
+// for, so a mutating walk cannot fail closed on its absence without refusing to
+// descend anywhere at all (B4, unidentifiedMount). The mount table is the whole
+// answer here, which is the degradation identityOf already accepts — the dev
+// box, not the kernel (INV-2).
+const kernelMountIDs = false
+
 // identityOf has nothing to report off Linux: there is no st_dev behind a
 // Windows FileInfo and no mount ID to ask for (F4). The zero value leaves
 // mount-point classification to the mount table alone, which is the same

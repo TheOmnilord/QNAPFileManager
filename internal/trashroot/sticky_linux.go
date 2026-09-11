@@ -1,9 +1,12 @@
 package trashroot
 
 import (
+	"errors"
 	"io/fs"
 	"os"
+	"runtime"
 	"syscall"
+	"unsafe"
 )
 
 // stickyEnforced is true where the sticky bit is real. On Linux — the only
@@ -95,6 +98,172 @@ func ownerOf(fi fs.FileInfo) (int, bool) {
 		return 0, false
 	}
 	return int(st.Uid), true
+}
+
+// nlinkOf pulls the link count out of the stat structure behind a FileInfo
+// (B3). A directory with exactly two links is one with "." and its parent's
+// entry and nothing else: empty, and therefore too young to be anything but the
+// one this process just created.
+//
+// The field width differs by architecture — Nlink is uint64 on linux/amd64 and
+// uint32 on linux/arm64, and both are release targets — so it is converted
+// explicitly rather than assigned.
+func nlinkOf(fi fs.FileInfo) (uint64, bool) {
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok || st == nil {
+		return 0, false
+	}
+	return uint64(st.Nlink), true
+}
+
+// atRemoveDir is AT_REMOVEDIR, the unlinkat flag that removes a directory
+// rather than a file. It is stable across Linux architectures.
+const atRemoveDir = 0x200
+
+// oPath is O_PATH: an open that asks the kernel for nothing but whether the
+// name resolves. It is the existence check the no-replace rename falls back to.
+const oPath = 0x200000
+
+// renameNoReplace is RENAME_NOREPLACE, the renameat2(2) flag that makes the
+// kernel refuse a rename onto an existing name instead of silently replacing it.
+const renameNoReplace = 0x1
+
+// removeDirIn is rmdir relative to an already-open directory (B3 step f): the
+// unpublished temporary directory goes away again through the same descriptor it
+// was created under, so a failure leaves no litter and no pathname is re-walked.
+func removeDirIn(dir *os.File, name string) error {
+	rc, err := dir.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var serr error
+	if cerr := rc.Control(func(pfd uintptr) {
+		for {
+			serr = rawUnlinkat(int(pfd), name, atRemoveDir)
+			if serr != syscall.EINTR {
+				return
+			}
+		}
+	}); cerr != nil {
+		return cerr
+	}
+	if serr != nil {
+		return &fs.PathError{Op: "unlinkat", Path: name, Err: serr}
+	}
+	return nil
+}
+
+// renameNoReplaceIn publishes the prepared directory under its final name, both
+// ends relative to the one held mount-root descriptor (B3 step e).
+//
+// RENAME_NOREPLACE is what makes the publication a decision the KERNEL makes:
+// the name is either free, in which case this process owns it, or occupied, in
+// which case EEXIST sends the caller back to validate whatever is there by the
+// ordinary rules. A plain rename would have replaced it — which, at this name,
+// means detaching a trash directory full of other people's deleted files.
+//
+// Where renameat2 or the flag is unavailable (an old kernel, a filesystem that
+// does not implement it) the fallback is an fstatat pre-check against that same
+// held descriptor rather than a fresh walk of the pathname, with the narrow
+// TOCTOU PLAN.md §2.4 already accepts for the same reason.
+func renameNoReplaceIn(dir *os.File, from, to string) error {
+	rc, err := dir.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var serr error
+	if cerr := rc.Control(func(pfd uintptr) {
+		fd := int(pfd)
+		for {
+			serr = renameat2(fd, from, fd, to, renameNoReplace)
+			if serr != syscall.EINTR {
+				break
+			}
+		}
+		if !errors.Is(serr, syscall.ENOSYS) && !errors.Is(serr, syscall.EINVAL) {
+			return
+		}
+		var exists bool
+		if exists, serr = existsIn(fd, to); serr != nil {
+			return
+		}
+		if exists {
+			serr = syscall.EEXIST
+			return
+		}
+		for {
+			serr = syscall.Renameat(fd, from, fd, to)
+			if serr != syscall.EINTR {
+				return
+			}
+		}
+	}); cerr != nil {
+		return cerr
+	}
+	if serr != nil {
+		return &fs.PathError{Op: "renameat", Path: to, Err: serr}
+	}
+	return nil
+}
+
+// existsIn reports whether name resolves inside the directory fd refers to. The
+// open is O_PATH|O_NOFOLLOW, so a symlink standing at the name is an existing
+// entry rather than something followed — the same answer renameat2 would give.
+func existsIn(fd int, name string) (bool, error) {
+	nfd, err := syscall.Openat(fd, name, oPath|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	if err == nil {
+		syscall.Close(nfd)
+		return true, nil
+	}
+	if errors.Is(err, syscall.ENOENT) {
+		return false, nil
+	}
+	return false, err
+}
+
+// renameat2 is renameat2(2), which the syscall package does not export. The
+// unsafe shape is the one the vet rules sanction for a syscall call (a Pointer
+// converted to uintptr in the argument list); both names are kept alive across
+// the call rather than trusted to escape analysis.
+func renameat2(fromFD int, fromName string, toFD int, toName string, flags uint) error {
+	if sysRenameat2 == 0 {
+		// The syscall number is not compiled in for this architecture; behave as
+		// an old kernel would and let the caller take the pre-check fallback.
+		return syscall.ENOSYS
+	}
+	fromPtr, err := syscall.BytePtrFromString(fromName)
+	if err != nil {
+		return err
+	}
+	toPtr, err := syscall.BytePtrFromString(toName)
+	if err != nil {
+		return err
+	}
+	_, _, errno := syscall.Syscall6(sysRenameat2,
+		uintptr(fromFD), uintptr(unsafe.Pointer(fromPtr)),
+		uintptr(toFD), uintptr(unsafe.Pointer(toPtr)), uintptr(flags), 0)
+	runtime.KeepAlive(fromPtr)
+	runtime.KeepAlive(toPtr)
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+// rawUnlinkat is unlinkat(2), including the flags word the exported
+// syscall.Unlinkat drops — AT_REMOVEDIR is the one flag that separates deleting
+// a file from removing a directory.
+func rawUnlinkat(dirfd int, name string, flags int) error {
+	p, err := syscall.BytePtrFromString(name)
+	if err != nil {
+		return err
+	}
+	_, _, errno := syscall.Syscall(syscall.SYS_UNLINKAT, uintptr(dirfd), uintptr(unsafe.Pointer(p)), uintptr(flags))
+	runtime.KeepAlive(p)
+	if errno != 0 {
+		return errno
+	}
+	return nil
 }
 
 // sysOpen is open(2), retried over EINTR.

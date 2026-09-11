@@ -83,6 +83,72 @@ func TestMountPointOffTheTableIsFoundByDevice(t *testing.T) {
 	}
 }
 
+// TestMutatingWalkStopsWhereTheKernelWillNotNameAMount is B4: the fail-closed
+// half of F4.
+//
+// When statx(STATX_MNT_ID) fails AND /proc/self/fdinfo carries no "mnt_id:", the
+// only comparison left is st_dev — and a bind mount is one device with two
+// mounts, which is the shape QTS builds its whole share layout out of. So the
+// device comparison says "same filesystem, carry on" for exactly the boundary a
+// recursive delete must not cross. A measurement can live with that; a delete
+// cannot, so a mutating walk refuses to descend rather than guess.
+//
+// The hook is what makes the corner observable: on any kernel since 3.15 one of
+// the two sources answers, so this path is a true corner rather than a routine
+// one.
+func TestMutatingWalkStopsWhereTheKernelWillNotNameAMount(t *testing.T) {
+	base := tempDir(t)
+	mkdir(t, base, "a/sub")
+	mkdir(t, base, "a/far")
+	write(t, base, "a/one.txt", "one")
+	write(t, base, "a/sub/inside.txt", "inside")
+	write(t, base, "a/far/inside.txt", "inside")
+	r := newRoot(t, base)
+
+	// No mount IDs at all. "sub" shares the parent's device — a bind mount looks
+	// precisely like this — and "far" does not.
+	prev := identityFor
+	identityFor = func(d *dirRef) mountIdentity {
+		if strings.HasSuffix(d.rel, "far") {
+			return mountIdentity{dev: 99, hasDev: true}
+		}
+		return mountIdentity{dev: 1, hasDev: true}
+	}
+	t.Cleanup(func() { identityFor = prev })
+
+	// A read-only walk keeps the st_dev fallback (Size): it descends into "sub",
+	// because a device comparison has nothing to object to.
+	var ro recorder
+	if err := Walk(context.Background(), r, nil, "/a", WalkOptions{}, ro.visitor()); err != nil {
+		t.Fatalf("Walk: %v", err)
+	}
+	if indexOf(ro.pre, "/a/sub/inside.txt") < 0 {
+		t.Errorf("a read-only walk must still descend where only st_dev can answer: pre = %v", ro.pre)
+	}
+
+	// Both mutating shapes refuse: the delete itself, and the bounded pre-scan
+	// that gives it its denominator (ProtectWrite).
+	for _, opts := range []WalkOptions{{Mutating: true}, {Protect: ProtectWrite}} {
+		var rw recorder
+		if err := Walk(context.Background(), r, nil, "/a", opts, rw.visitor()); err != nil {
+			t.Fatalf("Walk(%+v): %v", opts, err)
+		}
+		for _, p := range []string{"/a/sub/inside.txt", "/a/far/inside.txt"} {
+			if indexOf(rw.pre, p) >= 0 {
+				t.Errorf("Walk(%+v) descended into %q with no mount identity to go on: pre = %v", opts, p, rw.pre)
+			}
+		}
+		for _, p := range []string{"/a/sub", "/a/far"} {
+			if indexOf(rw.warns, p) < 0 {
+				t.Errorf("Walk(%+v) warns = %v, want %q reported rather than silently skipped", opts, rw.warns, p)
+			}
+		}
+		if indexOf(rw.pre, "/a/one.txt") < 0 {
+			t.Errorf("Walk(%+v): the rest of the tree must still be walked: pre = %v", opts, rw.pre)
+		}
+	}
+}
+
 // TestWalkRefusesARealMountPointWithoutCrossMounts is F4 against a real mount
 // rather than a test hook: a tmpfs mounted underneath the tree must not be
 // entered, and the decision must come from the DESCRIPTOR the walk opened, not

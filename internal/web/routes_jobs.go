@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"qnapfilemanager/internal/audit"
 	"qnapfilemanager/internal/backend"
@@ -37,6 +39,15 @@ import (
 //   - The session may be revalidated, or gone, while the job runs. The identity
 //     an audit line needs is therefore snapshotted (jobActorOf) before Submit;
 //     reading sess.who from the job goroutine would race a revalidation.
+//
+// M2-A review round 2 reshaped four things here, and each is marked at its
+// site: the guard is re-run when a queued job actually STARTS (W1); the result
+// audit line is written from the manager's completion hook rather than from
+// inside the work function, so a job that never ran is still recorded exactly
+// once (W2); a cancelled job publishes its partial result (W3); and everything
+// a job publishes — warning paths, the current path, the error — is mapped back
+// into the caller's own vocabulary and code-derived wording (W4/W5), since a
+// job dispatches against RESOLVED roots.
 const (
 	// permanentWarning is the exact sentence a permanent delete's confirmation
 	// summary carries. The client keys its grade-2 (typed phrase) dialog on this
@@ -58,7 +69,7 @@ const (
 
 // jobPath matches the two job-id request forms, "/api/jobs/<id>" and
 // "/api/jobs/<id>/cancel". The id must be exactly the 16 lower-case hex
-// characters jobs.newID mints, which is what keeps "/api/jobs/delete" a literal
+// characters jobs.NewID mints, which is what keeps "/api/jobs/delete" a literal
 // route rather than a job lookup.
 func jobPath(p string) (id, action string, ok bool) {
 	rest, found := strings.CutPrefix(p, "/api/jobs/")
@@ -74,17 +85,10 @@ func jobPath(p string) (id, action string, ok bool) {
 	return rest, action, true
 }
 
-func validJobID(id string) bool {
-	if len(id) != 16 {
-		return false
-	}
-	for _, c := range id {
-		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
-			return false
-		}
-	}
-	return true
-}
+// validJobID is jobs.ValidID: the route vocabulary and the manager's id
+// vocabulary are deliberately the same one, so a caller-supplied id (W7) can
+// never produce a job that /api/jobs/<id> cannot address.
+func validJobID(id string) bool { return jobs.ValidID(id) }
 
 // jobsReady reports whether the job spine is wired, mirroring mutationsReady.
 func (s *Server) jobsReady(w http.ResponseWriter, r *http.Request) bool {
@@ -154,13 +158,155 @@ func viewOf(res wproto.JobResult) jobResultView {
 	return jobResultView{Files: res.Files, Dirs: res.Dirs, Bytes: res.Bytes, Skipped: res.Skipped, Warnings: res.Warnings, Detail: res.Detail}
 }
 
+// --- requested ⇄ resolved roots (findings W4 and W5) -------------------------
+
+// jobRoots is one job's requested→resolved root mapping, captured at submit.
+//
+// A job is DISPATCHED against the resolved spellings (PLAN.md §2.0), so every
+// path the worker then reports — a per-item warning, the current item, the
+// trash-root refusal — is spelled in the resolved vocabulary, which may name a
+// symlink target the caller never asked about and cannot otherwise see. The M1
+// client-facing rule (routes_mutate.go) is that clients see error CODES and
+// REQUESTED paths only, so those paths are mapped back here.
+//
+// The mapping is a PREFIX substitution and is safe precisely because both
+// spellings of every root are known exactly — unlike the arbitrary
+// string-substitution M1 rejected, which could double-map a spelling into its
+// own output.
+type jobRoots struct {
+	requested []string
+	resolved  []string
+}
+
+// mappedRoots pairs the two spellings of the same roots, in order.
+func mappedRoots(requested, resolved []string) jobRoots {
+	return jobRoots{requested: append([]string(nil), requested...), resolved: append([]string(nil), resolved...)}
+}
+
+// identityRoots is the mapping for a job dispatched against exactly what the
+// client named (folder size, trash restore): there is nothing to map back, but
+// the fallback rule below still applies to a path under no root at all.
+func identityRoots(paths []string) jobRoots { return mappedRoots(paths, paths) }
+
+// underRoot reports whether p is root or lies inside it, by whole components.
+func underRoot(p, root string) bool {
+	if root == "" {
+		return false
+	}
+	return p == root || strings.HasPrefix(p, strings.TrimSuffix(root, "/")+"/")
+}
+
+// mapPath rewrites a worker-reported path into the caller's vocabulary: the
+// resolved root prefix becomes the requested one, longest root first so a
+// nested pair maps to the closer of the two. A path under NO known root is
+// reported as the first requested root rather than published verbatim — the
+// daemon cannot vouch for that spelling, and a job's own roots are the only
+// paths the caller already knows. With no roots at all (emptying the trash)
+// nothing is published: the code and the message carry the whole answer.
+func (jr jobRoots) mapPath(p string) string {
+	if p == "" {
+		return ""
+	}
+	best := -1
+	for i, root := range jr.resolved {
+		if i >= len(jr.requested) || !underRoot(p, root) {
+			continue
+		}
+		if best < 0 || len(root) > len(jr.resolved[best]) {
+			best = i
+		}
+	}
+	if best < 0 {
+		if len(jr.requested) > 0 {
+			return jr.requested[0]
+		}
+		return ""
+	}
+	root := jr.resolved[best]
+	if p == root {
+		return jr.requested[best]
+	}
+	return fsx.Join(jr.requested[best], strings.TrimPrefix(p, strings.TrimSuffix(root, "/")+"/"))
+}
+
+// --- sanitized job errors (finding W4) ---------------------------------------
+
+// jobError is what a job's work function returns in place of the worker's own
+// error. Job.Err is served to every client that may see the job, and a raw
+// worker error can carry both the resolved spelling and the kernel's own text,
+// so what is published is a code-derived generic sentence; the raw error goes
+// to the server log alone. The original is still wrapped, so the manager's
+// errors.Is(err, context.Canceled) and fsx.Code keep working, and ErrorCode
+// (jobs.ErrCoder) names the API vocabulary the UI shares with the HTTP layer.
+type jobError struct {
+	code string
+	msg  string
+	err  error
+}
+
+func (e *jobError) Error() string     { return e.msg }
+func (e *jobError) Unwrap() error     { return e.err }
+func (e *jobError) ErrorCode() string { return e.code }
+
+// jobErr sanitizes a worker error for publication and logs the original.
+func (s *Server) jobErr(op, id string, err error) error {
+	if err == nil {
+		return nil
+	}
+	code := fsx.Code(err)
+	s.logger.Printf("job %s op=%q raw error (%s): %v", id, op, code, err)
+	return &jobError{code: code, msg: jobErrorMessage(code), err: err}
+}
+
+// jobErrorMessage is the published wording for an error code. It never contains
+// a path: the job already names its own roots.
+func jobErrorMessage(code string) string {
+	switch code {
+	case "cancelled":
+		return "The operation was cancelled."
+	case "read_only":
+		return "Read-only mode is on, so the operation was refused."
+	case "protected":
+		return "This location is protected, so the operation was refused."
+	case "no_trash":
+		return "There is no Trash for this location."
+	case "queue_full":
+		return "Too many operations are already queued."
+	case "worker_gone":
+		return "The operation stopped because its worker process ended."
+	}
+	return backendMessage(code)
+}
+
+// jobWarnMessage is the published wording for ONE item's failure. The worker's
+// own message is logged, never served: it is the kernel's text about a resolved
+// path (W4).
+func jobWarnMessage(code string) string {
+	switch code {
+	case "":
+		return "This item could not be processed."
+	case "protected":
+		return "This location is protected and was skipped."
+	case "not_empty":
+		return "This folder is not empty."
+	case "exists":
+		return "An item with that name already exists."
+	case "cancelled":
+		return "The operation was cancelled."
+	}
+	return backendMessage(code)
+}
+
+// --- progress and warning sinks ----------------------------------------------
+
 // progressSink and warnSink adapt the worker's in-band frames to the manager's
-// progress handle. They are called on the RPC goroutine, in order.
-func progressSink(p *jobs.Progress) func(wproto.Prog) {
+// progress handle. They are called on the RPC goroutine, in order, and both map
+// the worker's paths back into the caller's vocabulary (W4).
+func (s *Server) progressSink(jr jobRoots, p *jobs.Progress) func(wproto.Prog) {
 	return func(pr wproto.Prog) {
 		p.Set(pr.Files, pr.FilesTotal, pr.Bytes, pr.BytesTotal)
 		if len(pr.Current) > 0 {
-			p.Current(string(pr.Current))
+			p.Current(jr.mapPath(string(pr.Current)))
 		}
 		if pr.Phase != "" {
 			p.Phase(pr.Phase)
@@ -168,21 +314,60 @@ func progressSink(p *jobs.Progress) func(wproto.Prog) {
 	}
 }
 
-func warnSink(p *jobs.Progress) func(wproto.Warn) {
-	return func(wn wproto.Warn) { p.Warn(string(wn.Path), wn.Code, wn.Message) }
+func (s *Server) warnSink(jr jobRoots, op, id string, p *jobs.Progress) func(wproto.Warn) {
+	return func(wn wproto.Warn) {
+		// The worker's spelling and its message stay server-side; the job
+		// publishes the requested path, the code, and the code's own wording.
+		s.logger.Printf("job %s op=%q warning path=%q code=%q: %s", id, op, string(wn.Path), wn.Code, wn.Message)
+		p.Warn(jr.mapPath(string(wn.Path)), wn.Code, jobWarnMessage(wn.Code))
+	}
 }
 
-// waitJobID hands the manager's job id to the work function. Submit starts the
-// goroutine before it returns the Job, so the id cannot simply be captured;
-// the function blocks on this channel until the caller publishes it (or the
-// job is cancelled while still queued).
-func waitJobID(ctx context.Context, ch <-chan string) (string, bool) {
-	select {
-	case id, ok := <-ch:
-		return id, ok
-	case <-ctx.Done():
-		return "", false
+// --- the start-of-job guard re-check (finding W1) -----------------------------
+
+// guardCheck is one op applied to a set of paths when a job starts.
+type guardCheck struct {
+	op    guard.Op
+	paths []string
+}
+
+// recheckGuard re-runs the guard at the instant a queued job actually STARTS.
+//
+// A confirmed delete can sit in the queue behind a full concurrency class for
+// minutes while an administrator turns read-only ON (or a protected rule starts
+// matching). The submit-time verdict is then stale, and dispatching on it would
+// write to the filesystem after the daemon was told to stop writing. So every
+// destructive job re-checks, on BOTH spellings of every root, before it calls
+// the worker; a refusal ends the job failed with the API code, and nothing is
+// dispatched. A warn-class verdict is NOT a refusal here: the confirmation
+// token that covered it was redeemed at submit.
+func (s *Server) recheckGuard(checks ...guardCheck) error {
+	if s.guard == nil {
+		return nil
 	}
+	if s.guard.ReadOnly() {
+		return &jobError{code: "read_only", msg: "Read-only mode was turned on before this operation started, so nothing was changed.", err: fsx.ErrReadOnly}
+	}
+	for _, check := range checks {
+		for _, p := range check.paths {
+			err := s.guard.Check(check.op, p)
+			switch {
+			case err == nil, errors.Is(err, guard.ErrConfirmRequired):
+				continue
+			case errors.Is(err, guard.ErrReadOnly):
+				return &jobError{code: "read_only", msg: "Read-only mode was turned on before this operation started, so nothing was changed.", err: fsx.ErrReadOnly}
+			case errors.Is(err, guard.ErrProtected):
+				// The verdict can name a resolved spelling: server log only.
+				s.logger.Printf("job guard re-check refused: %v", err)
+				return &jobError{code: "protected", msg: "This location is protected, so the operation was refused before it started.", err: fsx.ErrProtected}
+			default:
+				code := fsx.Code(err)
+				s.logger.Printf("job guard re-check failed (%s): %v", code, err)
+				return &jobError{code: code, msg: jobErrorMessage(code), err: err}
+			}
+		}
+	}
+	return nil
 }
 
 // jobPaths decodes and cleans a job's root paths, honouring the pathB64
@@ -311,31 +496,60 @@ func (s *Server) jobDelete(w http.ResponseWriter, r *http.Request, sess *session
 		warnings = append(warnings, fmt.Sprintf("%d items are selected.", len(paths)))
 	}
 	summary := guard.Summary{Files: int64(len(paths)), Bytes: totalBytes, Warnings: warnings}
-	m := mutation{op: "delete", files: int64(len(paths)), bytes: totalBytes}
+	// The audited path is the FIRST REQUESTED root (W7): a delete's durable
+	// record has to say what was deleted, and the requested spelling is the one
+	// the client is allowed to see. The rest of the selection is named in the
+	// intent line's detail.
+	m := mutation{op: "delete", path: paths[0], files: int64(len(paths)), bytes: totalBytes}
+	roots := mappedRoots(paths, resolved)
 	// extraConfirm is always on: every delete, trash or permanent, is redeemed
 	// against a single-use token (decision 10).
 	if !s.authorize(w, r, sess, worstGuard(checks...), true, m, "", deleteJobTokenParts(mode, body.CrossMounts, paths), true, body.Confirm, summary) {
 		return
 	}
-	// The trash directory has to exist before the user's worker — which has only
-	// their own permissions — can rename anything into it, so the root front-end
-	// makes it: the one sanctioned front-end filesystem write (decision 10,
-	// trashroot's package comment). No trash here is not an error, it is the
-	// fact that this delete would be permanent, and the client re-asks at grade 2.
-	if !permanent && !s.ensureTrashRoots(w, r, sess, resolved) {
-		return
+	if !permanent {
+		// The Trash switch is a NAS-wide setting (config.Trash.Enabled). With it
+		// off, nothing may create the world-writable sticky directories decision
+		// 10 describes — so the mode is refused HERE, before any Ensure, rather
+		// than by making the directories anyway and then dispatching a trash
+		// delete (W6). The client re-asks at grade 2, exactly as it does for a
+		// volume that has no same-device trash.
+		if !s.cfg.Trash.Enabled {
+			writeError(w, http.StatusConflict, "no_trash", "Trash is disabled on this NAS, so deleting is permanent.", paths[0], "delete", "")
+			return
+		}
+		// The trash directory has to exist before the user's worker — which has
+		// only their own permissions — can rename anything into it, so the root
+		// front-end makes it: the one sanctioned front-end filesystem write
+		// (decision 10, trashroot's package comment). No trash here is not an
+		// error either, it is the fact that this delete would be permanent.
+		if !s.ensureTrashRoots(w, r, sess, roots) {
+			return
+		}
 	}
 
-	detail := mode
-	if body.CrossMounts {
-		detail += ", including mounted sub-folders"
-	}
-	detail += fmt.Sprintf(", %d root(s)", len(paths))
-	big := permanent || int64(len(paths)) >= milestoneFiles || totalBytes >= milestoneBytes
-	if err := s.writeAudit(sess, r, m, "intent", "", "", detail, big); err != nil {
-		writeError(w, http.StatusInternalServerError, "audit_unavailable", "The change was refused: its audit record could not be saved.", "", m.op, err.Error())
+	// The id is chosen HERE, before the durable intent line is written (W7), so
+	// the intent, the result and the /api/jobs/<id> the client polls are one
+	// correlated record: without it two concurrent deletes cannot be told apart
+	// in the audit trail, and after a retention sweep or a restart nothing says
+	// what a given job id deleted.
+	id, err := jobs.NewID()
+	if err != nil {
+		s.fail(w, r, "internal", "The delete could not be prepared.", paths[0], err.Error())
 		return
 	}
+	modeDetail := mode
+	if body.CrossMounts {
+		modeDetail += ", including mounted sub-folders"
+	}
+	big := permanent || int64(len(paths)) >= milestoneFiles || totalBytes >= milestoneBytes
+	// The intent names every root it can (capped), so the durable record says
+	// WHAT was about to be deleted, not merely that something was.
+	if err := s.writeAudit(sess, r, m, "intent", "", "", jobIntentDetail(id, modeDetail, paths), big); err != nil {
+		writeError(w, http.StatusInternalServerError, "audit_unavailable", "The change was refused: its audit record could not be saved.", paths[0], m.op, err.Error())
+		return
+	}
+	resultDetail := fmt.Sprintf("job %s: %s, %d root(s)", id, modeDetail, len(paths))
 
 	// Dispatch the RESOLVED spellings, binding the work as tightly as possible to
 	// what was guarded (PLAN.md §2.0 residual race).
@@ -345,41 +559,75 @@ func (s *Server) jobDelete(w http.ResponseWriter, r *http.Request, sess *session
 	}
 	reqBody, err := json.Marshal(wproto.DeleteReq{Paths: wire, Recursive: true, Trash: !permanent, CrossMounts: body.CrossMounts})
 	if err != nil {
-		s.fail(w, r, "internal", "The delete could not be prepared.", "", err.Error())
+		s.fail(w, r, "internal", "The delete could not be prepared.", paths[0], err.Error())
 		return
 	}
 	who, actor := sess.who, jobActorOf(sess, r)
 	started := time.Now()
-	idCh := make(chan string, 1)
-	job, err := s.jobMgr.Submit(jobs.KindDelete, deleteTitle(mode, paths), jobs.Meta{Src: paths, Actor: who.User, UID: who.UID}, func(ctx context.Context, p *jobs.Progress) (any, error) {
-		id, ok := waitJobID(ctx, idCh)
-		if !ok {
-			return nil, ctx.Err()
+	meta := jobs.Meta{
+		ID: id, Src: paths, Actor: who.User, UID: who.UID,
+		// ALL result auditing happens in this hook (W2): a job cancelled while
+		// still queued, or closed at shutdown, never runs the function below, so
+		// a result line written from inside it would simply be missing for the
+		// one destructive intent that most needs closing out.
+		OnFinish: s.jobFinishHook(actor, "delete", id, m.path, resultDetail, big),
+	}
+	job, err := s.jobMgr.Submit(jobs.KindDelete, deleteTitle(mode, paths), meta, func(ctx context.Context, p *jobs.Progress) (any, error) {
+		// W1: the queue may have held this job while read-only was switched on.
+		if derr := s.recheckGuard(guardCheck{op: guard.OpDelete, paths: paths}, guardCheck{op: guard.OpDelete, paths: resolved}); derr != nil {
+			return nil, derr
 		}
-		res, err := s.jobRunner.Job(ctx, who, wproto.JobReq{JobID: id, Kind: wproto.JobDelete, Body: reqBody}, progressSink(p), warnSink(p))
+		res, err := s.jobRunner.Job(ctx, who, wproto.JobReq{JobID: id, Kind: wproto.JobDelete, Body: reqBody}, s.progressSink(roots, p), s.warnSink(roots, "delete", id, p))
 		view := viewOf(res)
-		if err == nil && !permanent {
+		if !permanent {
 			// The worker names the entries it created, which is the exact answer
-			// and the one the Undo uses. No ids at all means a worker older than
-			// this contract (JobResult.TrashIDs came after M2-A round 1), and
-			// only then is the listing heuristic asked to guess.
+			// and the one the Undo uses — and it names them on a CANCELLED job
+			// too, for what it managed before it stopped (W3), which is why this
+			// no longer waits for err == nil. No ids at all means a worker older
+			// than this contract (JobResult.TrashIDs came after M2-A round 1),
+			// and only then is the listing heuristic asked to guess.
 			view.TrashIDs = res.TrashIDs
-			if len(view.TrashIDs) == 0 && res.Files+res.Dirs > 0 {
+			if err == nil && len(view.TrashIDs) == 0 && res.Files+res.Dirs > 0 {
 				view.TrashIDs = s.trashIDsFor(ctx, who, paths, started)
 			}
 		}
-		s.auditJobResult(ctx, actor, "delete", id, res, err, big, detail)
-		if err != nil {
-			return nil, err
-		}
-		return view, nil
+		// W3: the structured view goes back ALONGSIDE the error, so a cancelled
+		// delete still publishes its partial counts, its retained warnings and
+		// the trash ids an Undo needs.
+		return view, s.jobErr("delete", id, err)
 	})
 	if err != nil {
 		s.failJobSubmit(w, r, sess, m, err)
 		return
 	}
-	idCh <- job.ID
 	s.writeJob(w, *job)
+}
+
+// jobIntentDetail composes a job's durable intent detail (W7): the correlation
+// id, what the job will do, and the roots it will do it to. The paths are the
+// REQUESTED spellings — the client's own vocabulary, never a resolved one — and
+// the list is capped so a thousand-item selection does not write a thousand
+// paths into one line. A root whose bytes are not valid UTF-8 is named in
+// base64 rather than mangled into U+FFFD by the JSON encoder.
+func jobIntentDetail(id, what string, paths []string) string {
+	const maxNamed = 20
+	named := paths
+	extra := 0
+	if len(named) > maxNamed {
+		extra, named = len(named)-maxNamed, named[:maxNamed]
+	}
+	shown := make([]string, 0, len(named))
+	for _, p := range named {
+		if !utf8.ValidString(p) {
+			p = "b64:" + base64.RawURLEncoding.EncodeToString([]byte(p))
+		}
+		shown = append(shown, p)
+	}
+	list := strings.Join(shown, ", ")
+	if extra > 0 {
+		list += fmt.Sprintf(", and %d more", extra)
+	}
+	return fmt.Sprintf("job %s: %s, %d root(s): %s", id, what, len(paths), list)
 }
 
 // ensureTrashRoots prepares <mount>/.@qfm_trash for every distinct trash root
@@ -389,18 +637,26 @@ func (s *Server) jobDelete(w http.ResponseWriter, r *http.Request, sess *session
 //
 // A location with no usable same-device trash answers 409 no_trash rather than
 // silently promoting the delete to a copy or to a permanent unlink; the client
-// re-asks at grade 2 with that reason (ui-ux §4.4).
-func (s *Server) ensureTrashRoots(w http.ResponseWriter, r *http.Request, sess *session, paths []string) bool {
+// re-asks at grade 2 with that reason (ui-ux §4.4). It is prepared for the
+// RESOLVED roots — that is where the worker will rename to — but every answer
+// names the REQUESTED spelling the caller supplied (W5), since a client is only
+// ever shown paths it named itself.
+func (s *Server) ensureTrashRoots(w http.ResponseWriter, r *http.Request, sess *session, roots jobRoots) bool {
 	ensure := s.ensureTrash
 	if ensure == nil {
 		ensure = trashroot.Ensure
 	}
 	done := map[string]bool{}
-	for _, p := range paths {
+	for i, p := range roots.resolved {
+		// The path echoed back to the client and into the audit record.
+		requested := p
+		if i < len(roots.requested) {
+			requested = roots.requested[i]
+		}
 		osPath, err := s.Root.OS(p)
 		if err != nil {
-			s.logRaw(r, "trash-root", p, err)
-			s.fail(w, r, "internal", "The Trash location for this item could not be determined.", p, "")
+			s.logRaw(r, "trash-root", requested, err)
+			s.fail(w, r, "internal", "The Trash location for this item could not be determined.", requested, "")
 			return false
 		}
 		if root, _, ok := s.platform.TrashRootFor(osPath); ok {
@@ -412,12 +668,12 @@ func (s *Server) ensureTrashRoots(w http.ResponseWriter, r *http.Request, sess *
 		dir, created, err := ensure(s.platform, osPath)
 		switch {
 		case errors.Is(err, trashroot.ErrNoTrash):
-			s.logRaw(r, "trash-root", p, err)
-			writeError(w, http.StatusConflict, "no_trash", "There is no Trash on this volume, so deleting here is permanent.", p, "delete", "")
+			s.logRaw(r, "trash-root", requested, err)
+			writeError(w, http.StatusConflict, "no_trash", "There is no Trash on this volume, so deleting here is permanent.", requested, "delete", "")
 			return false
 		case err != nil:
-			s.logRaw(r, "trash-root", p, err)
-			s.fail(w, r, "internal", "The Trash folder could not be prepared.", p, "")
+			s.logRaw(r, "trash-root", requested, err)
+			s.fail(w, r, "internal", "The Trash folder could not be prepared.", requested, "")
 			return false
 		}
 		if !created {
@@ -468,54 +724,90 @@ func (s *Server) trashIDsFor(ctx context.Context, who backend.Principal, paths [
 	return ids
 }
 
-// auditJobResult records what a job actually did. It runs on the job goroutine,
-// after the HTTP request is long gone, which is exactly why jobAudit makes the
-// durable write cancellation-immune.
+// jobFinishHook builds the manager's completion hook: the ONE place a job's
+// result line is written (W2).
 //
-// A cancelled job records result "cancelled" with the partial counts the worker
-// reported before it stopped — nothing is rolled back (design §3), so the
-// record says what remains rather than pretending the work was undone.
-func (s *Server) auditJobResult(ctx context.Context, who jobActor, op, id string, res wproto.JobResult, err error, force bool, detail string) {
-	result, code := jobOutcome(res, err)
-	full := fmt.Sprintf("%s: %d item(s), %d byte(s)", detail, res.Files, res.Bytes)
-	if res.Warnings > 0 {
-		full += fmt.Sprintf(", %d warning(s)", res.Warnings)
+// Auditing from inside the work function missed two terminal transitions
+// entirely — a job cancelled while still queued, and one the manager closes at
+// shutdown, neither of which ever calls the function — so a durable delete
+// INTENT could stand forever with no result beside it. The manager now calls
+// this exactly once per job, on every terminal transition, after the state is
+// final; the identity is the snapshot taken at submit (jobActorOf), and the
+// write is cancellation-immune, because by now the request is long gone.
+func (s *Server) jobFinishHook(who jobActor, op, id, path, detail string, force bool) func(jobs.Job) {
+	return func(j jobs.Job) { s.auditJobFinish(who, op, id, path, detail, force, j) }
+}
+
+func (s *Server) auditJobFinish(who jobActor, op, id, path, detail string, force bool, j jobs.Job) {
+	result, code := jobFinishOutcome(j)
+	// The worker's own summary is the authority on what happened; the manager's
+	// live counters are the fallback for a job that never published one.
+	files, bytes, warnings := j.Files, j.Bytes, j.WarningCount
+	var view jobResultView
+	if len(j.Result) > 0 && json.Unmarshal(j.Result, &view) == nil {
+		files, bytes = view.Files, view.Bytes
+		if view.Warnings > warnings {
+			warnings = view.Warnings
+		}
+	}
+	full := fmt.Sprintf("%s: %d item(s), %d byte(s)", detail, files, bytes)
+	if warnings > 0 {
+		full += fmt.Sprintf(", %d warning(s)", warnings)
 	}
 	switch result {
 	case "cancelled":
-		full += "; cancelled, partial work remains and was not rolled back"
-	case "error":
+		// Partial is the manager's own record of whether the work ever started:
+		// a job cancelled in the queue changed nothing at all, and says so.
+		if j.Partial {
+			full += "; cancelled, partial work remains and was not rolled back"
+		} else {
+			full += "; cancelled before it started, nothing was changed"
+		}
+	case "denied", "error":
 		full += "; " + code
 	}
-	s.jobAudit(ctx, who, audit.Event{
-		Op: op, Job: id, Phase: "result", Result: result, Code: code,
-		Files: res.Files, Bytes: res.Bytes, Detail: full,
-	}, jobMilestone(force, res))
+	s.jobAudit(context.Background(), who, audit.Event{
+		Op: op, Job: id, Path: path, Phase: "result", Result: result, Code: code,
+		Files: files, Bytes: bytes, Detail: full,
+	}, jobMilestone(force, result, files, bytes))
 }
 
-// jobOutcome maps a finished job to the audit vocabulary. A cancellation is its
-// own result, not an error: the work stopped because somebody asked, and the
-// counts it carries are what actually happened before it did.
-func jobOutcome(res wproto.JobResult, err error) (result, code string) {
-	switch {
-	case err == nil:
-		if res.Warnings > 0 {
+// jobMilestone decides whether a finished job is mirrored to QuLog: a permanent
+// delete (or an emptied trash) always, any job that touched a hundred items or
+// a gigabyte — the same scale rule as guard.NeedsConfirm — and any DENIAL, which
+// is the record that the daemon refused destructive work somebody had already
+// confirmed (W1).
+func jobMilestone(force bool, result string, files, bytes int64) bool {
+	return force || result == "denied" || files >= milestoneFiles || bytes >= milestoneBytes
+}
+
+// jobFinishOutcome maps a terminal job to the audit vocabulary. A cancellation
+// is its own result, not an error: the work stopped because somebody asked, and
+// the counts it carries are what actually happened before it did. A failure the
+// GUARD caused — read-only switched on, a path that became protected while the
+// job waited in the queue (W1) — is a denial rather than an error, so the trail
+// reads the same whether the refusal came before or after the 202.
+func jobFinishOutcome(j jobs.Job) (result, code string) {
+	switch j.State {
+	case jobs.StateCancelled:
+		return "cancelled", fsx.Code(context.Canceled)
+	case jobs.StateFailed:
+		code = j.ErrCode
+		if code == "" {
+			code = "internal"
+		}
+		switch code {
+		case "read_only", "readonly", "protected", "confirm_required", "confirm_invalid":
+			return "denied", code
+		}
+		return "error", code
+	default:
+		if j.WarningCount > 0 {
 			// Some items failed and were skipped; the job as a whole did not.
 			return "partial", ""
 		}
 		return "ok", ""
-	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
-		return "cancelled", fsx.Code(context.Canceled)
-	default:
-		return "error", fsx.Code(err)
 	}
-}
-
-// jobMilestone decides whether a finished job is mirrored to QuLog: a permanent
-// delete (or an emptied trash) always, and any job that touched a hundred items
-// or a gigabyte — the same scale rule as guard.NeedsConfirm.
-func jobMilestone(force bool, res wproto.JobResult) bool {
-	return force || res.Files >= milestoneFiles || res.Bytes >= milestoneBytes
 }
 
 // failJobSubmit answers a job the manager would not take. A full queue is the
@@ -586,23 +878,24 @@ func (s *Server) jobSize(w http.ResponseWriter, r *http.Request, sess *session) 
 		title = fmt.Sprintf("Calculating size: %d items", len(paths))
 	}
 	who := sess.who
-	idCh := make(chan string, 1)
-	job, err := s.jobMgr.Submit(jobs.KindSize, title, jobs.Meta{Src: paths, Actor: who.User, UID: who.UID}, func(ctx context.Context, p *jobs.Progress) (any, error) {
-		id, ok := waitJobID(ctx, idCh)
-		if !ok {
-			return nil, ctx.Err()
-		}
-		res, err := s.jobRunner.Job(ctx, who, wproto.JobReq{JobID: id, Kind: wproto.JobSize, Body: reqBody}, progressSink(p), warnSink(p))
-		if err != nil {
-			return nil, err
-		}
-		return viewOf(res), nil
+	id, err := jobs.NewID()
+	if err != nil {
+		s.fail(w, r, "internal", "The size request could not be prepared.", paths[0], err.Error())
+		return
+	}
+	// A size job dispatches exactly what the client named, so the mapping is the
+	// identity — but the sinks still run through it, so a warning about a path
+	// under NO root is answered with a root rather than a worker spelling (W4).
+	roots := identityRoots(paths)
+	job, err := s.jobMgr.Submit(jobs.KindSize, title, jobs.Meta{ID: id, Src: paths, Actor: who.User, UID: who.UID}, func(ctx context.Context, p *jobs.Progress) (any, error) {
+		res, err := s.jobRunner.Job(ctx, who, wproto.JobReq{JobID: id, Kind: wproto.JobSize, Body: reqBody}, s.progressSink(roots, p), s.warnSink(roots, "size", id, p))
+		// W3: a cancelled measurement still publishes what it counted.
+		return viewOf(res), s.jobErr("size", id, err)
 	})
 	if err != nil {
 		s.failJobSubmit(w, r, sess, mutation{op: "size"}, err)
 		return
 	}
-	idCh <- job.ID
 	s.writeJob(w, *job)
 }
 

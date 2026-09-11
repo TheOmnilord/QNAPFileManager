@@ -104,9 +104,24 @@ export function createPoller({load,interval=500,timers=globalThis}) {
 // --- panel ------------------------------------------------------------------
 
 const dismissed = new Set();   // ids the user cleared from the panel locally
-const lastState = new Map();   // id -> state, so only transitions are announced
+// trackedStates is id -> the last state this session saw, so only TRANSITIONS
+// are announced and acted on. It is seeded at submit (seedJob) as well as by
+// polling: a short job can reach its terminal state before the first
+// GET /api/jobs answers, and without a previous state such a job used to be
+// skipped entirely — no completion handling, no list or tree refresh, and the
+// poller stopping with the work invisible (round 2, finding W8).
+export const trackedStates = new Map();
 let poller = null;
 let refreshAfterJob = false;
+// primed marks that one full listing has been seen. The very first listing of a
+// session is a BASELINE: it can hold finished jobs retained from minutes ago (or
+// another session's), and announcing a backlog of completions nobody just asked
+// for would be noise. Everything after it is a real transition.
+let primed = false;
+
+// REFRESH_KINDS are the kinds whose completion changes what the list and the
+// tree show, so finishing one reloads both.
+const REFRESH_KINDS = new Set(['delete','trash-restore','trash-empty']);
 
 function panelOpen(open) {
  $('#jobsPanel').hidden = !open;
@@ -143,21 +158,47 @@ function jobRow(job) {
  return row;
 }
 
+// jobTransitions computes what changed since the last poll and updates the
+// state map in place. Pure enough to unit-test: given a listing and the states
+// previously seen, it says which jobs started, which finished, and whether the
+// file list needs reloading.
+//
+// A job seen for the first time ALREADY terminal counts as having finished
+// (finding W8) — that is what a job which outran the first poll looks like —
+// unless this is the priming listing, which only records a baseline.
+export function jobTransitions(list,previous,{prime=false} = {}) {
+ const events = [];
+ let refresh = false;
+ for (const job of list) {
+  const before = previous.get(job.id);
+  if (before === job.state) continue;
+  const first = before === undefined;
+  previous.set(job.id,job.state);
+  if (first && prime) continue;
+  if (jobLive(job)) { if (first) events.push({job,kind:'started'}); continue; }
+  events.push({job,kind:'finished'});
+  if (REFRESH_KINDS.has(job.kind)) refresh = true;
+ }
+ for (const id of [...previous.keys()]) if (!list.some(j => j.id === id)) previous.delete(id);
+ return {events,refresh};
+}
+
+// seedJob records the state a job was in when its 202 came back, so a job that
+// finishes before the first poll still reads as a transition (finding W8).
+export function seedJob(job) { if (job?.id && job.state) trackedStates.set(job.id,job.state); }
+
 // announceTransitions says only what §3.4 permits: a job started, a job
 // finished. Percentages are never announced — a screen reader repeating "37%,
 // 38%, 39%" twice a second is unusable.
 function announceTransitions(list) {
- for (const job of list) {
-  const previous = lastState.get(job.id);
-  if (previous === job.state) continue;
-  lastState.set(job.id,job.state);
-  if (previous === undefined) { if (jobLive(job)) announce(`${jobTitle(job)} started.`); continue; }
-  if (!jobLive(job)) {
-   announce(`${jobTitle(job)} ${job.state === 'done' ? 'finished' : job.state}.`);
-   if (job.kind === 'delete' || job.kind === 'trash-restore' || job.kind === 'trash-empty') refreshAfterJob = true;
-  }
+ const {events,refresh} = jobTransitions(list,trackedStates,{prime:!primed});
+ primed = true;
+ for (const {job,kind} of events) {
+  announce(kind === 'started'
+   ? `${jobTitle(job)} started.`
+   : `${jobTitle(job)} ${job.state === 'done' ? 'finished' : job.state}.`);
  }
- for (const id of [...lastState.keys()]) if (!list.some(j => j.id === id)) lastState.delete(id);
+ if (refresh) refreshAfterJob = true;
 }
 
 export function renderJobs(list) {
@@ -200,8 +241,11 @@ export async function cancelJob(id) {
 }
 
 // trackJob shows the panel for a job that was just submitted and starts polling.
+// It records the submitted state first (finding W8), so however fast the job
+// finishes its completion is still seen as a transition.
 export function trackJob(job) {
  if (!job) return;
+ seedJob(job);
  dismissed.delete(job.id);
  panelOpen(true);
  // pollJobs refreshes immediately and then every 500 ms while anything is

@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"qnapfilemanager/internal/platform"
@@ -48,6 +49,203 @@ func expectOwner(t *testing.T, uid int) {
 	prev := wantOwner
 	wantOwner = uid
 	t.Cleanup(func() { wantOwner = prev })
+}
+
+// pinTempName fixes the random component of the unpublished directory's name
+// for one test and reports how many times it was asked for (B3). The name is
+// otherwise 16 hex digits, which is exactly what a test needs to be able to
+// stand in front of.
+func pinTempName(t *testing.T, name string) *int {
+	t.Helper()
+	calls := 0
+	prev := newTempName
+	newTempName = func() (string, error) {
+		calls++
+		return name, nil
+	}
+	t.Cleanup(func() { newTempName = prev })
+	return &calls
+}
+
+// leftovers lists what the mount root holds besides the published trash
+// directory, so a test can assert that a refusal left no half-made directory
+// behind (B3 step f).
+func leftovers(t *testing.T, root string) []string {
+	t.Helper()
+	ents, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, e := range ents {
+		if e.Name() != DirName {
+			out = append(out, e.Name())
+		}
+	}
+	return out
+}
+
+// TestEnsurePublishesUnderATemporaryName is B3's happy path. The directory is
+// created under an unpredictable name, proved and given its mode through its own
+// descriptor, and only then renamed onto ".@qfm_trash" — so there is no instant
+// at which the published name refers to a directory this process has not
+// examined, and no instant at which something else could be standing at it while
+// a root fchmod is aimed there.
+func TestEnsurePublishesUnderATemporaryName(t *testing.T) {
+	root := tempMount(t)
+	plat := storageAt(t, root)
+	calls := pinTempName(t, tempPrefix+"0123456789abcdef")
+
+	dir, created, err := Ensure(plat, filepath.Join(root, "Public"))
+	if err != nil || !created {
+		t.Fatalf("Ensure = %q,%v,%v", dir, created, err)
+	}
+	if *calls != 1 {
+		t.Errorf("the temporary name was asked for %d times, want once: the directory is published, not named into existence", *calls)
+	}
+	fi, err := os.Lstat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fi.IsDir() || fi.Mode().Perm() != 0o777 || fi.Mode()&fs.ModeSticky == 0 {
+		t.Fatalf("mode = %v, want a sticky 1777 directory", fi.Mode())
+	}
+	if owner, ok := ownerOf(fi); ok && owner != wantOwner {
+		t.Errorf("owner = %d, want %d", owner, wantOwner)
+	}
+	if rest := leftovers(t, root); len(rest) != 0 {
+		t.Errorf("the mount root still holds %v: the temporary directory was not consumed by the rename", rest)
+	}
+}
+
+// TestEnsureRefusesAPlantedTemporaryName is the substitution B3 exists for, seen
+// from the only place a test can stand: something is already at the name the
+// publication is about to use. A directory that this process did not create is
+// never opened, never chmodded to 1777 and never published — the whole attack
+// was to get a root fchmod aimed at somebody else's directory.
+func TestEnsureRefusesAPlantedTemporaryName(t *testing.T) {
+	root := tempMount(t)
+	plat := storageAt(t, root)
+	name := tempPrefix + "deadbeefdeadbeef"
+	pinTempName(t, name)
+	planted := filepath.Join(root, name)
+	if err := os.MkdirAll(filepath.Join(planted, "victim"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(planted, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	dir, created, err := Ensure(plat, filepath.Join(root, "Public"))
+	if !errors.Is(err, ErrUnsafeTrash) {
+		t.Fatalf("Ensure = %q,%v,%v — want ErrUnsafeTrash", dir, created, err)
+	}
+	fi, err := os.Lstat(planted)
+	if err != nil {
+		t.Fatalf("the planted directory was removed: %v", err)
+	}
+	if fi.Mode().Perm() != 0o755 || fi.Mode()&fs.ModeSticky != 0 {
+		t.Errorf("the planted directory is now %v: a root fchmod reached a directory this process did not create", fi.Mode())
+	}
+	if _, err := os.Lstat(filepath.Join(root, DirName)); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("something was published as the trash directory: %v", err)
+	}
+}
+
+// TestPrepareRefusesASubstitutedDirectory is step (c) on its own: the four
+// questions asked of the temporary directory's descriptor. A directory that is
+// not empty, or whose permission bits are not the 0700 it was created with, is
+// not the directory this process just made — whatever its name says — and it
+// must not be given the trash mode.
+func TestPrepareRefusesASubstitutedDirectory(t *testing.T) {
+	root := tempMount(t)
+	rootFD, err := openDirNoFollow(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rootFD.Close()
+
+	cases := []struct {
+		name  string
+		perm  fs.FileMode
+		place func(t *testing.T, dir string)
+	}{
+		{"not empty", 0o700, func(t *testing.T, dir string) {
+			// @Recycle, a share, anything worth substituting: it has children,
+			// so its link count is not 2.
+			if err := os.MkdirAll(filepath.Join(dir, "snapshot"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"not 0700", 0o777, func(t *testing.T, dir string) {
+			if err := os.Mkdir(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(dir, 0o777); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			name := "substituted-" + strings.ReplaceAll(c.name, " ", "-")
+			dir := filepath.Join(root, name)
+			c.place(t, dir)
+
+			if err := prepare(rootFD, name, dir); !errors.Is(err, ErrUnsafeTrash) {
+				t.Fatalf("prepare = %v, want ErrUnsafeTrash", err)
+			}
+			fi, err := os.Lstat(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if fi.Mode().Perm() != c.perm || fi.Mode()&fs.ModeSticky != 0 {
+				t.Errorf("mode = %v, want it left at %v: the substituted directory was given the trash mode", fi.Mode(), c.perm)
+			}
+		})
+	}
+}
+
+// TestEnsureDoesNotRepairAPlantedTrashDirectory: something that is already at
+// the published name and is not a trash we may use is refused (ErrUnsafeTrash)
+// and left EXACTLY as it was — not chmodded into shape, not removed, not
+// adopted. The pre-B3 sequence would have found this directory through its own
+// openat and turned it 1777 as root; QNAP's root-owned @Recycle is the real
+// instance of it, and PLAN.md decision 10 says @Recycle is never written to.
+func TestEnsureDoesNotRepairAPlantedTrashDirectory(t *testing.T) {
+	root := tempMount(t)
+	plat := storageAt(t, root)
+	dir := filepath.Join(root, DirName)
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "kept"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, created, err := Ensure(plat, filepath.Join(root, "Public"))
+	if !errors.Is(err, ErrUnsafeTrash) {
+		t.Fatalf("Ensure = %q,%v,%v — want ErrUnsafeTrash", got, created, err)
+	}
+	fi, err := os.Lstat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o755 || fi.Mode()&fs.ModeSticky != 0 {
+		t.Errorf("mode = %v, want the planted directory untouched at 0755", fi.Mode())
+	}
+	if _, err := os.Lstat(filepath.Join(dir, "kept")); err != nil {
+		t.Errorf("the planted directory's contents were disturbed: %v", err)
+	}
+	if rest := leftovers(t, root); len(rest) != 0 {
+		t.Errorf("the refusal left %v behind", rest)
+	}
 }
 
 // TestEnsureRefusesADirectoryOwnedBySomebodyElse is F3's ownership check: the

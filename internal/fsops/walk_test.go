@@ -424,6 +424,98 @@ func TestWalkCrossesAnIdentifiedMountOfTheSameDomain(t *testing.T) {
 	}
 }
 
+// pretendLiveTable makes the walk treat a synthetic mount table as the running
+// kernel's for one test (B5).
+//
+// The rule under test only applies to a live table — one whose first field is
+// the same number statx reports as STATX_MNT_ID — and a test cannot produce one
+// of those on a dev box, or on any box without mounting something. So the seam
+// that answers the question is the thing replaced, exactly as identityFor is.
+func pretendLiveTable(t *testing.T) {
+	t.Helper()
+	prev := liveTableOf
+	liveTableOf = func(*platform.Platform) bool { return true }
+	t.Cleanup(func() { liveTableOf = prev })
+}
+
+// TestWalkRefusesToCrossAMountTheLiveTableDoesNotList is B5.
+//
+// The child descriptor carries a mount ID the kernel gave it, and the refreshed
+// table has no row with that ID. Falling through to a lookup by PATHNAME there
+// does not answer the question less precisely — it answers a different question,
+// "what filesystem does this name lead to now", which after a rename or a fresh
+// mount over the name can be somebody else's. Here the table even says yes: it
+// lists the child's name as an ext4 mount of the same device, so the pathname
+// lookup would authorise the crossing. The identity is what refuses it.
+//
+// TestWalkCrossesAnIdentifiedMountOfTheSameDomain is the control: the same
+// setup, minus the live table, still crosses — because a static table's IDs are
+// invented and no descriptor could ever match one (PLAN.md decision 15).
+func TestWalkRefusesToCrossAMountTheLiveTableDoesNotList(t *testing.T) {
+	base := tempDir(t)
+	mkdir(t, base, "a/sub")
+	write(t, base, "a/sub/inside.txt", "inside")
+	r, api := hostRoot(t, base)
+	plat := synthPlatform(t,
+		synthMount{mountPoint: api, fsType: "ext4", dev: "8:1"},
+		synthMount{mountPoint: api + "/a/sub", fsType: "ext4", dev: "8:1"},
+	)
+	// The parent names its own row; the child names a mount no row carries.
+	fakeIdentities(t, map[string]uint64{"a": synthMountIDBase, "a/sub": 4242})
+	pretendLiveTable(t)
+
+	var on recorder
+	if err := Walk(context.Background(), r, plat, api+"/a", WalkOptions{CrossMounts: true}, on.visitor()); err != nil {
+		t.Fatalf("Walk: %v", err)
+	}
+	if indexOf(on.pre, api+"/a/sub/inside.txt") >= 0 {
+		t.Errorf("the walk crossed into a mount the kernel named and the table cannot: pre = %v", on.pre)
+	}
+	if indexOf(on.mount, api+"/a/sub") < 0 {
+		t.Errorf("mount = %v, want the boundary reported as one so a size job can still count the directory", on.mount)
+	}
+}
+
+// TestWalkCapsComeFromTheMatchedMountNotItsPathname is B7.
+//
+// Once the kernel's mount ID has named the exact row a descriptor belongs to,
+// asking the table again BY PATHNAME throws that answer away. Platform.For is a
+// longest-prefix lookup keyed by mount point, and a mount point is not unique:
+// two mounts stacked at one path (a bind mount over a share, a tmpfs over a
+// directory — the shape QTS builds its layout out of) leave only the topmost one
+// reachable by name.
+//
+// The table here is exactly that. The child descriptor names the nfs4 row, which
+// decision 9 never crosses into; a second row over-mounts the same path with an
+// ext4 filesystem of the parent's own device, which the crossing rule would
+// welcome. So a by-name lookup authorises a walk into a network mount, and only
+// caps taken from the matched row itself refuse it.
+func TestWalkCapsComeFromTheMatchedMountNotItsPathname(t *testing.T) {
+	base := tempDir(t)
+	mkdir(t, base, "a/sub")
+	write(t, base, "a/sub/inside.txt", "inside")
+	r, api := hostRoot(t, base)
+	plat := synthPlatform(t,
+		synthMount{mountPoint: api, fsType: "ext4", dev: "8:1"},
+		// The row the descriptor names: a network mount, never crossed into.
+		synthMount{mountPoint: api + "/a/sub", fsType: "nfs4", dev: "0:42", source: "nas:/export"},
+		// Stacked at the same name, and the only one a pathname can reach.
+		synthMount{mountPoint: api + "/a/sub", fsType: "ext4", dev: "8:1"},
+	)
+	fakeIdentities(t, map[string]uint64{"a": synthMountIDBase, "a/sub": synthMountIDBase + 1})
+
+	var on recorder
+	if err := Walk(context.Background(), r, plat, api+"/a", WalkOptions{CrossMounts: true}, on.visitor()); err != nil {
+		t.Fatalf("Walk: %v", err)
+	}
+	if indexOf(on.pre, api+"/a/sub/inside.txt") >= 0 {
+		t.Errorf("the walk crossed into the nfs4 mount its descriptor named, on the strength of an ext4 row stacked over the same path: pre = %v", on.pre)
+	}
+	if indexOf(on.mount, api+"/a/sub") < 0 {
+		t.Errorf("mount = %v, want the boundary reported as one", on.mount)
+	}
+}
+
 // TestWalkProtectRefusesNeverWriteComponents is F10: the guard only ever sees a
 // job's root paths, so the walk applies the component rule itself, to every
 // entry the recursion reaches.

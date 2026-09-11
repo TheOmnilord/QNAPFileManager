@@ -109,6 +109,53 @@ fixes were needed on top of the CI-green M0, each described in docs/research/qts
 
 Running build at verification: 0.0.35. Still open: the administrator identity decision (below), and the M1 items.
 
+## M2 plan — jobs + transfer (started 2026-09-11)
+
+Same roles as M1: Fable orchestrates and judges every finding, Opus implements, gpt-6-astra (low) runs a normal and an
+adversarial review per round, up to ten rounds. M2 is split into three phases, each independently reviewable and
+testable on the two NAS units. The survey before starting found that M0/M1 had already laid the whole job wire
+protocol (`OpJob`/`OpCancel`, `prog`/`warn` frame kinds, the request shapes), the pool's id correlation and
+cancel-by-request plumbing, and the worker's per-request concurrency; what M2 builds is execution on both ends, the
+manager, the routes and the UI. Upload was listed under M1 but never wired (no `OpenWrite`/`Finalize` in the worker),
+so it lands in M2-C.
+
+- **M2-A — job spine, recursive delete, trash.** A shared contract was committed first (`09a0772`) so the two
+  implementers could work in parallel without a compile dependency: `wproto` gained `NewProg`/`NewWarn`, `JobResult`
+  (the terminal summary, which folds per-item warnings in, capped at 100, so a `warn` frame dropped by a slow reader is
+  never a lost record), `SizeReq`, `DeleteReq.CrossMounts`, `OpTrashList` and the trash restore/empty kinds;
+  `backend.Jobs`; `config.Jobs`; and `platform.TrashRootFor`. Worker side: `fsops.Walk` (never follows symlinks,
+  crossing by decision 9 through `platform.MayCross`, per-item warn-and-continue), `DeleteTree` with a bounded pre-scan
+  (design §3: 30 s / 500 000 entries, else indeterminate), `Size`, `Trash`/`TrashList`/`TrashRestore`/`TrashEmpty`,
+  and the worker's `OpJob` runner with a coalescing progress emitter (≤10 frames/s or 8 MiB) and cancel by job id. Pool
+  side: `Pool.Job` (one long-lived RPC drained to callbacks until the terminal frame; on cancel it tells the worker and
+  keeps draining to the worker's own partial result), `CancelJob`, `TrashList`, `jobs.Manager` per design §3, and
+  `trashroot.Ensure` — the one sanctioned root-front-end filesystem write outside the worker (decision 10). Web + UI
+  follow once both halves land: delete → Trash by default (ladder L1) with permanent delete at L2, folder size, the
+  jobs panel (polling v1), the trash panel with restore and empty, and the "Include mounted sub-folders" checkbox.
+- **M2-B — copy/move with the EXDEV pre-flight** and a destination picker. Conflict policy (skip / overwrite / keep
+  both) is chosen up front in the dialog in v1; the interactive `awaiting_input` pause of ui-ux §6.4 is deferred.
+- **M2-C — upload, archive, search.**
+
+Decisions made for M2-A:
+- **Trash root = the nearest enclosing mount, which must itself be Storage and non-network.** Decision 10's wording
+  ("nearest enclosing mount point whose `FSCaps.Storage` is true") was ambiguous; the golden QTS mount table showed
+  why it matters: QTS's root filesystem is flash storage, so a rule that climbs past `/proc` to a Storage parent would
+  have offered to trash `/proc`. The rule never climbs — the item's data lives on its nearest mount, so any parent
+  would `EXDEV` anyway — and `/proc`, `/sys`, `/dev`, tmpfs and network mounts therefore never get a trash root
+  (`platform.TrashRootFor`, tested against both golden tables).
+- **The `.@qfm_trash` directory is created by the root front-end** (`trashroot.Ensure`, mode `1777`, audited as a
+  milestone, disclosed in the trash panel, skippable via `trash.enabled=false`); the user's worker only ever creates
+  its own `<uid>/` subdirectory inside it and renames into `<uid>/<unix>-<hex>/`. Both sides compute the root through
+  the same pure mount-table lookup, so they agree by construction. The worker writes `meta.json` before the rename, so
+  a crash leaves at worst an orphan sidecar, which listing tolerates.
+- **Trash restore does not recreate missing parents in v1** (it reports `not_found`); collisions report `exists`.
+- **Delete-to-trash is `JobDelete` with `DeleteReq.Trash`**; the older `JobTrash` kind is accepted as an alias.
+- **Cancelled jobs do not roll back partial work** (design §3); the job carries a `Partial` flag and a note saying so.
+- **Jobs are polled in v1** (`GET /api/jobs`, 500 ms while active); SSE is a later refinement. Jobs are in-memory;
+  the audit log is the durable record.
+- **`worker.jobsInOwnProcess`** (identity plan §2.8) is deferred; the worker serves requests concurrently, so a job
+  does not block that user's browsing.
+
 ## Milestones
 
 | Milestone | Exit criterion | Share |

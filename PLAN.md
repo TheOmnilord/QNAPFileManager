@@ -137,6 +137,14 @@ so it lands in M2-C.
   both) is chosen up front in the dialog in v1; the interactive `awaiting_input` pause of ui-ux §6.4 is deferred.
 - **M2-C — upload, archive, search.**
 
+**M2-A review status (2026-09-11):** the M2-A stack — job spine, recursive delete, folder size, same-device trash
+with restore and empty, the routes, the jobs drawer and the trash panel — went through six gpt-6-astra rounds
+(standard + adversarial, Fable judging), converging on a clean verification pass: 14, 16, 7, 2, 1, 0 findings per
+round, every one accepted and fixed (`docs/reviews/m2a-round*`). Three CI failures on the way all came from the
+non-root Linux race job and were all genuine (fixture assumptions and scheduling races), now deterministic; that job is
+the one to read first. One residual was added (§2.7). Ready for the supervised hardware test of recursive delete,
+folder size and trash on QTS and QuTS hero; not a production sign-off.
+
 Decisions made for M2-A:
 - **Trash root = the nearest enclosing mount, which must itself be Storage and non-network.** Decision 10's wording
   ("nearest enclosing mount point whose `FSCaps.Storage` is true") was ambiguous; the golden QTS mount table showed

@@ -356,8 +356,13 @@ func (s *Server) deleteBlockers(ctx context.Context, sess *session, dir string) 
 	}
 	out := make([]deleteBlocker, 0, len(l.Entries))
 	for _, e := range l.Entries {
+		// Prefer NameB64 WHENEVER it is present: SetName sets it exactly for a
+		// non-UTF-8 name and leaves Name populated with the raw bytes, which the
+		// worker's JSON serialisation then flattens to U+FFFD by the time it reaches
+		// here — so keying on "Name is empty" would never pick the byte-safe form and
+		// distinct names could collide (review of the not_empty fix).
 		name := e.Name
-		if name == "" && e.NameB64 != "" {
+		if e.NameB64 != "" {
 			name = "b64:" + e.NameB64
 		}
 		out = append(out, deleteBlocker{Name: name, Hidden: e.Hidden, Dir: e.Type == "dir"})

@@ -200,6 +200,53 @@ func (notEmptyMutator) Delete(context.Context, backend.Principal, string) error 
 	return &fs.PathError{Op: "unlinkat", Path: "x", Err: syscall.ENOTEMPTY}
 }
 
+// fixedListBackend returns a chosen set of entries from List, standing in for a
+// worker listing whose names crossed the JSON boundary (so a non-UTF-8 Name is
+// already flattened while NameB64 carries the true bytes).
+type fixedListBackend struct {
+	*fakeBackend
+	entries []fsx.Entry
+}
+
+func (b fixedListBackend) List(context.Context, backend.Principal, string, fsx.ListOptions) (fsx.Listing, error) {
+	return fsx.Listing{Entries: b.entries, Total: len(b.entries)}, nil
+}
+
+// TestDeleteBlockersByteSafeName proves the review fix: a blocker whose name is
+// not valid UTF-8 is reported by its byte-safe NameB64 spelling, not the
+// JSON-flattened Name — so two distinct names cannot collide in the list.
+func TestDeleteBlockersByteSafeName(t *testing.T) {
+	s, b := fixture(t, true)
+	s.guard.SetReadOnly(false)
+	if err := os.MkdirAll(filepath.Join(b.dir, "Testtt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var e fsx.Entry
+	e.SetName([]byte("\xff\xfehidden")) // non-UTF-8: Name stays set, NameB64 populated
+	e.Type = "dir"
+	e.Hidden = true
+	if e.NameB64 == "" {
+		t.Fatal("precondition: NameB64 should be set for a non-UTF-8 name")
+	}
+	s.backend = fixedListBackend{fakeBackend: b, entries: []fsx.Entry{e}}
+	s.mutator = notEmptyMutator{b}
+	c, csrf := sessionCookie(t, s)
+	first := post(s, "/api/fs/delete", c, csrf, `{"path":"/Testtt"}`)
+	var tok struct{ Confirm struct{ Token string } }
+	json.NewDecoder(first.Body).Decode(&tok)
+	resp := post(s, "/api/fs/delete", c, csrf, `{"path":"/Testtt","confirm":"`+tok.Confirm.Token+`"}`)
+	var out struct {
+		Blockers []struct{ Name string }
+	}
+	json.NewDecoder(resp.Body).Decode(&out)
+	if len(out.Blockers) != 1 {
+		t.Fatalf("blockers = %+v, want 1", out.Blockers)
+	}
+	if want := "b64:" + e.NameB64; out.Blockers[0].Name != want {
+		t.Fatalf("blocker name = %q, want the byte-safe %q", out.Blockers[0].Name, want)
+	}
+}
+
 func TestEveryDeleteNeedsToken(t *testing.T) {
 	s, b := fixture(t, true)
 	s.guard.SetReadOnly(false)

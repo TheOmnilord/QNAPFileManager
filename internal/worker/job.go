@@ -34,41 +34,71 @@ const (
 	progBytes    = 8 << 20
 )
 
-// runJob serves one OpJob request from start to finish on its own goroutine.
-//
-// The job runs under a context derived from the request's, registered under the
-// JobID so an OpCancel naming the job stops it — and still cancelled by the
-// request's own context, so a dead connection or a cancellation by frame id
-// stops it too. Partial work is never rolled back; a cancelled job reports what
-// it managed to do, and the front-end says so rather than pretending otherwise
-// (backend plan §3).
-func (s *session) runJob(ctx context.Context, f wproto.Frame) {
+// jobStart is a job the read loop has accepted: the parsed request and, when
+// it named a JobID, the registration that makes it cancellable. It exists
+// because both of those have to be in place before the handler goroutine is
+// spawned (F5); see session.serve.
+type jobStart struct {
+	req wproto.JobReq
+	ent *jobEntry
+}
+
+// acceptJob parses an OpJob frame and registers the job, on the read loop and
+// before anything runs (F5). Any failure here — a malformed request, a JobID
+// that is already in use (F9) — is answered with an err frame and nothing is
+// started.
+func (s *session) acceptJob(f wproto.Frame, cancel context.CancelFunc) (*jobStart, error) {
 	var req wproto.JobReq
 	if err := f.Unmarshal(&req); err != nil {
-		s.replyErr(f.ID, err, nil)
-		return
+		return nil, err
 	}
-	jctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	js := &jobStart{req: req}
 	if req.JobID != "" {
-		s.beginJob(req.JobID, cancel)
-		defer s.endJob(req.JobID)
+		ent, err := s.beginJob(req.JobID, cancel)
+		if err != nil {
+			return nil, err
+		}
+		js.ent = ent
 	}
+	return js, nil
+}
 
+// runJob serves one accepted OpJob request from start to finish on its own
+// goroutine.
+//
+// The job runs under the request's own context, which is the one registered
+// under the JobID: an OpCancel naming either the job or the frame stops it, and
+// so does a dead connection. Partial work is never rolled back; a cancelled job
+// reports what it managed to do, and the front-end says so rather than
+// pretending otherwise (backend plan §3).
+func (s *session) runJob(ctx context.Context, f wproto.Frame, js *jobStart) {
 	e := &progEmitter{s: s, id: f.ID}
-	res, err := s.jobWork(jctx, req, e)
+	res, err := s.jobWork(ctx, js.req, e)
 	e.fold(&res)
+
+	// The name is dropped BEFORE the terminal frame goes out (F9). A front-end
+	// that reuses a job id the moment it sees the outcome would otherwise race
+	// this deferred unregistration and have its new job refused — or, worse,
+	// silently unregistered by the old one.
+	if js.ent != nil {
+		s.endJob(js.req.JobID, js.ent)
+	}
+	// Whatever the coalescing held back, the last progress state goes out now,
+	// so the UI's counters and the terminal result agree (protocol review).
+	e.flush()
 
 	switch {
 	case err == nil:
 		s.replyOK(f.ID, res)
-	case jctx.Err() != nil:
-		// Cancelled, by the front-end or by the connection going away. The code
-		// is "cancelled" (fsx.Code of context.Canceled) and the partial counts
-		// travel in the message, because the wire's err frame carries a code, an
-		// errno, a message and a path and has no room for a JobResult — a
-		// contract this side does not get to change.
-		s.replyErr(f.ID, e.cancelled(res), nil)
+	case ctx.Err() != nil:
+		// Cancelled, by the front-end or by the connection going away. The
+		// terminal is an OK frame carrying the partial JobResult with Cancelled
+		// set (F7): the counts and the folded warnings are the record of what
+		// actually happened, and an err frame — a code, an errno, a message and
+		// a path — has no room for any of it. The pool turns Cancelled back into
+		// context.Canceled for its caller, so nothing downstream mistakes this
+		// for a job that completed.
+		s.replyOK(f.ID, e.cancelled(res))
 	default:
 		s.replyErr(f.ID, err, nil)
 	}
@@ -176,6 +206,12 @@ type progEmitter struct {
 	// total is the last denominator a progress update carried, kept so the
 	// cancellation message can say "after N of M".
 	total int64
+	// pending is the most recent progress state the coalescing held back, and
+	// held is whether there is one. flush sends it before the terminal frame,
+	// so a job that finished between two ticks does not leave a UI showing a
+	// count the terminal result then contradicts.
+	pending wproto.Prog
+	held    bool
 	// warnings counts every per-item failure; warns keeps the first WarnCap of
 	// them verbatim for the terminal result.
 	warnings int
@@ -203,9 +239,32 @@ func (e *progEmitter) prog(p wproto.Prog) {
 	if send {
 		e.last = now
 		e.lastBytes = p.Bytes
+		e.held = false
+	} else {
+		e.pending = p
+		e.held = true
 	}
 	e.mu.Unlock()
 	if !send {
+		return
+	}
+	f, err := wproto.NewProg(e.id, p)
+	if err != nil {
+		return
+	}
+	e.s.reply(f)
+}
+
+// flush sends the progress update the coalescing swallowed, if there was one.
+// It runs once, immediately before the terminal frame, and never after it: a
+// prog frame arriving behind the terminal would be a reply for a request id the
+// front-end has already retired.
+func (e *progEmitter) flush() {
+	e.mu.Lock()
+	p, held := e.pending, e.held
+	e.held = false
+	e.mu.Unlock()
+	if !held {
 		return
 	}
 	f, err := wproto.NewProg(e.id, p)
@@ -244,18 +303,28 @@ func (e *progEmitter) fold(res *wproto.JobResult) {
 	res.Warns = e.warns
 }
 
-// cancelled builds the terminal error of a cancelled job: the "cancelled" code
-// plus the partial counts, so the front-end can say what was done before the
-// user stopped it and make clear that it was not undone.
-func (e *progEmitter) cancelled(res wproto.JobResult) error {
+// cancelled builds the terminal result of a cancelled job (F7): the partial
+// counts and the folded warnings the job actually accumulated, marked
+// Cancelled, with a Detail that says what was done before the user stopped it
+// and that it was not undone.
+//
+// It is a JobResult and not an error on purpose. The err frame carries a code,
+// an errno, a message and a path, so the old spelling had to squeeze the counts
+// into prose and the pool could only hand its caller an empty result back — the
+// warnings and the numbers were lost exactly where they mattered most, on the
+// destructive operation that stopped half way.
+func (e *progEmitter) cancelled(res wproto.JobResult) wproto.JobResult {
 	e.mu.Lock()
 	total := e.total
 	e.mu.Unlock()
+	res.Cancelled = true
 	done := res.Files + res.Dirs
 	if total > 0 {
-		return fmt.Errorf("cancelled after %d of %d items (%d bytes, %d warnings); what was done is not undone: %w",
-			done, total, res.Bytes, res.Warnings, context.Canceled)
+		res.Detail = fmt.Sprintf("cancelled after %d of %d items (%d bytes, %d warnings); what was done is not undone",
+			done, total, res.Bytes, res.Warnings)
+	} else {
+		res.Detail = fmt.Sprintf("cancelled after %d items (%d bytes, %d warnings); what was done is not undone",
+			done, res.Bytes, res.Warnings)
 	}
-	return fmt.Errorf("cancelled after %d items (%d bytes, %d warnings); what was done is not undone: %w",
-		done, res.Bytes, res.Warnings, context.Canceled)
+	return res
 }

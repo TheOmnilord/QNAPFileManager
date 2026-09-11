@@ -4,7 +4,9 @@ import {state,update,sessionGuard} from './state.js';
 import {initList,loadList} from './list.js';
 import {loadTree} from './tree.js';
 import {initViewer} from './viewer.js';
-import {initActions} from './actions.js';
+import {initActions,deleteSelection} from './actions.js';
+import {initJobs,pollJobs} from './jobs.js';
+import {initTrash} from './trash.js';
 import {initSettings,loadAudit} from './settings.js';
 import {sessionBootstrap,transientAuthError} from './bootstrap.js';
 
@@ -57,9 +59,9 @@ function showSession(session) {
   $('#chipReadonly').textContent='Read-only'; $('#chipReadonly').hidden=!!session.canWrite;
   $('#adminSettings').hidden=!session.admin; $('#setReadOnly').checked=session.readOnly;
   if (session.groupsIncomplete) $('#announce').textContent='Warning: supplementary groups are incomplete.';
-  navigate(); loadTree();
+  navigate(); loadTree(); pollJobs();
 }
-initList(); initViewer(); initActions(); initSettings();
+initList(); initViewer(); initActions(); initJobs(); initTrash(); initSettings();
 $('.skip').addEventListener('click',ev => { ev.preventDefault(); $('#list').focus(); });
 window.addEventListener('hashchange',navigate);
 $('#btnRetry').addEventListener('click',connect);
@@ -86,6 +88,7 @@ document.addEventListener('keydown',ev => {
  if (ctrl && ev.key.toLowerCase()==='l') { ev.preventDefault(); $('#pathEdit').focus(); $('#pathEdit').select(); return; }
  if (editing) return;
  if (ctrl && ev.key.toLowerCase()==='h') { ev.preventDefault(); $('#chkHidden').checked=!state.hidden; hidden(); }
+ else if (ev.key==='Delete') { ev.preventDefault(); deleteSelection(); }
  else if (ev.key==='F5') { ev.preventDefault(); loadList(); }
  else if (ev.key==='Backspace') { ev.preventDefault(); up(); }
  else if (ev.altKey && ev.key==='ArrowLeft') { ev.preventDefault(); history.back(); }

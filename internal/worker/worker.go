@@ -29,6 +29,7 @@ import (
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
+	"syscall"
 
 	"qnapfilemanager/internal/fsops"
 	"qnapfilemanager/internal/fsx"
@@ -98,7 +99,7 @@ func Run(ctx context.Context, rw io.ReadWriter, o Options) error {
 		opts:     o,
 		sem:      make(chan struct{}, o.MaxConcurrent),
 		inflight: map[uint64]context.CancelFunc{},
-		jobs:     map[string]context.CancelFunc{},
+		jobs:     map[string]*jobEntry{},
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -130,14 +131,14 @@ type session struct {
 	inflightMu sync.Mutex
 	inflight   map[uint64]context.CancelFunc
 
-	// jobs holds one cancel function per running job, keyed by the JobID the
+	// jobs holds one registration per running job, keyed by the JobID the
 	// front-end chose (identity plan §2.5). It is separate from inflight
 	// because the two identifiers are: a job outlives any single frame, and the
 	// front-end's jobs.Manager knows the job by its own id long after it has
 	// forgotten which request frame started it. Guarded by jobsMu, which is
 	// never held across a handler or a write.
 	jobsMu sync.Mutex
-	jobs   map[string]context.CancelFunc
+	jobs   map[string]*jobEntry
 
 	// fatalOnce/fatalErr record the first unrecoverable transport failure.
 	fatalOnce sync.Once
@@ -198,18 +199,44 @@ func (s *session) cancelRequest(id uint64) {
 	}
 }
 
-// beginJob registers a running job's cancel function under its JobID.
-func (s *session) beginJob(id string, cancel context.CancelFunc) {
-	s.jobsMu.Lock()
-	s.jobs[id] = cancel
-	s.jobsMu.Unlock()
+// jobEntry is one registered job. The pointer itself is the registration's
+// identity: endJob drops the name only when the entry under it is still this
+// one, which is what stops a finishing job from unregistering the job that has
+// already taken its id (M2-A review round 1, finding 9).
+type jobEntry struct {
+	cancel context.CancelFunc
 }
 
-// endJob unregisters a job that has finished. The job's own defer cancels its
-// context; this only drops the name.
-func (s *session) endJob(id string) {
+// beginJob registers a running job under its JobID and hands back the entry
+// that owns the name.
+//
+// A JobID that is still registered is REFUSED rather than overwritten (F9).
+// Overwriting put two live jobs under one name: a cancellation then stopped
+// whichever of them happened to be in the map, and the first of the two to
+// finish deleted the other's entry, leaving a destructive job that could no
+// longer be stopped at all. The refusal classifies as "conflict" (fsx.Code of
+// EBUSY), which is what the front-end shows for an id that is already in use.
+func (s *session) beginJob(id string, cancel context.CancelFunc) (*jobEntry, error) {
+	ent := &jobEntry{cancel: cancel}
 	s.jobsMu.Lock()
-	delete(s.jobs, id)
+	defer s.jobsMu.Unlock()
+	if _, ok := s.jobs[id]; ok {
+		return nil, fmt.Errorf("the job id %q is already running on this worker: %w", id, syscall.EBUSY)
+	}
+	s.jobs[id] = ent
+	return ent, nil
+}
+
+// endJob unregisters a job that has finished, and only if the name is still
+// its own (F9). The job's own defer cancels its context; this only drops the
+// name — early, before the terminal frame goes out, so that a front-end which
+// reuses the id the instant it sees the terminal cannot collide with the
+// registration of the job that has just ended.
+func (s *session) endJob(id string, ent *jobEntry) {
+	s.jobsMu.Lock()
+	if cur, ok := s.jobs[id]; ok && cur == ent {
+		delete(s.jobs, id)
+	}
 	s.jobsMu.Unlock()
 }
 
@@ -218,10 +245,10 @@ func (s *session) endJob(id string) {
 // the user pressing cancel race by nature.
 func (s *session) cancelJob(id string) {
 	s.jobsMu.Lock()
-	cancel := s.jobs[id]
+	ent := s.jobs[id]
 	s.jobsMu.Unlock()
-	if cancel != nil {
-		cancel()
+	if ent != nil {
+		ent.cancel()
 	}
 }
 
@@ -398,13 +425,45 @@ func (s *session) serve(ctx context.Context) error {
 			continue
 		}
 		rctx, cancel := s.begin(ctx, f.ID)
+
+		// F5 (M2-A review round 1): a job has to be cancellable from the
+		// instant its frame is accepted, not from whenever its goroutine
+		// happens to get scheduled. OpCancel is answered synchronously on this
+		// same loop, so an OpCancel{JobID} arriving right behind an OpJob used
+		// to find an empty table, be acknowledged as a harmless no-op, and
+		// leave the destructive job to start a moment later under a context
+		// nobody had cancelled — while the front-end had already reported the
+		// job stopped, drained its grace and released its hold. The JobReq is
+		// therefore parsed and BOTH registrations (the request id above and
+		// the JobID here) are made before the handler exists.
+		//
+		// The test dispatch hook replaces every operation handler, jobs
+		// included, so there is nothing to pre-register when it is set.
+		var job *jobStart
+		if f.Op == wproto.OpJob && s.opts.dispatch == nil {
+			js, err := s.acceptJob(f, cancel)
+			if err != nil {
+				// Nothing was spawned and nothing registered: unwind the two
+				// things that were, and answer with the refusal.
+				s.end(f.ID, cancel)
+				<-s.sem
+				s.replyErr(f.ID, err, nil)
+				continue
+			}
+			job = js
+		}
+
 		s.wg.Add(1)
-		go func(f wproto.Frame) {
+		go func(f wproto.Frame, job *jobStart) {
 			defer s.wg.Done()
 			defer func() { <-s.sem }()
 			defer s.end(f.ID, cancel)
+			if job != nil {
+				s.runJob(rctx, f, job)
+				return
+			}
 			s.dispatch(rctx, f)
-		}(f)
+		}(f, job)
 	}
 }
 
@@ -455,6 +514,8 @@ func (s *session) dispatch(ctx context.Context, f wproto.Frame) {
 		s.replyOK(f.ID, v)
 		return
 	}
+	// OpJob is not here: a job is accepted and registered on the read loop
+	// (F5) and run by runJob directly, so it never reaches this switch.
 	switch f.Op {
 	case wproto.OpPing:
 		s.replyOK(f.ID, nil)
@@ -474,8 +535,6 @@ func (s *session) dispatch(ctx context.Context, f wproto.Frame) {
 		s.delete(ctx, f)
 	case wproto.OpOpenRead:
 		s.openRead(ctx, f)
-	case wproto.OpJob:
-		s.runJob(ctx, f)
 	case wproto.OpTrashList:
 		s.trashList(ctx, f)
 	default:

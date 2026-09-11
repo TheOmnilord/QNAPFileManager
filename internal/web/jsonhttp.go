@@ -23,6 +23,11 @@ func statusCode(code string) int {
 		return 404
 	case "exists", "not_empty", "cross_device", "conflict":
 		return 409
+	case "no_trash":
+		// There is no same-device trash for this location, so the delete the
+		// client asked for cannot be made reversible. It re-asks as a permanent
+		// delete at confirmation level 2 (PLAN.md decision 10, ui-ux §4.4).
+		return 409
 	case "too_large":
 		return 413
 	case "unsupported":

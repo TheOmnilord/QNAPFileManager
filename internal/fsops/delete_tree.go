@@ -81,7 +81,7 @@ func DeleteTree(ctx context.Context, r fsx.Root, plat *platform.Platform, paths 
 
 	if o.Recursive {
 		lim := scanLimits{deadline: time.Now().Add(scanMaxDuration), maxEntries: scanMaxEntries}
-		scan, err := scanTrees(ctx, r, plat, paths, o.CrossMounts, emit, lim, true)
+		scan, err := scanTrees(ctx, r, plat, paths, o.CrossMounts, emit, lim, true, ProtectWrite)
 		if err != nil {
 			return d.res, err
 		}
@@ -143,6 +143,14 @@ func (d *treeDeleter) one(ctx context.Context, p string, o DeleteOptions) error 
 		d.res.Skipped++
 		return nil
 	}
+	// F10: the never-write component rule, applied to the selected path before
+	// anything is resolved. The guard refuses these too, and it is refused here
+	// as well for the same reason the mount-point rule is: the guard sees a job's
+	// root paths and this is the process that sees every path below them.
+	if reason, hit := neverWritePath(clean); hit {
+		d.refuse(clean, neverWriteErr(clean, reason))
+		return nil
+	}
 	// The leaf is kept literal: a symlink named for deletion is the link, never
 	// the thing it points at.
 	tg, err := resolve(d.r, clean, false)
@@ -191,7 +199,11 @@ func (d *treeDeleter) one(ctx context.Context, p string, o DeleteOptions) error 
 		return nil
 	}
 
-	return Walk(ctx, d.r, d.plat, tg.api, WalkOptions{CrossMounts: o.CrossMounts, Mutating: true}, Visitor{
+	return Walk(ctx, d.r, d.plat, tg.api, WalkOptions{
+		CrossMounts: o.CrossMounts,
+		Mutating:    true,
+		Protect:     ProtectWrite,
+	}, Visitor{
 		Pre:  d.pre,
 		Post: d.post,
 		Warn: func(apiPath string, err error) {

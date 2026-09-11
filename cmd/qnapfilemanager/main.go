@@ -27,6 +27,7 @@ import (
 	"qnapfilemanager/internal/fsx"
 	"qnapfilemanager/internal/guard"
 	"qnapfilemanager/internal/idmap"
+	"qnapfilemanager/internal/jobs"
 	"qnapfilemanager/internal/logfile"
 	"qnapfilemanager/internal/platform"
 	"qnapfilemanager/internal/qtsauth"
@@ -370,9 +371,41 @@ func runServe(args []string, stderr io.Writer) error {
 	frontend.ConfigPath = o.configPath
 	frontend.AuditPath = auditPath
 	// The guard resolves parent symlinks through this same jail mapping before a
-	// mutation (resolveForGuard). The zero Root production uses is the identity
-	// mapping; a -jail dev loop passes its own.
+	// mutation (resolveForGuard). It is also how a delete-to-trash maps an API
+	// path to the OS path trashroot.Ensure needs. The zero Root production uses
+	// is the identity mapping; a -jail dev loop passes its own.
 	frontend.Root = root
+
+	// The M2-A job spine. The manager is the front-end's bookkeeping (queue,
+	// progress, cancellation, retention); the pool is what actually runs a job,
+	// as one long-lived RPC to the worker that carries the user's credentials.
+	// Jobs are in-memory only — the audit log is the durable record — so the
+	// manager is closed, not persisted, at shutdown.
+	jobMgr := jobs.New(jobs.LimitsFrom(cfg.Jobs))
+	defer func() {
+		// Runs before the pool's own Shutdown (defers are LIFO and the pool's was
+		// registered first): stop the work, then the workers doing it.
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if err := jobMgr.Close(ctx); err != nil {
+			logger.Printf("job manager shutdown: %v", err)
+		}
+	}()
+	reapCtx, stopReap := context.WithCancel(context.Background())
+	defer stopReap()
+	go func() {
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-reapCtx.Done():
+				return
+			case <-ticker.C:
+				jobMgr.Reap()
+			}
+		}
+	}()
+	frontend.SetJobs(poolBackend{b}, jobMgr)
 	srv.frontend = frontend.Handler()
 	return srv.run(context.Background())
 }

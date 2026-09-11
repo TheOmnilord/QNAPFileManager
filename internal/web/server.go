@@ -21,8 +21,10 @@ import (
 	"qnapfilemanager/internal/fsx"
 	"qnapfilemanager/internal/guard"
 	"qnapfilemanager/internal/idmap"
+	"qnapfilemanager/internal/jobs"
 	"qnapfilemanager/internal/platform"
 	"qnapfilemanager/internal/qtsauth"
+	"qnapfilemanager/internal/trashroot"
 )
 
 //go:embed static
@@ -44,6 +46,17 @@ type Server struct {
 	guard   *guard.Guard
 	auditor *audit.Logger
 	mutator backend.Mutator
+
+	// M2-A job spine. Both are nil-tolerant, like the M1 trio above: a fixture
+	// without them answers a clear 500 on the job routes instead of panicking.
+	// jobRunner is the worker-side long-lived RPC (the pool); jobMgr is the
+	// front-end's own bookkeeping (queue, progress, cancellation, retention).
+	jobRunner backend.Jobs
+	jobMgr    *jobs.Manager
+	// ensureTrash is trashroot.Ensure, indirected so a test can drive the
+	// trash-root creation path (and its audit milestone) on a host whose mount
+	// table has no storage mounts. Never nil after New.
+	ensureTrash func(*platform.Platform, string) (string, bool, error)
 	// ConfigPath is where a read-only toggle is persisted (config.Save); empty
 	// means the change is applied in memory only. AuditPath is the JSON-lines
 	// file /api/audit/export streams. Both are set by the caller after New.
@@ -100,6 +113,12 @@ func New(cfg config.Config, b backend.Backend, v *qtsauth.Verifier, ids *idmap.M
 		}
 	}
 	s.mutator = mutator
+	s.ensureTrash = trashroot.Ensure
+	// The same pool that implements Backend and Mutator implements Jobs; type-
+	// assert it so cmd can wire the job manager alone (SetJobs).
+	if j, ok := b.(backend.Jobs); ok {
+		s.jobRunner = j
+	}
 	// The admission channels are created here, before any goroutine can see
 	// the server, rather than lazily on the first request: the race detector
 	// caught a test reading them while the first request's once.Do was still
@@ -108,15 +127,46 @@ func New(cfg config.Config, b backend.Backend, v *qtsauth.Verifier, ids *idmap.M
 	return s
 }
 
+// SetJobs wires the M2-A job spine: runner is the worker-side long-lived RPC
+// (the pool) and mgr the front-end manager whose Reap ticker and Close the
+// caller owns. Either may be nil, which leaves the job routes answering 500
+// "this build cannot run jobs" — the same shape mutationsReady uses.
+func (s *Server) SetJobs(runner backend.Jobs, mgr *jobs.Manager) {
+	if runner != nil {
+		s.jobRunner = runner
+	}
+	s.jobMgr = mgr
+}
+
 // routes is also the source of truth for the static JS endpoint contract test.
 // The value is the set of methods a path answers; a request for anything else
-// gets 405 with an Allow header.
+// gets 405 with an Allow header. The two job-id forms (/api/jobs/<id> and
+// /api/jobs/<id>/cancel) are not literal paths and are matched by routeFor.
 var routes = map[string][]string{
 	"/api/session": {"GET"}, "/api/status": {"GET"}, "/api/fs/list": {"GET"},
 	"/api/fs/stat": {"GET"}, "/api/fs/roots": {"GET"}, "/api/fs/download": {"GET"},
 	"/api/fs/text": {"GET"}, "/api/ids": {"GET"}, "/api/diag": {"GET"}, "/api/logout": {"POST"},
 	"/api/fs/mkdir": {"POST"}, "/api/fs/rename": {"POST"}, "/api/fs/delete": {"POST"},
 	"/api/settings": {"GET", "POST"}, "/api/audit": {"GET"}, "/api/audit/export": {"GET"},
+	"/api/jobs": {"GET"}, "/api/jobs/delete": {"POST"}, "/api/jobs/size": {"POST"},
+	"/api/trash": {"GET"}, "/api/trash/restore": {"POST"}, "/api/trash/empty": {"POST"},
+}
+
+// routeFor resolves a request path to the methods it answers. Literal routes
+// win, so /api/jobs/delete is the delete route and never a job whose id is
+// "delete" — job ids are 16 hex characters (jobs.newID) and jobPath insists on
+// exactly that shape, so the two vocabularies cannot collide.
+func routeFor(p string) ([]string, bool) {
+	if methods, ok := routes[p]; ok {
+		return methods, true
+	}
+	if _, action, ok := jobPath(p); ok {
+		if action == "cancel" {
+			return []string{"POST"}, true
+		}
+		return []string{"GET"}, true
+	}
+	return nil, false
 }
 
 // allowedMethod reports whether method is served by one of methods; a HEAD is
@@ -248,7 +298,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-	methods, ok := routes[r.URL.Path]
+	methods, ok := routeFor(r.URL.Path)
 	if !ok {
 		s.fail(w, r, "not_found", "No such endpoint.", "", "")
 		return
@@ -301,10 +351,32 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		s.auditTail(w, r, sess)
 	case "/api/audit/export":
 		s.auditExport(w, r, sess)
+	case "/api/jobs":
+		s.jobList(w, r, sess)
+	case "/api/jobs/delete":
+		s.jobDelete(w, r, sess)
+	case "/api/jobs/size":
+		s.jobSize(w, r, sess)
+	case "/api/trash":
+		s.trashList(w, r, sess)
+	case "/api/trash/restore":
+		s.trashRestore(w, r, sess)
+	case "/api/trash/empty":
+		s.trashEmpty(w, r, sess)
 	case "/api/logout":
 		s.destroy(sess.id)
 		s.cookie(w, r, "", -1)
 		writeJSON(w, map[string]bool{"authenticated": false})
+	default:
+		// The two job-id forms; routeFor has already vetted the shape and the
+		// method, so anything reaching here is /api/jobs/<id>[/cancel].
+		if id, action, ok := jobPath(r.URL.Path); ok {
+			if action == "cancel" {
+				s.jobCancel(w, r, sess, id)
+			} else {
+				s.jobGet(w, r, sess, id)
+			}
+		}
 	}
 }
 

@@ -133,6 +133,12 @@ type Options struct {
 	// handshake still runs). Production leaves it nil; tests inject one that
 	// fails, or one that blocks, to exercise the accounting around it.
 	newWorker func(backend.Principal) (*client, error)
+
+	// jobCancelGrace shortens the wait for a cancelled job's outcome. Zero
+	// means jobCancelGrace, which is what production uses; a test that has to
+	// reach the expiry (F13 — the worker is terminated) sets a few
+	// milliseconds rather than making the suite sit out ten real seconds.
+	jobCancelGrace time.Duration
 }
 
 func (o Options) normalise() Options {

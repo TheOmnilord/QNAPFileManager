@@ -6,6 +6,27 @@ export function el(tag, attrs = {}, text = '') {
  return node;
 }
 export function announce(message) { $('#announce').textContent = message; }
+// toast shows a transient message with one optional action (ui-ux §4.4: a
+// trashed item's Undo lives here for 15 seconds). Only one is shown at a time;
+// a new one replaces the old, and dismissing cancels the timer.
+let toastTimer = null;
+export function toast(message, actionLabel, onAction, ms = 15000) {
+ const box = $('#toast'); if (!box) return;
+ if (toastTimer) { clearTimeout(toastTimer); toastTimer = null; }
+ const hide = () => { if (toastTimer) { clearTimeout(toastTimer); toastTimer = null; } box.hidden = true; box.replaceChildren(); };
+ box.replaceChildren(el('span', {}, message));
+ if (actionLabel && onAction) {
+  const button = el('button', {class:'toastAction'}, actionLabel);
+  button.addEventListener('click', () => { hide(); onAction(); });
+  box.append(button);
+ }
+ const dismiss = el('button', {class:'toastClose','aria-label':'Dismiss'}, '×');
+ dismiss.addEventListener('click', hide);
+ box.append(dismiss);
+ box.hidden = false;
+ announce(message);
+ toastTimer = setTimeout(hide, ms);
+}
 export function error(err) { $('#status').textContent = err.message || String(err); announce(err.message || String(err)); }
 export function openDialog(id) { const dialog = $(id); if (!dialog.open) dialog.showModal(); }
 export function pathArgs(entry) { return entry.pathB64 ? {pathB64:entry.pathB64} : {path:entry.path}; }

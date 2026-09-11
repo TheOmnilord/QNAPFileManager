@@ -52,12 +52,16 @@ type scanResult struct {
 // pass that follows it walks the same tree and will report the same EACCES
 // itself, and warning twice for one file would inflate the count the front-end
 // shows.
+// protect is the never-write component rule this pass applies (F10). A delete's
+// pre-scan passes ProtectWrite so its denominator counts exactly what the delete
+// will go on to remove; Size passes ProtectSnapshots, which skips .zfs and still
+// counts @Recycle.
 func scanTrees(ctx context.Context, r fsx.Root, plat *platform.Platform, paths []string,
-	crossMounts bool, emit Emit, lim scanLimits, quiet bool) (scanResult, error) {
+	crossMounts bool, emit Emit, lim scanLimits, quiet bool, protect Protect) (scanResult, error) {
 
 	var res scanResult
 	var since int64
-	opts := WalkOptions{CrossMounts: crossMounts}
+	opts := WalkOptions{CrossMounts: crossMounts, Protect: protect}
 
 	for _, p := range paths {
 		if err := ctx.Err(); err != nil {
@@ -124,8 +128,14 @@ func scanTrees(ctx context.Context, r fsx.Root, plat *platform.Platform, paths [
 // The phase is "scanning" throughout: nothing is being changed, and a UI that
 // showed a progress bar labelled "working" for a measurement would be lying
 // about what could be lost by cancelling it (nothing).
+//
+// ".zfs" is skipped even though this pass writes nothing (F10): a snapshot
+// directory holds the whole history of a share, so counting it would answer a
+// question nobody asked with a number nobody could use. "@Recycle" is counted —
+// it is an ordinary directory whose bytes are really there, and decision 10 only
+// forbids WRITING to it.
 func Size(ctx context.Context, r fsx.Root, plat *platform.Platform, paths []string, crossMounts bool, emit Emit) (wproto.JobResult, error) {
-	res, err := scanTrees(ctx, r, plat, paths, crossMounts, emit, scanLimits{}, false)
+	res, err := scanTrees(ctx, r, plat, paths, crossMounts, emit, scanLimits{}, false, ProtectSnapshots)
 	out := wproto.JobResult{Files: res.files, Dirs: res.dirs, Bytes: res.bytes}
 	if err != nil {
 		return out, err

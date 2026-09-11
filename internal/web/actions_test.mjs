@@ -1,7 +1,7 @@
 // Run with: node --test internal/web/actions_test.mjs
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
-import {runMutation, actionMessage} from './static/js/actions.js';
+import {runMutation, actionMessage, deleteGrade, PERMANENT_WARNING} from './static/js/actions.js';
 import {update} from './static/js/state.js';
 
 test('runMutation drives the server confirmation-token flow', async t => {
@@ -46,6 +46,27 @@ test('actionMessage names the hidden blockers on a not-empty delete', () => {
 });
 
 test('actionMessage falls back to the code message when no blockers are present', () => {
- assert.match(actionMessage({code:'not_empty'}), /coming in a later version/);
+ assert.match(actionMessage({code:'not_empty'}), /removes a folder and its contents/);
  assert.match(actionMessage({code:'protected'}), /protected system path/);
+ assert.match(actionMessage({code:'no_trash'}), /no Trash on this volume/);
+});
+
+test('deleteGrade is the confirmation ladder', () => {
+ // A move to Trash is reversible: grade 1, a simple confirm.
+ assert.equal(deleteGrade({mode:'trash',summary:{files:3,bytes:100}}),1);
+ assert.equal(deleteGrade({mode:'trash',summary:null}),1);
+ // A permanent delete is grade 2 (typed phrase) whatever the summary says.
+ assert.equal(deleteGrade({mode:'permanent',summary:{files:1,bytes:0}}),2);
+ // …and so is a trash delete the server warned about, at scale, or in a
+ // warn-class location.
+ assert.equal(deleteGrade({mode:'trash',summary:{warnings:[PERMANENT_WARNING]}}),2);
+ assert.equal(deleteGrade({mode:'trash',summary:{warnings:['Inside a protected system path.']}}),2);
+ assert.equal(deleteGrade({mode:'trash',summary:{files:101}}),2);
+ assert.equal(deleteGrade({mode:'trash',summary:{bytes:(1<<30)+1}}),2);
+});
+
+test('the permanent warning is the exact sentence the server sends', () => {
+ // Pinned on both sides: web.permanentWarning in routes_jobs.go carries the
+ // same text, and a Go test asserts it.
+ assert.equal(PERMANENT_WARNING,'This delete is permanent and cannot be undone.');
 });

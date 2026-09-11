@@ -385,6 +385,14 @@ func (p *Pool) call(ctx context.Context, c *client, op wproto.Op, body any) (wpr
 
 	if err := p.writeFrame(ctx, c, req); err != nil {
 		c.abandon(id, pend)
+		// F12: the deadline was already gone before the write was attempted, so
+		// the transport was never touched. This caller's request simply never
+		// happened; the worker is fine and the calls its other callers have in
+		// flight are none of this one's business.
+		var nw *notWritten
+		if errors.As(err, &nw) {
+			return wproto.Frame{}, nil, nw.err
+		}
 		gone := workerGone(c.key, err)
 		// A write that failed part-way has desynchronised the framing, and a
 		// write that timed out has left a worker that is not reading. Neither
@@ -444,8 +452,28 @@ func (p *Pool) call(ctx context.Context, c *client, op wproto.Op, body any) (wpr
 // will wait for a worker to take the bytes.
 const writeTimeout = 10 * time.Second
 
+// notWritten marks a writeFrame failure in which not one byte reached the
+// transport, because the caller's deadline had already passed when the write
+// was asked for (M2-A review round 1, finding 12).
+//
+// The distinction is the whole point. Every other write failure means the
+// stream is now in an unknown state — a frame half on the wire, or a worker
+// that has stopped reading — and the only safe answer is to close the
+// connection and retire the process. This one means nothing happened at all:
+// the worker is healthy, its other calls are mid-flight and untouched, and
+// retiring it would kill a user's running download to punish a submission that
+// expired a microsecond too early.
+type notWritten struct{ err error }
+
+func (e *notWritten) Error() string { return e.err.Error() }
+func (e *notWritten) Unwrap() error { return e.err }
+
 // writeFrame puts one frame on a worker's transport without ever blocking
 // indefinitely on a worker that has stopped reading.
+//
+// A deadline that has already expired comes back wrapped in *notWritten, so the
+// caller can tell "the transport is now suspect" from "this caller gave up
+// before we tried"; see F12 at each call site.
 func (p *Pool) writeFrame(ctx context.Context, c *client, f wproto.Frame) error {
 	d := writeTimeout
 	if dl, ok := ctx.Deadline(); ok {
@@ -455,9 +483,9 @@ func (p *Pool) writeFrame(ctx context.Context, c *client, f wproto.Frame) error 
 	}
 	if d <= 0 {
 		if err := ctx.Err(); err != nil {
-			return err
+			return &notWritten{err: err}
 		}
-		return context.DeadlineExceeded
+		return &notWritten{err: context.DeadlineExceeded}
 	}
 	return c.tr.WriteWithin(d, f, nil)
 }

@@ -1,9 +1,15 @@
 package fsops
 
 import (
+	"errors"
 	"io/fs"
 	"os"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync/atomic"
 	"syscall"
+	"unsafe"
 
 	"qnapfilemanager/internal/fsx"
 )
@@ -91,29 +97,258 @@ func (d *dirRef) unlink(name string, isDir bool) error {
 }
 
 // stat describes the directory itself, by fstat on the descriptor: no lookup,
-// and the st_dev the walk compares a child against.
+// and the ownership and mode every trash check is made against (F1, F2).
 func (d *dirRef) stat() (os.FileInfo, error) { return d.f.Stat() }
 
 func (d *dirRef) close() error { return d.f.Close() }
 
-// openFileAt opens (or creates) a file inside an already-resolved directory,
-// through that directory's own O_PATH descriptor.
+// mkdir creates a subdirectory of this one, with mkdirat relative to the held
+// descriptor (F2). Nothing is named: whatever the pathname of this directory
+// meant when it was opened, the entry lands inside the object the descriptor
+// refers to and nowhere else.
+func (d *dirRef) mkdir(name string, mode os.FileMode) error {
+	if err := mkdiratIn(d.f, name, syscallMode(mode)); err != nil {
+		return &fs.PathError{Op: "mkdirat", Path: relJoin(d.rel, name), Err: err}
+	}
+	return nil
+}
+
+// openFile opens (or creates) a file inside this directory, with openat relative
+// to the held descriptor (F2). O_NOFOLLOW refuses a symlink somebody dropped in
+// rather than following it, and O_CLOEXEC keeps the descriptor out of anything
+// the worker execs.
+func (d *dirRef) openFile(name string, flags int, perm os.FileMode) (*os.File, error) {
+	fd, err := openatPerm(d.f, name, flags|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, syscallMode(perm))
+	if err != nil {
+		return nil, &fs.PathError{Op: "openat", Path: relJoin(d.rel, name), Err: err}
+	}
+	return os.NewFile(uintptr(fd), relJoin(d.rel, name)), nil
+}
+
+// readSidecarFlags are the flags a trash sidecar is opened with (F8).
+// O_NONBLOCK is what keeps a planted fifo from taking a worker hostage: opening
+// one for reading with no writer blocks inside open(2) itself, where no deadline
+// in this process can reach it. The fstat that follows is what refuses it.
+const readSidecarFlags = os.O_RDONLY | syscall.O_NONBLOCK
+
+// renameInto renames one entry from an already-resolved parent into THIS
+// directory's held descriptor, with RENAME_NOREPLACE (F2).
 //
-// It exists for the trash sidecar: meta.json is written into an entry directory
-// the worker has just created, and reading it back for the trash panel must not
-// follow a symlink somebody else dropped in. O_NOFOLLOW is what refuses that,
-// and O_CLOEXEC keeps the descriptor out of anything the worker execs.
-func openFileAt(j fsx.Jail, parentRel, name string, flags int, perm os.FileMode) (*os.File, error) {
-	parent, err := walkOPath(j, parentRel)
+// The destination half is the descriptor rather than a pathname, which is the
+// whole point: the trash is a 1777 directory shared with every other uid on the
+// volume, and a pathname re-resolved at rename time is a pathname somebody else
+// can have swapped in the meantime.
+func (d *dirRef) renameInto(fromJail fsx.Jail, fromParentRel, fromName, toName string) error {
+	fromDir, err := walkOPath(fromJail, fromParentRel)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	defer parent.Close()
-	fd, err := openatPerm(parent, name, flags|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, syscallMode(perm))
+	defer fromDir.Close()
+	if err := renameNoReplaceIn(fromDir, fromName, d.f, toName); err != nil {
+		return &fs.PathError{Op: "renameat", Path: relJoin(fromParentRel, fromName), Err: err}
+	}
+	return nil
+}
+
+// renameOut renames one entry OUT of this directory's held descriptor to an
+// already-resolved destination, with RENAME_NOREPLACE (F2). It is the restore
+// half of renameInto.
+func (d *dirRef) renameOut(fromName string, toJail fsx.Jail, toParentRel, toName string) error {
+	toDir, err := walkOPath(toJail, toParentRel)
 	if err != nil {
-		return nil, &fs.PathError{Op: "openat", Path: relJoin(parentRel, name), Err: err}
+		return err
 	}
-	return os.NewFile(uintptr(fd), relJoin(parentRel, name)), nil
+	defer toDir.Close()
+	if err := renameNoReplaceIn(d.f, fromName, toDir, toName); err != nil {
+		return &fs.PathError{Op: "renameat", Path: relJoin(toParentRel, toName), Err: err}
+	}
+	return nil
+}
+
+// renameNoReplaceIn is renameat2(RENAME_NOREPLACE) between two held
+// descriptors, with the same fallback renameAt takes when the syscall or the
+// flag is unavailable (PLAN.md §2.4): an fstatat pre-check against the
+// destination descriptor, never a fresh walk of its pathname.
+func renameNoReplaceIn(fromDir *os.File, fromName string, toDir *os.File, toName string) error {
+	err := renameatIn(fromDir, fromName, toDir, toName, true)
+	if errors.Is(err, syscall.ENOSYS) || errors.Is(err, syscall.EINVAL) {
+		exists, serr := destExistsAt(toDir, toName)
+		if serr != nil {
+			return serr
+		}
+		if exists {
+			return syscall.EEXIST
+		}
+		err = renameatIn(fromDir, fromName, toDir, toName, false)
+	}
+	return err
+}
+
+// identityOf reads the mount identity of a held directory descriptor (F4).
+//
+// The mount ID comes first because it is the only answer that separates two
+// mounts of one device — a bind mount, which is how QTS builds its share layout,
+// and which a st_dev comparison reports as "same filesystem, carry on". statx
+// with STATX_MNT_ID (Linux 5.8) answers it in one syscall; /proc/self/fdinfo is
+// the fallback for an older kernel or an architecture whose statx number is not
+// compiled in here, and st_dev is the fallback for a system with neither.
+func identityOf(d *dirRef) mountIdentity {
+	var id mountIdentity
+	if fi, err := d.stat(); err == nil {
+		id.dev, id.hasDev = devOf(fi)
+	}
+	if mnt, ok := mountIDOf(d.f); ok {
+		id.mnt, id.hasMnt = mnt, true
+	}
+	return id
+}
+
+// statxMntID is STATX_MNT_ID, the request mask bit (and the reply mask bit) for
+// the mount ID. atEmptyPath is AT_EMPTY_PATH, which makes statx describe the
+// descriptor itself rather than a name below it, and atSymlinkNoFollow is
+// AT_SYMLINK_NOFOLLOW. All three are stable across Linux architectures, and
+// every one of them is an AT_ flag: an O_ flag passed here would be an unknown
+// bit and the kernel would answer EINVAL.
+const (
+	statxMntID        = 0x1000
+	atEmptyPath       = 0x1000
+	atSymlinkNoFollow = 0x100
+)
+
+// statxNoMntID records that statx cannot answer here — an old kernel (ENOSYS,
+// EINVAL) or an architecture whose syscall number is not compiled in. A walk of
+// a million directories must not make a million syscalls the kernel has already
+// refused, and the worker serves several jobs at once, so the flag is atomic:
+// the only transition is false to true and both values are correct to act on,
+// but "correct to act on" is not the same as "safe to race on" under -race.
+var statxNoMntID atomic.Bool
+
+// mountIDOf returns the kernel's mount ID for an open descriptor.
+func mountIDOf(f *os.File) (uint64, bool) {
+	rc, err := f.SyscallConn()
+	if err != nil {
+		return 0, false
+	}
+	var (
+		id uint64
+		ok bool
+	)
+	if cerr := rc.Control(func(pfd uintptr) {
+		if sysStatx != 0 && !statxNoMntID.Load() {
+			mnt, serr := statxMountID(int(pfd))
+			if serr == nil {
+				id, ok = mnt, true
+				return
+			}
+			if errors.Is(serr, syscall.ENOSYS) || errors.Is(serr, syscall.EINVAL) {
+				statxNoMntID.Store(true)
+			}
+		}
+		id, ok = fdinfoMountID(int(pfd))
+	}); cerr != nil {
+		return 0, false
+	}
+	return id, ok
+}
+
+// statxTimestamp is struct statx_timestamp.
+type statxTimestamp struct {
+	Sec  int64
+	Nsec uint32
+	_    int32
+}
+
+// statxData is struct statx (256 bytes). Every field is spelled out rather than
+// skipped with padding because the kernel fills the whole structure and the
+// offset of stx_mnt_id is what this file is for; a short or mis-aligned struct
+// would read a neighbouring field and call it a mount ID.
+type statxData struct {
+	Mask           uint32
+	Blksize        uint32
+	Attributes     uint64
+	Nlink          uint32
+	UID            uint32
+	GID            uint32
+	Mode           uint16
+	_              uint16
+	Ino            uint64
+	Size           uint64
+	Blocks         uint64
+	AttributesMask uint64
+	Atime          statxTimestamp
+	Btime          statxTimestamp
+	Ctime          statxTimestamp
+	Mtime          statxTimestamp
+	RdevMajor      uint32
+	RdevMinor      uint32
+	DevMajor       uint32
+	DevMinor       uint32
+	MntID          uint64
+	DioMemAlign    uint32
+	DioOffsetAlign uint32
+	_              [12]uint64
+}
+
+// struct statx is 256 bytes and stx_mnt_id sits at offset 144 inside it. If the
+// Go struct above ever stops being exactly that size — a field dropped, a
+// padding word forgotten, an architecture with different alignment — this line
+// fails to compile rather than letting mountIDOf read a neighbouring field and
+// call it a mount ID.
+var (
+	_ [1]struct{} = [unsafe.Sizeof(statxData{}) - 255]struct{}{}
+	_ [1]struct{} = [unsafe.Offsetof(statxData{}.MntID) - 143]struct{}{}
+)
+
+// statxMountID is statx(2) asking for nothing but the mount ID of the
+// descriptor itself.
+//
+// The syscall package exports no SYS_STATX on any architecture, so the number is
+// named per architecture here (statx_linux_*.go) the way sysRenameat2 already
+// is. The unsafe shape is the one the vet rules sanction for a syscall call (a
+// Pointer converted to uintptr in the argument list), and both arguments are
+// kept alive across it rather than trusted to escape analysis.
+func statxMountID(fd int) (uint64, error) {
+	empty, err := syscall.BytePtrFromString("")
+	if err != nil {
+		return 0, err
+	}
+	var stx statxData
+	_, _, errno := syscall.Syscall6(sysStatx,
+		uintptr(fd), uintptr(unsafe.Pointer(empty)),
+		uintptr(atEmptyPath|atSymlinkNoFollow), uintptr(statxMntID),
+		uintptr(unsafe.Pointer(&stx)), 0)
+	runtime.KeepAlive(empty)
+	runtime.KeepAlive(&stx)
+	if errno != 0 {
+		return 0, errno
+	}
+	if stx.Mask&statxMntID == 0 {
+		// The kernel understood statx but has no mount ID to give (before 5.8).
+		return 0, syscall.ENOSYS
+	}
+	return stx.MntID, nil
+}
+
+// fdinfoMountID reads the mount ID out of /proc/self/fdinfo/<fd>, which every
+// kernel since 3.8 prints as "mnt_id:". It is the fallback for a kernel without
+// STATX_MNT_ID and for an architecture whose statx number is not compiled in.
+func fdinfoMountID(fd int) (uint64, bool) {
+	data, err := os.ReadFile("/proc/self/fdinfo/" + strconv.Itoa(fd))
+	if err != nil {
+		return 0, false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		rest, found := strings.CutPrefix(line, "mnt_id:")
+		if !found {
+			continue
+		}
+		id, err := strconv.ParseUint(strings.TrimSpace(rest), 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		return id, true
+	}
+	return 0, false
 }
 
 // openatPerm is openat(2) with a creation mode, retried over EINTR. openatIn

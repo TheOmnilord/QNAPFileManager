@@ -2,6 +2,7 @@ package workerpool
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -35,9 +36,18 @@ const jobFrames = 256
 // jobCancelGrace is how long a cancelled job is still listened to. The caller
 // has gone, but the worker has not: it is finishing the item it was on and will
 // report what it managed to do, and that report (with its partial counts) is
-// worth waiting a little for. Past this the pending slot is abandoned rather
-// than held for a worker that is not answering.
+// worth waiting a little for. A worker still silent past this is not finishing
+// an item, it is not stopping — so it is terminated rather than abandoned
+// (F13); see cancelAndDrain.
 const jobCancelGrace = 10 * time.Second
+
+// cancelGrace is jobCancelGrace unless a test shortened it.
+func (p *Pool) cancelGrace() time.Duration {
+	if d := p.opts.jobCancelGrace; d > 0 {
+		return d
+	}
+	return jobCancelGrace
+}
 
 // Job runs one job to completion as the principal.
 //
@@ -51,6 +61,13 @@ const jobCancelGrace = 10 * time.Second
 // the worker sent them; a slow callback can cost a progress frame or a warning
 // frame (both are recoverable — the JobResult carries the warning count) but
 // never the result.
+//
+// A CANCELLED job returns a non-zero JobResult AND a non-nil error (F7): the
+// result has Cancelled set and carries the partial Files/Bytes/Dirs/Skipped,
+// the warning count and the retained warnings, and the error is
+// context.Canceled. Callers must read the result even when err != nil — nothing
+// rolls the partial work back, and those counts are all there is to show for
+// it. jobs.Manager does exactly that: cancelled, Partial, and the result kept.
 func (p *Pool) Job(ctx context.Context, who backend.Principal, req wproto.JobReq, onProg func(wproto.Prog), onWarn func(wproto.Warn)) (wproto.JobResult, error) {
 	if req.JobID == "" {
 		return wproto.JobResult{}, fmt.Errorf("a job needs an id: %w", fsx.ErrBadName)
@@ -98,6 +115,15 @@ func (p *Pool) runJob(ctx context.Context, c *client, req wproto.JobReq, onProg 
 	defer c.abandon(id, pend)
 
 	if err := p.writeFrame(ctx, c, frame); err != nil {
+		// F12: an expired deadline that never touched the transport is this
+		// submission's problem and nobody else's. Abandoning the pending entry
+		// (the deferred abandon above) is the whole of the cleanup; closing the
+		// connection here would fail every other call this worker is serving
+		// with worker_gone and retire a process that is perfectly healthy.
+		var nw *notWritten
+		if errors.As(err, &nw) {
+			return wproto.JobResult{}, nw.err
+		}
 		gone := workerGone(c.key, err)
 		// A write that failed part-way has desynchronised the framing and a
 		// write that timed out has left a worker that is not reading; neither is
@@ -109,27 +135,73 @@ func (p *Pool) runJob(ctx context.Context, c *client, req wproto.JobReq, onProg 
 		return wproto.JobResult{}, gone
 	}
 
+	track := &jobTrack{}
 	for {
 		select {
 		case r := <-pend.ch:
-			done, res, err := p.jobFrame(c, r, onProg, onWarn)
+			done, res, err := p.jobFrame(c, r, track, onProg, onWarn)
 			if done {
-				return res, err
+				return jobOutcomeOf(res, err)
 			}
 		case <-c.gone:
-			return p.jobWorkerGone(c, pend, onProg, onWarn)
+			return p.jobWorkerGone(c, pend, track, onProg, onWarn)
 		case <-ctx.Done():
 			// The caller has given up. The worker has not: it is still deleting
 			// files under this job id, and dropping this end would leave it
 			// running with nobody to stop it.
-			return p.cancelAndDrain(ctx, c, req.JobID, pend, onProg, onWarn)
+			return p.cancelAndDrain(ctx, c, req.JobID, pend, track, onProg, onWarn)
 		}
 	}
 }
 
+// jobTrack is what this end remembers of a running job while it runs: the last
+// progress state and the warnings it was shown. It is only ever touched from
+// the single goroutine inside runJob, so it needs no lock.
+//
+// It exists for the one outcome that arrives without a terminal frame: a worker
+// that would not stop within the cancellation grace and had to be terminated
+// (F13). The counts it kept are then the only account of what that job did.
+type jobTrack struct {
+	last     wproto.Prog
+	warnings int
+	warns    []wproto.Warn
+}
+
+// result turns what was observed into the partial JobResult of a job that never
+// reported one.
+func (t *jobTrack) result() wproto.JobResult {
+	return wproto.JobResult{
+		Files:     t.last.Files,
+		Bytes:     t.last.Bytes,
+		Warnings:  t.warnings,
+		Warns:     append([]wproto.Warn(nil), t.warns...),
+		Cancelled: true,
+	}
+}
+
+// jobOutcomeOf applies the cancellation convention (F7) to a terminal frame's
+// outcome.
+//
+// A worker that stopped on a cancellation reports it as an OK frame whose
+// JobResult has Cancelled set and carries the partial counts and the folded
+// warnings. The pool hands those back to its caller TOGETHER WITH
+// context.Canceled — a non-zero result beside a non-nil error, deliberately —
+// because the numbers are exactly what a caller has to show for a destructive
+// operation that stopped half way, and nothing rolls that work back.
+//
+// A worker that predates the convention answers with an err frame carrying the
+// "cancelled" code instead; remoteError unwraps that to context.Canceled and
+// the result is simply empty, which is the old behaviour unchanged.
+func jobOutcomeOf(res wproto.JobResult, err error) (wproto.JobResult, error) {
+	if err == nil && res.Cancelled {
+		return res, context.Canceled
+	}
+	return res, err
+}
+
 // jobFrame dispatches one received frame. done is true for a terminal frame,
 // whose result and error are the job's.
-func (p *Pool) jobFrame(c *client, r result, onProg func(wproto.Prog), onWarn func(wproto.Warn)) (done bool, res wproto.JobResult, err error) {
+func (p *Pool) jobFrame(c *client, r result, track *jobTrack, onProg func(wproto.Prog), onWarn func(wproto.Warn)) (done bool, res wproto.JobResult, err error) {
 	// A job passes no descriptors. One that arrives anyway is closed here
 	// rather than left open in the root front-end until the daemon restarts.
 	if len(r.files) > 0 {
@@ -148,6 +220,9 @@ func (p *Pool) jobFrame(c *client, r result, onProg func(wproto.Prog), onWarn fu
 			p.opts.Logger.Printf("workerpool: %s sent an unreadable progress frame on request %d: %v", c.key, r.f.ID, err)
 			return false, wproto.JobResult{}, nil
 		}
+		if track != nil {
+			track.last = prog
+		}
 		if onProg != nil {
 			onProg(prog)
 		}
@@ -158,6 +233,12 @@ func (p *Pool) jobFrame(c *client, r result, onProg func(wproto.Prog), onWarn fu
 		if err := r.f.Unmarshal(&warn); err != nil {
 			p.opts.Logger.Printf("workerpool: %s sent an unreadable warning frame on request %d: %v", c.key, r.f.ID, err)
 			return false, wproto.JobResult{}, nil
+		}
+		if track != nil {
+			track.warnings++
+			if len(track.warns) < wproto.WarnCap {
+				track.warns = append(track.warns, warn)
+			}
 		}
 		if onWarn != nil {
 			onWarn(warn)
@@ -191,13 +272,13 @@ func (p *Pool) jobFrame(c *client, r result, onProg func(wproto.Prog), onWarn fu
 //
 // When there is nothing buffered the job is lost and the partial work it did
 // stands: there is no rollback, and the caller says so.
-func (p *Pool) jobWorkerGone(c *client, pend *pending, onProg func(wproto.Prog), onWarn func(wproto.Warn)) (wproto.JobResult, error) {
+func (p *Pool) jobWorkerGone(c *client, pend *pending, track *jobTrack, onProg func(wproto.Prog), onWarn func(wproto.Warn)) (wproto.JobResult, error) {
 	for {
 		select {
 		case r := <-pend.ch:
-			done, res, err := p.jobFrame(c, r, onProg, onWarn)
+			done, res, err := p.jobFrame(c, r, track, onProg, onWarn)
 			if done {
-				return res, err
+				return jobOutcomeOf(res, err)
 			}
 		default:
 			if err := c.deadError(); err != nil {
@@ -216,29 +297,56 @@ func (p *Pool) jobWorkerGone(c *client, pend *pending, onProg func(wproto.Prog),
 // The error is the worker's if it reported one (its own "cancelled" carries the
 // code through fsx.Code), and the context's otherwise, because the contract is
 // that a cancelled job returns ctx.Err().
-func (p *Pool) cancelAndDrain(ctx context.Context, c *client, jobID string, pend *pending, onProg func(wproto.Prog), onWarn func(wproto.Warn)) (wproto.JobResult, error) {
+//
+// When the grace runs out the worker is RETIRED rather than merely abandoned
+// (F13), and that costs the user their worker — the pool spawns a fresh one on
+// their next request. It is the only honest option. A destructive job that is
+// still inside a filesystem call after ten seconds of being asked to stop is
+// still deleting files; walking away from the pending slot while telling the
+// caller "cancelled" and releasing the semaphore left that job running under a
+// worker the pool then considered idle, reusable and evictable. Terminating the
+// process (SIGTERM, then SIGKILL) is what actually makes the mutation stop.
+func (p *Pool) cancelAndDrain(ctx context.Context, c *client, jobID string, pend *pending, track *jobTrack, onProg func(wproto.Prog), onWarn func(wproto.Warn)) (wproto.JobResult, error) {
 	p.cancelJob(c, jobID)
 
-	t := time.NewTimer(jobCancelGrace)
+	grace := p.cancelGrace()
+	t := time.NewTimer(grace)
 	defer t.Stop()
 	for {
 		select {
 		case r := <-pend.ch:
-			done, res, err := p.jobFrame(c, r, onProg, onWarn)
+			done, res, err := p.jobFrame(c, r, track, onProg, onWarn)
 			if !done {
 				continue
 			}
+			res, err = jobOutcomeOf(res, err)
 			if err == nil {
 				err = ctx.Err()
 			}
 			return res, err
 		case <-c.gone:
-			res, err := p.jobWorkerGone(c, pend, onProg, onWarn)
+			res, err := p.jobWorkerGone(c, pend, track, onProg, onWarn)
 			return res, err
 		case <-t.C:
-			p.opts.Logger.Printf("workerpool: %s did not report the outcome of the cancelled job %s within %s",
-				c.key, jobID, jobCancelGrace)
-			return wproto.JobResult{}, ctx.Err()
+			p.opts.Logger.Printf("workerpool: %s did not stop the cancelled job %s within %s; terminating the worker so the job cannot carry on mutating",
+				c.key, jobID, grace)
+			gone := workerGone(c.key, fmt.Errorf("the cancelled job %s did not stop within %s", jobID, grace))
+			// The transport goes first so nothing else is written down it, then
+			// the process itself. retire runs on its own goroutine: it waits out
+			// the signal ladder, and this caller — whose context expired a while
+			// ago — must not wait with it. The hold taken by Job is released by
+			// its own defer as usual, after this returns; retire never touches
+			// the in-flight count, so the accounting stays balanced either way.
+			_ = c.tr.Close()
+			go p.retire(c, gone)
+
+			res := track.result()
+			res.Detail = "worker did not stop within grace; it was terminated — partial work remains"
+			err := ctx.Err()
+			if err == nil {
+				err = context.Canceled
+			}
+			return res, err
 		}
 	}
 }

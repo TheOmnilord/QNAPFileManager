@@ -3,14 +3,36 @@ package fsops
 // Trash: delete as a same-device rename into the nearest enclosing storage
 // mount's .@qfm_trash (PLAN.md decision 10, identity plan §4.2).
 //
-// Four rules shape every function here.
+// The threat model is what shapes every function here, and it is worth stating
+// plainly because it is not the usual one. .@qfm_trash is mode 1777: a sticky
+// directory SHARED by every uid on the volume. Any local user may create
+// entries in it, including entries named for somebody else's uid, and an
+// administrator's worker runs as ROOT (PLAN.md decision 6) — so root's own trash
+// is <trash>/0/, a name any user can get to first. The sticky bit stops one user
+// renaming or unlinking another's entries; it stops nothing about what they may
+// create, and the OWNER of a sticky directory is exempt from its restrictions
+// altogether. So:
+//
+//   - Every check is made on a HELD DESCRIPTOR (openat then fstat), never on a
+//     pathname, because a pathname inside a directory somebody else can write to
+//     is a pathname they can swap between the check and the use (F2).
+//   - Nothing is consumed that is not OWNED by the uid consuming it: <uid>/ must
+//     be a directory owned by exactly that uid, each entry directory likewise,
+//     and meta.json must be a regular file owned by it (F1, F8). Anything else is
+//     an untrusted trash entry and is skipped — never listed, never restored,
+//     never deleted.
+//   - The trash root itself must be a directory owned by uid 0 with the sticky
+//     bit set (F2). An attacker-owned sticky directory standing at that name is
+//     refused outright, because its owner may rename anything inside it.
+//
+// Four rules of the older design still hold.
 //
 //   - The trash directory is never created by this package. The root front-end
 //     creates <mountRoot>/.@qfm_trash once, mode 1777, as an audited and
-//     disclosed act; a worker running as an ordinary user could not create it
-//     inside a share it does not own anyway. If it is not there — or if it is
-//     not a directory — the answer is "no_trash" and the item is left exactly
-//     where it is. A trash that cannot be reached must never become a delete.
+//     disclosed act (internal/trashroot). If it is not there — or is not the
+//     directory described above — the answer is "no_trash" and the item is left
+//     exactly where it is. A trash that cannot be reached must never become a
+//     delete.
 //   - The move is a rename and nothing else. The trash root is the nearest
 //     enclosing mount of the item, so the rename is same-device by
 //     construction; an EXDEV here means the mount table and the filesystem
@@ -22,7 +44,7 @@ package fsops
 //   - @Recycle is never written to. It is QTS's own recycle bin, its restore
 //     metadata is a firmware-private format, and an entry we put there is one
 //     File Station would list and could not restore (backend plan §2.7). It
-//     stays an ordinary read-only directory in the listing.
+//     stays an ordinary read-only directory in the listing (never_write.go).
 
 import (
 	"context"
@@ -51,6 +73,18 @@ const (
 	TrashDirName = ".@qfm_trash"
 	// trashMetaName is the sidecar inside one entry directory.
 	trashMetaName = "meta.json"
+	// trashItemName is the FIXED internal name the trashed item itself is stored
+	// under inside its entry directory (F9).
+	//
+	// It used to keep its original basename, and that was two bugs in one. An
+	// item literally called "meta.json" could not be trashed at all — the
+	// NOREPLACE rename collided with the sidecar that had just been written
+	// beside it — and a crash between the sidecar and the rename left an orphan
+	// meta.json that a listing had to tell apart from a payload by name. With a
+	// fixed name the payload and the sidecar can never collide, the original
+	// basename lives in the sidecar where it belongs, and "is the payload there"
+	// is one lstat of one known name.
+	trashItemName = "item"
 	// trashEntryMode is the mode of a user's trash subdirectory and of every
 	// entry inside it: private to the user who deleted the item.
 	trashEntryMode = 0o700
@@ -68,10 +102,31 @@ const (
 
 // ErrNoTrash means there is no usable trash directory for a path: it is not on
 // a storage mount, the mount is a network one, the mount root is outside the
-// jail, or .@qfm_trash is missing or is not a directory. Every caller turns it
-// into a "no_trash" warning and leaves the item alone — it is never an excuse
-// to delete something permanently.
+// jail, or .@qfm_trash is missing, is not a directory, is not sticky, or does
+// not belong to root. Every caller turns it into a "no_trash" warning and leaves
+// the item alone — it is never an excuse to delete something permanently.
 var ErrNoTrash = errors.New("there is no trash directory for this path")
+
+// ErrUntrustedTrash means something inside the shared sticky trash directory is
+// not this user's to consume: a <uid>/ subdirectory, an entry directory or a
+// meta.json that somebody else owns, or a sidecar that is not a regular file
+// (F1, F8). It wraps fsx.ErrProtected, so it reaches the client as "protected" —
+// the app refused it, the kernel did not.
+//
+// The consequence of getting this wrong is the reason it exists. Anyone may
+// create <trash>/0/<id>/ with a payload and a meta.json naming any destination
+// they like; a root worker that listed it would offer an administrator a restore
+// that writes an attacker's file to an attacker's chosen path.
+var ErrUntrustedTrash = fmt.Errorf("untrusted trash entry: %w", fsx.ErrProtected)
+
+// trashRootUID is the uid .@qfm_trash must belong to: root, because the root
+// front-end is the only thing that creates it (trashroot.Ensure).
+//
+// It is a variable solely so that this package's own tests can run as an
+// ordinary user, where t.TempDir() can never produce a root-owned directory —
+// the same reason platform.mountProbe is one. Production never assigns to it,
+// and the CI root job runs the tests with it at zero.
+var trashRootUID = 0
 
 // trashMeta is the sidecar written beside a trashed item.
 //
@@ -80,6 +135,9 @@ var ErrNoTrash = errors.New("there is no trash directory for this path")
 // a Linux filename is arbitrary bytes: without OrigPathB64 a restore of
 // "/share/Public/caf\xe9" would put the item back under a mangled name. The
 // same reasoning is why every path on the wire is []byte (wproto).
+//
+// Name is the original basename, and since F9 it is the ONLY place the item's
+// real name exists: on disk the payload is called "item".
 type trashMeta struct {
 	OrigPath    string `json:"origPath"`
 	OrigPathB64 string `json:"origPathB64,omitempty"`
@@ -109,7 +167,11 @@ func (m trashMeta) orig() ([]byte, error) {
 }
 
 // trashLoc is one .@qfm_trash directory: the API path it is known by and the
-// already-resolved, jail-relative name every syscall against it uses.
+// already-resolved, jail-relative name a descriptor for it is opened from.
+//
+// It holds no descriptor of its own. Each operation opens one, validates it, and
+// keeps it for the whole of that operation (F2); a handle cached across
+// operations would be a handle nobody re-checked.
 type trashLoc struct {
 	api  string
 	jail fsx.Jail
@@ -123,10 +185,6 @@ type trashLoc struct {
 // climbing past a pseudo-filesystem to a storage parent. That is what makes the
 // root front-end (which creates the directory) and this worker (which renames
 // into it) agree on the same root without either of them stat'ing anything.
-//
-// The directory itself is then resolved with the leaf kept literal and lstat'ed:
-// a symlink standing where .@qfm_trash should be is refused rather than
-// followed, because following it would move a user's files wherever it pointed.
 func trashFor(r fsx.Root, plat *platform.Platform, apiPath string) (trashLoc, error) {
 	if plat == nil {
 		return trashLoc{}, fmt.Errorf("no mount table is available: %w", ErrNoTrash)
@@ -145,95 +203,180 @@ func trashFor(r fsx.Root, plat *platform.Platform, apiPath string) (trashLoc, er
 		// means there is no trash this worker may reach.
 		return trashLoc{}, fmt.Errorf("the mount root %q is not reachable: %w", mountRoot, ErrNoTrash)
 	}
-	return openTrashDir(r, fsx.Join(rootAPI, TrashDirName))
+	return locateTrash(r, fsx.Join(rootAPI, TrashDirName))
 }
 
-// openTrashDir resolves an existing .@qfm_trash directory and refuses anything
-// that is not one.
-func openTrashDir(r fsx.Root, trashAPI string) (trashLoc, error) {
+// locateTrash resolves where a .@qfm_trash would be, with the leaf kept literal
+// so a symlink standing there is never followed. It decides nothing about what
+// is actually at that name: that is trashLoc.open's job, on a descriptor.
+func locateTrash(r fsx.Root, trashAPI string) (trashLoc, error) {
 	tg, err := resolve(r, trashAPI, false)
 	if err != nil {
 		return trashLoc{}, fmt.Errorf("%q: %w", trashAPI, ErrNoTrash)
 	}
-	fi, err := statAt(tg.jail, tg.rel)
-	if err != nil {
-		// Not created yet. The front-end creates it 1777 on demand; a worker
-		// must not, and must not delete the item either.
-		return trashLoc{}, fmt.Errorf("%q is not there: %w", trashAPI, ErrNoTrash)
-	}
-	if fi.Mode()&fs.ModeSymlink != 0 || !fi.IsDir() {
-		return trashLoc{}, fmt.Errorf("%q is a %s, not a directory: %w", trashAPI, fsx.TypeString(fi.Mode()), ErrNoTrash)
-	}
 	return trashLoc{api: tg.api, jail: tg.jail, rel: tg.rel}, nil
 }
 
-// userDir returns the jail-relative name of this uid's subdirectory inside the
-// trash, creating it 0700 if it is not there.
+// open opens the trash root and proves, on the descriptor, that it is the
+// directory the root front-end made (F2).
 //
-// The ownership check is the point of the function. The trash directory is
-// sticky and world-writable, so the kernel stops one user removing or renaming
-// another's entries — but it does not stop a user creating the *name* of
-// somebody else's subdirectory first. A directory called "1001" that belongs to
-// somebody else, or a symlink standing in its place, would make this worker
-// move uid 1001's files somewhere its owner can read them. So the entry is
-// lstat'ed after the mkdir and refused unless it is a real directory owned by
-// this uid. Off Linux there is no ownership behind a FileInfo (statDetail
-// reports none) and the dev box has one user, so the check degrades to the type
-// test there.
-func (t trashLoc) userDir(uid int) (string, error) {
-	name := strconv.Itoa(uid)
-	rel := relJoin(t.rel, name)
-	if err := mkdirAt(t.jail, t.rel, name, trashEntryMode, false); err != nil && !errors.Is(err, fs.ErrExist) {
-		return "", err
-	}
-	fi, err := statAt(t.jail, rel)
+// The open is O_DIRECTORY|O_NOFOLLOW through the jail's own primitives, so a
+// symlink at the name is ELOOP rather than something followed and a fifo is
+// ENOTDIR rather than a blocked worker. The fstat that follows is the check
+// itself, and it asks three questions: is this a directory, does it belong to
+// uid 0, and is the sticky bit set. The ownership question is the one that is
+// easy to miss — the owner of a sticky directory is exempt from its
+// restrictions, so an attacker-owned 1777 directory is not a trash with a
+// safety property, it is an attacker's directory wearing the same mode bits.
+//
+// Everything the caller does afterwards is done RELATIVE TO the descriptor this
+// returns, never by re-naming the path.
+func (t trashLoc) open() (*dirRef, error) {
+	d, err := openDirRef(t.jail, t.rel)
 	if err != nil {
-		return "", err
+		// Both errors are wrapped: the caller distinguishes "it is simply not
+		// there" (fs.ErrNotExist, which is silence) from "it is there and it is
+		// not ours to use" (which is worth saying out loud).
+		return nil, fmt.Errorf("%q cannot be opened as a directory: %w: %w", t.api, err, ErrNoTrash)
 	}
-	if fi.Mode()&fs.ModeSymlink != 0 || !fi.IsDir() {
-		return "", fmt.Errorf("%s/%s is a %s, not a directory: %w", t.api, name, fsx.TypeString(fi.Mode()), ErrNoTrash)
+	fi, err := d.stat()
+	if err != nil {
+		d.close()
+		return nil, fmt.Errorf("%q cannot be described: %w: %w", t.api, err, ErrNoTrash)
 	}
-	if owner, _, _, ok := statDetail(fi); ok && owner != uid {
-		return "", fmt.Errorf("%s/%s belongs to uid %d, not to uid %d: %w", t.api, name, owner, uid, ErrNoTrash)
+	if err := checkTrashRoot(t.api, fi); err != nil {
+		d.close()
+		return nil, err
 	}
-	return rel, nil
+	return d, nil
 }
 
-// newEntryDir creates <trash>/<uid>/<unix>-<8 hex> and returns its id and its
-// jail-relative name. The id is time-ordered so the panel can sort without
-// reading a sidecar, and random so two workers cannot collide inside a second.
-func newEntryDir(j fsx.Jail, userRel string) (id, rel string, err error) {
+// checkTrashRoot is the fstat half of trashLoc.open, split out so it can be
+// stated once and tested directly.
+//
+// Off Linux there is no ownership and no sticky bit behind a FileInfo
+// (statDetail reports none), so the check degrades to the type test there. That
+// is the dev box, not the kernel (INV-2); the CI root job runs the real thing.
+func checkTrashRoot(api string, fi os.FileInfo) error {
+	if fi.Mode()&fs.ModeSymlink != 0 || !fi.IsDir() {
+		return fmt.Errorf("%q is a %s, not a directory: %w", api, fsx.TypeString(fi.Mode()), ErrNoTrash)
+	}
+	owner, _, _, ok := statDetail(fi)
+	if !ok {
+		return nil
+	}
+	if owner != trashRootUID {
+		return fmt.Errorf("%q belongs to uid %d rather than to uid %d, so it is not the trash the front-end made: %w",
+			api, owner, trashRootUID, ErrNoTrash)
+	}
+	if fi.Mode()&fs.ModeSticky == 0 {
+		return fmt.Errorf("%q is not sticky (mode %v), so one user could take another's deleted files: %w",
+			api, fi.Mode().Perm(), ErrNoTrash)
+	}
+	return nil
+}
+
+// ownedDir proves, on a held descriptor, that it refers to a directory owned by
+// exactly uid (F1). It is the check every consuming path makes — on <uid>/ and
+// on each entry directory inside it — before anything in it is read, restored or
+// removed.
+func ownedDir(d *dirRef, api string, uid int) error {
+	fi, err := d.stat()
+	if err != nil {
+		return err
+	}
+	if fi.Mode()&fs.ModeSymlink != 0 || !fi.IsDir() {
+		return fmt.Errorf("%s is a %s, not a directory: %w", api, fsx.TypeString(fi.Mode()), ErrUntrustedTrash)
+	}
+	if owner, _, _, ok := statDetail(fi); ok && owner != uid {
+		return fmt.Errorf("%s belongs to uid %d, not to uid %d: %w", api, owner, uid, ErrUntrustedTrash)
+	}
+	return nil
+}
+
+// userDirIn returns a held descriptor for <trash>/<uid>/, creating it 0700 if it
+// is not there.
+//
+// The ownership check is the point of the function, and it is made on the
+// descriptor rather than on the name (F1, F2). The trash directory is sticky and
+// world-writable, so the kernel stops one user removing or renaming another's
+// entries — but it does not stop a user creating the *name* of somebody else's
+// subdirectory first. A directory called "0" that belongs to somebody else, or a
+// symlink standing in its place, would make a root worker move an
+// administrator's deleted files somewhere its planter can read them.
+func userDirIn(root *dirRef, trashAPI string, uid int) (*dirRef, error) {
+	name := strconv.Itoa(uid)
+	if err := root.mkdir(name, trashEntryMode); err != nil && !errors.Is(err, fs.ErrExist) {
+		return nil, err
+	}
+	return openUserDir(root, trashAPI, uid)
+}
+
+// openUserDir opens an EXISTING <trash>/<uid>/ and validates it. It is what the
+// consuming paths use — list, restore, empty — which must never create anything.
+func openUserDir(root *dirRef, trashAPI string, uid int) (*dirRef, error) {
+	name := strconv.Itoa(uid)
+	d, err := root.child(name)
+	if err != nil {
+		return nil, err
+	}
+	if err := ownedDir(d, fsx.Join(trashAPI, name), uid); err != nil {
+		d.close()
+		return nil, err
+	}
+	return d, nil
+}
+
+// newEntryDir creates <trash>/<uid>/<unix>-<8 hex> relative to the held <uid>/
+// descriptor and returns its id and a descriptor for it. The id is time-ordered
+// so the panel can sort without reading a sidecar, and random so two workers
+// cannot collide inside a second.
+func newEntryDir(user *dirRef, userAPI string, uid int) (id string, entry *dirRef, err error) {
 	for attempt := 0; attempt < trashEntryAttempts; attempt++ {
 		var b [4]byte
 		if _, err := rand.Read(b[:]); err != nil {
-			return "", "", err
+			return "", nil, err
 		}
 		id = strconv.FormatInt(time.Now().Unix(), 10) + "-" + hex.EncodeToString(b[:])
-		err = mkdirAt(j, userRel, id, trashEntryMode, false)
+		err = user.mkdir(id, trashEntryMode)
 		if err == nil {
-			return id, relJoin(userRel, id), nil
+			d, oerr := user.child(id)
+			if oerr != nil {
+				_ = user.unlink(id, true)
+				return "", nil, oerr
+			}
+			// Belt and braces: the directory was just created inside a 0700
+			// directory this uid owns, so nothing else could have got there — but
+			// the check costs one fstat and the answer is the one the rest of the
+			// file depends on.
+			if cerr := ownedDir(d, fsx.Join(userAPI, id), uid); cerr != nil {
+				d.close()
+				_ = user.unlink(id, true)
+				return "", nil, cerr
+			}
+			return id, d, nil
 		}
 		if !errors.Is(err, fs.ErrExist) {
-			return "", "", err
+			return "", nil, err
 		}
 	}
-	return "", "", fmt.Errorf("could not find a free trash entry name after %d attempts: %w", trashEntryAttempts, fsx.ErrUnsupported)
+	return "", nil, fmt.Errorf("could not find a free trash entry name after %d attempts: %w", trashEntryAttempts, fsx.ErrUnsupported)
 }
 
-// writeTrashMeta writes the sidecar into an entry directory, before the item is
-// moved in beside it.
+// writeTrashMeta writes the sidecar into an entry directory, through that
+// directory's held descriptor, before the item is moved in beside it.
 //
 // It is fsync'ed. The ordering this file depends on — sidecar first, rename
 // second — is program order, and program order survives a power cut only for
 // data that has actually reached the disk. The cost is one fsync per *selected
 // item*, not per file: trashing a directory of a million files is one rename
 // and one sidecar.
-func writeTrashMeta(j fsx.Jail, entryRel string, m trashMeta) error {
+func writeTrashMeta(entry *dirRef, m trashMeta) error {
 	data, err := json.Marshal(m)
 	if err != nil {
 		return err
 	}
-	f, err := openFileAt(j, entryRel, trashMetaName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	f, err := entry.openFile(trashMetaName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return err
 	}
@@ -248,25 +391,63 @@ func writeTrashMeta(j fsx.Jail, entryRel string, m trashMeta) error {
 	return f.Close()
 }
 
-// readTrashMeta reads one sidecar. A missing, oversized or malformed one is an
-// error the caller skips over: a trash panel that refused to open because of
-// one unreadable entry would be worse than one that lists the rest.
-func readTrashMeta(j fsx.Jail, entryRel string) (trashMeta, error) {
-	f, err := openFileAt(j, entryRel, trashMetaName, os.O_RDONLY, 0)
+// readTrashMeta reads one sidecar, and treats it as what it is: a file inside a
+// world-writable sticky directory, which means a file an attacker may have put
+// there (F8).
+//
+// Four things are therefore proved before a byte is parsed, all of them on the
+// descriptor the openat returned rather than on the name:
+//
+//   - it is a REGULAR file. A planted fifo would otherwise park this worker
+//     inside open(2) with no writer, where no deadline in this process can reach
+//     it, which is why the open carries O_NONBLOCK and the blocking mode is put
+//     back only once the fstat has answered;
+//   - it is not a symlink, which O_NOFOLLOW settled in the kernel;
+//   - it belongs to the uid reading it;
+//   - it is no larger than maxTrashMeta, taken from the fstat rather than
+//     discovered by reading 64 KiB of somebody's choosing.
+//
+// A missing, oversized, foreign or malformed sidecar is an error the caller
+// skips over: a trash panel that refused to open because of one bad entry would
+// be worse than one that lists the rest.
+func readTrashMeta(entry *dirRef, entryAPI string, uid int) (trashMeta, error) {
+	f, err := entry.openFile(trashMetaName, readSidecarFlags, 0)
 	if err != nil {
 		return trashMeta{}, err
 	}
 	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return trashMeta{}, err
+	}
+	if !fi.Mode().IsRegular() {
+		return trashMeta{}, fmt.Errorf("%s/%s is a %s, not a regular file: %w",
+			entryAPI, trashMetaName, fsx.TypeString(fi.Mode()), ErrUntrustedTrash)
+	}
+	if owner, _, _, ok := statDetail(fi); ok && owner != uid {
+		return trashMeta{}, fmt.Errorf("%s/%s belongs to uid %d, not to uid %d: %w",
+			entryAPI, trashMetaName, owner, uid, ErrUntrustedTrash)
+	}
+	if fi.Size() > maxTrashMeta {
+		return trashMeta{}, fmt.Errorf("%s/%s is %d bytes, more than the %d a sidecar may be: %w",
+			entryAPI, trashMetaName, fi.Size(), maxTrashMeta, ErrUntrustedTrash)
+	}
+	// Proved regular, so the descriptor is not registered with the runtime
+	// poller and the non-blocking flag can come back off for an ordinary read.
+	if err := clearNonblock(f); err != nil {
+		return trashMeta{}, err
+	}
 	data, err := io.ReadAll(io.LimitReader(f, maxTrashMeta+1))
 	if err != nil {
 		return trashMeta{}, err
 	}
 	if len(data) > maxTrashMeta {
-		return trashMeta{}, fmt.Errorf("%s is larger than %d bytes: %w", entryRel, maxTrashMeta, fsx.ErrBadName)
+		return trashMeta{}, fmt.Errorf("%s/%s grew past %d bytes while it was being read: %w",
+			entryAPI, trashMetaName, maxTrashMeta, ErrUntrustedTrash)
 	}
 	var m trashMeta
 	if err := json.Unmarshal(data, &m); err != nil {
-		return trashMeta{}, fmt.Errorf("%s: %w", entryRel, err)
+		return trashMeta{}, fmt.Errorf("%s/%s: %w", entryAPI, trashMetaName, err)
 	}
 	return m, nil
 }
@@ -296,6 +477,18 @@ func metaFor(apiPath string, fi os.FileInfo) trashMeta {
 	return m
 }
 
+// trashWarn reports why one item could not be trashed. An untrusted entry is the
+// app's own refusal and reaches the client as "protected"; everything else is
+// "no_trash", which is what the front-end turns into "this would be a permanent
+// delete, confirm it".
+func trashWarn(emit Emit, apiPath string, err error) {
+	if errors.Is(err, ErrUntrustedTrash) {
+		emit.warnErr(apiPath, err)
+		return
+	}
+	emit.warn(apiPath, "no_trash", err.Error(), fsx.Errno(err))
+}
+
 // Trash moves each path into the nearest .@qfm_trash as this worker's user.
 //
 // A path with no usable trash is reported as no_trash and SKIPPED — never
@@ -321,6 +514,15 @@ func Trash(ctx context.Context, r fsx.Root, plat *platform.Platform, uid int, pa
 			res.Skipped++
 			continue
 		}
+		// F10: the never-write component rule. A trash is a rename out of where
+		// the item lives, so .zfs (read-only in the kernel) and @Recycle
+		// (decision 10: never written) are refused here as the guard refuses
+		// them, rather than attempted and reported as a kernel error.
+		if reason, hit := neverWritePath(clean); hit {
+			emit.warnErr(clean, neverWriteErr(clean, reason))
+			res.Skipped++
+			continue
+		}
 		loc, err := trashFor(r, plat, clean)
 		if err != nil {
 			emit.warn(clean, "no_trash", err.Error(), fsx.Errno(err))
@@ -340,9 +542,18 @@ func Trash(ctx context.Context, r fsx.Root, plat *platform.Platform, uid int, pa
 	return res, nil
 }
 
-// trashOne moves one item. Every failure after the entry directory exists
-// removes it again, so a refusal leaves no litter behind.
+// trashOne moves one item, through held descriptors at every step (F2). Every
+// failure after the entry directory exists removes it again, so a refusal leaves
+// no litter behind.
 func trashOne(r fsx.Root, loc trashLoc, uid int, clean, name string, res *wproto.JobResult, emit Emit) error {
+	root, err := loc.open()
+	if err != nil {
+		trashWarn(emit, clean, err)
+		res.Skipped++
+		return nil
+	}
+	defer root.close()
+
 	src, err := resolve(r, fsx.Parent(clean), true)
 	if err != nil {
 		emit.warnErr(clean, err)
@@ -355,29 +566,42 @@ func trashOne(r fsx.Root, loc trashLoc, uid int, clean, name string, res *wproto
 		res.Skipped++
 		return nil
 	}
-	userRel, err := loc.userDir(uid)
+
+	user, err := userDirIn(root, loc.api, uid)
 	if err != nil {
-		emit.warn(clean, "no_trash", err.Error(), fsx.Errno(err))
+		trashWarn(emit, clean, err)
 		res.Skipped++
 		return nil
 	}
-	id, entryRel, err := newEntryDir(loc.jail, userRel)
+	defer user.close()
+
+	userAPI := fsx.Join(loc.api, strconv.Itoa(uid))
+	id, entry, err := newEntryDir(user, userAPI, uid)
 	if err != nil {
-		emit.warn(clean, "no_trash", err.Error(), fsx.Errno(err))
+		trashWarn(emit, clean, err)
 		res.Skipped++
 		return nil
 	}
-	if err := writeTrashMeta(loc.jail, entryRel, metaFor(clean, fi)); err != nil {
-		removeEntryDir(loc.jail, userRel, entryRel, id)
-		emit.warn(clean, "no_trash", err.Error(), fsx.Errno(err))
+	// Closed twice on the paths that remove the entry: os.File.Close on an
+	// already-closed file is ErrClosed and nothing else, and the close has to
+	// happen before the rmdir because a Windows directory with an open handle
+	// cannot be removed.
+	defer entry.close()
+
+	if err := writeTrashMeta(entry, metaFor(clean, fi)); err != nil {
+		removeEntryDir(user, entry, id)
+		trashWarn(emit, clean, err)
 		res.Skipped++
 		return nil
 	}
+	// F9: the payload goes in under a fixed internal name, so an item called
+	// "meta.json" cannot collide with the sidecar beside it.
+	//
 	// NOREPLACE: the entry directory was just created, so nothing can legitimately
 	// be standing at this name — and if something is, overwriting it would destroy
 	// whatever it was.
-	if err := renameAt(src.jail, src.rel, name, loc.jail, entryRel, name, true); err != nil {
-		removeEntryDir(loc.jail, userRel, entryRel, id)
+	if err := entry.renameInto(src.jail, src.rel, name, trashItemName); err != nil {
+		removeEntryDir(user, entry, id)
 		if errors.Is(err, fsx.ErrCrossDevice) || errors.Is(err, syscall.EXDEV) {
 			emit.warn(clean, "no_trash",
 				fmt.Sprintf("%q and its trash are on different filesystems, so it was left alone", clean), fsx.Errno(err))
@@ -403,17 +627,22 @@ func trashOne(r fsx.Root, loc trashLoc, uid int, clean, name string, res *wproto
 }
 
 // removeEntryDir undoes a half-made trash entry: the sidecar, then the
-// directory. Failures are ignored — the caller is already reporting why the
-// trash did not happen, and a leftover empty entry directory is litter rather
-// than damage (TrashEmpty removes it).
-func removeEntryDir(j fsx.Jail, userRel, entryRel, id string) {
-	_ = unlinkAt(j, entryRel, trashMetaName, false)
-	_ = unlinkAt(j, userRel, id, true)
+// directory, both through the descriptors that were just used to make them.
+// Failures are ignored — the caller is already reporting why the trash did not
+// happen, and a leftover empty entry directory is litter rather than damage
+// (TrashEmpty removes it).
+func removeEntryDir(user, entry *dirRef, id string) {
+	_ = entry.unlink(trashMetaName, false)
+	// The handle goes before the directory: on Windows an open handle keeps a
+	// directory from being removed at all.
+	_ = entry.close()
+	_ = user.unlink(id, true)
 }
 
-// trashRoots enumerates every .@qfm_trash this worker can reach: one per
-// Storage, non-network mount in the table, skipping the ones with no trash
-// directory and the ones outside the jail.
+// trashRoots enumerates every place a .@qfm_trash could be for this worker: one
+// per Storage, non-network mount in the table, skipping the ones outside the
+// jail. Whether anything usable is actually AT that name is decided later, on a
+// descriptor (trashLoc.open).
 func trashRoots(r fsx.Root, plat *platform.Platform) []trashLoc {
 	if plat == nil {
 		return nil
@@ -433,7 +662,7 @@ func trashRoots(r fsx.Root, plat *platform.Platform) []trashLoc {
 		if err != nil {
 			continue
 		}
-		loc, err := openTrashDir(r, fsx.Join(rootAPI, TrashDirName))
+		loc, err := locateTrash(r, fsx.Join(rootAPI, TrashDirName))
 		if err != nil {
 			continue
 		}
@@ -446,27 +675,38 @@ func trashRoots(r fsx.Root, plat *platform.Platform) []trashLoc {
 //
 // Only <trash>/<uid>/ is read, on every trash root: one user's panel never
 // enumerates another's entries, even though the sticky directory above is
-// world-readable. An entry whose sidecar is missing, unreadable or malformed is
-// skipped, and so is one whose item is not there — the half-written entry a
-// crash between the sidecar and the rename leaves behind. TrashEmpty clears
-// both.
+// world-readable. Every step is validated on a held descriptor (F1, F2) — the
+// trash root belongs to root and is sticky, <uid>/ belongs to this uid, each
+// entry directory belongs to this uid, and its meta.json is a regular file
+// belonging to this uid — because a forged <trash>/0/<id>/ that a root session
+// LISTED would be an attacker's entry offered to an administrator as their own.
+//
+// An entry that fails any of those checks is skipped, and so is one whose
+// sidecar is missing, unreadable or malformed, and one whose payload is not
+// there — the orphan sidecar a crash between the sidecar and the rename leaves
+// behind (F9). TrashEmpty clears them.
+//
+// Unlike every other function here this one has no Emit to warn through: it is a
+// plain request/response RPC, not a job (wproto.OpTrashList). A skipped entry is
+// therefore silent, which is the right trade for a panel — the alternative is a
+// panel that will not open.
 func TrashList(ctx context.Context, r fsx.Root, plat *platform.Platform, uid int) ([]wproto.TrashItem, error) {
 	out := make([]wproto.TrashItem, 0, 16)
-	name := strconv.Itoa(uid)
 	for _, loc := range trashRoots(r, plat) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		userRel := relJoin(loc.rel, name)
-		if fi, err := statAt(loc.jail, userRel); err != nil || !fi.IsDir() {
-			continue
-		}
-		d, err := openDirRef(loc.jail, userRel)
+		root, err := loc.open()
 		if err != nil {
 			continue
 		}
-		items, err := listTrashDir(ctx, d, loc, userRel, len(out))
-		d.close()
+		user, err := openUserDir(root, loc.api, uid)
+		root.close()
+		if err != nil {
+			continue
+		}
+		items, err := listTrashDir(ctx, user, loc, uid, len(out))
+		user.close()
 		if err != nil {
 			return nil, err
 		}
@@ -484,39 +724,21 @@ func TrashList(ctx context.Context, r fsx.Root, plat *platform.Platform, uid int
 	return out, nil
 }
 
-// listTrashDir reads one <trash>/<uid>/ directory.
-func listTrashDir(ctx context.Context, d *dirRef, loc trashLoc, userRel string, already int) ([]wproto.TrashItem, error) {
+// listTrashDir reads one already-validated <trash>/<uid>/ descriptor.
+func listTrashDir(ctx context.Context, user *dirRef, loc trashLoc, uid, already int) ([]wproto.TrashItem, error) {
 	var out []wproto.TrashItem
+	userAPI := fsx.Join(loc.api, strconv.Itoa(uid))
 	for already+len(out) < trashListCap {
-		ids, readErr := d.names(readChunk)
+		ids, readErr := user.names(readChunk)
 		for _, id := range ids {
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
-			entryRel := relJoin(userRel, id)
-			meta, err := readTrashMeta(loc.jail, entryRel)
-			if err != nil {
+			item, ok := trashItemOf(user, loc, userAPI, id, uid)
+			if !ok {
 				continue
 			}
-			raw, err := meta.orig()
-			if err != nil {
-				continue
-			}
-			itemName := fsx.Base(string(raw))
-			if _, err := statAt(loc.jail, relJoin(entryRel, itemName)); err != nil {
-				// The sidecar is there and the item is not: a crash between the
-				// two writes. Not listed, because a restore of it would fail.
-				continue
-			}
-			out = append(out, wproto.TrashItem{
-				ID:        id,
-				Name:      []byte(itemName),
-				OrigPath:  raw,
-				Type:      meta.Type,
-				Size:      meta.Size,
-				DeletedAt: meta.DeletedAt,
-				Trash:     []byte(loc.api),
-			})
+			out = append(out, item)
 			if already+len(out) >= trashListCap {
 				break
 			}
@@ -531,6 +753,50 @@ func listTrashDir(ctx context.Context, d *dirRef, loc trashLoc, userRel string, 
 	return out, nil
 }
 
+// trashItemOf describes one entry directory, or reports that it is not one this
+// user may consume.
+func trashItemOf(user *dirRef, loc trashLoc, userAPI, id string, uid int) (wproto.TrashItem, bool) {
+	if err := fsx.ValidName(id); err != nil {
+		return wproto.TrashItem{}, false
+	}
+	entry, err := user.child(id)
+	if err != nil {
+		return wproto.TrashItem{}, false
+	}
+	defer entry.close()
+	entryAPI := fsx.Join(userAPI, id)
+	if err := ownedDir(entry, entryAPI, uid); err != nil {
+		return wproto.TrashItem{}, false
+	}
+	meta, err := readTrashMeta(entry, entryAPI, uid)
+	if err != nil {
+		return wproto.TrashItem{}, false
+	}
+	raw, err := meta.orig()
+	if err != nil {
+		return wproto.TrashItem{}, false
+	}
+	itemName := fsx.Base(string(raw))
+	if err := fsx.ValidName(itemName); err != nil {
+		return wproto.TrashItem{}, false
+	}
+	// F9: the payload has a fixed name, so "is it there" is one lstat of one
+	// known entry. The sidecar is there and the item is not means a crash
+	// between the two writes, and a restore of it could only fail.
+	if _, err := entry.lstat(trashItemName); err != nil {
+		return wproto.TrashItem{}, false
+	}
+	return wproto.TrashItem{
+		ID:        id,
+		Name:      []byte(itemName),
+		OrigPath:  raw,
+		Type:      meta.Type,
+		Size:      meta.Size,
+		DeletedAt: meta.DeletedAt,
+		Trash:     []byte(loc.api),
+	}, true
+}
+
 // TrashRestore moves items back to where they came from.
 //
 // v1 does not recreate a missing original parent: a restore that had to invent
@@ -539,10 +805,14 @@ func listTrashDir(ctx context.Context, d *dirRef, loc trashLoc, userRel string, 
 // An original path that is occupied again is "exists" and is left alone rather
 // than overwritten — the rename is NOREPLACE, so the kernel enforces that
 // rather than a check that could be raced.
+//
+// The entry it restores FROM is validated the same way TrashList validates what
+// it shows (F1): an entry directory or a sidecar that belongs to somebody else
+// is not restored, because a restore is a write to a destination the sidecar
+// chose, and that sidecar would be theirs.
 func TrashRestore(ctx context.Context, r fsx.Root, plat *platform.Platform, uid int, ids []string, emit Emit) (wproto.JobResult, error) {
 	var res wproto.JobResult
 	locs := trashRoots(r, plat)
-	userName := strconv.Itoa(uid)
 	for _, id := range ids {
 		if err := ctx.Err(); err != nil {
 			return res, err
@@ -552,32 +822,56 @@ func TrashRestore(ctx context.Context, r fsx.Root, plat *platform.Platform, uid 
 			res.Skipped++
 			continue
 		}
-		loc, entryRel, ok := findTrashEntry(locs, userName, id)
+		loc, user, entry, ok := findTrashEntry(locs, uid, id)
 		if !ok {
 			emit.warn(id, "not_found", fmt.Sprintf("there is no trash entry %q", id), 0)
 			res.Skipped++
 			continue
 		}
-		restoreOne(r, loc, relJoin(loc.rel, userName), entryRel, id, &res, emit)
+		restoreOne(r, loc, user, entry, id, uid, &res, emit)
+		entry.close()
+		user.close()
 	}
 	return res, nil
 }
 
 // findTrashEntry locates one entry id across the trash roots this worker can
-// reach.
-func findTrashEntry(locs []trashLoc, userName, id string) (trashLoc, string, bool) {
+// reach and hands back held, validated descriptors for <uid>/ and for the entry
+// itself. The caller closes both.
+func findTrashEntry(locs []trashLoc, uid int, id string) (trashLoc, *dirRef, *dirRef, bool) {
 	for _, loc := range locs {
-		entryRel := relJoin(relJoin(loc.rel, userName), id)
-		if fi, err := statAt(loc.jail, entryRel); err == nil && fi.IsDir() {
-			return loc, entryRel, true
+		root, err := loc.open()
+		if err != nil {
+			continue
 		}
+		user, err := openUserDir(root, loc.api, uid)
+		// The trash root has served its purpose — it was the descriptor <uid>/
+		// was opened relative to — and the validated <uid>/ handle is what the
+		// rest of the restore addresses.
+		root.close()
+		if err != nil {
+			continue
+		}
+		entry, err := user.child(id)
+		if err != nil {
+			user.close()
+			continue
+		}
+		entryAPI := fsx.Join(fsx.Join(loc.api, strconv.Itoa(uid)), id)
+		if err := ownedDir(entry, entryAPI, uid); err != nil {
+			entry.close()
+			user.close()
+			continue
+		}
+		return loc, user, entry, true
 	}
-	return trashLoc{}, "", false
+	return trashLoc{}, nil, nil, false
 }
 
 // restoreOne puts one entry back and then removes the entry directory.
-func restoreOne(r fsx.Root, loc trashLoc, userRel, entryRel, id string, res *wproto.JobResult, emit Emit) {
-	meta, err := readTrashMeta(loc.jail, entryRel)
+func restoreOne(r fsx.Root, loc trashLoc, user, entry *dirRef, id string, uid int, res *wproto.JobResult, emit Emit) {
+	entryAPI := fsx.Join(fsx.Join(loc.api, strconv.Itoa(uid)), id)
+	meta, err := readTrashMeta(entry, entryAPI, uid)
 	if err != nil {
 		emit.warnErr(id, err)
 		res.Skipped++
@@ -601,15 +895,38 @@ func restoreOne(r fsx.Root, loc trashLoc, userRel, entryRel, id string, res *wpr
 		res.Skipped++
 		return
 	}
-	fi, err := statAt(loc.jail, relJoin(entryRel, name))
+	// F10: the sidecar names the destination, and the sidecar is a file. A
+	// restore into .zfs or @Recycle is refused for the same reason a delete of
+	// one is.
+	if reason, hit := neverWritePath(orig); hit {
+		emit.warnErr(orig, neverWriteErr(orig, reason))
+		res.Skipped++
+		return
+	}
+	fi, err := entry.lstat(trashItemName)
 	if err != nil {
 		emit.warnErr(orig, err)
 		res.Skipped++
 		return
 	}
-	dst, err := resolve(r, fsx.Parent(orig), true)
+
+	parent := fsx.Parent(orig)
+	dst, err := resolve(r, parent, true)
 	if err != nil {
 		emit.warnErr(orig, err)
+		res.Skipped++
+		return
+	}
+	// F6: the original parent must still be reachable with NO symlink component.
+	// resolve() follows links, and what it hands back is where they led; if that
+	// is not the path the sidecar named, then something on the way has become a
+	// symlink since the item was trashed, and putting the file back "where it
+	// came from" would put it wherever that link now points. The original
+	// location changed, which is a conflict rather than a restore.
+	if dst.api != parent {
+		emit.warn(orig, "conflict",
+			fmt.Sprintf("%q is now reached through a symlink to %q, so %q was left in the trash",
+				parent, dst.api, name), 0)
 		res.Skipped++
 		return
 	}
@@ -618,14 +935,16 @@ func restoreOne(r fsx.Root, loc trashLoc, userRel, entryRel, id string, res *wpr
 		// the caller's own syscall; this is that syscall.
 		if errors.Is(err, fs.ErrNotExist) {
 			emit.warn(orig, "not_found",
-				fmt.Sprintf("the folder %q is gone, so %q cannot be put back where it was", fsx.Parent(orig), name), 0)
+				fmt.Sprintf("the folder %q is gone, so %q cannot be put back where it was", parent, name), 0)
 		} else {
 			emit.warnErr(orig, err)
 		}
 		res.Skipped++
 		return
 	}
-	if err := renameAt(loc.jail, entryRel, name, dst.jail, dst.rel, name, true); err != nil {
+	// F9: the payload comes back out from under its fixed internal name and
+	// regains the basename the sidecar recorded.
+	if err := entry.renameOut(trashItemName, dst.jail, dst.rel, name); err != nil {
 		if errors.Is(err, fs.ErrExist) {
 			emit.warn(orig, "exists", fmt.Sprintf("%q is there again, so the trashed copy was left in the trash", orig), 0)
 		} else {
@@ -634,10 +953,14 @@ func restoreOne(r fsx.Root, loc trashLoc, userRel, entryRel, id string, res *wpr
 		res.Skipped++
 		return
 	}
-	if err := unlinkAt(loc.jail, entryRel, trashMetaName, false); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	if err := entry.unlink(trashMetaName, false); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		emit.warnErr(orig, err)
-	} else if err := unlinkAt(loc.jail, userRel, id, true); err != nil {
-		emit.warnErr(orig, err)
+	} else {
+		// The handle goes before the directory, as in removeEntryDir.
+		_ = entry.close()
+		if err := user.unlink(id, true); err != nil {
+			emit.warnErr(orig, err)
+		}
 	}
 	if fi.IsDir() {
 		res.Dirs++
@@ -659,14 +982,42 @@ func restoreOne(r fsx.Root, loc trashLoc, userRel, entryRel, id string, res *wpr
 // trashed — and it is the one operation here that destroys data, which is why
 // the front-end puts it behind the same confirmation ladder a permanent delete
 // has.
+//
+// The validation comes first and on descriptors (F1, F2): the trash root must
+// belong to root and be sticky, and <uid>/ must belong to this uid. A <uid>/
+// somebody else owns is NOT emptied — emptying it would be this worker deleting
+// another user's files on their behalf, or, for a root session, deleting
+// whatever an attacker had pre-created under the name "0" and chose to have
+// removed at that moment.
+//
+// Only after those two hold is the delete addressed by pathname, and that is
+// safe precisely because of what was proved: inside a sticky directory owned by
+// root, an entry owned by this uid can be renamed away by this uid or by root
+// and by nobody else, and every component of the path is re-walked with
+// O_NOFOLLOW, so no symlink can be substituted either.
 func TrashEmpty(ctx context.Context, r fsx.Root, plat *platform.Platform, uid int, emit Emit) (wproto.JobResult, error) {
 	name := strconv.Itoa(uid)
 	var targets []string
 	for _, loc := range trashRoots(r, plat) {
-		userRel := relJoin(loc.rel, name)
-		if fi, err := statAt(loc.jail, userRel); err != nil || !fi.IsDir() {
+		root, err := loc.open()
+		if err != nil {
+			if !errors.Is(err, fs.ErrNotExist) {
+				// A trash root that is there but is not ours to use is worth
+				// saying out loud; one that simply is not there is not.
+				trashWarn(emit, loc.api, err)
+			}
 			continue
 		}
+		user, uerr := openUserDir(root, loc.api, uid)
+		root.close()
+		if uerr != nil {
+			if errors.Is(uerr, ErrUntrustedTrash) {
+				emit.warnErr(fsx.Join(loc.api, name), uerr)
+			}
+			// Anything else means this user has nothing here.
+			continue
+		}
+		user.close()
 		targets = append(targets, fsx.Join(loc.api, name))
 	}
 	if len(targets) == 0 {
@@ -674,6 +1025,7 @@ func TrashEmpty(ctx context.Context, r fsx.Root, plat *platform.Platform, uid in
 	}
 	// CrossMounts is off: a trash directory lives on one filesystem by
 	// construction, so anything mounted underneath one is somebody else's
-	// problem and must not be emptied.
+	// problem and must not be emptied. DeleteTree applies the never-write
+	// component rule of its own accord (F10).
 	return DeleteTree(ctx, r, plat, targets, DeleteOptions{Recursive: true}, emit)
 }

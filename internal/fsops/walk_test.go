@@ -44,6 +44,17 @@ type synthMount struct {
 	source     string
 }
 
+// synthMountIDBase is where the invented mount IDs of a synthetic table start.
+//
+// It is deliberately far above anything a running kernel hands out. The walk
+// identifies a child mount from its DESCRIPTOR where it can (F4) — statx's
+// STATX_MNT_ID is mountinfo's first field — so a synthetic ID that collided with
+// a real one would make the walk resolve a real /tmp descriptor to an invented
+// row and answer a crossing question with somebody else's capabilities. Out of
+// range, the fd lookup misses and the by-name fallback decides, which is what a
+// static table is for (PLAN.md decision 15).
+const synthMountIDBase = 900000
+
 // synthPlatform builds a Platform from mountinfo text, which is how the hero
 // and the mount-crossing rules are exercised on a dev box with neither
 // (PLAN.md decision 15). The table is static: FromMountinfo never refreshes it
@@ -61,13 +72,38 @@ func synthPlatform(t *testing.T, mounts ...synthMount) *platform.Platform {
 			src = "/dev/sda1"
 		}
 		fmt.Fprintf(&b, "%d 1 %s / %s rw,relatime - %s %s rw\n",
-			36+i, dev, strings.ReplaceAll(m.mountPoint, " ", `\040`), m.fsType, src)
+			synthMountIDBase+i, dev, strings.ReplaceAll(m.mountPoint, " ", `\040`), m.fsType, src)
 	}
 	p, err := platform.FromMountinfo(strings.NewReader(b.String()))
 	if err != nil {
 		t.Fatalf("building the synthetic mount table: %v", err)
 	}
 	return p
+}
+
+// fakeIdentities replaces the walk's fd mount identity for the duration of a
+// test: a directory whose jail-relative name ENDS with one of the given
+// suffixes gets that mount ID, and everything else gets a single shared one.
+// The match is by suffix because an unjailed Root spells a temporary directory
+// as its whole absolute path.
+//
+// It exists because the property under test — "the descriptor says this is
+// another mount, so do not enter it" — needs a real mount to observe, and
+// mounting anything needs root. The hook lets the decision be exercised on every
+// platform; the CI root job mounts the real thing (see
+// TestWalkRefusesARealMountPointWithoutCrossMounts, mount_linux_test.go).
+func fakeIdentities(t *testing.T, ids map[string]uint64) {
+	t.Helper()
+	prev := identityFor
+	identityFor = func(d *dirRef) mountIdentity {
+		for suffix, mnt := range ids {
+			if d.rel == suffix || strings.HasSuffix(d.rel, "/"+suffix) {
+				return mountIdentity{mnt: mnt, hasMnt: true}
+			}
+		}
+		return mountIdentity{mnt: 1, hasMnt: true}
+	}
+	t.Cleanup(func() { identityFor = prev })
 }
 
 // requireOwnPermissions skips a test whose subject is the kernel refusing this
@@ -317,5 +353,208 @@ func TestWalkMountCrossingRule(t *testing.T) {
 	}
 	if indexOf(onto.pre, api+"/a/sub/inside.txt") >= 0 {
 		t.Errorf("the walk crossed into a RAM disk")
+	}
+}
+
+// TestWalkRefusesAMountIdentityChangeWithoutCrossMounts is F4: the crossing
+// decision is bound to the OPENED directory, not to the lstat that classified
+// its name, and it compares a MOUNT IDENTITY rather than only st_dev.
+//
+// The mount table here says nothing at all — /a/sub is an ordinary directory as
+// far as it is concerned — so the only thing that can stop the walk is the
+// descriptor itself reporting a different mount. A bind mount is exactly that
+// shape: one device, two mounts, and a pure device comparison walks straight
+// across it.
+func TestWalkRefusesAMountIdentityChangeWithoutCrossMounts(t *testing.T) {
+	base := tempDir(t)
+	mkdir(t, base, "a/sub")
+	write(t, base, "a/one.txt", "one")
+	write(t, base, "a/sub/inside.txt", "inside")
+	r, api := hostRoot(t, base)
+	// The table knows only the volume root: /a/sub is not a mount point by name.
+	plat := synthPlatform(t, synthMount{mountPoint: api, fsType: "ext4", dev: "8:1"})
+	fakeIdentities(t, map[string]uint64{"a/sub": 4242})
+
+	var off recorder
+	if err := Walk(context.Background(), r, plat, api+"/a", WalkOptions{}, off.visitor()); err != nil {
+		t.Fatalf("Walk: %v", err)
+	}
+	if indexOf(off.mount, api+"/a/sub") < 0 {
+		t.Errorf("the descriptor's mount identity was not used: mount = %v pre = %v", off.mount, off.pre)
+	}
+	if indexOf(off.pre, api+"/a/sub/inside.txt") >= 0 {
+		t.Error("the walk entered a directory on another mount without CrossMounts")
+	}
+	if indexOf(off.pre, api+"/a/one.txt") < 0 {
+		t.Error("the rest of the tree must still be walked")
+	}
+
+	// With CrossMounts on it is still refused: the table cannot name the mount
+	// the descriptor belongs to, and an unidentifiable mount fails closed.
+	var on recorder
+	if err := Walk(context.Background(), r, plat, api+"/a", WalkOptions{CrossMounts: true}, on.visitor()); err != nil {
+		t.Fatalf("Walk: %v", err)
+	}
+	if indexOf(on.pre, api+"/a/sub/inside.txt") >= 0 {
+		t.Error("CrossMounts crossed into a mount the table could not identify")
+	}
+}
+
+// TestWalkCrossesAnIdentifiedMountOfTheSameDomain: the other half of F4's
+// fail-closed rule. The descriptor says "another mount" and the refreshed table
+// can name it, so decision 9 gets a real question to answer — and answers yes
+// for a mount of the same storage domain.
+func TestWalkCrossesAnIdentifiedMountOfTheSameDomain(t *testing.T) {
+	base := tempDir(t)
+	mkdir(t, base, "a/sub")
+	write(t, base, "a/sub/inside.txt", "inside")
+	r, api := hostRoot(t, base)
+	plat := synthPlatform(t,
+		synthMount{mountPoint: api, fsType: "ext4", dev: "8:1"},
+		synthMount{mountPoint: api + "/a/sub", fsType: "ext4", dev: "8:1"},
+	)
+	fakeIdentities(t, map[string]uint64{"a/sub": 4242})
+
+	var on recorder
+	if err := Walk(context.Background(), r, plat, api+"/a", WalkOptions{CrossMounts: true}, on.visitor()); err != nil {
+		t.Fatalf("Walk: %v", err)
+	}
+	if indexOf(on.pre, api+"/a/sub/inside.txt") < 0 {
+		t.Errorf("CrossMounts did not descend into an identified mount of the same domain: pre = %v", on.pre)
+	}
+}
+
+// TestWalkProtectRefusesNeverWriteComponents is F10: the guard only ever sees a
+// job's root paths, so the walk applies the component rule itself, to every
+// entry the recursion reaches.
+func TestWalkProtectRefusesNeverWriteComponents(t *testing.T) {
+	base := tempDir(t)
+	mkdir(t, base, "a/.zfs/snapshot")
+	mkdir(t, base, "a/@Recycle")
+	write(t, base, "a/.zfs/snapshot/old.txt", "a snapshot")
+	write(t, base, "a/@Recycle/bin.txt", "the recycle bin")
+	write(t, base, "a/ordinary.txt", "fine")
+	r := newRoot(t, base)
+
+	var mutating recorder
+	if err := Walk(context.Background(), r, nil, "/a", WalkOptions{Protect: ProtectWrite}, mutating.visitor()); err != nil {
+		t.Fatalf("Walk: %v", err)
+	}
+	for _, refused := range []string{"/a/.zfs", "/a/@Recycle"} {
+		if indexOf(mutating.pre, refused) >= 0 {
+			t.Errorf("%q was visited by a mutating walk: pre = %v", refused, mutating.pre)
+		}
+		if indexOf(mutating.warns, refused) < 0 {
+			t.Errorf("%q was skipped without a warning: warns = %v", refused, mutating.warns)
+		}
+	}
+	if indexOf(mutating.pre, "/a/ordinary.txt") < 0 {
+		t.Error("the rest of the tree must still be walked")
+	}
+
+	// A read-only walk skips .zfs — a snapshot tree can be enormous — and reads
+	// @Recycle, which decision 10 only forbids WRITING to.
+	var reading recorder
+	if err := Walk(context.Background(), r, nil, "/a", WalkOptions{Protect: ProtectSnapshots}, reading.visitor()); err != nil {
+		t.Fatalf("Walk: %v", err)
+	}
+	if indexOf(reading.pre, "/a/.zfs") >= 0 {
+		t.Errorf("a read-only walk counted a snapshot tree: pre = %v", reading.pre)
+	}
+	if indexOf(reading.pre, "/a/@Recycle/bin.txt") < 0 {
+		t.Errorf("a read-only walk must be able to read @Recycle: pre = %v", reading.pre)
+	}
+}
+
+// TestNeverWriteName pins the shared helper the guard's rule is mirrored by.
+func TestNeverWriteName(t *testing.T) {
+	for _, name := range []string{".zfs", "@Recycle"} {
+		if reason, hit := NeverWriteName(name); !hit || reason == "" {
+			t.Errorf("NeverWriteName(%q) = %q,%v — want a refusal with a reason", name, reason, hit)
+		}
+	}
+	for _, name := range []string{"zfs", ".zfsx", "Recycle", "@Recycled", "a", ""} {
+		if _, hit := NeverWriteName(name); hit {
+			t.Errorf("NeverWriteName(%q) refused an ordinary name", name)
+		}
+	}
+	// The reasons are path-free, exactly as the guard's are, so one can be shown
+	// to a client without disclosing a resolved spelling.
+	for _, name := range []string{".zfs", "@Recycle"} {
+		reason, _ := NeverWriteName(name)
+		if strings.Contains(reason, "/") {
+			t.Errorf("NeverWriteName(%q) reason %q carries a path", name, reason)
+		}
+	}
+	if _, hit := neverWritePath("/share/Public/.zfs/snapshot/x"); !hit {
+		t.Error("neverWritePath missed a .zfs component in the middle of a path")
+	}
+	if _, hit := neverWritePath("/share/Public/@Recycle"); !hit {
+		t.Error("neverWritePath missed a trailing @Recycle")
+	}
+	if _, hit := neverWritePath("/share/Public/report.txt"); hit {
+		t.Error("neverWritePath refused an ordinary path")
+	}
+}
+
+// TestWalkRechecksTheMountIdentityOnEveryRetryPass is the rest of F4: a mutating
+// visitor may ask for a directory to be read again (errRetryDir, the ext4 htree
+// case), and that re-open must be put through the identical check. A mount that
+// appeared between two passes over a directory being emptied has to stop the
+// walk exactly as one that was there from the start does — otherwise the second
+// pass is the unchecked one.
+func TestWalkRechecksTheMountIdentityOnEveryRetryPass(t *testing.T) {
+	base := tempDir(t)
+	mkdir(t, base, "a/sub")
+	write(t, base, "a/sub/inside.txt", "inside")
+	r := newRoot(t, base)
+
+	// "sub" is on the parent's mount the first time it is opened and on another
+	// one every time after that.
+	opens := 0
+	prev := identityFor
+	identityFor = func(d *dirRef) mountIdentity {
+		if strings.HasSuffix(d.rel, "sub") {
+			opens++
+			if opens > 1 {
+				return mountIdentity{mnt: 4242, hasMnt: true}
+			}
+		}
+		return mountIdentity{mnt: 1, hasMnt: true}
+	}
+	t.Cleanup(func() { identityFor = prev })
+
+	var rec recorder
+	v := rec.visitor()
+	post := v.Post
+	asked := false
+	v.Post = func(it WalkItem) error {
+		if err := post(it); err != nil {
+			return err
+		}
+		if it.Path == "/a/sub" && !asked {
+			asked = true
+			return errRetryDir
+		}
+		return nil
+	}
+	if err := Walk(context.Background(), r, nil, "/a", WalkOptions{Mutating: true}, v); err != nil {
+		t.Fatalf("Walk: %v", err)
+	}
+	if !asked {
+		t.Fatal("the visitor never got to ask for a second pass")
+	}
+	if indexOf(rec.warns, "/a/sub") < 0 {
+		t.Errorf("warns = %v, want the re-opened directory refused as a mount point", rec.warns)
+	}
+	// One Post only: the second pass was refused before it could run.
+	count := 0
+	for _, p := range rec.post {
+		if p == "/a/sub" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("post hooks for /a/sub = %d, want exactly one", count)
 	}
 }

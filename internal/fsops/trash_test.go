@@ -42,8 +42,16 @@ func trashFixture(t *testing.T) (fsx.Root, *platform.Platform, string, string) {
 // world-writable and sticky, so a user may add entries and only remove their
 // own. Windows has no sticky bit and no second user; the directory is enough
 // there.
+//
+// The ownership the worker now demands of it (F2 — uid 0, because the root
+// front-end is what makes it) cannot be produced by a test running as an
+// ordinary user, so trashRootUID is pointed at whoever this process is. On the
+// CI root job that is already zero and the assignment changes nothing; the check
+// itself runs either way, and TestTrashRefusesAnAttackerOwnedRoot is what proves
+// a mismatch is refused.
 func makeTrashDir(t *testing.T, base string) {
 	t.Helper()
+	expectTrashOwner(t, selfUID())
 	dir := filepath.Join(base, TrashDirName)
 	if err := os.Mkdir(dir, 0o777); err != nil {
 		t.Fatal(err)
@@ -53,6 +61,30 @@ func makeTrashDir(t *testing.T, base string) {
 			t.Fatal(err)
 		}
 	}
+}
+
+// expectTrashOwner points the trash root's required owner at uid for one test.
+func expectTrashOwner(t *testing.T, uid int) {
+	t.Helper()
+	prev := trashRootUID
+	trashRootUID = uid
+	t.Cleanup(func() { trashRootUID = prev })
+}
+
+// requireOwnership skips a test whose subject is a uid comparison. Windows has
+// no uid behind a FileInfo, so statDetail reports none and every ownership check
+// in this package degrades to a type test there (INV-2 — never simulate the
+// kernel). The Linux CI jobs run these for real.
+func requireOwnership(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("a Windows FileInfo carries no uid, so there is no ownership to compare")
+	}
+}
+
+// trashEntryDir names the directory one trash entry lives in.
+func trashEntryDir(base string, uid int, id string) string {
+	return filepath.Join(base, TrashDirName, itoa(uid), id)
 }
 
 // TestTrashDirNameMatchesTheFrontEnd: the worker renames into the directory the
@@ -134,8 +166,14 @@ func TestTrashRoundTrip(t *testing.T) {
 			}
 		}
 	}
-	if got, err := os.ReadFile(filepath.Join(entry, "doc.txt")); err != nil || string(got) != "hello" {
+	// F9: on disk the payload has a fixed internal name, and the original
+	// basename lives in the sidecar. That is what lets an item called
+	// "meta.json" be trashed at all.
+	if got, err := os.ReadFile(filepath.Join(entry, trashItemName)); err != nil || string(got) != "hello" {
 		t.Fatalf("the item in the trash = %q, %v", got, err)
+	}
+	if exists(t, entry, "doc.txt") {
+		t.Error("the payload must not keep its original name inside the entry directory")
 	}
 
 	// Restore puts it back and takes the entry with it.
@@ -179,9 +217,12 @@ func TestTrashMovesAWholeTreeInOneRename(t *testing.T) {
 	if err != nil || len(items) != 1 || items[0].Type != "dir" {
 		t.Fatalf("TrashList = %+v, %v", items, err)
 	}
-	entry := filepath.Join(base, TrashDirName, itoa(uid), items[0].ID)
-	if got, err := os.ReadFile(filepath.Join(entry, "a", "sub", "two.txt")); err != nil || string(got) != "twotwo" {
+	entry := trashEntryDir(base, uid, items[0].ID)
+	if got, err := os.ReadFile(filepath.Join(entry, trashItemName, "sub", "two.txt")); err != nil || string(got) != "twotwo" {
 		t.Fatalf("the tree did not move whole: %q %v", got, err)
+	}
+	if string(items[0].Name) != "a" {
+		t.Errorf("item name = %q, want the original basename from the sidecar", items[0].Name)
 	}
 }
 

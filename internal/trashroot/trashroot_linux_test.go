@@ -25,13 +25,97 @@ func storageAt(t *testing.T, dir string) *platform.Platform {
 // tempMount is a temporary directory pretending to be a volume root. The
 // symlinks are evaluated because /tmp is a symlink on some distributions and
 // mountinfo paths are resolved.
+//
+// It also points the required owner (F3 — uid 0, because the root front-end is
+// the only thing that creates the trash directory) at whoever this process is: a
+// test running as an ordinary user can never produce a root-owned directory. On
+// the CI root job the assignment changes nothing, the check runs either way, and
+// TestEnsureRefusesADirectoryOwnedBySomebodyElse is what proves a mismatch is
+// refused.
 func tempMount(t *testing.T) string {
 	t.Helper()
+	expectOwner(t, os.Geteuid())
 	dir := t.TempDir()
 	if real, err := filepath.EvalSymlinks(dir); err == nil {
 		dir = real
 	}
 	return dir
+}
+
+// expectOwner points the trash directory's required owner at uid for one test.
+func expectOwner(t *testing.T, uid int) {
+	t.Helper()
+	prev := wantOwner
+	wantOwner = uid
+	t.Cleanup(func() { wantOwner = prev })
+}
+
+// TestEnsureRefusesADirectoryOwnedBySomebodyElse is F3's ownership check: the
+// owner of a sticky directory is EXEMPT from its restrictions, so a 1777
+// directory that does not belong to root may have every one of its entries
+// renamed or unlinked by whoever made it. Reusing one would hand a stream of
+// other people's deleted files to its owner.
+func TestEnsureRefusesADirectoryOwnedBySomebodyElse(t *testing.T) {
+	root := tempMount(t)
+	dir := filepath.Join(root, DirName)
+	if err := os.Mkdir(dir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o777|fs.ModeSticky); err != nil {
+		t.Fatal(err)
+	}
+	plat := storageAt(t, root)
+	// The directory really belongs to this process; saying the front-end runs as
+	// somebody else is the same comparison the other way up, and it is the only
+	// one a test without a second account can make.
+	expectOwner(t, os.Geteuid()+1)
+
+	got, created, err := Ensure(plat, filepath.Join(root, "Public"))
+	if !errors.Is(err, ErrUnsafeTrash) {
+		t.Fatalf("Ensure = %q,%v,%v — want ErrUnsafeTrash", got, created, err)
+	}
+	if created {
+		t.Error("nothing may be reported as created here")
+	}
+}
+
+// TestEnsureAppliesTheModeThroughTheDescriptor is the rest of F3. The old shape
+// was os.Mkdir followed by os.Chmod — two lookups of one name, with a window
+// between them in which whoever owns the parent directory could rename the new
+// directory away and put a symlink in its place, so the chmod landed 1777 on
+// whatever that link pointed at, as root.
+//
+// The observable consequence is that the directory Ensure reports is the one it
+// actually made, sticky and 0777, and that a second call finds it rather than
+// re-chmod'ing a name.
+func TestEnsureAppliesTheModeThroughTheDescriptor(t *testing.T) {
+	root := tempMount(t)
+	plat := storageAt(t, root)
+	decoy := filepath.Join(root, "decoy")
+	if err := os.Mkdir(decoy, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	dir, created, err := Ensure(plat, filepath.Join(root, "Public"))
+	if err != nil || !created {
+		t.Fatalf("Ensure = %q,%v,%v", dir, created, err)
+	}
+	fi, err := os.Lstat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode()&fs.ModeSticky == 0 || fi.Mode().Perm() != 0o777 {
+		t.Fatalf("mode = %v, want 1777 applied through the descriptor", fi.Mode())
+	}
+	// Nothing else on the volume was touched: the fchmod went to the descriptor
+	// the mkdir produced and could not have reached a neighbour.
+	dfi, err := os.Lstat(decoy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dfi.Mode().Perm() != 0o700 {
+		t.Errorf("the decoy directory is now %v: the mode was applied by name", dfi.Mode())
+	}
 }
 
 // TestEnsureCreatesASticky1777DirectoryOnce is the whole contract: the

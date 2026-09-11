@@ -63,6 +63,42 @@ func (d *dirRef) stat() (os.FileInfo, error) { return statAt(d.j, d.rel) }
 
 func (d *dirRef) close() error { return d.f.Close() }
 
+// mkdir creates a subdirectory of this one.
+func (d *dirRef) mkdir(name string, mode os.FileMode) error {
+	return mkdirAt(d.j, d.rel, name, mode, false)
+}
+
+// openFile opens (or creates) a file inside this directory. os.Root.OpenFile
+// honours O_CREATE|O_EXCL and refuses a name that would leave the tree.
+func (d *dirRef) openFile(name string, flags int, perm os.FileMode) (*os.File, error) {
+	return openFileAt(d.j, d.rel, name, flags, perm)
+}
+
+// readSidecarFlags are the flags a trash sidecar is opened with. There is no
+// O_NONBLOCK to ask for here and no fifo on the dev box to need it (F8): the
+// fstat that follows is still what decides, and on the NAS it is the kernel's
+// (INV-2).
+const readSidecarFlags = os.O_RDONLY
+
+// renameInto renames one entry from an already-resolved parent into this
+// directory. Both sides belong to the same os.Root, which resolves each name
+// against the root descriptor.
+func (d *dirRef) renameInto(fromJail fsx.Jail, fromParentRel, fromName, toName string) error {
+	return renameAt(fromJail, fromParentRel, fromName, d.j, d.rel, toName, true)
+}
+
+// renameOut renames one entry out of this directory to an already-resolved
+// destination.
+func (d *dirRef) renameOut(fromName string, toJail fsx.Jail, toParentRel, toName string) error {
+	return renameAt(d.j, d.rel, fromName, toJail, toParentRel, toName, true)
+}
+
+// identityOf has nothing to report off Linux: there is no st_dev behind a
+// Windows FileInfo and no mount ID to ask for (F4). The zero value leaves
+// mount-point classification to the mount table alone, which is the same
+// degradation devOf and the listing's mount flag already accept.
+func identityOf(*dirRef) mountIdentity { return mountIdentity{} }
+
 // openFileAt opens (or creates) a file inside an already-resolved directory,
 // for the trash sidecar. os.Root.OpenFile honours O_CREATE|O_EXCL and refuses
 // a name that would leave the tree.

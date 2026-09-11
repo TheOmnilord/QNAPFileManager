@@ -560,16 +560,7 @@ func (e *entry) finish(now time.Time, res any, err error, ctxErr error) {
 	case err == nil:
 		j.State = StateDone
 		j.ETA = 0
-		if res != nil {
-			if b, merr := json.Marshal(res); merr == nil {
-				j.Result = b
-			} else {
-				j.WarningCount++
-				if len(j.Warnings) < WarnCap {
-					j.Warnings = append(j.Warnings, "the job's result could not be recorded: "+merr.Error())
-				}
-			}
-		}
+		e.recordResult(res)
 	case e.cancelRequested || errors.Is(err, context.Canceled) || errors.Is(ctxErr, context.Canceled):
 		// Partial work is not rolled back, and the job says so itself.
 		j.State = StateCancelled
@@ -578,6 +569,13 @@ func (e *entry) finish(now time.Time, res any, err error, ctxErr error) {
 		j.Note = cancelNote(j.Files, j.FilesTotal)
 		j.Err = err.Error()
 		j.ErrCode = fsx.Code(context.Canceled)
+		// A cancelled job's work function may return a result ALONGSIDE its
+		// error, and for a worker job it does: wproto.JobResult with Cancelled
+		// set, the partial counts and every warning the worker folded in
+		// (M2-A review round 1, finding 7). Dropping it here — which is what
+		// keying the record off err == nil did — threw away the only structured
+		// account of what a half-finished delete actually deleted.
+		e.recordResult(res)
 	default:
 		j.State = StateFailed
 		j.ETA = -1
@@ -588,6 +586,27 @@ func (e *entry) finish(now time.Time, res any, err error, ctxErr error) {
 			j.Note = failNote(j.Files, j.FilesTotal)
 		}
 	}
+}
+
+// recordResult marshals a work function's own summary into the job. The caller
+// holds e.mu.
+//
+// A result that cannot be marshalled is recorded as a warning rather than
+// dropped silently: the job itself happened, and the fact that its summary did
+// not survive is a bug worth seeing.
+func (e *entry) recordResult(res any) {
+	if res == nil {
+		return
+	}
+	b, err := json.Marshal(res)
+	if err != nil {
+		e.job.WarningCount++
+		if len(e.job.Warnings) < WarnCap {
+			e.job.Warnings = append(e.job.Warnings, "the job's result could not be recorded: "+err.Error())
+		}
+		return
+	}
+	e.job.Result = b
 }
 
 func cancelNote(files, total int64) string {

@@ -186,19 +186,8 @@ func TestJobWarningsAreSentAndFoldedIntoTheResult(t *testing.T) {
 // frames a second (or one per 8 MiB), so a million-file delete does not flood
 // the socket.
 func TestJobProgressIsCoalesced(t *testing.T) {
-	base := t.TempDir()
-	if real, err := filepath.EvalSymlinks(base); err == nil {
-		base = real
-	}
-	if err := os.Mkdir(filepath.Join(base, "many"), 0o755); err != nil {
-		t.Fatal(err)
-	}
 	const files = 400
-	for i := 0; i < files; i++ {
-		if err := os.WriteFile(filepath.Join(base, "many", fmt.Sprintf("f%04d.txt", i)), []byte("x"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
+	base := manyFiles(t, files)
 	tr, _ := dial(t, base)
 	helloIn(t, tr, base)
 
@@ -215,14 +204,46 @@ func TestJobProgressIsCoalesced(t *testing.T) {
 		t.Fatalf("result = %+v, want %d files", res, files)
 	}
 	// Two phases, so two "first" frames go out at once; everything after that
-	// is bounded by the interval.
-	allowed := 2 + int(elapsed/progInterval) + 1
+	// is bounded by the interval, plus the one final flush of whatever the
+	// coalescing was still holding when the job ended.
+	allowed := 2 + int(elapsed/progInterval) + 2
 	if len(s.progs) > allowed {
 		t.Fatalf("%d progress frames for %d items in %v; the coalescing allows %d",
 			len(s.progs), files, elapsed, allowed)
 	}
 	if len(s.progs) == 0 {
 		t.Fatal("no progress at all")
+	}
+}
+
+// TestTheLastProgressStateIsFlushedBeforeTheTerminal: the coalescing holds back
+// updates, and a job short enough to finish inside one interval would otherwise
+// leave a UI showing the first frame's counts for ever while the terminal
+// result said something else. The held state goes out before the terminal frame
+// and never after it — a progress frame behind the terminal would be a reply
+// for a request id the front-end has already retired.
+func TestTheLastProgressStateIsFlushedBeforeTheTerminal(t *testing.T) {
+	base := jobTree(t)
+	tr, _ := dial(t, base)
+	helloIn(t, tr, base)
+
+	send(t, tr, 51, wproto.OpJob, wproto.JobReq{
+		JobID: "job-flush",
+		Kind:  wproto.JobDelete,
+		Body:  mustJSON(t, wproto.DeleteReq{Paths: [][]byte{[]byte("/a")}, Recursive: true}),
+	})
+	s := readJob(t, tr, 51)
+	res := s.result(t)
+	if len(s.progs) == 0 {
+		t.Fatal("no progress at all")
+	}
+	last := s.progs[len(s.progs)-1]
+	if last.Phase != wproto.PhaseWorking {
+		t.Fatalf("last progress = %+v, want the working phase", last)
+	}
+	// Delete counts files and directories together in its progress.
+	if want := res.Files + res.Dirs; last.Files != want {
+		t.Fatalf("last progress reported %d of the %d items the terminal result accounts for", last.Files, want)
 	}
 }
 
@@ -234,19 +255,7 @@ func TestJobProgressIsCoalesced(t *testing.T) {
 // under its JobID. The cancellation is sent at that point, and the terminal
 // frame reports the partial work rather than a completed delete.
 func TestJobCancelByJobIDStopsARunningDelete(t *testing.T) {
-	base := t.TempDir()
-	if real, err := filepath.EvalSymlinks(base); err == nil {
-		base = real
-	}
-	if err := os.Mkdir(filepath.Join(base, "many"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	const files = 2000
-	for i := 0; i < files; i++ {
-		if err := os.WriteFile(filepath.Join(base, "many", fmt.Sprintf("f%04d.txt", i)), []byte("x"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
+	base := manyFiles(t, 2000)
 	tr, _ := dial(t, base)
 	helloIn(t, tr, base)
 
@@ -269,14 +278,15 @@ func TestJobCancelByJobIDStopsARunningDelete(t *testing.T) {
 	send(t, tr, 12, wproto.OpCancel, wproto.CancelReq{JobID: "job-4"})
 
 	s := readJob(t, tr, 11)
-	if s.term.Kind != wproto.KindErr {
-		t.Fatalf("terminal frame = %s %s, want a cancellation", s.term.Kind, s.term.Body)
+	// F7: the terminal of a cancelled job is an OK frame carrying the partial
+	// JobResult with Cancelled set — an err frame has nowhere to put the counts
+	// or the warnings.
+	res := s.result(t)
+	if !res.Cancelled {
+		t.Fatalf("terminal result = %+v, want Cancelled set", res)
 	}
-	if s.term.Err.Code != "cancelled" {
-		t.Fatalf("terminal error = %+v, want the cancelled code", s.term.Err)
-	}
-	if !strings.Contains(s.term.Err.Message, "cancelled after") {
-		t.Errorf("message = %q, want the partial counts", s.term.Err.Message)
+	if !strings.Contains(res.Detail, "cancelled after") {
+		t.Errorf("detail = %q, want the partial counts", res.Detail)
 	}
 	left, err := os.ReadDir(filepath.Join(base, "many"))
 	if err != nil {
@@ -284,6 +294,130 @@ func TestJobCancelByJobIDStopsARunningDelete(t *testing.T) {
 	}
 	if len(left) == 0 {
 		t.Fatal("the cancelled delete emptied the directory anyway")
+	}
+}
+
+// manyFiles builds a directory of n one-byte files under a fresh jail and
+// returns the jail root.
+func manyFiles(t *testing.T, n int) string {
+	t.Helper()
+	base := t.TempDir()
+	if real, err := filepath.EvalSymlinks(base); err == nil {
+		base = real
+	}
+	if err := os.Mkdir(filepath.Join(base, "many"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < n; i++ {
+		if err := os.WriteFile(filepath.Join(base, "many", fmt.Sprintf("f%04d.txt", i)), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return base
+}
+
+// TestJobCancelArrivingRightBehindTheJobIsHonoured is F5.
+//
+// The registration happens on the read loop, before the handler goroutine
+// exists, so an OpCancel sent immediately after the OpJob cannot find an empty
+// table. The transport is an unbuffered pipe, so writing the OpJob frame
+// returns only once the loop has read it: the cancellation that follows is
+// therefore processed by the very next iteration of the same loop, and a
+// registration made anywhere later would have missed it — leaving a destructive
+// job running under a context nobody had cancelled while the front-end had
+// already been told it stopped.
+func TestJobCancelArrivingRightBehindTheJobIsHonoured(t *testing.T) {
+	const files = 500
+	base := manyFiles(t, files)
+	tr, _ := dial(t, base)
+	helloIn(t, tr, base)
+
+	send(t, tr, 31, wproto.OpJob, wproto.JobReq{
+		JobID: "job-racer",
+		Kind:  wproto.JobDelete,
+		Body:  mustJSON(t, wproto.DeleteReq{Paths: [][]byte{[]byte("/many")}, Recursive: true}),
+	})
+	send(t, tr, 32, wproto.OpCancel, wproto.CancelReq{JobID: "job-racer"})
+
+	res := readJob(t, tr, 31).result(t)
+	if !res.Cancelled {
+		t.Fatalf("result = %+v, want a cancelled job: the cancellation was accepted but the job ran anyway", res)
+	}
+	left, err := os.ReadDir(filepath.Join(base, "many"))
+	if err != nil {
+		t.Fatalf("the cancelled delete removed the directory itself: %v", err)
+	}
+	if len(left) == 0 {
+		t.Fatal("the cancelled delete emptied the directory anyway")
+	}
+}
+
+// TestDuplicateJobIDIsRefusedAndTheFirstStaysCancellable is F9.
+//
+// Overwriting the registration put two live jobs under one name: a cancellation
+// then stopped whichever happened to be in the map, and the first to finish
+// deleted the other's entry, so a running destructive job could no longer be
+// stopped at all. The second submission is refused with "conflict" instead, and
+// the first is still the one the id names.
+func TestDuplicateJobIDIsRefusedAndTheFirstStaysCancellable(t *testing.T) {
+	const files = 3000
+	base := manyFiles(t, files)
+	tr, _ := dial(t, base)
+	helloIn(t, tr, base)
+
+	send(t, tr, 41, wproto.OpJob, wproto.JobReq{
+		JobID: "job-dup",
+		Kind:  wproto.JobDelete,
+		Body:  mustJSON(t, wproto.DeleteReq{Paths: [][]byte{[]byte("/many")}, Recursive: true}),
+	})
+	// The first frame of the stream proves the job is running and registered:
+	// the pipe is unbuffered, so the worker is blocked writing it.
+	f, files0, err := tr.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range files0 {
+		file.Close()
+	}
+	if f.ID != 41 || f.Kind != wproto.KindProg {
+		t.Fatalf("first frame = %+v, want progress for the job", f)
+	}
+
+	send(t, tr, 42, wproto.OpJob, wproto.JobReq{
+		JobID: "job-dup",
+		Kind:  wproto.JobDelete,
+		Body:  mustJSON(t, wproto.DeleteReq{Paths: [][]byte{[]byte("/many")}, Recursive: true}),
+	})
+	dup := readJob(t, tr, 42)
+	if dup.term.Kind != wproto.KindErr {
+		t.Fatalf("the duplicate job id was accepted: %+v", dup.term)
+	}
+	if dup.term.Err.Code != "conflict" {
+		t.Fatalf("duplicate job id = %+v, want the conflict code", dup.term.Err)
+	}
+
+	// And the id still names the FIRST job, which is what makes it stoppable.
+	send(t, tr, 43, wproto.OpCancel, wproto.CancelReq{JobID: "job-dup"})
+	res := readJob(t, tr, 41).result(t)
+	if !res.Cancelled {
+		t.Fatalf("result = %+v, want the first job cancelled", res)
+	}
+	left, err := os.ReadDir(filepath.Join(base, "many"))
+	if err != nil || len(left) == 0 {
+		t.Fatalf("the cancelled delete emptied the directory anyway (%d left, %v)", len(left), err)
+	}
+
+	// The name is unregistered before the terminal frame goes out, so a
+	// front-end that reuses the id the instant it sees the outcome is not
+	// refused.
+	send(t, tr, 44, wproto.OpJob, wproto.JobReq{
+		JobID: "job-dup",
+		Kind:  wproto.JobSize,
+		Body:  mustJSON(t, wproto.SizeReq{Paths: [][]byte{[]byte("/many")}}),
+	})
+	again := readJob(t, tr, 44)
+	if again.term.Kind != wproto.KindOK {
+		t.Fatalf("reusing the id of a finished job = %+v, want it accepted", again.term.Err)
 	}
 }
 

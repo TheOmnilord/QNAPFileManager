@@ -327,6 +327,59 @@ func TestCancelStopsAJobAndSaysWhatWasLeftBehind(t *testing.T) {
 	}
 }
 
+// TestACancelledJobKeepsItsStructuredResult is F7 at this end of the chain.
+//
+// A worker job's function returns (result, context.Canceled): the result is the
+// wproto.JobResult the worker sent, with Cancelled set, the partial counts and
+// every warning it folded in. Recording it only when err == nil threw that away
+// — and it is precisely the destructive, half-finished job whose numbers a user
+// has to be able to read afterwards.
+func TestACancelledJobKeepsItsStructuredResult(t *testing.T) {
+	m, _ := newManager(t, Limits{})
+
+	type partial struct {
+		Files     int64 `json:"f"`
+		Warnings  int   `json:"w"`
+		Cancelled bool  `json:"cancelled"`
+	}
+	started := make(chan struct{})
+	job, err := m.Submit(KindDelete, "Deleting 8003 items", Meta{Actor: "alice"}, func(ctx context.Context, p *Progress) (any, error) {
+		p.Set(412, 8003, 0, 0)
+		close(started)
+		<-ctx.Done()
+		return partial{Files: 412, Warnings: 3, Cancelled: true}, ctx.Err()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(testWait):
+		t.Fatal("the job never started")
+	}
+	if !m.Cancel(job.ID) {
+		t.Fatal("Cancel reported nothing to cancel")
+	}
+
+	got := waitState(t, m, job.ID, StateCancelled)
+	if !got.Partial || got.ErrCode != "cancelled" {
+		t.Fatalf("job = %+v, want a partial cancellation", got)
+	}
+	if !strings.Contains(got.Note, "412 of 8003") {
+		t.Errorf("note = %q, want the counts", got.Note)
+	}
+	if len(got.Result) == 0 {
+		t.Fatal("the cancelled job dropped the partial result its work function returned")
+	}
+	var back partial
+	if err := json.Unmarshal(got.Result, &back); err != nil {
+		t.Fatalf("result = %s (%v)", got.Result, err)
+	}
+	if back.Files != 412 || back.Warnings != 3 || !back.Cancelled {
+		t.Fatalf("result = %+v, want the worker's partial counts", back)
+	}
+}
+
 // TestCancelWhileQueuedIsNotPartial: nothing ran, so there is nothing to warn
 // about. The distinction matters — the UI's wording differs.
 func TestCancelWhileQueuedIsNotPartial(t *testing.T) {

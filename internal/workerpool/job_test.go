@@ -36,9 +36,16 @@ type jobScript struct {
 	// hold, when set, makes the job wait after its frames until the test opens
 	// it (or cancels the job).
 	hold chan struct{}
-	// cancelReply picks what a cancelled job answers with: "err" (the worker's
-	// own cancelled error, carrying its partial counts in the detail) or "ok"
-	// (a JobResult whose counters are the partial ones).
+	// cancelReply picks what a cancelled job answers with:
+	//   "err"        the pre-F7 spelling — the worker's own cancelled error,
+	//                with its partial counts squeezed into the message. Still
+	//                tolerated, for a worker left over from an older build.
+	//   "ok"         an OK JobResult whose counters are the partial ones, but
+	//                without the Cancelled marker.
+	//   "structured" the F7 convention: an OK JobResult with Cancelled set, the
+	//                partial counts and the folded warnings.
+	//   "ignore"     no answer at all — the worker is still inside a filesystem
+	//                call and will not stop (F13).
 	cancelReply string
 	// crashAfter closes the connection after this many progress frames, which
 	// is what a segfaulting worker looks like from the pool's side. 0 disables.
@@ -89,6 +96,14 @@ func newFakeWorker(t *testing.T, who backend.Principal, script jobScript) (*clie
 // the first acquire, so a test pings before it reads from made.
 func jobPool(t *testing.T, script jobScript) (*Pool, <-chan *fakeWorker, *clock, *atomic.Int64) {
 	t.Helper()
+	return jobPoolWith(t, script, nil)
+}
+
+// jobPoolWith is jobPool with a hand on the pool's options, for the one test
+// that has to reach the cancellation grace without sitting out ten real
+// seconds.
+func jobPoolWith(t *testing.T, script jobScript, tweak func(*Options)) (*Pool, <-chan *fakeWorker, *clock, *atomic.Int64) {
+	t.Helper()
 	made := make(chan *fakeWorker, 4)
 	var spawns atomic.Int64
 	p, clk := testPool(t, func(o *Options) {
@@ -97,6 +112,9 @@ func jobPool(t *testing.T, script jobScript) (*Pool, <-chan *fakeWorker, *clock,
 			c, w := newFakeWorker(t, who, script)
 			made <- w
 			return c, nil
+		}
+		if tweak != nil {
+			tweak(o)
 		}
 	})
 	return p, made, clk, &spawns
@@ -203,13 +221,33 @@ func (w *fakeWorker) runJob(id uint64, req wproto.JobReq) {
 func (w *fakeWorker) finishCancelled(id uint64) {
 	partial := wproto.JobResult{Files: 412, Warnings: w.script.warns, Detail: "cancelled after 412 of 8003 files"}
 	var f wproto.Frame
-	if w.script.cancelReply == "ok" {
+	switch w.script.cancelReply {
+	case "ignore":
+		// Still blocked in the filesystem. Nothing comes back, ever.
+		return
+	case "structured":
+		partial.Bytes = 9000
+		partial.Dirs = 7
+		partial.Skipped = 2
+		partial.Cancelled = true
+		for i := 0; i < w.script.warns && i < wproto.WarnCap; i++ {
+			partial.Warns = append(partial.Warns, wproto.Warn{
+				Path:    []byte(fmt.Sprintf("/share/Public/w%d", i)),
+				Code:    "permission",
+				Message: "EACCES",
+				Errno:   13,
+			})
+		}
 		var err error
-		f, err = wproto.NewOK(id, partial)
-		if err != nil {
+		if f, err = wproto.NewOK(id, partial); err != nil {
 			return
 		}
-	} else {
+	case "ok":
+		var err error
+		if f, err = wproto.NewOK(id, partial); err != nil {
+			return
+		}
+	default:
 		f = wproto.NewErr(id, fmt.Errorf("cancelled after 412 of 8003 files: %w", context.Canceled), nil)
 	}
 	if w.peer.Write(f, nil) == nil {
@@ -640,6 +678,250 @@ func TestTrashListIsAPlainCall(t *testing.T) {
 	item := resp.Items[0]
 	if string(item.OrigPath) != string(raw) || item.ID != "1757600000-0a1b2c3d" || item.Size != 12 {
 		t.Fatalf("item = %+v", item)
+	}
+}
+
+// TestACancelledJobReturnsItsPartialResultAndTheCancellation is F7: the worker
+// reports a cancellation as an OK frame whose JobResult has Cancelled set, and
+// the pool hands those counts back TOGETHER WITH context.Canceled. The numbers
+// and the folded warnings are the only account of what a half-finished delete
+// deleted, and nothing rolls it back.
+func TestACancelledJobReturnsItsPartialResultAndTheCancellation(t *testing.T) {
+	hold := make(chan struct{})
+	defer close(hold)
+	p, made, _, _ := jobPool(t, jobScript{progs: 2, warns: 3, filesTotal: 8003, hold: hold, cancelReply: "structured"})
+	who := alice()
+	w := spawnWorker(t, p, made, who)
+
+	first := make(chan struct{})
+	var once sync.Once
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	out := runJobAsync(p, ctx, who, deleteJob("structured000001"),
+		func(wproto.Prog) { once.Do(func() { close(first) }) }, nil)
+	select {
+	case <-first:
+	case <-time.After(testWait):
+		t.Fatal("the job never reported progress")
+	}
+	cancel()
+	select {
+	case <-w.cancels:
+	case <-time.After(testWait):
+		t.Fatal("the worker was never told to cancel")
+	}
+
+	got := awaitJob(t, out)
+	if !errors.Is(got.err, context.Canceled) {
+		t.Fatalf("err = %v, want a cancellation", got.err)
+	}
+	if !got.res.Cancelled {
+		t.Fatalf("result = %+v, want Cancelled set", got.res)
+	}
+	if got.res.Files != 412 || got.res.Bytes != 9000 || got.res.Dirs != 7 || got.res.Skipped != 2 {
+		t.Fatalf("result = %+v, want the worker's partial counts", got.res)
+	}
+	if got.res.Warnings != 3 || len(got.res.Warns) != 3 {
+		t.Fatalf("result = %+v, want the worker's folded warnings", got.res)
+	}
+	if !strings.Contains(got.res.Detail, "412 of 8003") {
+		t.Fatalf("detail = %q, want the partial counts", got.res.Detail)
+	}
+}
+
+// TestAnExpiredDeadlineDoesNotRetireAHealthyWorker is F12.
+//
+// writeFrame returns before it touches the transport when the caller's deadline
+// has already passed. Treating that like any other write failure closed the
+// connection, failed every concurrent RPC on that worker with worker_gone and
+// retired the process — so one submission that expired a microsecond too early
+// killed a colleague's running job. Nothing was written, so nothing is
+// desynchronised, and the worker is left alone.
+func TestAnExpiredDeadlineDoesNotRetireAHealthyWorker(t *testing.T) {
+	for _, path := range []string{"job", "call"} {
+		t.Run("on the "+path+" path", func(t *testing.T) {
+			hold := make(chan struct{})
+			p, made, _, _ := jobPool(t, jobScript{progs: 1, hold: hold, result: wproto.JobResult{Files: 9}})
+			who := alice()
+			spawnWorker(t, p, made, who)
+			c := p.workerForTest(t, who.Key())
+
+			// A first RPC is put in flight and left there.
+			first := make(chan struct{})
+			var once sync.Once
+			out := runJobAsync(p, context.Background(), who, deleteJob("healthyjob000001"),
+				func(wproto.Prog) { once.Do(func() { close(first) }) }, nil)
+			select {
+			case <-first:
+			case <-time.After(testWait):
+				t.Fatal("the first job never started")
+			}
+
+			// And a second one arrives with its deadline already behind it.
+			ctx := pastDeadline{context.Background()}
+			var err error
+			if path == "job" {
+				_, err = p.Job(ctx, who, deleteJob("expiredjob000001"), nil, nil)
+			} else {
+				_, err = p.TrashList(ctx, who)
+			}
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("err = %v, want the deadline, not a worker failure", err)
+			}
+			if errors.Is(err, fsx.ErrWorkerGone) {
+				t.Fatalf("an expired submission reported the worker as gone: %v", err)
+			}
+			if c.isDead() {
+				t.Fatal("an expired submission killed the worker")
+			}
+
+			// The first RPC is untouched: it finishes normally.
+			close(hold)
+			got := awaitJob(t, out)
+			if got.err != nil || got.res.Files != 9 {
+				t.Fatalf("the concurrent job was disturbed: %+v, %v", got.res, got.err)
+			}
+		})
+	}
+}
+
+// pastDeadline reports a deadline that has already gone by while Err is still
+// nil. That is a real instant in the life of any bounded call — the timer has
+// not fired yet — and it is the only one in which writeFrame is reached with
+// nothing left to write within; reproducing it by sleeping would be a race.
+type pastDeadline struct{ context.Context }
+
+func (pastDeadline) Deadline() (time.Time, bool) { return time.Now().Add(-time.Minute), true }
+
+// TestAJobThatWillNotStopInGraceTerminatesItsWorker is F13.
+//
+// A worker still inside a filesystem call when the grace expires is not merely
+// abandoned: it is terminated. Walking away released the semaphore and handed
+// the worker back to the pool as idle and reusable while the job it was told to
+// stop went on deleting files. The user loses their worker — the pool spawns a
+// fresh one on their next request — and the partial counts last seen travel
+// back with the cancellation.
+func TestAJobThatWillNotStopInGraceTerminatesItsWorker(t *testing.T) {
+	hold := make(chan struct{})
+	defer close(hold)
+	p, made, _, spawns := jobPoolWith(t, jobScript{progs: 3, warns: 2, filesTotal: 8003, hold: hold, cancelReply: "ignore"},
+		func(o *Options) { o.jobCancelGrace = 50 * time.Millisecond })
+	who := alice()
+	w := spawnWorker(t, p, made, who)
+	c := p.workerForTest(t, who.Key())
+
+	// The warnings are written after the progress, so the second warning
+	// arriving proves both are accounted for before the cancellation.
+	seen := make(chan struct{})
+	var once sync.Once
+	var warns atomic.Int64
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	out := runJobAsync(p, ctx, who, deleteJob("stubbornjob00001"), nil,
+		func(wproto.Warn) {
+			if warns.Add(1) == 2 {
+				once.Do(func() { close(seen) })
+			}
+		})
+	select {
+	case <-seen:
+	case <-time.After(testWait):
+		t.Fatal("the job never reported its progress")
+	}
+	cancel()
+	select {
+	case <-w.cancels:
+	case <-time.After(testWait):
+		t.Fatal("the worker was never told to cancel")
+	}
+
+	got := awaitJob(t, out)
+	if !errors.Is(got.err, context.Canceled) {
+		t.Fatalf("err = %v, want a cancellation", got.err)
+	}
+	if !got.res.Cancelled {
+		t.Fatalf("result = %+v, want Cancelled set", got.res)
+	}
+	if !strings.Contains(got.res.Detail, "it was terminated") {
+		t.Fatalf("detail = %q, want the termination note", got.res.Detail)
+	}
+	if got.res.Files != 3 || got.res.Warnings != 2 || len(got.res.Warns) != 2 {
+		t.Fatalf("result = %+v, want the counts and warnings last seen", got.res)
+	}
+
+	// The worker is gone, not idle: nothing may be handed this process again.
+	deadline := time.Now().Add(testWait)
+	for !c.isDead() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !c.isDead() {
+		t.Fatal("the worker that would not stop a destructive job was left alive and reusable")
+	}
+	p.mu.Lock()
+	cur, still := p.workers[who.Key()]
+	p.mu.Unlock()
+	if still && cur == c {
+		t.Fatal("the terminated worker is still the pool's worker for this user")
+	}
+
+	// And the next request gets a fresh one.
+	if err := p.Ping(context.Background(), who); err != nil {
+		t.Fatalf("ping after the termination: %v", err)
+	}
+	select {
+	case <-made:
+	case <-time.After(testWait):
+		t.Fatal("no replacement worker was spawned")
+	}
+	if n := spawns.Load(); n != 2 {
+		t.Fatalf("%d workers were spawned, want the original and its replacement", n)
+	}
+}
+
+// TestABurstOfWarningsNeverCostsTheTerminalFrame: a job that warns on every
+// item of a million-item tree outruns any caller. The buffer overflows, the
+// oldest Prog or Warn is evicted — both are recoverable, the JobResult folds
+// the warning count back in — and the terminal frame still arrives. A dropped
+// terminal would leave the caller waiting for a reply that had come and gone.
+func TestABurstOfWarningsNeverCostsTheTerminalFrame(t *testing.T) {
+	const burst = jobFrames * 3
+	want := wproto.JobResult{Files: 1, Warnings: burst, Detail: "done"}
+	p, made, _, _ := jobPool(t, jobScript{warns: burst, result: want})
+	who := alice()
+	w := spawnWorker(t, p, made, who)
+
+	release := make(chan struct{})
+	var seen atomic.Int64
+	out := runJobAsync(p, context.Background(), who, deleteJob("warnburst0000001"), nil,
+		func(wproto.Warn) {
+			if seen.Add(1) == 1 {
+				// The first callback blocks until every warning has been
+				// written, so the buffer is certain to overflow.
+				<-release
+			}
+		})
+
+	select {
+	case <-w.wrote:
+	case <-time.After(testWait):
+		t.Fatal("the worker never finished writing its warnings")
+	}
+	close(release)
+
+	got := awaitJob(t, out)
+	if got.err != nil {
+		t.Fatalf("job: %v", got.err)
+	}
+	if !reflect.DeepEqual(got.res, want) {
+		t.Fatalf("result = %+v, want %+v", got.res, want)
+	}
+	if n := seen.Load(); n >= burst {
+		t.Fatalf("%d of %d warnings were delivered; the burst was meant to overflow the buffer", n, burst)
+	}
+	// The count survives whatever the socket dropped, which is what makes the
+	// eviction acceptable.
+	if got.res.Warnings != burst {
+		t.Fatalf("result warnings = %d, want the worker's total of %d", got.res.Warnings, burst)
 	}
 }
 

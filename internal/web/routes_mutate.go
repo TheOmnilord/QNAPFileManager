@@ -110,7 +110,8 @@ func (s *Server) auditAuthDenied(r *http.Request, sess *session, code, detail st
 // authentication failure reaching it is worth a denial audit line (adv 10).
 func isMutationRoute(p string) bool {
 	switch p {
-	case "/api/fs/mkdir", "/api/fs/rename", "/api/fs/delete", "/api/settings":
+	case "/api/fs/mkdir", "/api/fs/rename", "/api/fs/delete", "/api/settings",
+		"/api/jobs/delete", "/api/trash/restore", "/api/trash/empty":
 		return true
 	}
 	return false

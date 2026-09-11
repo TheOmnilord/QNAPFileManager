@@ -1,0 +1,263 @@
+import {api} from './api.js';
+import {$,el,error,announce,pathArgs} from './dom.js';
+import {state,sessionGuard} from './state.js';
+import {loadList} from './list.js';
+import {loadTree} from './tree.js';
+import {propsTarget} from './viewer.js';
+
+// The jobs panel (ui-ux §3.4): a right-side drawer listing every operation this
+// session can see, polled while anything is live and silent when nothing is.
+//
+// Everything that formats a number is a pure function at the top of this file,
+// so the wording of "1,204 / 3,900 files · 8.2 / 14.1 GiB · 112 MiB/s · ~52 s
+// left" is unit-tested rather than eyeballed.
+
+const UNITS = ['B','KiB','MiB','GiB','TiB','PiB'];
+
+// formatBytes renders a byte count in binary units, with one decimal below 100
+// so "8.2 GiB" and "112 MiB" both read naturally.
+export function formatBytes(bytes) {
+ const n = Number(bytes);
+ if (!Number.isFinite(n) || n < 0) return '—';
+ let value = n, unit = 0;
+ while (value >= 1024 && unit < UNITS.length-1) { value /= 1024; unit++; }
+ if (unit === 0) return `${Math.round(value)} B`;
+ return `${value >= 100 ? Math.round(value) : Number(value.toFixed(1))} ${UNITS[unit]}`;
+}
+
+export function formatRate(bytesPerSecond) {
+ const n = Number(bytesPerSecond);
+ if (!Number.isFinite(n) || n <= 0) return '';
+ return `${formatBytes(n)}/s`;
+}
+
+// formatETA turns the server's seconds-remaining into words. -1 means unknown,
+// and unknown is said by saying nothing rather than by guessing.
+export function formatETA(seconds) {
+ const s = Number(seconds);
+ if (!Number.isFinite(s) || s < 0) return '';
+ if (s < 60) return `~${Math.round(s)} s left`;
+ if (s < 3600) { const m = Math.floor(s/60), rest = Math.round(s%60); return rest ? `~${m} m ${rest} s left` : `~${m} m left`; }
+ const h = Math.floor(s/3600), m = Math.round((s%3600)/60);
+ return m ? `~${h} h ${m} m left` : `~${h} h left`;
+}
+
+// jobPercent is the fraction complete, or null when the job is indeterminate —
+// a capped scan reports a total of -1 (design §3) and the bar then has no
+// meaningful denominator, so it is shown as indeterminate instead of guessed.
+export function jobPercent(job) {
+ if (!job) return null;
+ if (job.bytesTotal > 0) return Math.max(0,Math.min(100,Math.round(job.bytes/job.bytesTotal*100)));
+ if (job.filesTotal > 0) return Math.max(0,Math.min(100,Math.round(job.files/job.filesTotal*100)));
+ return null;
+}
+
+export const jobLive = job => job && (job.state === 'queued' || job.state === 'running');
+export const shouldPoll = list => Array.isArray(list) && list.some(jobLive);
+
+// jobDetailLine is the panel's second line. Counts with no total drop the
+// denominator rather than printing "of -1"; a rate or an ETA that is not known
+// is simply absent.
+export function jobDetailLine(job) {
+ if (!job) return '';
+ const parts = [];
+ parts.push(job.filesTotal >= 0
+  ? `${job.files.toLocaleString()} / ${job.filesTotal.toLocaleString()} files`
+  : `${job.files.toLocaleString()} files`);
+ if (job.bytes > 0 || job.bytesTotal > 0) {
+  parts.push(job.bytesTotal >= 0
+   ? `${formatBytes(job.bytes)} / ${formatBytes(job.bytesTotal)}`
+   : formatBytes(job.bytes));
+ }
+ const rate = formatRate(job.rate); if (rate) parts.push(rate);
+ // An ETA of 0 means "about to finish", which is not worth saying, and a
+ // finished job's last estimate is stale.
+ if (job.eta > 0 && jobLive(job)) parts.push(formatETA(job.eta));
+ return parts.join(' · ');
+}
+
+// jobTitle is "kind → target": the Title the server composed, falling back to
+// the kind when a job has none.
+export function jobTitle(job) { return job?.title || job?.kind || 'Operation'; }
+
+// createPoller is the polling loop, with its timer injected so a test can drive
+// it without waiting. load() returns whether polling should continue; the next
+// tick is only scheduled once the previous one has answered, so a slow response
+// cannot stack requests.
+export function createPoller({load,interval=500,timers=globalThis}) {
+ let handle = null, stopped = true;
+ const tick = async () => {
+  handle = null;
+  let again = false;
+  try { again = await load(); } catch { again = false; }
+  if (!stopped && again) schedule();
+ };
+ const schedule = () => { if (handle === null) handle = timers.setTimeout(tick,interval); };
+ return {
+  start() { stopped = false; schedule(); },
+  stop() { stopped = true; if (handle !== null) { timers.clearTimeout(handle); handle = null; } },
+  get running() { return handle !== null; },
+  tick,
+ };
+}
+
+// --- panel ------------------------------------------------------------------
+
+const dismissed = new Set();   // ids the user cleared from the panel locally
+const lastState = new Map();   // id -> state, so only transitions are announced
+let poller = null;
+let refreshAfterJob = false;
+
+function panelOpen(open) {
+ $('#jobsPanel').hidden = !open;
+ $('#btnJobs').setAttribute('aria-expanded',String(open));
+}
+
+function jobRow(job) {
+ const row = el('div',{id:`job-${job.id}`,class:`job job-${job.state}`,role:'group','aria-label':jobTitle(job)});
+ const head = el('div',{class:'jobHead'});
+ head.append(el('span',{class:'jobTitle'},jobTitle(job)));
+ const percent = jobPercent(job);
+ head.append(el('span',{class:'jobPct'},jobLive(job) ? (percent === null ? '…' : `${percent}%`) : job.state));
+ if (jobLive(job)) {
+  const cancel = el('button',{id:`jobCancel-${job.id}`,class:'jobCancel'},'Cancel');
+  cancel.addEventListener('click',() => cancelJob(job.id));
+  head.append(cancel);
+ }
+ row.append(head);
+ const bar = el('progress',{id:`jobBar-${job.id}`});
+ if (percent !== null) { bar.max = 100; bar.value = percent; } // no value at all = indeterminate
+ row.append(bar);
+ row.append(el('p',{class:'jobLine'},jobDetailLine(job)));
+ if (job.current && jobLive(job)) row.append(el('p',{class:'jobCurrent'},`now: ${job.current}`));
+ if (job.note) row.append(el('p',{class:'jobNote'},job.note));
+ if (job.error && job.state === 'failed') row.append(el('p',{class:'jobNote'},job.error));
+ if (job.warningCount) {
+  const box = el('details',{id:`jobErrors-${job.id}`,class:'errbox'});
+  box.append(el('summary',{},`Show warnings (${job.warningCount.toLocaleString()})`));
+  const list = el('ul',{});
+  for (const warning of job.warnings || []) list.append(el('li',{},warning));
+  if (job.warningCount > (job.warnings || []).length) list.append(el('li',{},`… and ${(job.warningCount-(job.warnings||[]).length).toLocaleString()} more`));
+  box.append(list); row.append(box);
+ }
+ return row;
+}
+
+// announceTransitions says only what §3.4 permits: a job started, a job
+// finished. Percentages are never announced — a screen reader repeating "37%,
+// 38%, 39%" twice a second is unusable.
+function announceTransitions(list) {
+ for (const job of list) {
+  const previous = lastState.get(job.id);
+  if (previous === job.state) continue;
+  lastState.set(job.id,job.state);
+  if (previous === undefined) { if (jobLive(job)) announce(`${jobTitle(job)} started.`); continue; }
+  if (!jobLive(job)) {
+   announce(`${jobTitle(job)} ${job.state === 'done' ? 'finished' : job.state}.`);
+   if (job.kind === 'delete' || job.kind === 'trash-restore' || job.kind === 'trash-empty') refreshAfterJob = true;
+  }
+ }
+ for (const id of [...lastState.keys()]) if (!list.some(j => j.id === id)) lastState.delete(id);
+}
+
+export function renderJobs(list) {
+ const visible = list.filter(j => !dismissed.has(j.id));
+ $('#jobsList').replaceChildren(...visible.map(jobRow));
+ $('#jobsEmpty').hidden = visible.length > 0;
+ const live = visible.filter(jobLive).length;
+ $('#btnJobs').textContent = live ? `Operations (${live})` : 'Operations';
+}
+
+// refreshJobs polls once and reports whether anything is still live. A failure
+// is shown but does not stop the loop from being restarted by the next submit.
+export async function refreshJobs() {
+ if (!state.session) return false;
+ const valid = sessionGuard();
+ const data = await api('api/jobs');
+ if (!valid()) return false;
+ const list = data.jobs || [];
+ announceTransitions(list);
+ renderJobs(list);
+ if (refreshAfterJob) { refreshAfterJob = false; loadList(); loadTree(); }
+ return shouldPoll(list) && !document.hidden;
+}
+
+// pollJobs starts (or restarts) the 500 ms loop. It is called after every
+// submit and whenever the tab becomes visible again; the loop stops itself when
+// nothing is queued or running.
+export function pollJobs() {
+ if (!poller) return;
+ poller.stop();
+ refreshJobs().then(again => { if (again) poller.start(); }).catch(err => error(err));
+}
+
+export async function cancelJob(id) {
+ const valid = sessionGuard();
+ try {
+  await api(`api/jobs/${id}/cancel`,{},{method:'POST'});
+  if (valid()) pollJobs();
+ } catch(err) { if (valid()) error(err); }
+}
+
+// trackJob shows the panel for a job that was just submitted and starts polling.
+export function trackJob(job) {
+ if (!job) return;
+ dismissed.delete(job.id);
+ panelOpen(true);
+ // pollJobs refreshes immediately and then every 500 ms while anything is
+ // live, so the new job appears from the same listing as everything else
+ // rather than being painted alone and then replaced.
+ pollJobs();
+}
+
+// awaitJob resolves with the finished job, polling until it leaves the live
+// states. Used by "Calculate size", which has a result to show.
+export async function awaitJob(id,{tries=1200,delay=500} = {}) {
+ for (let i = 0; i < tries; i++) {
+  const valid = sessionGuard();
+  const data = await api(`api/jobs/${id}`);
+  if (!valid()) return null;
+  if (!jobLive(data.job)) return data.job;
+  await new Promise(resolve => setTimeout(resolve,delay));
+ }
+ return null;
+}
+
+// calculateSize runs a size job for whatever the Properties dialog is showing
+// and fills the result in when it finishes (ui-ux §3.6). The job is visible in
+// the panel like any other, so a measurement of a huge tree can be cancelled.
+export async function calculateSize() {
+ const entry = propsTarget();
+ if (!entry) return;
+ const valid = sessionGuard();
+ $('#btnCalcSize').disabled = true; $('#propsSize').textContent = 'Calculating…';
+ try {
+  const res = await api('api/jobs/size',{},{method:'POST',headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({paths:[pathArgs(entry)],crossMounts:state.session?.family==='quts_hero'})});
+  if (!valid()) return;
+  trackJob(res.job);
+  const job = await awaitJob(res.job.id);
+  if (!valid() || propsTarget() !== entry) return;
+  if (!job) { $('#propsSize').textContent = 'Still measuring — see Operations.'; return; }
+  if (job.state !== 'done') { $('#propsSize').textContent = job.note || job.error || `Measurement ${job.state}.`; return; }
+  const result = job.result || {};
+  $('#propsSize').textContent = `${formatBytes(result.bytes||0)} in ${(result.files||0).toLocaleString()} file(s) and ${(result.dirs||0).toLocaleString()} folder(s)`;
+ } catch(err) { if (valid()) { $('#propsSize').textContent = err.message; error(err); } }
+ finally { if (valid()) $('#btnCalcSize').disabled = false; }
+}
+
+export function initJobs() {
+ poller = createPoller({load:refreshJobs});
+ $('#btnCalcSize').addEventListener('click',calculateSize);
+ $('#btnJobs').addEventListener('click',() => { const open = $('#jobsPanel').hidden; panelOpen(open); if (open) pollJobs(); });
+ $('#btnJobsClose').addEventListener('click',() => panelOpen(false));
+ $('#btnJobsClear').addEventListener('click',async () => {
+  // The manager reaps finished jobs on its own schedule, so "clear" is local:
+  // it hides what this session has already seen rather than pretending to
+  // delete a record somebody else may still need.
+  try { const data = await api('api/jobs'); for (const job of data.jobs || []) if (!jobLive(job)) dismissed.add(job.id); }
+  catch(err) { error(err); return; }
+  pollJobs();
+ });
+ document.addEventListener('visibilitychange',() => { if (document.hidden) poller.stop(); else pollJobs(); });
+}

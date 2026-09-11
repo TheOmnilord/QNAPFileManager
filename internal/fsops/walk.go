@@ -79,6 +79,13 @@ type WalkOptions struct {
 	// refused, because a read-only walk that re-read a directory would simply
 	// visit everything twice.
 	Mutating bool
+
+	// Protect refuses the never-write components the front-end guard refuses,
+	// per component, as the recursion reaches them (F10, never_write.go). The
+	// guard only ever sees a job's root paths, so without this a delete of a
+	// share would walk straight into its .zfs snapshot directory and its
+	// @Recycle bin — neither of which the guard was ever asked about.
+	Protect Protect
 }
 
 // WalkItem is one thing the walk reached.
@@ -250,10 +257,7 @@ func (w *walker) visit(ctx context.Context, it WalkItem, open dirOpener) error {
 // dropped in its place, cannot make the walk continue somewhere else.
 func (w *walker) children(ctx context.Context, d *dirRef, parent WalkItem) error {
 	parentOS, _ := w.r.OS(parent.Path)
-	parentDev, hasParentDev := uint64(0), false
-	if fi, err := d.stat(); err == nil {
-		parentDev, hasParentDev = devOf(fi)
-	}
+	parentID := identityFor(d)
 	for {
 		names, readErr := d.names(readChunk)
 		for _, name := range names {
@@ -261,6 +265,13 @@ func (w *walker) children(ctx context.Context, d *dirRef, parent WalkItem) error
 				return err
 			}
 			childPath := fsx.Join(parent.Path, name)
+			if reason, hit := w.opts.Protect.refuses(name); hit {
+				// F10: the component rule the guard applies to a job's root
+				// paths, applied here to every entry the recursion reaches.
+				// Neither entered nor removed nor counted — just reported.
+				w.warn(childPath, neverWriteErr(childPath, reason))
+				continue
+			}
 			fi, err := d.lstat(name)
 			if err != nil {
 				// Unlinked between getdents and the stat: an ordinary race in a
@@ -284,16 +295,7 @@ func (w *walker) children(ctx context.Context, d *dirRef, parent WalkItem) error
 				}
 				continue
 			}
-			if w.isMountPoint(childPath, fi, parentDev, hasParentDev) && !w.mayCross(parentOS, childPath) {
-				// Visited as an item so a size job can report the directory
-				// itself, never descended into and never removed.
-				it.Mount = true
-				if err := w.visit(ctx, it, nil); err != nil {
-					return err
-				}
-				continue
-			}
-			if err := w.visit(ctx, it, func() (*dirRef, error) { return d.child(name) }); err != nil {
+			if err := w.directory(ctx, d, it, parentOS, parentID); err != nil {
 				return err
 			}
 		}
@@ -311,34 +313,129 @@ func (w *walker) children(ctx context.Context, d *dirRef, parent WalkItem) error
 	}
 }
 
-// isMountPoint reports whether a child directory is the root of another
-// filesystem.
+// directory handles one child directory: it is OPENED first and the crossing
+// decision is then made from that descriptor (F4).
 //
-// The mount table answers first, by name, because reading it resolves nothing.
-// What it cannot answer is a mount made since the table was last read, and that
-// is settled by comparing the st_dev the walk already holds for the child with
-// the one it holds for the directory it lives in — both from descriptors, never
-// from a pathname. Off Linux there is no st_dev behind a FileInfo, so the table
-// is the whole answer there (devOf returns false), which is the same degradation
-// the listing's mount flag already accepts.
-func (w *walker) isMountPoint(childPath string, fi os.FileInfo, parentDev uint64, hasParentDev bool) bool {
+// The order is the whole point. The old shape decided from the lstat that
+// classified the entry and opened the directory afterwards, so the thing that
+// was measured and the thing that was walked were two different lookups with a
+// rename-sized gap between them. Now the openat with O_DIRECTORY|O_NOFOLLOW
+// happens first and every question — is this another filesystem, may the walk
+// enter it — is answered by fstat'ing that held descriptor. Whatever is swapped
+// into the name afterwards is a different object that this walk never touches.
+//
+// A directory that cannot be opened is one item's failure, not the job's, which
+// is the same answer visit() gave when it did the opening itself.
+func (w *walker) directory(ctx context.Context, parentDir *dirRef, it WalkItem, parentOS string, parentID mountIdentity) error {
+	child, boundary, err := w.openChild(parentDir, it.Name, it.Path, parentOS, parentID)
+	if err != nil {
+		// The item is still visited before the failure is reported, which is the
+		// order the walk has always had: a size job counts the directory it
+		// could not read, and a delete gets its Pre hook for it. Only the
+		// descent and the Post hook are lost.
+		if verr := w.visit(ctx, it, nil); verr != nil {
+			return verr
+		}
+		w.warn(it.Path, err)
+		return nil
+	}
+	if boundary {
+		// Visited as an item so a size job can report the directory itself,
+		// never descended into and never removed.
+		it.Mount = true
+		return w.visit(ctx, it, nil)
+	}
+
+	// The descriptor openChild just proved is the one the first pass uses.
+	// errRetryDir asks for a second pass, and that re-open is put through the
+	// identical check — a mount that appeared between two passes over a
+	// directory being emptied must stop the walk just as one that was there from
+	// the start does.
+	first := child
+	open := func() (*dirRef, error) {
+		if first != nil {
+			d := first
+			first = nil
+			return d, nil
+		}
+		d, boundary, err := w.openChild(parentDir, it.Name, it.Path, parentOS, parentID)
+		if err != nil {
+			return nil, err
+		}
+		if boundary {
+			// openChild closed the descriptor itself; there is nothing here to
+			// release, and nothing to descend into either.
+			return nil, fmt.Errorf("%q became a mount point and was left alone: %w", it.Path, fsx.ErrProtected)
+		}
+		return d, nil
+	}
+	verr := w.visit(ctx, it, open)
+	if first != nil {
+		// Pre returned fs.SkipDir, so the descriptor was never consumed.
+		first.close()
+	}
+	return verr
+}
+
+// openChild opens one child directory and decides, from that descriptor alone,
+// whether it is a mount boundary the walk may not cross (F4). It returns either
+// an open dirRef to descend into, or boundary = true with nothing open.
+func (w *walker) openChild(parentDir *dirRef, name, childPath, parentOS string, parentID mountIdentity) (*dirRef, bool, error) {
+	child, err := parentDir.child(name)
+	if err != nil {
+		return nil, false, err
+	}
+	childID := identityFor(child)
+	if !w.isMountPoint(childPath, childID, parentID) {
+		return child, false, nil
+	}
+	if !w.mayCrossInto(parentOS, parentID, childPath, childID) {
+		child.close()
+		return nil, true, nil
+	}
+	return child, false, nil
+}
+
+// isMountPoint reports whether a child directory that is now OPEN is the root of
+// another filesystem.
+//
+// Two answers are combined. The mount table answers by name, because reading it
+// resolves nothing — but it cannot see a mount made since it was last read. The
+// descriptor answers by identity, and that is the authoritative half: the mount
+// ID (statx STATX_MNT_ID, Linux 5.8+, or /proc/self/fdinfo as a fallback)
+// distinguishes two mounts even when they share a st_dev, which is exactly the
+// shape of a bind mount — the case a pure device comparison reports as "same
+// filesystem, carry on". st_dev is the older fallback for a kernel with neither.
+// Off Linux there is no identity behind a FileInfo at all, so the table is the
+// whole answer there, which is the degradation the listing's mount flag already
+// accepts (INV-2: this is the dev box, not the kernel).
+func (w *walker) isMountPoint(childPath string, childID mountIdentity, parentID mountIdentity) bool {
 	if w.plat != nil {
 		if osPath, err := w.r.OS(childPath); err == nil && osPath != "" && w.plat.IsMountPointByTable(osPath) {
 			return true
 		}
 	}
-	if !hasParentDev {
-		return false
-	}
-	dev, ok := devOf(fi)
-	return ok && dev != parentDev
+	return childID.differsFrom(parentID)
 }
 
-// mayCross applies PLAN.md decision 9 to a child that is a mount point: the
-// walk descends only when it was asked to and only where the mount table says
-// the two filesystems are one storage domain. With no mount table there is no
-// way to ask, and the answer to a question that cannot be asked is no.
-func (w *walker) mayCross(parentOS, childPath string) bool {
+// mayCrossInto applies PLAN.md decision 9 to a child that the held descriptor
+// says is on another mount: the walk descends only when it was asked to and only
+// where the mount table says the two filesystems are one storage domain.
+//
+// The table is refreshed first, and then the child mount is identified from the
+// DESCRIPTOR where the kernel gave one — the mount ID statx reported is the same
+// number /proc/self/mountinfo prints in its first field, so the fd names its own
+// row in the table rather than the table being asked about a pathname that may
+// by now mean something else. A name lookup is the fallback for a kernel with no
+// mount IDs and for a static table (PLAN.md decision 15), whose invented IDs
+// deliberately cannot collide with a running kernel's.
+//
+// If neither identifies the mount the answer is NO. That is the fail-closed rule
+// this function exists for: the descriptor has already proved the walk is about
+// to leave the filesystem it started on, and crossing into a mount nobody can
+// name is precisely the case decision 9 refuses — a USB disk, another pool, a
+// network share. With no mount table there is no way to ask at all.
+func (w *walker) mayCrossInto(parentOS string, parentID mountIdentity, childPath string, childID mountIdentity) bool {
 	if !w.opts.CrossMounts || w.plat == nil {
 		return false
 	}
@@ -346,8 +443,75 @@ func (w *walker) mayCross(parentOS, childPath string) bool {
 	if err != nil || childOS == "" || parentOS == "" {
 		return false
 	}
-	return w.plat.MayCross(w.plat.For(parentOS), w.plat.For(childOS))
+	// A mount made since the last read is exactly what the fd identity just
+	// caught, so the table is re-read before it is asked about it. On a static
+	// table this is a no-op (Platform.Refresh).
+	_ = w.plat.Refresh()
+	childCaps, ok := w.capsFor(childID, childOS, true)
+	if !ok {
+		return false
+	}
+	// The parent is allowed the longest-prefix answer: it is not the thing being
+	// entered, and its worst case is the zero FSCaps, which MayCross refuses.
+	parentCaps, _ := w.capsFor(parentID, parentOS, false)
+	return w.plat.MayCross(parentCaps, childCaps)
 }
+
+// capsFor names the mount a descriptor belongs to and returns its capabilities.
+//
+// byID is the authoritative lookup: statx's mount ID is mountinfo's first field,
+// so a descriptor identifies its own row. requireMount says the caller needs a
+// definite answer — the child of a crossing decision — in which case a name that
+// the table does not list as a mount point is a failure rather than a
+// longest-prefix guess.
+func (w *walker) capsFor(id mountIdentity, osPath string, requireMount bool) (platform.FSCaps, bool) {
+	if id.hasMnt {
+		for _, m := range w.plat.Mounts() {
+			if uint64(m.ID) == id.mnt {
+				return w.plat.For(m.MountPoint), true
+			}
+		}
+	}
+	if requireMount && !w.plat.IsMountPointByTable(osPath) {
+		return platform.FSCaps{}, false
+	}
+	return w.plat.For(osPath), true
+}
+
+// mountIdentity is what a held directory descriptor says about the filesystem it
+// belongs to (F4).
+//
+// mnt is the kernel's mount ID — what statx reports as STATX_MNT_ID and what
+// /proc/self/mountinfo prints in its first field. It is the value that matters,
+// because two mounts of the same device (a bind mount, and QTS builds its whole
+// share layout out of them) have one st_dev and two mount IDs: comparing devices
+// alone would walk straight across that boundary. dev is the older fallback, for
+// a kernel before 5.8 and for everything that is not Linux.
+type mountIdentity struct {
+	mnt    uint64
+	hasMnt bool
+	dev    uint64
+	hasDev bool
+}
+
+// differsFrom reports whether two descriptors are on different mounts. An
+// unanswerable comparison is "no": the mount table has already had its say, and
+// inventing a boundary from missing data would stop every ordinary walk.
+func (id mountIdentity) differsFrom(other mountIdentity) bool {
+	if id.hasMnt && other.hasMnt {
+		return id.mnt != other.mnt
+	}
+	if id.hasDev && other.hasDev {
+		return id.dev != other.dev
+	}
+	return false
+}
+
+// identityFor reads a descriptor's mount identity. It is a variable so that a
+// test can supply one without a real mount — mounting anything needs root, and
+// off Linux there is no identity to read at all (walk_other.go). The CI root and
+// ZFS jobs exercise the real thing.
+var identityFor = identityOf
 
 // Emit is how a long-running fsops job reports back: coalesced progress and
 // per-item warnings. Both hooks may be nil, which is what the tests and the

@@ -283,6 +283,17 @@ type JobResult struct {
 	Warnings int    `json:"w,omitempty"`
 	Warns    []Warn `json:"ws,omitempty"`
 	Detail   string `json:"m,omitempty"`
+	// Cancelled marks a job that stopped on cancellation. The worker still
+	// sends the terminal as an OK frame carrying this partial result — the
+	// counts and the folded warnings are the authoritative record of what
+	// actually happened, and an Err frame has no body to carry them (M2-A
+	// review round 1, finding 7). The pool returns the result together with
+	// context.Canceled so the manager keeps the structured partial data.
+	Cancelled bool `json:"cancelled,omitempty"`
+	// TrashIDs are the trash entry ids ("<unix>-<8hex>") a delete-to-trash job
+	// created, in path order, so the UI's Undo can restore exactly those
+	// entries instead of guessing from origPath and time (M2-A web review).
+	TrashIDs []string `json:"tids,omitempty"`
 }
 
 // SizeReq measures trees: files, directories and bytes under each path.

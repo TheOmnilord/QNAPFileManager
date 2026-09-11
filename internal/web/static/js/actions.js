@@ -1,8 +1,9 @@
 import {api} from './api.js';
-import {$,el,error,announce,openDialog,pathArgs} from './dom.js';
+import {$,el,error,announce,openDialog,pathArgs,toast} from './dom.js';
 import {state,sessionGuard} from './state.js';
 import {loadList,focused,selectedOne,selectionEntries,extraActions} from './list.js';
 import {loadTree} from './tree.js';
+import {trackJob} from './jobs.js';
 
 // post sends a JSON body to a mutation route. api() attaches the CSRF header and
 // throws an Error carrying .code and, for a 409, .confirm.
@@ -49,6 +50,7 @@ export function confirmDialog({title,body,why='',danger=false,phrase=''}) {
   $('#confirmTitle').textContent=title; $('#confirmBody').textContent=body;
   $('#confirmWhy').textContent=why; $('#confirmWhy').hidden=!why;
   const needPhrase=!!phrase; phraseLabel.hidden=!needPhrase; input.value='';
+  $('#confirmPhraseName').textContent=phrase;
   ok.textContent=danger?'Delete':'Confirm';
   const validate=() => { ok.disabled=needPhrase && input.value!==phrase; };
   validate();
@@ -68,22 +70,25 @@ function askWarn(confirm,message) {
 }
 
 // actionMessage maps a failure to a plain-language message (§6). Pure, so it is
-// unit-testable. A not-empty delete names what is still inside, so an
-// "empty-looking" folder (usually hidden QNAP metadata like .@__thumb) explains
-// itself rather than looking like a bug; recursive delete is a later version.
+// unit-testable. A not-empty refusal still names what is inside — the M1
+// single-level endpoint remains for API compatibility, and an "empty-looking"
+// folder (usually hidden QNAP metadata like .@__thumb) should explain itself
+// rather than look like a bug.
 export function actionMessage(err) {
  const messages={
   read_only:'Read-only mode is on. Open Settings to turn it off before making changes.',
   protected:'That is a protected system path and cannot be changed here.',
-  not_empty:'The folder is not empty. Deleting a folder’s contents is coming in a later version.',
+  not_empty:'The folder is not empty. Use Delete, which removes a folder and its contents.',
   permission:'The system refused the change (permission denied).',
   exists:'A file or folder with that name already exists here.',
   cross_device:'The source and destination are on different volumes.',
+  no_trash:'There is no Trash on this volume, so deleting here is permanent.',
+  queue_full:'Too many operations are already queued. Wait for some to finish, then try again.',
  };
  if (err.code==='not_empty' && Array.isArray(err.blockers) && err.blockers.length){
   const names = err.blockers.map(b=>b.name).join(', ') + (err.truncated ? ', …' : '');
   const note = err.blockers.some(b=>b.hidden) ? ' These are hidden items — turn on Hidden to see them.' : '';
-  return `The folder is not empty — still inside: ${names}.${note} Deleting a folder’s contents is coming in a later version.`;
+  return `The folder is not empty — still inside: ${names}.${note} Use Delete, which removes a folder and its contents.`;
  }
  return messages[err.code] || err.message || 'The change could not be completed.';
 }
@@ -124,40 +129,133 @@ export async function renameEntry(entry) {
  } catch(err) { if (valid()) actionError(err); }
 }
 
+// PERMANENT_WARNING is the exact sentence the server puts in a permanent
+// delete's confirmation summary (web.permanentWarning). It is a pinned contract
+// between the two halves: seeing it is what promotes the dialog to grade 2,
+// whatever the client thought it was asking for.
+export const PERMANENT_WARNING='This delete is permanent and cannot be undone.';
+
+// deleteGrade is the confirmation ladder for a delete (ui-ux §4.2). Grade 1 is
+// a simple confirm — a move to Trash is reversible. Grade 2 (typed phrase) is
+// for anything irreversible: a permanent delete, a server summary that says so,
+// a warn-class path, or a selection past the scale thresholds. Pure, so the
+// rule is unit-tested rather than inferred from the DOM.
+export function deleteGrade({mode,summary}) {
+ const s=summary||{},warnings=s.warnings||[];
+ if (mode==='permanent') return 2;
+ if (warnings.includes(PERMANENT_WARNING)) return 2;
+ if (warnings.length) return 2;
+ if ((s.files||0)>100 || (s.bytes||0)>(1<<30)) return 2;
+ return 1;
+}
+
+// deleteDialog is the one delete prompt: it chooses the mode, carries the
+// crossing checkbox on QuTS hero, and is itself the grade-1 or grade-2
+// confirmation. It resolves to {mode,crossMounts} or null.
+function deleteDialog({entries,mode,summary,note}) {
+ return new Promise(resolve => {
+  const dlg=$('#dlgDelete'),ok=$('#delOK'),perm=$('#delPermanent'),cross=$('#delCross'),phrase=$('#delPhrase');
+  const label=entries.length===1 ? `“${entries[0].name}”` : `${entries.length} items`;
+  const hero=state.session?.family==='quts_hero';
+  $('#delCrossRow').hidden=!hero;
+  if (!hero) cross.checked=false;
+  perm.checked=mode==='permanent';
+  $('#delNote').textContent=note||''; $('#delNote').hidden=!note;
+  const paint=() => {
+   const current=perm.checked ? 'permanent' : 'trash';
+   const grade=deleteGrade({mode:current,summary});
+   const warnings=(summary?.warnings||[]).filter(warning => warning!==PERMANENT_WARNING);
+   $('#delTitle').textContent=current==='permanent' ? 'Delete permanently' : 'Move to Trash';
+   $('#delBody').textContent=current==='permanent'
+    ? `Delete ${label} permanently? This cannot be undone.`
+    : `Move ${label} to Trash?`;
+   $('#delWhy').textContent=warnings.join(' · '); $('#delWhy').hidden=!warnings.length;
+   const needPhrase=grade===2;
+   $('#delPhraseLabel').hidden=!needPhrase;
+   $('#delPhraseName').textContent=entries[0].name;
+   dlg.classList.toggle('danger',needPhrase);
+   ok.textContent=current==='permanent' ? 'Delete permanently' : 'Move to Trash';
+   ok.disabled=needPhrase && phrase.value!==entries[0].name;
+  };
+  phrase.value='';
+  const cleanup=() => { ok.removeEventListener('click',onOK); perm.removeEventListener('change',paint); phrase.removeEventListener('input',paint); dlg.removeEventListener('close',onClose); };
+  const onOK=() => { cleanup(); const answer={mode:perm.checked ? 'permanent' : 'trash',crossMounts:!!cross.checked}; dlg.close(); resolve(answer); };
+  const onClose=() => { cleanup(); resolve(null); };
+  ok.addEventListener('click',onOK); perm.addEventListener('change',paint); phrase.addEventListener('input',paint); dlg.addEventListener('close',onClose);
+  paint();
+  openDialog('#dlgDelete');
+  (deleteGrade({mode:perm.checked ? 'permanent' : 'trash',summary})===2 ? phrase : ok).focus?.();
+ });
+}
+
+// deleteEntries deletes ANY selection — folders included, which is what the job
+// spine adds over M1's single-level /api/fs/delete (kept for compatibility, no
+// longer used here). The server demands a redeemed confirmation token for both
+// modes (decision 10), so the flow is: ask, POST, take the token challenge back
+// with the server's real summary, and re-post.
 export async function deleteEntries(entries) {
  if (!state.session?.canWrite || !entries || !entries.length) return;
- const label=entries.length===1 ? `“${entries[0].name}”` : `${entries.length} items`;
- // Grade 1: a simple confirm before any request.
- if (!await confirmDialog({title:'Delete',body:`Delete ${label}? This cannot be undone.`,danger:true})) return;
- const body=entries.length===1 ? pathArgs(entries[0]) : {paths:entries.map(pathArgs)};
- const valid=sessionGuard();
- try {
-  // Every delete is permanent in M1 (trash is M2), so the server now demands a
-  // confirmation token for ALL deletes and must be given the token round-trip
-  // (decision 10). A plain permanent delete carries no warnings, and the grade-1
-  // dialog above already covered it, so approve it silently; a warn-class area
-  // (server sends summary.warnings) still shows the detailed grade-2 dialog.
-  const res=await runMutation('api/fs/delete',body,(confirm,message) => {
-   const s=confirm.summary||{};
-   const warnings=s.warnings||[];
-   // A protected/warn path carries warnings; a large delete crosses the scale
-   // thresholds (100 files or 1 GiB, matching the server's guard.NeedsConfirm).
-   // Either one must be shown and explicitly acknowledged (standard P1 / adv 4);
-   // only a plain, small, unprotected permanent delete — already covered by the
-   // grade-1 dialog above — is auto-approved.
-   const large=(s.files||0)>100 || (s.bytes||0)>(1<<30);
-   if (!warnings.length && !large) return true;
-   const why=warnings.length ? warnings.join(' · ') : `${(s.files||0).toLocaleString()} item(s), ${(s.bytes||0).toLocaleString()} byte(s). This cannot be undone.`;
-   return confirmDialog({title:'Confirm deletion',body:message||'This delete needs confirmation.',why,danger:true});
-  });
-  if (!valid()) return;
-  if (res===null) return;
-  if (res.results) {
-   const failed=res.results.filter(r => !r.ok);
-   if (failed.length) { error(new Error(`${res.results.length-failed.length} of ${res.results.length} deleted; ${failed.length} could not be (${failed.map(r => r.code).join(', ')}).`)); afterMutation(); return; }
+ let mode='trash',note='',summary=null;
+ const shown=new Set();
+ for (;;) {
+  const choice=await deleteDialog({entries,mode,summary,note});
+  if (!choice) return;
+  mode=choice.mode;
+  // What the dialog just displayed, so a challenge that adds nothing new is not
+  // shown a second time (and the loop cannot spin on the same warnings).
+  const shownGrade=deleteGrade({mode,summary});
+  for (const warning of summary?.warnings||[]) shown.add(warning);
+  const body={paths:entries.map(pathArgs),mode,crossMounts:choice.crossMounts};
+  const valid=sessionGuard();
+  try {
+   // The dialog just shown IS the confirmation, so a challenge whose summary
+   // holds nothing the dialog did not already cover is approved directly; a
+   // summary that raises the grade re-opens the dialog with the server's own
+   // reasons before the token is spent.
+   let reAsk=false;
+   const res=await runMutation('api/jobs/delete',body,async confirm => {
+    const s=confirm.summary||{};
+    const unseen=(s.warnings||[]).filter(warning => warning!==PERMANENT_WARNING && !shown.has(warning));
+    if (!unseen.length && deleteGrade({mode,summary:s})<=shownGrade) return true;
+    summary=s; reAsk=true; return false;
+   });
+   if (!valid()) return;
+   if (reAsk) continue;
+   if (res===null) return;
+   trackJob(res.job);
+   announce(mode==='permanent' ? 'Deleting…' : 'Moving to Trash…');
+   if (mode!=='permanent') undoToast(res.job,entries.length);
+   return;
+  } catch(err) {
+   if (!valid()) return;
+   if (err.code==='no_trash') {
+    // §4.4: never silently promoted. The dialog re-opens as a permanent delete
+    // and says why it had to.
+    mode='permanent'; summary=null;
+    note='No Trash is available on this volume, so this delete is permanent.';
+    continue;
+   }
+   actionError(err); return;
   }
-  afterMutation('Deleted.');
- } catch(err) { if (valid()) actionError(err); }
+ }
+}
+
+// undoToast offers the 15-second Undo of ui-ux §4.4. The ids come from the
+// finished job's result; the trash panel is the fallback when they are not
+// there yet (the worker's JobResult carries counts, not entry ids).
+function undoToast(job,count) {
+ toast(`Moved ${count.toLocaleString()} item(s) to Trash`,'Undo',async () => {
+  const valid=sessionGuard();
+  try {
+   const data=await api(`api/jobs/${job.id}`);
+   if (!valid()) return;
+   const ids=data.job?.result?.trashIds||[];
+   if (!ids.length) { error(new Error('Those items could not be identified for Undo. Open Trash to restore them.')); return; }
+   const res=await api('api/trash/restore',{},{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ids})});
+   if (!valid()) return;
+   trackJob(res.job);
+  } catch(err) { if (valid()) actionError(err); }
+ },15000);
 }
 
 // deleteSelection deletes the current explicit selection (toolbar/keyboard). It

@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"qnapfilemanager/internal/fsx"
@@ -79,5 +80,57 @@ func TestMountPointOffTheTableIsFoundByDevice(t *testing.T) {
 	}
 	if !e.MountPoint {
 		t.Error("/proc is a mount point and its device differs from /'s, so it must be classified as one")
+	}
+}
+
+// TestWalkRefusesARealMountPointWithoutCrossMounts is F4 against a real mount
+// rather than a test hook: a tmpfs mounted underneath the tree must not be
+// entered, and the decision must come from the DESCRIPTOR the walk opened, not
+// from the mount table — which here is told nothing about it.
+//
+// Mounting needs root, so this is the CI root job's test (test-linux-root in
+// PLAN.md decision 14). It skips everywhere else rather than simulating the
+// kernel (INV-2).
+func TestWalkRefusesARealMountPointWithoutCrossMounts(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("mounting a tmpfs needs root; the CI root job runs this one")
+	}
+	base := tempDir(t)
+	mkdir(t, base, "a/sub")
+	write(t, base, "a/one.txt", "one")
+	mnt := filepath.Join(base, "a", "sub")
+	if err := syscall.Mount("tmpfs", mnt, "tmpfs", 0, "size=1m"); err != nil {
+		t.Skipf("tmpfs is not available here: %v", err)
+	}
+	t.Cleanup(func() { _ = syscall.Unmount(mnt, 0) })
+	if err := os.WriteFile(filepath.Join(mnt, "inside.txt"), []byte("on the tmpfs"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r := newRoot(t, base)
+
+	// No mount table at all: the fd identity is the only thing that can answer,
+	// and it must.
+	var off recorder
+	if err := Walk(context.Background(), r, nil, "/a", WalkOptions{}, off.visitor()); err != nil {
+		t.Fatalf("Walk: %v", err)
+	}
+	if indexOf(off.mount, "/a/sub") < 0 {
+		t.Errorf("the tmpfs was not recognised as a mount point: mount = %v pre = %v", off.mount, off.pre)
+	}
+	if indexOf(off.pre, "/a/sub/inside.txt") >= 0 {
+		t.Error("the walk entered a real mount point without CrossMounts")
+	}
+	if indexOf(off.pre, "/a/one.txt") < 0 {
+		t.Error("the rest of the tree must still be walked")
+	}
+
+	// CrossMounts cannot help either: a tmpfs is not Storage, so decision 9
+	// refuses it however the table is asked.
+	var on recorder
+	if err := Walk(context.Background(), r, platform.Detect(), "/a", WalkOptions{CrossMounts: true}, on.visitor()); err != nil {
+		t.Fatalf("Walk: %v", err)
+	}
+	if indexOf(on.pre, "/a/sub/inside.txt") >= 0 {
+		t.Error("CrossMounts descended into a RAM disk")
 	}
 }

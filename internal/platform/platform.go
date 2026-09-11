@@ -301,6 +301,35 @@ func (p *Platform) MayCross(from, to FSCaps) bool {
 	return to.Storage && !to.Network && to.Domain == from.Domain
 }
 
+// TrashRootFor returns the mount root under which a trash directory for
+// osPath belongs (PLAN.md decision 10 / identity plan §4.2): the NEAREST
+// enclosing mount, which must itself be a Storage, non-network filesystem. On
+// QTS that is the volume (or bind-mounted share) root; on QuTS hero the share's
+// own dataset root, next to @Recycle.
+//
+// It never climbs past the nearest mount to a Storage parent. The item's data
+// lives on that nearest mount, so a rename into any parent would cross devices
+// (EXDEV) — and for a pseudo-filesystem it would be wrong outright: nothing
+// under /proc, /sys, /dev, a tmpfs RAM disk or a network mount is ever
+// trashed, even on a QTS whose root filesystem is itself flash storage. In all
+// those cases ok is false and the caller must treat the delete as permanent.
+//
+// It never touches the filesystem: it is a pure mount-table lookup, which is
+// exactly why the root front-end (which creates the 1777 trash directory) and
+// the user's worker (which renames into it) agree on the same root by
+// construction.
+func (p *Platform) TrashRootFor(osPath string) (mountRoot string, caps FSCaps, ok bool) {
+	m, found := p.MountFor(osPath)
+	if !found {
+		return "", FSCaps{}, false
+	}
+	c := p.For(m.MountPoint)
+	if !c.Storage || c.Network {
+		return "", FSCaps{}, false
+	}
+	return m.MountPoint, c, true
+}
+
 // IsMountPointByTable reports whether osPath is a mount point according to the
 // mount table alone. It touches the filesystem only to re-read
 // /proc/self/mountinfo, and never resolves osPath: no stat, no symlink

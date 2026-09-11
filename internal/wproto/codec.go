@@ -62,6 +62,28 @@ func NewErr(id uint64, err error, path []byte) Frame {
 	}}
 }
 
+// NewProg builds a non-terminal progress frame for the job running under id.
+// It carries the SAME id as the JobReq, so the pool's pending table routes it
+// to the waiting Job call without any second channel (identity plan §2.5).
+func NewProg(id uint64, p Prog) (Frame, error) {
+	b, err := json.Marshal(p)
+	if err != nil {
+		return Frame{}, fmt.Errorf("marshal progress: %w", err)
+	}
+	return Frame{ID: id, Kind: KindProg, Body: b}, nil
+}
+
+// NewWarn builds a non-terminal per-item warning frame for the job running
+// under id. A warning does not end the job; the terminal JobResult also folds
+// it in, so a frame lost to a slow reader is never a lost record.
+func NewWarn(id uint64, w Warn) (Frame, error) {
+	b, err := json.Marshal(w)
+	if err != nil {
+		return Frame{}, fmt.Errorf("marshal warning: %w", err)
+	}
+	return Frame{ID: id, Kind: KindWarn, Body: b}, nil
+}
+
 // Decode reads one length-prefixed JSON frame. It is the fd-free half of the
 // codec: the Unix-socket path in conn_linux.go uses the same framing, which is
 // what lets the protocol be tested on Windows where SCM_RIGHTS does not exist.

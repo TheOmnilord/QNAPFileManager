@@ -33,6 +33,25 @@ type Config struct {
 	Worker  Worker  `json:"worker"`
 	Limits  Limits  `json:"limits"`
 	Logging Logging `json:"logging"`
+	Jobs    Jobs    `json:"jobs"`
+}
+
+// Jobs bounds the M2 job manager (design §3). Two independent classes so a
+// folder-size probe is never stuck behind a 200 GB copy.
+type Jobs struct {
+	// ByteMovers caps concurrent copy/move/archive jobs; a spinning-disk NAS
+	// thrashes beyond two.
+	ByteMovers int `json:"byteMovers"`
+	// Metadata caps concurrent delete/size/search/trash jobs.
+	Metadata int `json:"metadata"`
+	// QueueDepth caps queued jobs per class; beyond it a submit is refused
+	// with queue_full rather than silently waiting.
+	QueueDepth int `json:"queueDepth"`
+	// RetainMinutes keeps a finished job visible this long, or RetainCount
+	// most recent, whichever keeps more. Jobs are in-memory only; the audit
+	// log is the durable record.
+	RetainMinutes int `json:"retainMinutes"`
+	RetainCount   int `json:"retainCount"`
 }
 
 type Web struct {
@@ -134,6 +153,7 @@ func Default() Config {
 		Worker:   Worker{Max: 8, IdleTimeout: "10m", Umask: "0022"},
 		Limits:   Limits{ListMax: 5000, MaxTextBytes: 2 << 20},
 		Logging:  Logging{MaxSizeMB: 8, QuLog: true},
+		Jobs:     Jobs{ByteMovers: 2, Metadata: 4, QueueDepth: 64, RetainMinutes: 60, RetainCount: 50},
 	}
 }
 

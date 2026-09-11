@@ -15,6 +15,7 @@ import (
 	"strconv"
 
 	"qnapfilemanager/internal/fsx"
+	"qnapfilemanager/internal/wproto"
 )
 
 // Principal is the resolved identity a request runs as. Root is true only for
@@ -88,3 +89,23 @@ type Mutator interface {
 }
 
 func itoa(i int) string { return strconv.Itoa(i) }
+
+// Jobs runs the long-lived M2 operations as a principal. A job is ONE RPC:
+// progress and per-item warnings arrive in-band through the callbacks until
+// the terminal result (identity plan §2.5). Like Mutator it is a separate
+// interface, so internal/web compiles against exactly what it uses; the
+// production *workerpool.Pool satisfies Backend, Mutator and Jobs.
+type Jobs interface {
+	// Job runs req to completion under ctx. onProg and onWarn may be nil.
+	// Cancelling ctx stops the job (the pool also tells the worker); a
+	// cancelled job returns ctx.Err(), and partial work is NOT rolled back —
+	// the caller states that fact rather than pretending otherwise (design §3).
+	Job(ctx context.Context, who Principal, req wproto.JobReq, onProg func(wproto.Prog), onWarn func(wproto.Warn)) (wproto.JobResult, error)
+	// CancelJob asks the principal's worker to stop jobID promptly. It is a
+	// separate, immediate RPC; the Job call itself returns once the worker
+	// has actually stopped.
+	CancelJob(ctx context.Context, who Principal, jobID string) error
+	// TrashList lists the principal's own trashed items: a plain read, not a
+	// job, so the trash panel opens without a job round-trip.
+	TrashList(ctx context.Context, who Principal) (wproto.TrashListResp, error)
+}

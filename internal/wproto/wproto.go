@@ -33,6 +33,7 @@ const (
 	OpText      Op = "text"
 	OpJob       Op = "job" // copy|move|delete|size|search|archive|chmod|chown|trash
 	OpCancel    Op = "cancel"
+	OpTrashList Op = "trashlist" // list the caller's own trash: a plain read, not a job (M2)
 	OpPing      Op = "ping"
 	OpBye       Op = "bye" // graceful shutdown: finish nothing new, exit
 )
@@ -58,7 +59,12 @@ const (
 	JobArchive = "archive"
 	JobChmod   = "chmod"
 	JobChown   = "chown"
-	JobTrash   = "trash"
+	JobTrash   = "trash" // accepted as JobDelete with DeleteReq.Trash set (M2)
+
+	// M2 trash management. A delete-to-trash is JobDelete with DeleteReq.Trash
+	// set; these two operate on the caller's own trash afterwards.
+	JobTrashRestore = "trash-restore" // TrashRestoreReq
+	JobTrashEmpty   = "trash-empty"   // TrashEmptyReq
 )
 
 // Conflict resolutions for a copy, move or upload finalize.

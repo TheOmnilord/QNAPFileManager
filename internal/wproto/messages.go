@@ -225,6 +225,9 @@ type DeleteReq struct {
 	Recursive bool     `json:"r,omitempty"`
 	// Trash renames into the nearest .@qfm_trash instead of unlinking.
 	Trash bool `json:"t,omitempty"`
+	// CrossMounts lets the recursive walk descend into mounts of the same
+	// storage domain ("include mounted sub-folders"); see CopyOptions.CrossMounts.
+	CrossMounts bool `json:"x,omitempty"`
 }
 
 // DeleteOneReq removes a single item (OpDelete, M1): a file, an empty
@@ -255,3 +258,65 @@ type Warn struct {
 	Message string `json:"m"`
 	Errno   int    `json:"n,omitempty"`
 }
+
+// ---- Jobs (M2) --------------------------------------------------------------
+//
+// The job kinds themselves (JobDelete, JobSize, JobTrashRestore, ...) live in
+// wproto.go beside the ops. The worker dispatches on them; the front-end's
+// jobs.Manager sorts them into the byte-mover and metadata semaphore classes
+// (design §3). A delete-to-trash is JobDelete with DeleteReq.Trash set; the
+// older JobTrash kind is accepted by the worker as the same thing.
+
+// WarnCap bounds JobResult.Warns; beyond it only Warnings counts.
+const WarnCap = 100
+
+// JobResult is the body of a job's terminal OK frame. It is also the job's
+// durable summary: the worker folds its per-item failures in here (capped),
+// so a Warn frame dropped by a slow reader is never a lost record.
+type JobResult struct {
+	Files   int64 `json:"f"`           // items completed (deleted, sized, restored, copied)
+	Bytes   int64 `json:"b"`           // bytes accounted
+	Dirs    int64 `json:"d,omitempty"` // directories completed
+	Skipped int64 `json:"s,omitempty"` // items skipped by policy or by a per-item failure
+	// Warnings is the TOTAL number of per-item failures; Warns carries the
+	// first WarnCap of them verbatim.
+	Warnings int    `json:"w,omitempty"`
+	Warns    []Warn `json:"ws,omitempty"`
+	Detail   string `json:"m,omitempty"`
+}
+
+// SizeReq measures trees: files, directories and bytes under each path.
+type SizeReq struct {
+	Paths       [][]byte `json:"p"`
+	CrossMounts bool     `json:"x,omitempty"`
+}
+
+// TrashListReq lists the caller's own trashed items (OpTrashList — a plain
+// request, not a job, so the panel opens without a job round-trip).
+type TrashListReq struct{}
+
+// TrashItem is one entry under <trash>/<uid>/. ID is the entry directory's
+// name ("<unix>-<8hex>"); the original path and stat come from its sidecar.
+type TrashItem struct {
+	ID        string `json:"i"`
+	Name      []byte `json:"n"` // original basename
+	OrigPath  []byte `json:"o"` // original API path
+	Type      string `json:"t"` // "dir" | "file" | "symlink" | ...
+	Size      int64  `json:"s"`
+	DeletedAt int64  `json:"d"` // unix seconds
+	Trash     []byte `json:"r"` // API path of the .@qfm_trash root holding it
+}
+
+type TrashListResp struct {
+	Items []TrashItem `json:"items"`
+}
+
+// TrashRestoreReq moves items back to their original paths (job kind
+// trash-restore). IDs are TrashItem.ID values.
+type TrashRestoreReq struct {
+	IDs []string `json:"i"`
+}
+
+// TrashEmptyReq permanently deletes everything in the caller's own trash
+// (job kind trash-empty).
+type TrashEmptyReq struct{}

@@ -117,6 +117,18 @@ func (s *session) jobWork(ctx context.Context, req wproto.JobReq, e *progEmitter
 		// JobTrash is the older spelling of "delete to trash" and means exactly
 		// DeleteReq.Trash, so either way of asking lands in the same place.
 		if body.Trash || req.Kind == wproto.JobTrash {
+			// Exact Undo. fsops.Trash names the entries it created in the
+			// result it returns — TrashIDs, in path order and only for the
+			// items it really moved — and this is the frame those ids travel
+			// in ("tids" on the wire), so the front-end's toast restores
+			// exactly those entries instead of matching original paths and a
+			// timestamp against the whole trash listing.
+			//
+			// Nothing below this point may drop them: progEmitter.fold writes
+			// only the warning ledger, and the terminal of a CANCELLED job is
+			// an OK frame carrying this same partial result (F7) — the entries
+			// it did create are real, and undoing them is precisely what
+			// somebody who stopped the job will want.
 			return fsops.Trash(ctx, s.root, s.plat, s.uid(), pathsOf(body.Paths), emit)
 		}
 		return fsops.DeleteTree(ctx, s.root, s.plat, pathsOf(body.Paths),

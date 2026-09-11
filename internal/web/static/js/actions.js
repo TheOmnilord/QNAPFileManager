@@ -240,16 +240,27 @@ export async function deleteEntries(entries) {
  }
 }
 
-// undoToast offers the 15-second Undo of ui-ux §4.4. The ids come from the
-// finished job's result; the trash panel is the fallback when they are not
-// there yet (the worker's JobResult carries counts, not entry ids).
+// undoToast offers the 15-second Undo of ui-ux §4.4.
+//
+// The ids are the job's own: the worker names the trash entries it created and
+// they reach here as result.trashIds, so the Undo restores exactly what this
+// delete moved rather than whatever the trash panel currently holds under the
+// same original path. The job is re-read on the click — the toast is offered the
+// moment the 202 comes back, long before the work is done, so the result is
+// usually not on the job object yet — and the one already in hand is preferred
+// when it is. No ids means the job is still running (or an old worker answered
+// and the server's fallback found nothing), and then the trash panel is the
+// honest answer rather than a guess.
 function undoToast(job,count) {
  toast(`Moved ${count.toLocaleString()} item(s) to Trash`,'Undo',async () => {
   const valid=sessionGuard();
   try {
-   const data=await api(`api/jobs/${job.id}`);
-   if (!valid()) return;
-   const ids=data.job?.result?.trashIds||[];
+   let ids=job?.result?.trashIds||[];
+   if (!ids.length) {
+    const data=await api(`api/jobs/${job.id}`);
+    if (!valid()) return;
+    ids=data.job?.result?.trashIds||[];
+   }
    if (!ids.length) { error(new Error('Those items could not be identified for Undo. Open Trash to restore them.')); return; }
    const res=await api('api/trash/restore',{},{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ids})});
    if (!valid()) return;

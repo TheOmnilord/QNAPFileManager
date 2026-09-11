@@ -7,6 +7,7 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -454,15 +455,25 @@ func TestJobSizeMeasuresWithoutChangingAnything(t *testing.T) {
 	}
 }
 
-// TestTrashJobAndTrashListRoundTrip drives the trash over the wire: a delete
-// with Trash set moves the item into .@qfm_trash, OpTrashList shows it, and a
-// trash-restore job puts it back.
+// trashHost builds the one fixture the trash needs and cannot invent: an
+// unjailed worker whose synthetic mount table declares the test's own temporary
+// directory to be an ext4 storage mount, with .@qfm_trash already standing in it
+// as the root front-end would have made it (1777, sticky).
 //
-// The worker is unjailed here, because the mount table speaks host paths: the
-// synthetic table declares the test's own temporary directory to be an ext4
-// storage mount, which is how the hero and QTS trash layouts are exercised on a
-// dev box (PLAN.md decision 15).
-func TestTrashJobAndTrashListRoundTrip(t *testing.T) {
+// It is unjailed because the mount table speaks host paths (PLAN.md decision
+// 15), and it returns the API spelling of that directory, which is what every
+// request below is addressed by.
+func trashHost(t *testing.T) (wproto.Transport, string, string) {
+	t.Helper()
+	// The worker demands that .@qfm_trash be owned by uid 0 — the root
+	// front-end is what makes it (round-1 finding 2) — and an unprivileged test
+	// process cannot produce a root-owned directory, so on Linux this fixture
+	// is only honest as root. fsops proves the ownership rule itself on every
+	// job; here the subject is the wire round trip, which the CI root job runs
+	// for real and Windows runs without uids (INV-2: never simulate the kernel).
+	if runtime.GOOS != "windows" && os.Geteuid() != 0 {
+		t.Skip("the trash root must be owned by root; run as root (the CI root job does)")
+	}
 	base := t.TempDir()
 	if real, err := filepath.EvalSymlinks(base); err == nil {
 		base = real
@@ -476,7 +487,6 @@ func TestTrashJobAndTrashListRoundTrip(t *testing.T) {
 	}
 	api := path.Clean("/" + strings.TrimPrefix(filepath.ToSlash(strings.TrimPrefix(base, vol)), "/"))
 
-	// The trash directory as the root front-end would have made it.
 	trash := filepath.Join(base, ".@qfm_trash")
 	if err := os.Mkdir(trash, 0o777); err != nil {
 		t.Fatal(err)
@@ -486,10 +496,6 @@ func TestTrashJobAndTrashListRoundTrip(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := os.WriteFile(filepath.Join(base, "doc.txt"), []byte("hello"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
 	line := fmt.Sprintf("36 1 8:1 / %s rw,relatime - ext4 /dev/sda1 rw\n", strings.ReplaceAll(api, " ", `\040`))
 	plat, err := platform.FromMountinfo(strings.NewReader(line))
 	if err != nil {
@@ -497,6 +503,22 @@ func TestTrashJobAndTrashListRoundTrip(t *testing.T) {
 	}
 	tr, _ := dialWith(t, "", Options{Platform: plat})
 	helloIn(t, tr, "")
+	return tr, base, api
+}
+
+// TestTrashJobAndTrashListRoundTrip drives the trash over the wire: a delete
+// with Trash set moves the item into .@qfm_trash, OpTrashList shows it, and a
+// trash-restore job puts it back.
+//
+// The worker is unjailed here, because the mount table speaks host paths: the
+// synthetic table declares the test's own temporary directory to be an ext4
+// storage mount, which is how the hero and QTS trash layouts are exercised on a
+// dev box (PLAN.md decision 15).
+func TestTrashJobAndTrashListRoundTrip(t *testing.T) {
+	tr, base, api := trashHost(t)
+	if err := os.WriteFile(filepath.Join(base, "doc.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	send(t, tr, 21, wproto.OpJob, wproto.JobReq{
 		JobID: "trash-1",
@@ -534,5 +556,76 @@ func TestTrashJobAndTrashListRoundTrip(t *testing.T) {
 	}
 	if got, err := os.ReadFile(filepath.Join(base, "doc.txt")); err != nil || string(got) != "hello" {
 		t.Fatalf("the restored file = %q, %v", got, err)
+	}
+}
+
+// TestTrashJobReportsTheEntryIDsItCreated: the terminal result of a
+// delete-to-trash names the entries the job made ("tids" on the wire), because
+// that is what the front-end's Undo restores. Guessing them from the listing by
+// original path and time is what this replaces, and a guess can name the wrong
+// entry when the same path is deleted twice.
+func TestTrashJobReportsTheEntryIDsItCreated(t *testing.T) {
+	tr, base, api := trashHost(t)
+	for _, name := range []string{"first.txt", "second.txt"} {
+		if err := os.WriteFile(filepath.Join(base, name), []byte(name), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	send(t, tr, 31, wproto.OpJob, wproto.JobReq{
+		JobID: "trash-ids",
+		Kind:  wproto.JobDelete,
+		Body: mustJSON(t, wproto.DeleteReq{Paths: [][]byte{
+			[]byte(api + "/first.txt"), []byte(api + "/second.txt"),
+		}, Trash: true}),
+	})
+	res := readJob(t, tr, 31).result(t)
+	if res.Files != 2 || res.Skipped != 0 || res.Warnings != 0 {
+		t.Fatalf("result = %+v, want both files trashed", res)
+	}
+	if len(res.TrashIDs) != 2 {
+		t.Fatalf("TrashIDs = %v, want one per trashed item", res.TrashIDs)
+	}
+
+	// The ids are the directories on disk, in the order the paths were given.
+	uid := 0
+	if id := os.Getuid(); id >= 0 {
+		uid = id
+	}
+	for i, want := range []string{"first.txt", "second.txt"} {
+		entry := filepath.Join(base, ".@qfm_trash", strconv.Itoa(uid), res.TrashIDs[i])
+		raw, err := os.ReadFile(filepath.Join(entry, "meta.json"))
+		if err != nil {
+			t.Fatalf("TrashIDs[%d] = %q names no entry on disk: %v", i, res.TrashIDs[i], err)
+		}
+		var meta struct {
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal(raw, &meta); err != nil {
+			t.Fatal(err)
+		}
+		if meta.Name != want {
+			t.Errorf("TrashIDs[%d] names %q, want the entry for %q", i, meta.Name, want)
+		}
+		if _, err := os.Lstat(filepath.Join(entry, "item")); err != nil {
+			t.Errorf("entry %q has no payload: %v", res.TrashIDs[i], err)
+		}
+	}
+
+	// And what the listing reports is the same set, which is what makes the ids
+	// usable as a restore request.
+	listed := req(t, tr, 32, wproto.OpTrashList, wproto.TrashListReq{})
+	var resp wproto.TrashListResp
+	if err := listed.Unmarshal(&resp); err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	for _, it := range resp.Items {
+		seen[it.ID] = true
+	}
+	for _, id := range res.TrashIDs {
+		if !seen[id] {
+			t.Errorf("id %q is not in the trash listing %+v", id, resp.Items)
+		}
 	}
 }

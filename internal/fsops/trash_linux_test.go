@@ -119,3 +119,59 @@ func TestTrashSidecarMustBeOwnedByTheReader(t *testing.T) {
 		t.Fatal("a sidecar owned by somebody else chose where a root worker wrote")
 	}
 }
+
+// TestTrashEmptyKeepsAnEntryTheKernelWillNotEmpty is finding 14 with the kernel
+// making the refusal rather than the app: a payload holding a sub-item this
+// process may not unlink, because the directory it is in is read-only to it.
+//
+// The entry must come out of the empty exactly as it went in — sidecar, payload
+// and all — because an entry whose sidecar had gone first would still be holding
+// the user's data with nothing left to name it: not listed, not restorable.
+//
+// Root is refused nothing (CAP_DAC_OVERRIDE), so this asks the unprivileged
+// Linux job; the @Recycle version of the same property runs everywhere.
+func TestTrashEmptyKeepsAnEntryTheKernelWillNotEmpty(t *testing.T) {
+	requireUnprivileged(t)
+	r, plat, base, api := trashFixture(t)
+	uid := selfUID()
+	mkdir(t, base, "tree/locked")
+	write(t, base, "tree/locked/file.txt", "x")
+	var log jobLog
+	res, err := Trash(context.Background(), r, plat, uid, []string{api + "/tree"}, log.emit())
+	if err != nil || len(res.TrashIDs) != 1 {
+		t.Fatalf("Trash = %+v, %v (%v)", res, err, log.warns)
+	}
+	id := res.TrashIDs[0]
+	// r-x: the file inside can be seen but not unlinked, so the directory
+	// holding it cannot go either.
+	locked := filepath.Join(trashEntryDir(base, uid, id), trashItemName, "locked")
+	if err := os.Chmod(locked, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	// Put it back before t.TempDir tries to remove the tree.
+	chmodBack(t, locked, 0o700)
+
+	var empty jobLog
+	if _, err := TrashEmpty(context.Background(), r, plat, uid, empty.emit()); err != nil {
+		t.Fatalf("TrashEmpty: %v", err)
+	}
+	items, err := TrashList(context.Background(), r, plat, uid)
+	if err != nil {
+		t.Fatalf("TrashList after empty: %v", err)
+	}
+	if len(items) != 1 || items[0].ID != id {
+		t.Fatalf("TrashList = %+v, want entry %s still listed after an empty it survived", items, id)
+	}
+	entry := trashEntryDir(base, uid, id)
+	for _, name := range []string{trashMetaName, trashItemName} {
+		if _, err := os.Lstat(filepath.Join(entry, name)); err != nil {
+			t.Errorf("%s of the kept entry: %v", name, err)
+		}
+	}
+	if _, err := os.Lstat(filepath.Join(locked, "file.txt")); err != nil {
+		t.Errorf("the file the kernel would not let go is gone: %v", err)
+	}
+	if indexOf(empty.codes(), "not_empty") < 0 {
+		t.Errorf("warn codes = %v, want the entry reported as kept", empty.codes())
+	}
+}

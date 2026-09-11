@@ -865,6 +865,100 @@ func TestTrashRestoreRefusals(t *testing.T) {
 	}
 }
 
+// --- Undo --------------------------------------------------------------------
+
+// jobResult reads the result view a finished job published.
+func jobResult(t *testing.T, job jobs.Job) jobResultView {
+	t.Helper()
+	var view jobResultView
+	if len(job.Result) == 0 {
+		t.Fatalf("job %s published no result", job.ID)
+	}
+	if err := json.Unmarshal(job.Result, &view); err != nil {
+		t.Fatal(err)
+	}
+	return view
+}
+
+// runTrashDelete posts one delete-to-trash through the confirmation ladder and
+// returns the finished job.
+func runTrashDelete(t *testing.T, s *Server, c *http.Cookie, csrf, path string) jobs.Job {
+	t.Helper()
+	body := fmt.Sprintf(`{"paths":[{"path":%q}],"mode":"trash"}`, path)
+	env := challenge(t, s, c, csrf, "/api/jobs/delete", body)
+	job := acceptedJob(t, post(s, "/api/jobs/delete", c, csrf, withToken(body, env.Confirm.Token)))
+	return awaitTerminal(t, s, job.ID)
+}
+
+// TestUndoUsesTheWorkersOwnTrashIDs: the worker names the entries its trash
+// delete created, and those ids — not a match against the trash listing — are
+// what the job's result carries and what the Undo restore then asks for.
+//
+// The listing here deliberately holds an entry for the same original path with a
+// DIFFERENT id, which is exactly the case the old heuristic got wrong: delete
+// the same name twice and "their own item, same origPath, trashed since this job
+// started" names both.
+func TestUndoUsesTheWorkersOwnTrashIDs(t *testing.T) {
+	s, _, fj := jobsFixture(t, jobs.Limits{})
+	fj.result = wproto.JobResult{Files: 1, Bytes: 5, TrashIDs: []string{"1700000100-11111111"}}
+	fj.trash = wproto.TrashListResp{Items: []wproto.TrashItem{
+		{ID: "1700000100-11111111", Name: []byte("a.txt"), OrigPath: []byte("/a.txt"), Type: "file", DeletedAt: time.Now().Unix()},
+		{ID: "1700000099-22222222", Name: []byte("a.txt"), OrigPath: []byte("/a.txt"), Type: "file", DeletedAt: time.Now().Unix()},
+	}}
+	c, csrf := sessionCookie(t, s)
+	final := runTrashDelete(t, s, c, csrf, "/a.txt")
+	view := jobResult(t, final)
+	if len(view.TrashIDs) != 1 || view.TrashIDs[0] != "1700000100-11111111" {
+		t.Fatalf("result trashIds = %v, want exactly the worker's own id", view.TrashIDs)
+	}
+
+	// The Undo: the client posts the ids it found on the job result, and what
+	// reaches the worker must be exactly those.
+	ids, err := json.Marshal(map[string]any{"ids": view.TrashIDs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	restore := acceptedJob(t, post(s, "/api/trash/restore", c, csrf, string(ids)))
+	awaitTerminal(t, s, restore.ID)
+	reqs := fj.requests()
+	var got wproto.TrashRestoreReq
+	if err := json.Unmarshal(reqs[len(reqs)-1].Body, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.IDs) != 1 || got.IDs[0] != view.TrashIDs[0] {
+		t.Fatalf("restore request %+v, want exactly the job's trash ids %v", got, view.TrashIDs)
+	}
+}
+
+// TestUndoFallsBackToTheListingForAnOlderWorker: a worker that reports no ids
+// at all is the one case the origPath/time heuristic is still for.
+func TestUndoFallsBackToTheListingForAnOlderWorker(t *testing.T) {
+	s, _, fj := jobsFixture(t, jobs.Limits{})
+	fj.result = wproto.JobResult{Files: 1, Bytes: 5}
+	fj.trash = wproto.TrashListResp{Items: []wproto.TrashItem{
+		{ID: "1700000100-33333333", Name: []byte("a.txt"), OrigPath: []byte("/a.txt"), Type: "file", DeletedAt: time.Now().Unix()},
+		{ID: "1700000101-44444444", Name: []byte("b.txt"), OrigPath: []byte("/b.txt"), Type: "file", DeletedAt: time.Now().Unix()},
+	}}
+	c, csrf := sessionCookie(t, s)
+	view := jobResult(t, runTrashDelete(t, s, c, csrf, "/a.txt"))
+	if len(view.TrashIDs) != 1 || view.TrashIDs[0] != "1700000100-33333333" {
+		t.Fatalf("result trashIds = %v, want the listing fallback to name the deleted root's entry", view.TrashIDs)
+	}
+}
+
+// A permanent delete has nothing to undo, and must not go looking.
+func TestPermanentDeleteReportsNoTrashIDs(t *testing.T) {
+	s, _, fj := jobsFixture(t, jobs.Limits{})
+	fj.result = wproto.JobResult{Files: 1, Bytes: 5, TrashIDs: []string{"1700000100-55555555"}}
+	c, csrf := sessionCookie(t, s)
+	body := `{"paths":[{"path":"/a.txt"}],"mode":"permanent"}`
+	env := challenge(t, s, c, csrf, "/api/jobs/delete", body)
+	job := acceptedJob(t, post(s, "/api/jobs/delete", c, csrf, withToken(body, env.Confirm.Token)))
+	if ids := jobResult(t, awaitTerminal(t, s, job.ID)).TrashIDs; len(ids) != 0 {
+		t.Fatalf("a permanent delete reported trash ids %v", ids)
+	}
+}
+
 func TestTrashEmptyIsGradeTwoAndAudited(t *testing.T) {
 	s, fj, c, csrf := trashFixture(t)
 	read := withAudit(t, s)

@@ -496,6 +496,15 @@ func trashWarn(emit Emit, apiPath string, err error) {
 // trash" that quietly became "delete" the moment the mount table said something
 // unexpected would be the worst kind of data loss, because the user asked for
 // the reversible operation.
+//
+// The entry ids it created come back in JobResult.TrashIDs, in the order the
+// paths were given and only for the items actually trashed. They are what makes
+// the front-end's Undo exact: without them the toast has to guess which entries
+// this delete produced by matching original paths and a timestamp against the
+// whole trash listing, which is a guess that a second delete of the same name,
+// or a clock a second out, can get wrong. A skipped item contributes no id, and
+// a cancelled job keeps the ids of what it did manage to move — those entries
+// are real, and undoing them is exactly what a user who cancelled will want.
 func Trash(ctx context.Context, r fsx.Root, plat *platform.Platform, uid int, paths []string, emit Emit) (wproto.JobResult, error) {
 	var res wproto.JobResult
 	for _, p := range paths {
@@ -617,6 +626,10 @@ func trashOne(r fsx.Root, loc trashLoc, uid int, clean, name string, res *wproto
 		res.Files++
 		res.Bytes += fi.Size()
 	}
+	// The rename is the point of no return, so the id is recorded here and
+	// nowhere earlier: every path above this one removes the entry it made, and
+	// an id for an entry that no longer exists would be an Undo that fails.
+	res.TrashIDs = append(res.TrashIDs, id)
 	emit.prog(wproto.Prog{
 		Files:   res.Files + res.Dirs,
 		Bytes:   res.Bytes,
@@ -977,11 +990,9 @@ func restoreOne(r fsx.Root, loc trashLoc, user, entry *dirRef, id string, uid in
 }
 
 // TrashEmpty permanently removes everything in the caller's own trash, on every
-// trash root this worker can reach. It is a plain recursive delete of
-// <trash>/<uid>/ — the directory is recreated the next time something is
-// trashed — and it is the one operation here that destroys data, which is why
-// the front-end puts it behind the same confirmation ladder a permanent delete
-// has.
+// trash root this worker can reach. It is the one operation here that destroys
+// data, which is why the front-end puts it behind the same confirmation ladder a
+// permanent delete has.
 //
 // The validation comes first and on descriptors (F1, F2): the trash root must
 // belong to root and be sticky, and <uid>/ must belong to this uid. A <uid>/
@@ -990,15 +1001,39 @@ func restoreOne(r fsx.Root, loc trashLoc, user, entry *dirRef, id string, uid in
 // whatever an attacker had pre-created under the name "0" and chose to have
 // removed at that moment.
 //
-// Only after those two hold is the delete addressed by pathname, and that is
-// safe precisely because of what was proved: inside a sticky directory owned by
-// root, an entry owned by this uid can be renamed away by this uid or by root
-// and by nobody else, and every component of the path is re-walked with
-// O_NOFOLLOW, so no symlink can be substituted either.
+// It used to be one recursive DeleteTree of <trash>/<uid>/, and that was finding
+// 14 of the round-1 review. A post-order tree delete treats meta.json as an
+// ordinary file, so the sidecar could be unlinked BEFORE the payload beside it —
+// and if the payload then failed to go (EPERM on one file inside it, a
+// cancellation stopping the walk), the entry was left with a payload nobody
+// could name: TrashList skips an entry with no sidecar, so it vanished from the
+// panel and could never be restored. Emptying destroyed the very thing the trash
+// exists to protect.
+//
+// So the trash is emptied ENTRY BY ENTRY, each against its own held descriptors,
+// in the one order that is safe to interrupt:
+//
+//	payload first (recursively, if it is a directory), then the sidecar,
+//	then the entry directory itself.
+//
+// Every prefix of that sequence leaves a state the rest of this file understands.
+// Stop before the payload is gone and the entry is untouched. Stop after the
+// payload is gone but before the sidecar is — a window of one unlink, and the
+// entry is the orphan sidecar a crashed trash already leaves, which TrashList
+// skips and the next empty clears. What can no longer happen is the reverse: an
+// entry that is still on disk, still holding the user's data, and no longer
+// listable or restorable.
+//
+// A payload that cannot be fully removed therefore keeps its sidecar and its
+// directory, is reported as a warning, and is still there — listed and
+// restorable — when the empty finishes. Cancellation is the same story for every
+// entry the job never reached.
 func TrashEmpty(ctx context.Context, r fsx.Root, plat *platform.Platform, uid int, emit Emit) (wproto.JobResult, error) {
-	name := strconv.Itoa(uid)
-	var targets []string
+	var res wproto.JobResult
 	for _, loc := range trashRoots(r, plat) {
+		if err := ctx.Err(); err != nil {
+			return res, err
+		}
 		root, err := loc.open()
 		if err != nil {
 			if !errors.Is(err, fs.ErrNotExist) {
@@ -1008,24 +1043,319 @@ func TrashEmpty(ctx context.Context, r fsx.Root, plat *platform.Platform, uid in
 			}
 			continue
 		}
-		user, uerr := openUserDir(root, loc.api, uid)
+		err = emptyUserTrash(ctx, root, loc, uid, &res, emit)
 		root.close()
-		if uerr != nil {
-			if errors.Is(uerr, ErrUntrustedTrash) {
-				emit.warnErr(fsx.Join(loc.api, name), uerr)
-			}
-			// Anything else means this user has nothing here.
-			continue
+		if err != nil {
+			// Cancellation, and nothing else: a per-entry failure is a warning.
+			return res, err
 		}
+	}
+	return res, nil
+}
+
+// emptyUserTrash empties <trash>/<uid>/ on ONE trash root, through the validated
+// descriptor for the root itself.
+//
+// The pass loop is the same discipline delete_tree.go's post hook has, for the
+// same reason: a directory enumerated while it is being emptied can skip entries
+// on a filesystem that renumbers getdents offsets, so a pass that removed
+// something is followed by another from a FRESH handle — and that re-open goes
+// through openUserDir's ownership check again rather than trusting the first
+// one. A pass that removes nothing ends it, so entries that were deliberately
+// kept cannot spin the loop.
+func emptyUserTrash(ctx context.Context, root *dirRef, loc trashLoc, uid int, res *wproto.JobResult, emit Emit) error {
+	name := strconv.Itoa(uid)
+	userAPI := fsx.Join(loc.api, name)
+	for attempt := 0; attempt < maxDirAttempts; attempt++ {
+		user, err := openUserDir(root, loc.api, uid)
+		if err != nil {
+			if attempt == 0 && errors.Is(err, ErrUntrustedTrash) {
+				emit.warnErr(userAPI, err)
+			}
+			// Anything else means this user has nothing here any more.
+			return nil
+		}
+		removed, perr := emptyPass(ctx, user, userAPI, uid, res, emit)
 		user.close()
-		targets = append(targets, fsx.Join(loc.api, name))
+		if perr != nil {
+			return perr
+		}
+		if removed == 0 {
+			break
+		}
 	}
-	if len(targets) == 0 {
-		return wproto.JobResult{}, nil
+	// The user's own subdirectory goes when it is empty — it is recreated the
+	// next time something is trashed. An ENOTEMPTY here is the correct answer
+	// rather than a failure: it means an entry was kept, which is what keeping
+	// it was for.
+	_ = root.unlink(name, true)
+	return nil
+}
+
+// emptyPass walks one already-validated <uid>/ handle once, emptying each entry
+// it names. It returns how many entries it removed; the error is cancellation
+// and nothing else.
+func emptyPass(ctx context.Context, user *dirRef, userAPI string, uid int, res *wproto.JobResult, emit Emit) (int, error) {
+	removed := 0
+	for {
+		ids, readErr := user.names(readChunk)
+		for _, id := range ids {
+			if err := ctx.Err(); err != nil {
+				return removed, err
+			}
+			gone, err := emptyEntry(ctx, user, userAPI, id, uid, res, emit)
+			if err != nil {
+				return removed, err
+			}
+			if gone {
+				removed++
+			}
+		}
+		if readErr != nil || len(ids) == 0 {
+			break
+		}
 	}
-	// CrossMounts is off: a trash directory lives on one filesystem by
-	// construction, so anything mounted underneath one is somebody else's
-	// problem and must not be emptied. DeleteTree applies the never-write
-	// component rule of its own accord (F10).
-	return DeleteTree(ctx, r, plat, targets, DeleteOptions{Recursive: true}, emit)
+	return removed, nil
+}
+
+// emptyEntry empties one <trash>/<uid>/<id>/, payload first (F14). It reports
+// whether the entry is gone; the error is cancellation and nothing else.
+func emptyEntry(ctx context.Context, user *dirRef, userAPI, id string, uid int, res *wproto.JobResult, emit Emit) (bool, error) {
+	entryAPI := fsx.Join(userAPI, id)
+	if err := fsx.ValidName(id); err != nil {
+		emit.warnErr(entryAPI, err)
+		res.Skipped++
+		return false, nil
+	}
+	fi, err := user.lstat(id)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			// Removed by another of this user's workers between the read and now.
+			return false, nil
+		}
+		emit.warnErr(entryAPI, err)
+		res.Skipped++
+		return false, nil
+	}
+	if !fi.IsDir() {
+		// Not an entry at all: a stray file or symlink directly inside a 0700
+		// directory this uid owns. Nothing can restore it and it can hold
+		// nothing, so it goes as the file or the link it is.
+		if err := user.unlink(id, false); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			emit.warnErr(entryAPI, err)
+			res.Skipped++
+			return false, nil
+		}
+		res.Files++
+		res.Bytes += fi.Size()
+		emptyProgress(res, emit, entryAPI)
+		return true, nil
+	}
+	entry, err := user.child(id)
+	if err != nil {
+		emit.warnErr(entryAPI, err)
+		res.Skipped++
+		return false, nil
+	}
+	// F1: an entry directory somebody else owns is not this user's to destroy,
+	// even inside their own <uid>/ — the name could have been pre-created.
+	if err := ownedDir(entry, entryAPI, uid); err != nil {
+		entry.close()
+		emit.warnErr(entryAPI, err)
+		res.Skipped++
+		return false, nil
+	}
+
+	// The order F14 exists for. Everything below is reported through warnings
+	// that leave the entry exactly as listable and as restorable as it was.
+	if err := emptyItem(ctx, entry, entryAPI, res, emit); err != nil {
+		entry.close()
+		if cerr := ctx.Err(); cerr != nil {
+			return false, cerr
+		}
+		emit.warn(entryAPI, "not_empty",
+			fmt.Sprintf("%q could not be emptied, so its record was kept and it can still be restored from the Trash", entryAPI),
+			fsx.Errno(err))
+		return false, nil
+	}
+	if err := entry.unlink(trashMetaName, false); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		entry.close()
+		emit.warnErr(fsx.Join(entryAPI, trashMetaName), err)
+		res.Skipped++
+		return false, nil
+	}
+	// The handle goes before the directory, as in removeEntryDir: on Windows an
+	// open handle keeps a directory from being removed at all.
+	entry.close()
+	if err := user.unlink(id, true); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		emit.warnErr(entryAPI, err)
+		res.Skipped++
+		return false, nil
+	}
+	res.Dirs++
+	emptyProgress(res, emit, entryAPI)
+	return true, nil
+}
+
+// emptyItem removes the payload of one entry — the fixed-name item, recursively
+// if it is a directory — through the entry's held descriptor.
+//
+// A missing payload is success, not a failure: that is the orphan sidecar a
+// crash between the sidecar and the rename leaves behind, and clearing it is one
+// of the things an empty is for.
+func emptyItem(ctx context.Context, entry *dirRef, entryAPI string, res *wproto.JobResult, emit Emit) error {
+	fi, err := entry.lstat(trashItemName)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		emit.warnErr(fsx.Join(entryAPI, trashItemName), err)
+		res.Skipped++
+		return err
+	}
+	return removeTrashTree(ctx, entry, entryAPI, trashItemName, fi, 0, res, emit)
+}
+
+// removeTrashTree removes one name below a held descriptor, descending into it
+// first if it is a directory. It is a small private recursion rather than a call
+// into Walk/DeleteTree because the whole point of F14 is that the entry is
+// addressed through the descriptor it was validated on, not through a pathname
+// inside a directory the world may write to.
+//
+// The three refusals of the general delete are kept, and for the same reasons:
+// the depth bound (one open descriptor per level), the never-write component
+// rule (F10), and the mount boundary — decided on the OPENED descriptor (F4),
+// never crossed, because a trash lives on exactly one filesystem and anything
+// mounted underneath one is somebody else's data.
+func removeTrashTree(ctx context.Context, dir *dirRef, dirAPI, name string, fi os.FileInfo, depth int, res *wproto.JobResult, emit Emit) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	itemAPI := fsx.Join(dirAPI, name)
+	if !fi.IsDir() {
+		// A symlink is unlinked as the link it is, never followed.
+		if err := dir.unlink(name, false); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			emit.warnErr(itemAPI, err)
+			res.Skipped++
+			return err
+		}
+		res.Files++
+		res.Bytes += fi.Size()
+		emptyProgress(res, emit, itemAPI)
+		return nil
+	}
+	if depth >= maxWalkDepth {
+		err := fmt.Errorf("%q is nested deeper than %d levels and was left alone: %w", itemAPI, maxWalkDepth, fsx.ErrUnsupported)
+		emit.warnErr(itemAPI, err)
+		res.Skipped++
+		return err
+	}
+	for attempt := 0; attempt < maxDirAttempts; attempt++ {
+		child, err := dir.child(name)
+		if err != nil {
+			emit.warnErr(itemAPI, err)
+			res.Skipped++
+			return err
+		}
+		if identityFor(child).differsFrom(identityFor(dir)) {
+			child.close()
+			err := fmt.Errorf("%q is a mount point and was left alone: %w", itemAPI, fsx.ErrProtected)
+			emit.warnErr(itemAPI, err)
+			res.Skipped++
+			return err
+		}
+		removed, cerr := removeTrashChildren(ctx, child, itemAPI, depth, res, emit)
+		child.close()
+		if cerr != nil {
+			return cerr
+		}
+		err = dir.unlink(name, true)
+		switch {
+		case err == nil:
+			res.Dirs++
+			emptyProgress(res, emit, itemAPI)
+			return nil
+		case errors.Is(err, fs.ErrNotExist):
+			return nil
+		case isNotEmpty(err) && removed > 0:
+			// Emptied while it was being enumerated: read it again from a fresh
+			// handle, which is re-checked exactly as the first one was.
+			continue
+		default:
+			emit.warnErr(itemAPI, err)
+			res.Skipped++
+			return err
+		}
+	}
+	err := fmt.Errorf("%q could not be emptied in %d passes: %w", itemAPI, maxDirAttempts, fsx.ErrUnsupported)
+	emit.warnErr(itemAPI, err)
+	res.Skipped++
+	return err
+}
+
+// removeTrashChildren removes everything below one held directory descriptor. It
+// returns how many entries went and the first failure it met — it carries on
+// past a failure so that a user emptying their trash is told about all forty
+// files that could not go, not just the first, exactly as the general delete
+// does. Cancellation stops it at once.
+func removeTrashChildren(ctx context.Context, dir *dirRef, dirAPI string, depth int, res *wproto.JobResult, emit Emit) (int, error) {
+	removed := 0
+	var firstErr error
+	for {
+		names, readErr := dir.names(readChunk)
+		for _, name := range names {
+			if err := ctx.Err(); err != nil {
+				return removed, err
+			}
+			childAPI := fsx.Join(dirAPI, name)
+			// F10: the never-write component rule, applied to every entry the
+			// recursion reaches and not just to the job's roots.
+			if reason, hit := NeverWriteName(name); hit {
+				err := neverWriteErr(childAPI, reason)
+				emit.warnErr(childAPI, err)
+				res.Skipped++
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
+			fi, err := dir.lstat(name)
+			if err != nil {
+				if errors.Is(err, fs.ErrNotExist) {
+					continue
+				}
+				emit.warnErr(childAPI, err)
+				res.Skipped++
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
+			if err := removeTrashTree(ctx, dir, dirAPI, name, fi, depth+1, res, emit); err != nil {
+				if cerr := ctx.Err(); cerr != nil {
+					return removed, cerr
+				}
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
+			removed++
+		}
+		if readErr != nil || len(names) == 0 {
+			break
+		}
+	}
+	return removed, firstErr
+}
+
+// emptyProgress reports one permanently removed item. The rate limiting is the
+// worker's (see Emit).
+func emptyProgress(res *wproto.JobResult, emit Emit, apiPath string) {
+	emit.prog(wproto.Prog{
+		Files:   res.Files + res.Dirs,
+		Bytes:   res.Bytes,
+		Current: []byte(apiPath),
+		Phase:   wproto.PhaseWorking,
+	})
 }

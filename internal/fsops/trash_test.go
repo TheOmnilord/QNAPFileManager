@@ -3,6 +3,7 @@ package fsops
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -12,6 +13,7 @@ import (
 	"qnapfilemanager/internal/fsx"
 	"qnapfilemanager/internal/platform"
 	"qnapfilemanager/internal/trashroot"
+	"qnapfilemanager/internal/wproto"
 )
 
 // selfUID is the uid the worker would use: the one the kernel gave this
@@ -435,6 +437,173 @@ func TestTrashEmptyRemovesEverything(t *testing.T) {
 	}
 	if !exists(t, base, TrashDirName) {
 		t.Error("the shared trash directory itself must not be removed")
+	}
+}
+
+// TestTrashEmptyKeepsAnEntryWhosePayloadCannotGo is finding 14: emptying must
+// never destroy the sidecar of an entry whose payload is still there.
+//
+// The payload here holds a component the worker never writes to (@Recycle, F10),
+// which is a refusal every uid gets — root included — so this asserts the
+// ordering rather than a permission the CI root job would not observe. The old
+// implementation was one recursive DeleteTree of <uid>/, which walked meta.json
+// as an ordinary file and could unlink it before reaching the payload: the entry
+// then still held the user's data but had nothing to name it with, so it fell
+// out of the listing and could never be restored.
+func TestTrashEmptyKeepsAnEntryWhosePayloadCannotGo(t *testing.T) {
+	r, plat, base, api := trashFixture(t)
+	uid := selfUID()
+	mkdir(t, base, "keep/@Recycle")
+	write(t, base, "keep/note.txt", "note")
+	write(t, base, "go.txt", "gone")
+	var log jobLog
+	if _, err := Trash(context.Background(), r, plat, uid, []string{api + "/keep", api + "/go.txt"}, log.emit()); err != nil {
+		t.Fatal(err)
+	}
+	if items, _ := TrashList(context.Background(), r, plat, uid); len(items) != 2 {
+		t.Fatalf("TrashList = %+v, want two items", items)
+	}
+
+	var empty jobLog
+	res, err := TrashEmpty(context.Background(), r, plat, uid, empty.emit())
+	if err != nil {
+		t.Fatalf("TrashEmpty: %v", err)
+	}
+	// The entry that could go, went; the other is still listed, which is the
+	// whole property: an entry that survives an empty must survive it INTACT.
+	items, err := TrashList(context.Background(), r, plat, uid)
+	if err != nil {
+		t.Fatalf("TrashList after empty: %v", err)
+	}
+	if len(items) != 1 || string(items[0].Name) != "keep" {
+		t.Fatalf("TrashList after empty = %+v (%+v, %v), want the refused entry still listed", items, res, empty.warns)
+	}
+	kept := TrashDirName + "/" + itoa(uid) + "/" + items[0].ID
+	if !exists(t, base, kept+"/"+trashMetaName) {
+		t.Fatal("the sidecar of a kept entry was removed before its payload")
+	}
+	if !exists(t, base, kept+"/"+trashItemName) {
+		t.Fatal("the payload of a kept entry is gone but its sidecar is not")
+	}
+	if indexOf(empty.codes(), "not_empty") < 0 || indexOf(empty.codes(), "protected") < 0 {
+		t.Errorf("warn codes = %v, want the refusal and the entry that was kept", empty.codes())
+	}
+
+	// And the point of keeping it: it can still be put back. What comes back is
+	// what the empty could not remove — the user asked for everything in the
+	// trash to go, so note.txt going and @Recycle staying is the honest outcome;
+	// what the fix is about is that the entry is still THERE to be restored.
+	var restore jobLog
+	rres, err := TrashRestore(context.Background(), r, plat, uid, []string{items[0].ID}, restore.emit())
+	if err != nil || rres.Dirs != 1 || rres.Skipped != 0 {
+		t.Fatalf("TrashRestore = %+v, %v (%v)", rres, err, restore.warns)
+	}
+	if !exists(t, base, "keep/@Recycle") {
+		t.Fatal("the kept entry did not come back")
+	}
+}
+
+// TestTrashEmptyCancellationLeavesTheRestIntact: a cancellation stops the empty
+// between entries, and every entry it never reached is still a listable,
+// restorable entry — not a payload whose sidecar was already gone.
+func TestTrashEmptyCancellationLeavesTheRestIntact(t *testing.T) {
+	r, plat, base, api := trashFixture(t)
+	uid := selfUID()
+	for _, name := range []string{"one.txt", "two.txt", "three.txt"} {
+		write(t, base, name, name)
+	}
+	var log jobLog
+	if _, err := Trash(context.Background(), r, plat, uid,
+		[]string{api + "/one.txt", api + "/two.txt", api + "/three.txt"}, log.emit()); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var empty jobLog
+	emit := empty.emit()
+	inner := emit.Prog
+	// Cancelled from inside the job, the moment the first item has gone: the
+	// alternative is a sleep, and a sleep would be racing the delete.
+	emit.Prog = func(p wproto.Prog) {
+		inner(p)
+		cancel()
+	}
+
+	res, err := TrashEmpty(ctx, r, plat, uid, emit)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("TrashEmpty = %+v, %v, want context.Canceled", res, err)
+	}
+	items, err := TrashList(context.Background(), r, plat, uid)
+	if err != nil {
+		t.Fatalf("TrashList after a cancelled empty: %v", err)
+	}
+	if len(items) == 0 || len(items) == 3 {
+		t.Fatalf("TrashList = %+v, want some entries emptied and the rest intact", items)
+	}
+	for _, it := range items {
+		entry := TrashDirName + "/" + itoa(uid) + "/" + it.ID
+		if !exists(t, base, entry+"/"+trashMetaName) || !exists(t, base, entry+"/"+trashItemName) {
+			t.Fatalf("entry %s survived a cancellation only in part", it.ID)
+		}
+	}
+	// Nothing was rolled back and nothing is half-removed, so a second empty
+	// finishes the job.
+	var again jobLog
+	if _, err := TrashEmpty(context.Background(), r, plat, uid, again.emit()); err != nil {
+		t.Fatalf("second TrashEmpty: %v", err)
+	}
+	if items, _ := TrashList(context.Background(), r, plat, uid); len(items) != 0 {
+		t.Fatalf("TrashList after the second empty = %+v", items)
+	}
+}
+
+// TestTrashIDsNameTheEntriesThatWereCreated: the ids the job reports are what
+// the front-end's Undo restores, so they must be the entries on disk, in the
+// order the paths were given, and only for the items actually trashed.
+func TestTrashIDsNameTheEntriesThatWereCreated(t *testing.T) {
+	r, plat, base, api := trashFixture(t)
+	uid := selfUID()
+	write(t, base, "first.txt", "first")
+	write(t, base, "second.txt", "second")
+	var log jobLog
+	// The middle path does not exist, so it is skipped and contributes no id.
+	res, err := Trash(context.Background(), r, plat, uid,
+		[]string{api + "/first.txt", api + "/missing.txt", api + "/second.txt"}, log.emit())
+	if err != nil {
+		t.Fatalf("Trash: %v", err)
+	}
+	if res.Files != 2 || res.Skipped != 1 {
+		t.Fatalf("result = %+v (%v)", res, log.warns)
+	}
+	if len(res.TrashIDs) != 2 {
+		t.Fatalf("TrashIDs = %v, want one id per item actually trashed", res.TrashIDs)
+	}
+	for i, want := range []string{"first.txt", "second.txt"} {
+		id := res.TrashIDs[i]
+		raw, err := os.ReadFile(filepath.Join(trashEntryDir(base, uid, id), trashMetaName))
+		if err != nil {
+			t.Fatalf("id %q names no entry on disk: %v", id, err)
+		}
+		var m trashMeta
+		if err := json.Unmarshal(raw, &m); err != nil {
+			t.Fatal(err)
+		}
+		if m.Name != want {
+			t.Errorf("TrashIDs[%d] = %q, whose sidecar names %q, want %q", i, id, m.Name, want)
+		}
+		if !exists(t, base, TrashDirName+"/"+itoa(uid)+"/"+id+"/"+trashItemName) {
+			t.Errorf("entry %q has no payload", id)
+		}
+	}
+	// And they are exactly what a restore takes.
+	var restore jobLog
+	rres, err := TrashRestore(context.Background(), r, plat, uid, res.TrashIDs, restore.emit())
+	if err != nil || rres.Files != 2 || rres.Skipped != 0 {
+		t.Fatalf("TrashRestore = %+v, %v (%v)", rres, err, restore.warns)
+	}
+	if !exists(t, base, "first.txt") || !exists(t, base, "second.txt") {
+		t.Fatal("the reported ids did not restore the items that were trashed")
 	}
 }
 

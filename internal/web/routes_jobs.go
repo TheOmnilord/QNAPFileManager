@@ -148,6 +148,9 @@ type jobResultView struct {
 }
 
 func viewOf(res wproto.JobResult) jobResultView {
+	// TrashIDs is deliberately NOT copied here. It is filled only where a job is
+	// known to have been a delete-to-trash (jobDelete), so that a result carrying
+	// ids can never be published for an operation whose items are gone for good.
 	return jobResultView{Files: res.Files, Dirs: res.Dirs, Bytes: res.Bytes, Skipped: res.Skipped, Warnings: res.Warnings, Detail: res.Detail}
 }
 
@@ -356,7 +359,14 @@ func (s *Server) jobDelete(w http.ResponseWriter, r *http.Request, sess *session
 		res, err := s.jobRunner.Job(ctx, who, wproto.JobReq{JobID: id, Kind: wproto.JobDelete, Body: reqBody}, progressSink(p), warnSink(p))
 		view := viewOf(res)
 		if err == nil && !permanent {
-			view.TrashIDs = s.trashIDsFor(ctx, who, paths, started)
+			// The worker names the entries it created, which is the exact answer
+			// and the one the Undo uses. No ids at all means a worker older than
+			// this contract (JobResult.TrashIDs came after M2-A round 1), and
+			// only then is the listing heuristic asked to guess.
+			view.TrashIDs = res.TrashIDs
+			if len(view.TrashIDs) == 0 && res.Files+res.Dirs > 0 {
+				view.TrashIDs = s.trashIDsFor(ctx, who, paths, started)
+			}
 		}
 		s.auditJobResult(ctx, actor, "delete", id, res, err, big, detail)
 		if err != nil {
@@ -425,12 +435,17 @@ func (s *Server) ensureTrashRoots(w http.ResponseWriter, r *http.Request, sess *
 	return true
 }
 
-// trashIDsFor names what a finished trash delete produced, so the toast's Undo
-// has something to restore. The worker's JobResult carries counts but no entry
-// ids (wproto.JobResult, M2-A contract), so the ids are recovered from the
-// caller's own trash listing: their own items, whose original path is one of
-// the deleted roots, trashed no earlier than this job started. Best effort — a
-// listing failure simply leaves the Undo to the trash panel.
+// trashIDsFor is the FALLBACK for naming what a finished trash delete produced,
+// used only when the worker's JobResult carried no TrashIDs of its own — a
+// worker older than the round-1 follow-up, since a job that trashed nothing has
+// nothing to undo either way.
+//
+// The ids are then recovered from the caller's own trash listing: their own
+// items, whose original path is one of the deleted roots, trashed no earlier
+// than this job started. It is a guess, which is exactly why the worker's answer
+// comes first: two deletes of the same path, or a clock a second out, are enough
+// to make it name the wrong entry. Best effort — a listing failure simply leaves
+// the Undo to the trash panel.
 func (s *Server) trashIDsFor(ctx context.Context, who backend.Principal, paths []string, started time.Time) []string {
 	lookup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer cancel()

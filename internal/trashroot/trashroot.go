@@ -82,10 +82,43 @@ const tempMode = os.FileMode(0o700)
 // whole window between the mkdirat and the fstat is a handful of syscalls.
 const tempMaxAge = 5 * time.Second
 
+// maxPublishAttempts bounds how many temporary directories one Ensure may
+// create when the one it made is refused for its TIMESTAMP alone (R4-1,
+// errStale). Each attempt uses a new random name and a fresh time reference, so
+// a stall or a clock step that hit the first one is unlikely to hit three; after
+// that the refusal stands, because a timing problem this persistent cannot be
+// told apart from the substitution the rule exists to catch.
+const maxPublishAttempts = 3
+
+// Logf is where this package reports what it cannot return to its caller. The
+// default is a no-op and the daemon points it at its own log at startup
+// (cmd/qnapfilemanager, runServe).
+//
+// Exactly one thing needs it (R4-2). When another process publishes the trash
+// directory first, Ensure drops its own temporary directory and returns the
+// winner — a SUCCESS — so any diagnostic attached to that attempt, including
+// "the temporary directory could not be proved to be ours and was left in
+// place", has no error to travel out on and would otherwise be lost. That
+// sentence is how an operator who finds an abandoned .@qfm_trash.tmp-* on a
+// volume learns where it came from, so it is logged before it is discarded.
+//
+// Assign it once, before anything can call Ensure: Ensure runs on request
+// goroutines, so the function it holds must also be safe for concurrent use
+// (log.Logger.Printf is).
+var Logf = func(string, ...any) {}
+
 // newTempName invents the unpublished name. It is a variable so this package's
 // own tests can pin it and pre-plant something at it — the substitution B3 is
 // about — the same reason wantOwner is one. Production never assigns to it.
 var newTempName = randomTempName
+
+// now is time.Now, and it is the reference the freshness rule is measured
+// against. It is a variable for the same reason newTempName is: R4-1 is about
+// what happens when that reference is wrong — a filesystem that stalls between
+// the reading and the mkdirat, or a wall-clock step in that window — and
+// skewing it is the only way a test can produce either without waiting.
+// Production never assigns to it.
+var now = time.Now
 
 // publishRename is step (e), the no-replace rename. It is a variable for the
 // same reason newTempName is: R3-BA2 is about what the FAILURE path does after
@@ -107,6 +140,25 @@ func randomTempName() (string, error) {
 // own. It is never a failure — the caller drops its temporary directory and
 // validates what is there by the ordinary rules.
 var errPublishedFirst = errors.New("trashroot: another process published the trash directory first")
+
+// errStale is internal too, and it is the FRESHNESS-ONLY refusal (R4-1).
+//
+// A directory reaches it having answered every question a substitution cannot:
+// it is a directory, it belongs to uid 0 — which an unprivileged attacker
+// cannot arrange at all — its permission bits are exactly the 0700 it was
+// created with, and reading it through its own descriptor yields nothing. Only
+// the timestamp is wrong, and the timestamp is the one property a legitimate
+// directory can fail by accident: FileInfo.ModTime carries no monotonic
+// reading, so the comparison is of WALL times, and a NAS that stalls longer
+// than tempMaxAge before the inode exists, or a clock step in that window,
+// makes the real thing look stale.
+//
+// So it is a distinct error rather than an ErrUnsafeTrash: the directory is
+// still refused and still never used, but Ensure may drop it and publish a new
+// one under a new name against a fresh reference (maxPublishAttempts) instead
+// of failing a delete that nothing attacked. Every OTHER provenance failure
+// stays exactly what it was — refused, never repaired, never retried.
+var errStale = errors.New("trashroot: the temporary directory's timestamp is not fresh")
 
 var (
 	// ErrNoTrash: this path has no usable same-device trash root — it is not on
@@ -133,7 +185,10 @@ var (
 // directory is made under an unpredictable temporary name, proved and given its
 // mode through its own descriptor, and only then renamed into place with
 // RENAME_NOREPLACE (B3, see publish). What is already at the name is validated
-// by the ordinary rules and never repaired.
+// by the ordinary rules and never repaired, and a publication refused for the
+// temporary directory's TIMESTAMP alone — the one provenance rule a legitimate
+// directory can fail by accident — is retried under a new name, at most
+// maxPublishAttempts times in all (R4-1).
 func Ensure(plat *platform.Platform, osPath string) (trashDir string, created bool, err error) {
 	if plat == nil {
 		return "", false, fmt.Errorf("no mount table is available: %w", ErrNoTrash)
@@ -166,10 +221,22 @@ func Ensure(plat *platform.Platform, osPath string) (trashDir string, created bo
 	}
 	defer rootFD.Close()
 
-	// Two passes at most: the second is for the one race worth handling, where
-	// another request published the directory while this one was preparing its
-	// own (B3, errPublishedFirst).
-	for attempt := 0; attempt < 2; attempt++ {
+	// The loop exists for two bounded retries, each of which has to take a fresh
+	// look at the published name before it tries again:
+	//
+	//   - another request published the directory while this one was preparing
+	//     its own (B3, errPublishedFirst). One more pass, which validates the
+	//     winner by the ordinary rules and never repairs it;
+	//   - the directory this call just made was refused for its TIMESTAMP alone
+	//     (R4-1, errStale). Up to maxPublishAttempts publications in total, each
+	//     under a new random name and against a fresh time reference.
+	//
+	// Every pass publishes at most once and every outcome either returns or
+	// consumes one of the two bounds, so the loop cannot run more than
+	// maxPublishAttempts times.
+	raced := false
+	publishes := 0
+	for {
 		d, lerr := openDirIn(rootFD, DirName)
 		switch {
 		case lerr == nil:
@@ -193,18 +260,40 @@ func Ensure(plat *platform.Platform, osPath string) (trashDir string, created bo
 			return "", false, fmt.Errorf("checking %s: %w", dir, lerr)
 		}
 
+		publishes++
 		switch err := publish(rootFD, root, dir); {
 		case err == nil:
 			return dir, true, nil
 		case errors.Is(err, errPublishedFirst):
 			// Somebody else won the race. Their directory is validated by the
 			// ordinary rules on the next pass, never repaired.
-			continue
+			//
+			// R4-2: this error is about to be DISCARDED — the next pass returns the
+			// winner and this call succeeds — and it may carry publish's cleanup
+			// diagnostic, the one that says a temporary directory could not be
+			// proved to be ours and was left behind. Nothing else will ever report
+			// it, so it goes to the log here, verbatim, before the retry.
+			Logf("%v", err)
+			if raced {
+				return "", false, fmt.Errorf("%s kept changing underneath us: %w", dir, ErrUnsafeTrash)
+			}
+			raced = true
+		case errors.Is(err, errStale):
+			// R4-1: a freshness-only refusal. The directory was root-owned, exactly
+			// 0700 and empty, so nothing was substituted; its cleanup has already
+			// run (or said why it could not), and the answer is a new name and a
+			// new time reference rather than a failed delete.
+			if publishes >= maxPublishAttempts {
+				return "", false, fmt.Errorf("%v; %d attempts to create %s each produced a directory whose "+
+					"timestamp was that far from the mkdirat that made it, which is a stalled filesystem or a "+
+					"stepped clock rather than a substitution — but at this point the two cannot be told "+
+					"apart: %w", err, publishes, dir, ErrUnsafeTrash)
+			}
+			Logf("trashroot: publishing %s again under a new name: %v", dir, err)
 		default:
 			return "", false, err
 		}
 	}
-	return "", false, fmt.Errorf("%s kept changing underneath us: %w", dir, ErrUnsafeTrash)
 }
 
 // publish creates the trash directory and moves it into place (B3).
@@ -227,7 +316,10 @@ func Ensure(plat *platform.Platform, osPath string) (trashDir string, created bo
 //	(c) fstat the descriptor and READ the directory through it, demanding what
 //	    only a directory THIS PROCESS just made can show: a directory, owned by
 //	    uid 0, permission bits of exactly 0700, genuinely empty, and with an
-//	    mtime within tempMaxAge of the mkdirat (see provenance — R3-BA1);
+//	    mtime within tempMaxAge of the mkdirat (see provenance — R3-BA1). A
+//	    failure of the LAST of those alone is errStale, which the caller retries
+//	    under a new name rather than refusing outright (R4-1); a failure of any
+//	    other is ErrUnsafeTrash and final;
 //	(d) fchmod THROUGH that descriptor to 1777, then fstat it again, because
 //	    what the kernel actually did is the only thing that counts (INV-2);
 //	(e) renameat2 the temporary name onto ".@qfm_trash" with RENAME_NOREPLACE,
@@ -261,8 +353,10 @@ func publish(rootFD *os.File, root, dir string) (retErr error) {
 	// attacker, so it is applied as late as possible and through a descriptor.
 	//
 	// createdAt is read immediately before the mkdirat and is the reference the
-	// mtime freshness rule is measured against (R3-BA1).
-	createdAt := time.Now()
+	// mtime freshness rule is measured against (R3-BA1). When it turns out to be
+	// wrong — a stall or a clock step between here and the inode — the refusal is
+	// errStale and Ensure tries again with a new name and a new reading (R4-1).
+	createdAt := now()
 	switch merr := mkdirIn(rootFD, name, 0o700); {
 	case merr == nil:
 	case errors.Is(merr, fs.ErrExist):
@@ -276,8 +370,9 @@ func publish(rootFD *os.File, root, dir string) (retErr error) {
 		return fmt.Errorf("creating %s: %w", tmp, merr)
 	}
 	published := false
-	// made is the identity of the directory provenance accepted, and it is the
-	// ONLY thing the cleanup below is allowed to remove (R3-BA2).
+	// made is the identity of the directory provenance accepted — or, for a
+	// freshness-only refusal, the identity it refused (R4-1) — and it is the ONLY
+	// thing the cleanup below is allowed to remove (R3-BA2).
 	var made os.FileInfo
 	defer func() {
 		// (f)
@@ -360,7 +455,9 @@ func removeIfStillOurs(rootFD *os.File, name string, made os.FileInfo) bool {
 // is opened, proved to be the one this process just made, given the trash mode
 // through its own descriptor, and re-examined. It returns the FileInfo
 // provenance accepted, which is the identity the failure cleanup re-checks
-// before it removes anything (R3-BA2).
+// before it removes anything (R3-BA2) — and, uniquely, the identity it REFUSED
+// when the refusal was errStale (R4-1), because that directory has to be taken
+// away before the publication is tried again.
 //
 // Nothing here is asked of a pathname. The openat is relative to the held
 // mount-root descriptor and every question afterwards is an fstat or a readdir
@@ -377,6 +474,17 @@ func prepare(rootFD *os.File, name, tmp string, createdAt time.Time) (os.FileInf
 		return nil, fmt.Errorf("checking %s: %w", tmp, err)
 	}
 	if err := provenance(d, tmp, fi, createdAt); err != nil {
+		if errors.Is(err, errStale) {
+			// R4-1: the identity travels out with the refusal, so publish's cleanup
+			// may remove this directory before Ensure publishes a new one. It is an
+			// identity worth acting on even though the timestamp is unexplained:
+			// the directory is root-owned, exactly 0700 and empty, and if it IS a
+			// substitution then the attacker renamed their own directory here to
+			// make it one — which already tore it out of wherever it was — so
+			// rmdir'ing an empty directory of theirs adds nothing to what they have
+			// done, while leaving it behind litters the volume on every stall.
+			return fi, err
+		}
 		return nil, err
 	}
 	if err := applyMode(d, tmp, Mode); err != nil {
@@ -404,10 +512,13 @@ func prepare(rootFD *os.File, name, tmp string, createdAt time.Time) (os.FileInf
 //   - emptiness is READ, not inferred. The directory is read through the held
 //     descriptor and must yield nothing at all (Readdirnames omits "." and
 //     ".."), which no directory holding files of any kind can survive;
-//   - freshness is demanded. A rename does not refresh an inode's mtime and an
-//     unprivileged attacker cannot set the mtime of a root-owned directory, so a
-//     substituted directory carries whenever it was really created while ours
-//     carries the instant of the mkdirat a few syscalls ago (tempMaxAge).
+//   - freshness is demanded, and asked LAST. A rename does not refresh an
+//     inode's mtime and an unprivileged attacker cannot set the mtime of a
+//     root-owned directory, so a substituted directory carries whenever it was
+//     really created while ours carries the instant of the mkdirat a few
+//     syscalls ago (tempMaxAge). It is also the only one of the four a real
+//     directory can fail without an attacker — a stall or a clock step — which
+//     is why failing it alone is errStale and retryable (R4-1).
 //
 // Owner and permission bits stay exactly as they were: uid 0 (a non-root user
 // cannot produce a root-owned directory at all) and precisely 0700.
@@ -443,10 +554,17 @@ func provenance(d *os.File, tmp string, fi os.FileInfo, createdAt time.Time) err
 		return fmt.Errorf("%s already holds entries, so it is not the empty directory this process made: %w",
 			tmp, ErrUnsafeTrash)
 	}
-	// Freshness (R3-BA1).
+	// Freshness (R3-BA1), and the LAST question asked — which is what makes a
+	// failure here a freshness-ONLY failure, errStale rather than ErrUnsafeTrash
+	// (R4-1). Everything above has already passed, so this is a directory only
+	// root could have made and only its timestamp is unaccounted for; since
+	// ModTime carries no monotonic reading, a stalled filesystem or a stepped
+	// wall clock produces exactly this. Still fail-closed — the directory is
+	// refused and never used — but Ensure may publish another one rather than
+	// turn a slow NAS into a failed delete.
 	if age := createdAt.Sub(fi.ModTime()); age > tempMaxAge || age < -tempMaxAge {
 		return fmt.Errorf("%s was last modified %v from the mkdirat that created it, which is more than %v, "+
-			"so it is not the directory this process made: %w", tmp, age, tempMaxAge, ErrUnsafeTrash)
+			"so it cannot be shown to be the directory this process made: %w", tmp, age, tempMaxAge, errStale)
 	}
 	return nil
 }

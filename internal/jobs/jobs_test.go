@@ -694,6 +694,13 @@ func TestETAIsUnknownUntilThereIsSomethingToEstimateFrom(t *testing.T) {
 		ls.wait()
 		p.Set(40, 80, 0, -1) // now a file count, and no byte total at all
 		ls.done()
+
+		// Hold here until the test has read the ETA that update produced.
+		// Returning straight away let the job FINISH — and finish sets ETA to
+		// 0 for a done job — before the test's Get ran; the race detector's
+		// scheduling made that ordering the usual one on CI.
+		ls.wait()
+		ls.done()
 		return nil, nil
 	})
 	if err != nil {
@@ -718,6 +725,9 @@ func TestETAIsUnknownUntilThereIsSomethingToEstimateFrom(t *testing.T) {
 	if j.ETA < 2 || j.ETA > 8 {
 		t.Fatalf("ETA = %d s from the file rate, want about 4", j.ETA)
 	}
+	// Only now let the work function return, so the job finishes (and its ETA
+	// becomes 0) strictly after the assertion above.
+	ls.step(t)
 	waitState(t, m, job.ID, StateDone)
 }
 

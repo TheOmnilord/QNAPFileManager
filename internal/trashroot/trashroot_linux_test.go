@@ -2,6 +2,7 @@ package trashroot
 
 import (
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -67,6 +68,53 @@ func pinTempName(t *testing.T, name string) *int {
 	}
 	t.Cleanup(func() { newTempName = prev })
 	return &calls
+}
+
+// pinTempNameSeries hands out a DIFFERENT unpublished name on every call and
+// records them, which is what a retry has to be judged by: publishing again
+// under the same name would be repairing a name rather than publishing a new
+// directory (R4-1).
+func pinTempNameSeries(t *testing.T) *[]string {
+	t.Helper()
+	var used []string
+	prev := newTempName
+	newTempName = func() (string, error) {
+		used = append(used, fmt.Sprintf("%s%016x", tempPrefix, len(used)+1))
+		return used[len(used)-1], nil
+	}
+	t.Cleanup(func() { newTempName = prev })
+	return &used
+}
+
+// pinNow skews the reference the freshness rule is measured against (R4-1): the
+// nth reading of the clock is offset by the nth duration given and anything
+// beyond the list is the real time. A negative offset is the stall or the
+// backwards clock step the finding is about — the reference is read, the world
+// moves on, and the directory the process then really does create looks far
+// older than the reading, although nothing was substituted.
+func pinNow(t *testing.T, skews ...time.Duration) {
+	t.Helper()
+	prev := now
+	calls := 0
+	now = func() time.Time {
+		var d time.Duration
+		if calls < len(skews) {
+			d = skews[calls]
+		}
+		calls++
+		return prev().Add(d)
+	}
+	t.Cleanup(func() { now = prev })
+}
+
+// pinLogf captures the package's logging hook for one test (R4-2).
+func pinLogf(t *testing.T) *[]string {
+	t.Helper()
+	var lines []string
+	prev := Logf
+	Logf = func(format string, args ...any) { lines = append(lines, fmt.Sprintf(format, args...)) }
+	t.Cleanup(func() { Logf = prev })
+	return &lines
 }
 
 // pinPublishRename replaces step (e) for one test (R3-BA2). It is the only
@@ -184,11 +232,17 @@ func TestPrepareRefusesASubstitutedDirectory(t *testing.T) {
 	defer rootFD.Close()
 
 	cases := []struct {
-		name  string
-		perm  fs.FileMode
-		place func(t *testing.T, dir string)
+		name string
+		perm fs.FileMode
+		// want is errStale for the freshness-ONLY refusal and ErrUnsafeTrash for
+		// every other one (R4-1), and identity says whether prepare hands the
+		// refused directory's identity back — which it does exactly when its
+		// caller is going to remove it and publish another.
+		want     error
+		identity bool
+		place    func(t *testing.T, dir string)
 	}{
-		{"not empty", 0o700, func(t *testing.T, dir string) {
+		{"not empty", 0o700, ErrUnsafeTrash, false, func(t *testing.T, dir string) {
 			// @Recycle, a share, anything worth substituting: it has children.
 			if err := os.MkdirAll(filepath.Join(dir, "snapshot"), 0o700); err != nil {
 				t.Fatal(err)
@@ -197,7 +251,7 @@ func TestPrepareRefusesASubstitutedDirectory(t *testing.T) {
 				t.Fatal(err)
 			}
 		}},
-		{"not 0700", 0o777, func(t *testing.T, dir string) {
+		{"not 0700", 0o777, ErrUnsafeTrash, false, func(t *testing.T, dir string) {
 			if err := os.Mkdir(dir, 0o700); err != nil {
 				t.Fatal(err)
 			}
@@ -205,7 +259,7 @@ func TestPrepareRefusesASubstitutedDirectory(t *testing.T) {
 				t.Fatal(err)
 			}
 		}},
-		{"only regular files", 0o700, func(t *testing.T, dir string) {
+		{"only regular files", 0o700, ErrUnsafeTrash, false, func(t *testing.T, dir string) {
 			// R3-BA1: a directory holding nothing but files still has exactly two
 			// links, so the retired nlink test called this empty. Reading it does
 			// not.
@@ -219,11 +273,17 @@ func TestPrepareRefusesASubstitutedDirectory(t *testing.T) {
 				t.Fatal(err)
 			}
 		}},
-		{"pre-existing", 0o700, func(t *testing.T, dir string) {
+		{"pre-existing", 0o700, errStale, true, func(t *testing.T, dir string) {
 			// R3-BA1: root-owned, 0700, genuinely empty — and made an hour ago, so
 			// it cannot be the one the mkdirat a few syscalls back produced. A
 			// rename does not refresh an inode's mtime, and an unprivileged
 			// attacker cannot set the mtime of a root-owned directory.
+			//
+			// R4-1: this is the one refusal that is errStale rather than
+			// ErrUnsafeTrash, because a directory that answers every other question
+			// and only has the wrong timestamp is also what a stalled filesystem or
+			// a stepped wall clock produces. It is still refused here; what changes
+			// is that the caller may take it away and publish another.
 			if err := os.Mkdir(dir, 0o700); err != nil {
 				t.Fatal(err)
 			}
@@ -240,13 +300,21 @@ func TestPrepareRefusesASubstitutedDirectory(t *testing.T) {
 			c.place(t, dir)
 
 			made, err := prepare(rootFD, name, dir, time.Now())
-			if !errors.Is(err, ErrUnsafeTrash) {
-				t.Fatalf("prepare = %v, want ErrUnsafeTrash", err)
+			if !errors.Is(err, c.want) {
+				t.Fatalf("prepare = %v, want %v", err, c.want)
 			}
-			if made != nil {
+			if c.want == errStale && errors.Is(err, ErrUnsafeTrash) {
+				// R4-1: if the two were the same error Ensure could not tell a
+				// retryable timing problem from a substitution, and would retry both.
+				t.Errorf("a freshness-only refusal must not also be ErrUnsafeTrash: %v", err)
+			}
+			switch {
+			case !c.identity && made != nil:
 				// R3-BA2: a refused directory must not be handed back as an
 				// identity the failure cleanup would then remove.
 				t.Errorf("prepare returned an identity (%v) for a directory it refused", made.Name())
+			case c.identity && made == nil:
+				t.Error("prepare returned no identity for a stale directory, so the caller cannot clear it before retrying")
 			}
 			fi, err := os.Lstat(dir)
 			if err != nil {
@@ -288,6 +356,127 @@ func TestPrepareAcceptsTheDirectoryItJustMade(t *testing.T) {
 	}
 	if fi.Mode().Perm() != 0o777 || fi.Mode()&fs.ModeSticky == 0 {
 		t.Errorf("mode = %v, want 1777", fi.Mode())
+	}
+}
+
+// TestEnsureRetriesATemporaryDirectoryThatIsOnlyStale is R4-1.
+//
+// The freshness rule compares WALL times: FileInfo.ModTime carries no monotonic
+// reading, so a NAS that stalls for longer than tempMaxAge between the clock
+// reading and the inode actually appearing — or a clock step in that window —
+// makes a directory this process unmistakably did create look stale. Refusing
+// outright turned that into a failed delete and left the temporary directory
+// behind, although nothing had been substituted.
+//
+// It still fails closed: that directory is never used. What it does instead is
+// take it away — it is root-owned, exactly 0700 and empty, and the identity is
+// re-checked before the rmdir — and publish a NEW one under a NEW name against
+// a fresh reading, which is the difference between a slow filesystem and an
+// attack.
+func TestEnsureRetriesATemporaryDirectoryThatIsOnlyStale(t *testing.T) {
+	root := tempMount(t)
+	plat := storageAt(t, root)
+	names := pinTempNameSeries(t)
+	pinNow(t, -time.Hour)
+	lines := pinLogf(t)
+
+	dir, created, err := Ensure(plat, filepath.Join(root, "Public"))
+	if err != nil || !created {
+		t.Fatalf("Ensure = %q,%v,%v — a stalled clock must not fail a delete", dir, created, err)
+	}
+	if len(*names) != 2 {
+		t.Fatalf("temporary names used = %v, want two: the stale attempt and the retry", *names)
+	}
+	if (*names)[0] == (*names)[1] {
+		t.Errorf("the retry reused the temporary name %q: a retry publishes a new directory, it does not repair a name", (*names)[0])
+	}
+	fi, err := os.Lstat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fi.IsDir() || fi.Mode().Perm() != 0o777 || fi.Mode()&fs.ModeSticky == 0 {
+		t.Errorf("mode = %v, want a sticky 1777 directory", fi.Mode())
+	}
+	if rest := leftovers(t, root); len(rest) != 0 {
+		t.Errorf("the mount root still holds %v: the stale attempt was not cleaned up before the retry", rest)
+	}
+	if len(*lines) != 1 {
+		t.Errorf("Logf lines = %v, want one: the retry is worth a line in the daemon log", *lines)
+	}
+}
+
+// TestEnsureDoesNotRetryAProvenanceRefusal is the other half of R4-1: only the
+// TIMESTAMP is retryable. A directory that fails any of the other three
+// questions is a substitution as far as this package can tell, and a retry on
+// the same volume would be a second root fchmod aimed at whatever the attacker
+// can arrange next. One attempt, one refusal, nothing published.
+func TestEnsureDoesNotRetryAProvenanceRefusal(t *testing.T) {
+	root := tempMount(t)
+	plat := storageAt(t, root)
+	names := pinTempNameSeries(t)
+	// The directory Ensure creates really belongs to this process; saying the
+	// front-end runs as somebody else is the same comparison the other way up,
+	// and it is the only ownership mismatch a test without a second account can
+	// make.
+	expectOwner(t, os.Geteuid()+1)
+
+	dir, created, err := Ensure(plat, filepath.Join(root, "Public"))
+	if !errors.Is(err, ErrUnsafeTrash) {
+		t.Fatalf("Ensure = %q,%v,%v — want ErrUnsafeTrash", dir, created, err)
+	}
+	if len(*names) != 1 {
+		t.Errorf("temporary names used = %v, want exactly one: a refusal that is not about the timestamp is final", *names)
+	}
+	if _, serr := os.Lstat(filepath.Join(root, DirName)); !errors.Is(serr, fs.ErrNotExist) {
+		t.Errorf("something was published as the trash directory: %v", serr)
+	}
+}
+
+// TestEnsureLogsALeftoverWhenAnotherPublisherWins is R4-2.
+//
+// The two halves of this situation used to cancel each other out. The cleanup
+// after a failed publication reports, in the error, that it could not prove the
+// temporary directory was its own and left it behind (R3-BA2) — and when the
+// failure is "somebody else published first", Ensure swallows that error,
+// validates the winner and returns SUCCESS, so the sentence an operator needs in
+// order to understand an abandoned .@qfm_trash.tmp-* on their volume was never
+// written anywhere. It now goes to the daemon log before the retry.
+func TestEnsureLogsALeftoverWhenAnotherPublisherWins(t *testing.T) {
+	root := tempMount(t)
+	plat := storageAt(t, root)
+	name := tempPrefix + "3333333333333333"
+	pinTempName(t, name)
+	lines := pinLogf(t)
+	winner := filepath.Join(root, DirName)
+	pinPublishRename(t, func(_ *os.File, from, _ string) error {
+		// Another request publishes a perfectly good trash directory first...
+		if err := os.Mkdir(winner, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(winner, 0o777|fs.ModeSticky); err != nil {
+			t.Fatal(err)
+		}
+		// ...and in the same instant our own temporary directory is renamed aside
+		// and something else takes its name, so the cleanup cannot prove what is
+		// standing there is ours and must leave it alone.
+		if err := os.Rename(filepath.Join(root, from), filepath.Join(root, "ours")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(filepath.Join(root, from), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		return &fs.PathError{Op: "renameat", Path: DirName, Err: syscall.EEXIST}
+	})
+
+	dir, created, err := Ensure(plat, filepath.Join(root, "Public"))
+	if err != nil || created || dir != winner {
+		t.Fatalf("Ensure = %q,%v,%v — want the winner's directory and no error", dir, created, err)
+	}
+	if len(*lines) != 1 {
+		t.Fatalf("Logf lines = %v, want exactly one", *lines)
+	}
+	if line := (*lines)[0]; !strings.Contains(line, filepath.Join(root, name)) || !strings.Contains(line, "left in place") {
+		t.Errorf("the logged line does not name the temporary directory that was left behind: %q", line)
 	}
 }
 

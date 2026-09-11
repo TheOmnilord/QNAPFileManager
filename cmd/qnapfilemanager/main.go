@@ -31,6 +31,7 @@ import (
 	"qnapfilemanager/internal/logfile"
 	"qnapfilemanager/internal/platform"
 	"qnapfilemanager/internal/qtsauth"
+	"qnapfilemanager/internal/trashroot"
 	"qnapfilemanager/internal/web"
 	"qnapfilemanager/internal/worker"
 	"qnapfilemanager/internal/workerpool"
@@ -291,6 +292,11 @@ func runServe(args []string, stderr io.Writer) error {
 		logw = w
 	}
 	logger := log.New(logw, "", log.LstdFlags|log.LUTC)
+	// The trash root reports here what it cannot return to its caller — notably a
+	// temporary directory it could not prove was its own and so left behind, on a
+	// call that then goes on to succeed (R4-2, trashroot.Logf). Assigned once,
+	// before anything serves.
+	trashroot.Logf = logger.Printf
 
 	passwdPath, groupPath, err := identityFiles(root, inProcess)
 	if err != nil {

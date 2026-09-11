@@ -1,7 +1,7 @@
 // Run with: node --test internal/web/actions_test.mjs
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
-import {runMutation} from './static/js/actions.js';
+import {runMutation, actionMessage} from './static/js/actions.js';
 import {update} from './static/js/state.js';
 
 test('runMutation drives the server confirmation-token flow', async t => {
@@ -37,4 +37,15 @@ test('runMutation rethrows a non-confirmable error', async t => {
  t.after(() => update({session:null}));
  t.mock.method(globalThis,'fetch',async () => new Response(JSON.stringify({error:{code:'protected',message:'no'}}),{status:403}));
  await assert.rejects(runMutation('api/fs/delete',{path:'/bin'},async () => true),err => { assert.equal(err.code,'protected'); return true; });
+});
+
+test('actionMessage names the hidden blockers on a not-empty delete', () => {
+ const msg = actionMessage({code:'not_empty', blockers:[{name:'.@__thumb', hidden:true, dir:true}], truncated:false});
+ assert.match(msg, /still inside: \.@__thumb/);
+ assert.match(msg, /hidden items/);
+});
+
+test('actionMessage falls back to the code message when no blockers are present', () => {
+ assert.match(actionMessage({code:'not_empty'}), /coming in a later version/);
+ assert.match(actionMessage({code:'protected'}), /protected system path/);
 });

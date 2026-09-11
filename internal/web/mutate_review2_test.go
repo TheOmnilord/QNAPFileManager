@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 
 	"qnapfilemanager/internal/audit"
@@ -132,6 +133,73 @@ func TestRenameFailClosedOnStatError(t *testing.T) {
 
 // TestEveryDeleteNeedsToken proves decision 10 / adv 9: in M1 every delete is
 // permanent, so even a small, ordinary file requires a confirmation token.
+// TestDeleteNonEmptyNamesBlockers proves the owner-hardware-test fix: a
+// single-level delete of a directory that looks empty (its only entry is hidden,
+// e.g. QNAP's .@__thumb) is refused as not_empty AND the response names the
+// blocking entry, so the refusal explains itself instead of looking like a bug.
+func TestDeleteNonEmptyNamesBlockers(t *testing.T) {
+	s, b := fixture(t, true)
+	s.guard.SetReadOnly(false)
+	// A folder whose only content is a hidden QNAP metadata entry.
+	if err := os.MkdirAll(filepath.Join(b.dir, "Testtt", ".@__thumb"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(b.dir, "Testtt", ".@__thumb", "t.jpg"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The dispatched delete returns a real ENOTEMPTY (the Linux NAS behaviour);
+	// os.Remove of a non-empty dir maps to "exists" on Windows, so a stub keeps the
+	// test deterministic cross-platform while the real backend still lists the dir.
+	s.mutator = notEmptyMutator{b}
+	c, csrf := sessionCookie(t, s)
+	first := post(s, "/api/fs/delete", c, csrf, `{"path":"/Testtt"}`)
+	var tok struct{ Confirm struct{ Token string } }
+	json.NewDecoder(first.Body).Decode(&tok)
+	if tok.Confirm.Token == "" {
+		t.Fatalf("no confirmation token for the delete")
+	}
+	resp := post(s, "/api/fs/delete", c, csrf, `{"path":"/Testtt","confirm":"`+tok.Confirm.Token+`"}`)
+	if resp.StatusCode != 409 {
+		t.Fatalf("status %d, want 409 not_empty", resp.StatusCode)
+	}
+	var out struct {
+		Error    struct{ Code string }
+		Blockers []struct {
+			Name   string
+			Hidden bool
+			Dir    bool
+		}
+	}
+	json.NewDecoder(resp.Body).Decode(&out)
+	if out.Error.Code != "not_empty" {
+		t.Fatalf("code %q, want not_empty", out.Error.Code)
+	}
+	var found bool
+	for _, blk := range out.Blockers {
+		if blk.Name == ".@__thumb" {
+			found = true
+			if !blk.Hidden || !blk.Dir {
+				t.Errorf(".@__thumb blocker = %+v, want hidden dir", blk)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("the not_empty response did not name the hidden blocker; blockers=%+v", out.Blockers)
+	}
+	// The folder must still exist — nothing was deleted.
+	if _, err := os.Stat(filepath.Join(b.dir, "Testtt")); err != nil {
+		t.Fatalf("folder should survive a refused delete: %v", err)
+	}
+}
+
+// notEmptyMutator dispatches a delete that fails with a real ENOTEMPTY, the Linux
+// NAS behaviour for a non-empty directory, independent of the host os.Remove.
+type notEmptyMutator struct{ *fakeBackend }
+
+func (notEmptyMutator) Delete(context.Context, backend.Principal, string) error {
+	return &fs.PathError{Op: "unlinkat", Path: "x", Err: syscall.ENOTEMPTY}
+}
+
 func TestEveryDeleteNeedsToken(t *testing.T) {
 	s, b := fixture(t, true)
 	s.guard.SetReadOnly(false)

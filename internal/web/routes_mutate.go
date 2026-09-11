@@ -332,6 +332,55 @@ func (s *Server) finish(w http.ResponseWriter, r *http.Request, sess *session, m
 	return true
 }
 
+// deleteBlocker names one entry that is keeping a single-level delete from
+// succeeding. It is the folder's own content, listed for the user who tried to
+// delete it, so there is no disclosure concern.
+type deleteBlocker struct {
+	Name   string `json:"name"`
+	Hidden bool   `json:"hidden"`
+	Dir    bool   `json:"dir"`
+}
+
+// deleteBlockers lists a directory as the user (hidden entries included) to name
+// what is keeping a single-level delete from succeeding: an "empty-looking" folder
+// on QNAP often still holds hidden metadata (.@__thumb, .streams) that the default
+// listing hides, so the refusal otherwise looks like a bug. Best-effort — a
+// listing failure yields nil and the caller still reports not_empty — and capped,
+// so a genuinely large directory does not produce an unbounded response. INV-1
+// holds: the listing goes through the backend (the worker, as the user), never
+// through fsops in this root front-end.
+func (s *Server) deleteBlockers(ctx context.Context, sess *session, dir string) ([]deleteBlocker, int, bool) {
+	l, err := s.backend.List(ctx, sess.who, dir, fsx.ListOptions{ShowHidden: true, ResolveLinks: false, Limit: 25})
+	if err != nil {
+		return nil, 0, false
+	}
+	out := make([]deleteBlocker, 0, len(l.Entries))
+	for _, e := range l.Entries {
+		name := e.Name
+		if name == "" && e.NameB64 != "" {
+			name = "b64:" + e.NameB64
+		}
+		out = append(out, deleteBlocker{Name: name, Hidden: e.Hidden, Dir: e.Type == "dir"})
+	}
+	return out, l.Total, l.Truncated
+}
+
+// failNotEmpty answers a single-level delete refused because the directory still
+// has entries. It carries the blocking entries so the client can explain WHY an
+// "empty-looking" folder will not delete, instead of a bare refusal. The path is
+// the REQUESTED spelling; only the folder's own contents are named.
+func (s *Server) failNotEmpty(w http.ResponseWriter, r *http.Request, path string, blockers []deleteBlocker, total int, truncated bool) {
+	s.logger.Printf("request ip=%q method=%s op=%q code=%s path=%q", ClientIP(r), r.Method, r.URL.Path, "not_empty", path)
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(statusCode("not_empty"))
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error":     map[string]string{"code": "not_empty", "message": "The folder is not empty.", "path": path, "op": r.URL.Path},
+		"blockers":  blockers,
+		"total":     total,
+		"truncated": truncated,
+	})
+}
+
 // failResolve answers a failed user-side path resolution (round-3 finding 2). The
 // worker resolved the operation's path as the user and returned the kernel's own
 // error — a permission denial for an unsearchable component, ErrOutsideRoot for
@@ -724,6 +773,18 @@ func (s *Server) deleteSingle(w http.ResponseWriter, r *http.Request, sess *sess
 	}
 	// Dispatch against the resolved path (adv 1b); residual race noted in §2.0.
 	err := s.mutator.Delete(r.Context(), sess.who, guardPath)
+	if err != nil && fsx.Code(err) == "not_empty" {
+		// A single-level delete (M1; recursion is M2) hit a non-empty directory.
+		// An "empty-looking" folder on QNAP usually still holds hidden metadata
+		// (.@__thumb, .streams) the default listing hides, so NAME what is blocking
+		// it rather than leaving a refusal that looks like a bug (owner hardware
+		// test, 2026-09-11). The audit result is still recorded, path-free.
+		s.logRaw(r, m.op, m.path, err)
+		s.writeAudit(sess, r, m, "result", "error", "not_empty", "", big)
+		blockers, total, truncated := s.deleteBlockers(r.Context(), sess, p)
+		s.failNotEmpty(w, r, p, blockers, total, truncated)
+		return
+	}
 	if !s.finish(w, r, sess, m, err, big) {
 		return
 	}

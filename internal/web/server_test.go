@@ -48,6 +48,7 @@ func (b *fakeBackend) Stat(_ context.Context, p backend.Principal, name string) 
 	e := fsx.Entry{Type: fsx.TypeString(fi.Mode()), Size: fi.Size(), MTime: fi.ModTime(), Mode: fsx.ModeOctal(fi.Mode()), ModeStr: fsx.ModeString(fi.Mode())}
 	e.SetName([]byte(fsx.Base(name)))
 	e.SetPath([]byte(name))
+	e.Hidden = strings.HasPrefix(fsx.Base(name), ".") // as production fsops flags dotfiles
 	return e, nil
 }
 func (b *fakeBackend) Readlink(_ context.Context, p backend.Principal, name string) (string, error) {

@@ -67,8 +67,11 @@ function askWarn(confirm,message) {
  return confirmDialog({title:'Confirm change',body:message||'This location needs confirmation.',why:(s.warnings||[]).join(' · ')});
 }
 
-// actionError maps a failure code to a plain-language message (§6).
-function actionError(err) {
+// actionMessage maps a failure to a plain-language message (§6). Pure, so it is
+// unit-testable. A not-empty delete names what is still inside, so an
+// "empty-looking" folder (usually hidden QNAP metadata like .@__thumb) explains
+// itself rather than looking like a bug; recursive delete is a later version.
+export function actionMessage(err) {
  const messages={
   read_only:'Read-only mode is on. Open Settings to turn it off before making changes.',
   protected:'That is a protected system path and cannot be changed here.',
@@ -77,8 +80,15 @@ function actionError(err) {
   exists:'A file or folder with that name already exists here.',
   cross_device:'The source and destination are on different volumes.',
  };
- error(new Error(messages[err.code] || err.message || 'The change could not be completed.'));
+ if (err.code==='not_empty' && Array.isArray(err.blockers) && err.blockers.length){
+  const names = err.blockers.map(b=>b.name).join(', ') + (err.truncated ? ', …' : '');
+  const note = err.blockers.some(b=>b.hidden) ? ' These are hidden items — turn on Hidden to see them.' : '';
+  return `The folder is not empty — still inside: ${names}.${note} Deleting a folder’s contents is coming in a later version.`;
+ }
+ return messages[err.code] || err.message || 'The change could not be completed.';
 }
+
+function actionError(err) { error(new Error(actionMessage(err))); }
 
 function afterMutation(message) {
  if (message) announce(message);

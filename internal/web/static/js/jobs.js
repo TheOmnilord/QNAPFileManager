@@ -55,24 +55,41 @@ export function jobPercent(job) {
 export const jobLive = job => job && (job.state === 'queued' || job.state === 'running');
 export const shouldPoll = list => Array.isArray(list) && list.some(jobLive);
 
+// jobBarState is the value for the row's <progress>, or null for the animated
+// indeterminate bar. A terminal job is NEVER indeterminate — a finished job used
+// to keep animating when it had no denominator: done is full (100), a stopped
+// job holds the fraction it reached (or 0). Only a RUNNING job with no
+// meaningful total stays indeterminate.
+export function jobBarState(job) {
+ if (!jobLive(job)) return job && job.state === 'done' ? 100 : (jobPercent(job) ?? 0);
+ return jobPercent(job);
+}
+
 // jobDetailLine is the panel's second line. Counts with no total drop the
 // denominator rather than printing "of -1"; a rate or an ETA that is not known
 // is simply absent.
 export function jobDetailLine(job) {
  if (!job) return '';
  const parts = [];
- parts.push(job.filesTotal >= 0
+ // Show the denominator only for a MEANINGFUL total (> 0). A metadata job
+ // (trash, restore, size) never sets a files total, so it stays 0, and a capped
+ // scan reports -1; both are non-positive and must read "N files", not the
+ // "1 / 0 files" a >= 0 test produced.
+ parts.push(job.filesTotal > 0
   ? `${job.files.toLocaleString()} / ${job.filesTotal.toLocaleString()} files`
   : `${job.files.toLocaleString()} files`);
  if (job.bytes > 0 || job.bytesTotal > 0) {
-  parts.push(job.bytesTotal >= 0
+  parts.push(job.bytesTotal > 0
    ? `${formatBytes(job.bytes)} / ${formatBytes(job.bytesTotal)}`
    : formatBytes(job.bytes));
  }
- const rate = formatRate(job.rate); if (rate) parts.push(rate);
- // An ETA of 0 means "about to finish", which is not worth saying, and a
- // finished job's last estimate is stale.
- if (job.eta > 0 && jobLive(job)) parts.push(formatETA(job.eta));
+ // A rate and an ETA are only meaningful while the job runs; a finished job's
+ // last estimate is stale (a "done" job used to still show e.g. "21 GiB/s"). An
+ // ETA of 0 means "about to finish", not worth saying.
+ if (jobLive(job)) {
+  const rate = formatRate(job.rate); if (rate) parts.push(rate);
+  if (job.eta > 0) parts.push(formatETA(job.eta));
+ }
  return parts.join(' · ');
 }
 
@@ -140,8 +157,12 @@ function jobRow(job) {
   head.append(cancel);
  }
  row.append(head);
- const bar = el('progress',{id:`jobBar-${job.id}`});
- if (percent !== null) { bar.max = 100; bar.value = percent; } // no value at all = indeterminate
+ const bar = el('progress',{id:`jobBar-${job.id}`,max:100});
+ // A <progress> with no value attribute renders INDETERMINATE (an animated
+ // sweep). jobBarState gives every terminal job a value so a finished job never
+ // keeps animating; only a running job with no denominator stays indeterminate.
+ const barValue = jobBarState(job);
+ if (barValue !== null) bar.value = barValue;
  row.append(bar);
  row.append(el('p',{class:'jobLine'},jobDetailLine(job)));
  if (job.current && jobLive(job)) row.append(el('p',{class:'jobCurrent'},`now: ${job.current}`));

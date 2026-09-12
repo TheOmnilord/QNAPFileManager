@@ -1,7 +1,7 @@
 // Run with: node --test internal/web/jobs_test.mjs
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
-import {formatBytes,formatRate,formatETA,jobPercent,jobDetailLine,shouldPoll,jobLive,createPoller,jobTransitions,seedJob,trackedStates} from './static/js/jobs.js';
+import {formatBytes,formatRate,formatETA,jobPercent,jobBarState,jobDetailLine,shouldPoll,jobLive,createPoller,jobTransitions,seedJob,trackedStates} from './static/js/jobs.js';
 
 test('formatBytes reads in binary units', () => {
  assert.equal(formatBytes(0),'0 B');
@@ -45,6 +45,26 @@ test('jobDetailLine drops the denominator when the scan was capped', () => {
 test('jobDetailLine hides a stale ETA once the job is finished', () => {
  const line = jobDetailLine({state:'cancelled',files:412,filesTotal:8003,bytes:0,bytesTotal:0,rate:0,eta:52});
  assert.equal(line,`${n(412)} / ${n(8003)} files`);
+});
+
+test('jobDetailLine drops a zero total (a metadata job) instead of printing "/ 0"', () => {
+ // Trash/restore/size jobs never set a files total, so it stays 0 — the bug was
+ // "1 / 0 files". A finished job must not show a total of 0 nor a stale rate.
+ const trash = jobDetailLine({state:'done',files:1,filesTotal:0,bytes:0,bytesTotal:0,rate:0,eta:0});
+ assert.equal(trash,'1 files');
+ const size = jobDetailLine({state:'done',files:36,filesTotal:0,bytes:6.3*1024**3,bytesTotal:0,rate:21.1*1024**3,eta:0});
+ assert.equal(size,`36 files · 6.3 GiB`); // no "/ 0 B", no stale GiB/s
+});
+
+test('jobBarState makes a finished job determinate, never animating', () => {
+ // done → full; a stopped job holds its fraction (or empty); a running job with
+ // no denominator stays indeterminate (null value = the animated sweep).
+ assert.equal(jobBarState({state:'done',files:1,filesTotal:0,bytes:0,bytesTotal:0}),100);
+ assert.equal(jobBarState({state:'done',files:1,filesTotal:4,bytes:0,bytesTotal:0}),100);
+ assert.equal(jobBarState({state:'cancelled',files:2,filesTotal:8,bytes:0,bytesTotal:0}),25);
+ assert.equal(jobBarState({state:'failed',files:0,filesTotal:0,bytes:0,bytesTotal:0}),0);
+ assert.equal(jobBarState({state:'running',files:1,filesTotal:4,bytes:0,bytesTotal:0}),25);
+ assert.equal(jobBarState({state:'running',files:5,filesTotal:0,bytes:0,bytesTotal:0}),null); // indeterminate
 });
 
 test('polling follows the live states', () => {

@@ -72,12 +72,16 @@ func mkdirAt(j fsx.Jail, parentRel, name string, mode os.FileMode, parents bool,
 		if err := chownLeaf(parent, name, as); err != nil {
 			// Label the phase so the front-end reports accurately (finding E): a
 			// refused provenance check is a concurrent change / substitution, not a
-			// chown failure.
+			// chown failure. The DIRECTORY WAS CREATED — join fsx.ErrOwnerUnset so
+			// fsx.Code is "owner_unset", positive proof to the front-end that the
+			// create happened and only the ownership step failed (round-3 finding 2),
+			// rather than it inferring that from the item merely existing. The
+			// underlying phase-labelled cause is kept for the server log.
 			op := "fchown"
 			if errors.Is(err, errLeafSubstituted) {
 				op = "provenance"
 			}
-			return &fs.PathError{Op: op, Path: relJoin(parentRel, name), Err: err}
+			return errors.Join(fsx.ErrOwnerUnset, &fs.PathError{Op: op, Path: relJoin(parentRel, name), Err: err})
 		}
 	}
 	return nil

@@ -36,6 +36,13 @@ var (
 	ErrWorkerGone = errors.New("the worker process is gone")
 	// ErrQueueFull: the job queue is at its limit.
 	ErrQueueFull = errors.New("the queue is full")
+	// ErrOwnerUnset: a create SUCCEEDED but the follow-up chown to the real user
+	// did not (the admin-as-real-user mkdir path), so the new item exists but is
+	// still owned by the daemon. It is positive proof the item was created and
+	// the ownership step failed — the front-end reports "owner_unset" on this
+	// code alone, never inferring it from an item merely existing (which a
+	// pre-existing file plus an unrelated create failure would falsely satisfy).
+	ErrOwnerUnset = errors.New("the item was created but its owner could not be set")
 )
 
 // Code maps an error to the API's error vocabulary, as fixed by
@@ -65,6 +72,8 @@ func Code(err error) string {
 		return "confirm_required"
 	case errors.Is(err, ErrQueueFull):
 		return "queue_full"
+	case errors.Is(err, ErrOwnerUnset):
+		return "owner_unset"
 	case errors.Is(err, ErrUnsupported):
 		return "unsupported"
 	case errors.Is(err, ErrCrossDevice):

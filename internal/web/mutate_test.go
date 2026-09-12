@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"net/http"
@@ -299,7 +300,55 @@ func (c *createThenFailBackend) Mkdir(ctx context.Context, p backend.Principal, 
 	if _, err := c.fakeBackend.Mkdir(ctx, p, dir, name, mode, parents, as); err != nil {
 		return fsx.Entry{}, err
 	}
-	return fsx.Entry{}, &fs.PathError{Op: "provenance", Path: fsx.Join(dir, name), Err: errors.New("a concurrent change was detected")}
+	// The create landed; only the chown failed — exactly what fsops returns, with
+	// fsx.ErrOwnerUnset joined so the code is owner_unset (round-3 finding 2).
+	return fsx.Entry{}, errors.Join(fsx.ErrOwnerUnset, &fs.PathError{Op: "provenance", Path: fsx.Join(dir, name), Err: errors.New("a concurrent change was detected")})
+}
+
+// workerGoneBackend fails the mkdir BEFORE it runs (the worker died), creating
+// nothing. It is used to prove the owner_unset report is keyed on the error CODE
+// and never inferred from a target merely existing.
+type workerGoneBackend struct {
+	*fakeBackend
+}
+
+func (workerGoneBackend) Mkdir(context.Context, backend.Principal, string, string, os.FileMode, bool, *wproto.CreateAs) (fsx.Entry, error) {
+	return fsx.Entry{}, fmt.Errorf("the mkdir never ran: %w", fsx.ErrWorkerGone)
+}
+
+// TestMkdirWorkerGoneOverExistingIsNotOwnerUnset is round-3 finding 2: a mkdir
+// that fails before it runs (a dead worker) over a path that ALREADY holds an
+// entry must be reported as the real failure (worker_gone), never as our own
+// partial create — the old code inferred owner_unset from the target existing
+// and would have told the user to delete a pre-existing file.
+func TestMkdirWorkerGoneOverExistingIsNotOwnerUnset(t *testing.T) {
+	s, b := fixture(t, true)
+	s.guard.SetReadOnly(false)
+	s.mutator = workerGoneBackend{b}
+	if err := os.MkdirAll(filepath.Join(b.dir, "home", "admin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A regular file the request did NOT create already sits at the target name.
+	if err := os.WriteFile(filepath.Join(b.dir, "home", "admin", "stuck"), []byte("mine"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c, csrf := sessionCookie(t, s)
+	s.sessions[c.Value].admin = true
+	s.sessions[c.Value].who.Root = true
+
+	resp := post(s, "/api/fs/mkdir", c, csrf, `{"dir":"/home/admin","name":"stuck"}`)
+	var e apiEnvelope
+	json.NewDecoder(resp.Body).Decode(&e)
+	if e.Error.Code == "owner_unset" {
+		t.Fatalf("a pre-existing entry plus a worker-gone create was mislabelled owner_unset")
+	}
+	if e.Error.Code != "worker_gone" {
+		t.Fatalf("code %q, want worker_gone (the real failure)", e.Error.Code)
+	}
+	// The pre-existing file is untouched.
+	if data, err := os.ReadFile(filepath.Join(b.dir, "home", "admin", "stuck")); err != nil || string(data) != "mine" {
+		t.Fatalf("the pre-existing file was disturbed: %q %v", data, err)
+	}
 }
 
 // TestMkdirOwnerUnsetReportsPartialState is finding E: when the folder is

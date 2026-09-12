@@ -508,20 +508,20 @@ func (s *Server) mkdir(w http.ResponseWriter, r *http.Request, sess *session) {
 	// possible to what was guarded (adv 1b / standard P1); see the residual-race
 	// note in PLAN.md §2.0.
 	entry, err := s.mutator.Mkdir(r.Context(), sess.who, resolvedDir, body.Name, os.FileMode(0), body.Parents, as)
-	// When the chown or its provenance check fails AFTER the mkdirat, the folder
-	// exists but is root-owned — not adopted to the user (finding E). Report that
-	// partial state honestly with a distinct code so the UI can refresh and tell
-	// the user rather than showing a bare refusal (and a retry then hitting
-	// EEXIST). The deliberate no-rollback behaviour is kept: the folder stays. A
-	// genuine name collision (code "exists") is NOT this case. Confirm as the user
-	// that the folder really landed before claiming it.
-	if err != nil && as != nil && fsx.Code(err) != "exists" {
-		if _, statErr := s.backend.Stat(r.Context(), sess.who, target); statErr == nil {
-			s.logRaw(r, m.op, m.path, err) // the raw error may name the resolved path
-			s.writeAudit(sess, r, m, "result", "error", "owner_unset", "folder created but owner could not be set", false)
-			s.fail(w, r, "owner_unset", "The folder was created but could not be assigned to you; it is owned by the system — check it or delete it.", target, "")
-			return
-		}
+	// The worker created the directory but could not chown it to the user (the
+	// admin-as-real-user path): the error carries fsx.ErrOwnerUnset, so its code
+	// is exactly "owner_unset" — positive proof the create happened and only the
+	// ownership step failed (finding E / round-3 finding 2). Report that partial
+	// state honestly so the UI refreshes and explains rather than showing a bare
+	// refusal a retry would turn into "exists". The no-rollback behaviour is kept:
+	// the folder stays. This keys on the CODE, never on the item merely existing —
+	// a create that failed before it ran (a dead worker) over a pre-existing entry
+	// must not be mislabelled as our partial create.
+	if fsx.Code(err) == "owner_unset" {
+		s.logRaw(r, m.op, m.path, err) // the raw cause may name the resolved path
+		s.writeAudit(sess, r, m, "result", "error", "owner_unset", "folder created but owner could not be set", false)
+		s.fail(w, r, "owner_unset", "The folder was created but could not be assigned to you; it is owned by the system — check it or delete it.", target, "")
+		return
 	}
 	if !s.finish(w, r, sess, m, err, false) {
 		return

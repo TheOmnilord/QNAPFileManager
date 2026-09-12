@@ -670,7 +670,7 @@ var _ backend.Mutator = (*Pool)(nil)
 // mkdir passes no descriptor, so the ordinary RPC path carries it in both
 // modes: in-process it travels the net.Pipe to the worker goroutine exactly as
 // a real socketpair would.
-func (p *Pool) Mkdir(ctx context.Context, who backend.Principal, dir, name string, mode os.FileMode, parents bool) (fsx.Entry, error) {
+func (p *Pool) Mkdir(ctx context.Context, who backend.Principal, dir, name string, mode os.FileMode, parents bool, as *wproto.CreateAs) (fsx.Entry, error) {
 	c, err := p.acquire(ctx, who)
 	if err != nil {
 		return fsx.Entry{}, err
@@ -681,6 +681,7 @@ func (p *Pool) Mkdir(ctx context.Context, who backend.Principal, dir, name strin
 		Name:    []byte(name),
 		Mode:    uint32(mode),
 		Parents: parents,
+		As:      as,
 	})
 	if err != nil {
 		return fsx.Entry{}, err

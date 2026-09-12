@@ -15,6 +15,7 @@ import (
 	"qnapfilemanager/internal/audit"
 	"qnapfilemanager/internal/fsx"
 	"qnapfilemanager/internal/guard"
+	"qnapfilemanager/internal/wproto"
 )
 
 // This file wires the M1 mutations (mkdir, rename, single/batch delete) into the
@@ -481,10 +482,27 @@ func (s *Server) mkdir(w http.ResponseWriter, r *http.Request, sess *session) {
 	if !s.auditIntent(w, r, sess, m, false) {
 		return
 	}
+	// Decide who owns the new folder. For an admin session the worker runs as
+	// root (decision 6), so a plain mkdir lands root-owned with a umask mode —
+	// which File Station's real-uid users then cannot write into (owner hardware
+	// report). So, ONLY for a root session AND ONLY in an ordinary (guard-normal)
+	// location, ask the worker to chown the created folder to the real signed-in
+	// user and set it group-writable (0770), matching File Station; the inherited
+	// group is kept (GID -1), so a setgid parent keeps it in administrators. A
+	// guard-warn or protected parent (/etc/config, the install tree, mount roots,
+	// /proc, ...) is a genuine system location and stays root-owned — the
+	// classification is taken on the RESOLVED parent, consistent with the
+	// dispatch below. A non-admin worker already runs as the user, so its content
+	// is user-owned and As stays nil (a non-root worker chowning to another uid
+	// is EPERM anyway). The front-end only ever names the session's OWN uid.
+	var as *wproto.CreateAs
+	if sess.who.Root && s.guard.Classify(resolvedDir) == "normal" {
+		as = &wproto.CreateAs{UID: sess.who.UID, GID: -1, Mode: 0o770}
+	}
 	// Dispatch against the resolved parent, binding the operation as tightly as
 	// possible to what was guarded (adv 1b / standard P1); see the residual-race
 	// note in PLAN.md §2.0.
-	entry, err := s.mutator.Mkdir(r.Context(), sess.who, resolvedDir, body.Name, os.FileMode(0), body.Parents)
+	entry, err := s.mutator.Mkdir(r.Context(), sess.who, resolvedDir, body.Name, os.FileMode(0), body.Parents, as)
 	if !s.finish(w, r, sess, m, err, false) {
 		return
 	}

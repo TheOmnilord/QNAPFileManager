@@ -628,7 +628,14 @@ func (s *session) mkdir(ctx context.Context, f wproto.Frame) {
 		s.replyErr(f.ID, err, nil)
 		return
 	}
-	e, err := fsops.Mkdir(ctx, s.root, string(req.Dir), string(req.Name), os.FileMode(req.Mode), req.Parents)
+	// Translate the wire owner (wproto.CreateAs) into the fsops owner, so fsops
+	// keeps its import graph (it does not import wproto). nil stays nil: the
+	// unchanged root-owned, umask-applied create.
+	var as *fsops.Owner
+	if req.As != nil {
+		as = &fsops.Owner{UID: req.As.UID, GID: req.As.GID, Mode: os.FileMode(req.As.Mode)}
+	}
+	e, err := fsops.Mkdir(ctx, s.root, string(req.Dir), string(req.Name), os.FileMode(req.Mode), req.Parents, as)
 	if err != nil {
 		s.replyErr(f.ID, err, req.Dir)
 		return

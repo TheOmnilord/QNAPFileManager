@@ -52,12 +52,35 @@ type StatResp struct {
 	Entry fsx.Entry `json:"e"`
 }
 
+// CreateAs asks the worker to chown (and optionally chmod) freshly created
+// content after it is created, so an administrator session's root worker can
+// make content owned by the real signed-in user — the way File Station does —
+// instead of leaving it root-owned. UID or GID of -1 leaves that id as the
+// kernel set it (so GID -1 keeps the group the parent's setgid bit supplied,
+// i.e. administrators); Mode 0 leaves the mode the umask produced. A nil
+// *CreateAs is the unchanged behaviour: root-owned, umask-applied.
+//
+// It is only meaningful for the root worker: a non-root worker asked to chown
+// to another uid is refused by the kernel (EPERM), which is why the front-end
+// sets it solely for an admin (root) session in an ordinary (guard-normal)
+// location (see internal/web/routes_mutate.go). It is carried on MkdirReq here
+// and reserved for the M2 create paths (copy, upload) as they land.
+type CreateAs struct {
+	UID  int    `json:"u"`
+	GID  int    `json:"g"`
+	Mode uint32 `json:"m"`
+}
+
 type MkdirReq struct {
 	Dir  []byte `json:"d"`
 	Name []byte `json:"n"`
 	Mode uint32 `json:"m"`
 	// Parents creates missing intermediate directories.
 	Parents bool `json:"p,omitempty"`
+	// As, when non-nil, asks the worker to chown/chmod the created directory to
+	// the given owner after creating it (the admin-as-real-user case). nil keeps
+	// the current root-owned, umask-applied behaviour.
+	As *CreateAs `json:"as,omitempty"`
 }
 
 type RenameReq struct {

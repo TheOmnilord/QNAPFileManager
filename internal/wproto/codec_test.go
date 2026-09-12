@@ -117,6 +117,61 @@ func TestNonUTF8PathsSurvive(t *testing.T) {
 	}
 }
 
+// TestMkdirAsRoundTrips checks the optional CreateAs owner survives the wire
+// both ways: a nil As stays nil (the unchanged, root-owned create) and encodes
+// no "as" key (omitempty), while a populated one round-trips its uid, gid and
+// mode — including a GID of -1, the "leave the group alone" sentinel that must
+// not be dropped by any omitempty on the inner field.
+func TestMkdirAsRoundTrips(t *testing.T) {
+	// nil As: absent on the wire, nil on the way back.
+	f, err := NewReq(1, OpMkdir, MkdirReq{Dir: []byte("/d"), Name: []byte("x")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(f.Body, []byte(`"as"`)) {
+		t.Fatalf("a nil As must not appear on the wire: %s", f.Body)
+	}
+	var buf bytes.Buffer
+	if err := Encode(&buf, f); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Decode(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back MkdirReq
+	if err := got.Unmarshal(&back); err != nil {
+		t.Fatal(err)
+	}
+	if back.As != nil {
+		t.Fatalf("As = %+v, want nil", back.As)
+	}
+
+	// Populated As with GID -1: every field survives.
+	f2, err := NewReq(2, OpMkdir, MkdirReq{Dir: []byte("/d"), Name: []byte("y"), As: &CreateAs{UID: 500, GID: -1, Mode: 0o770}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf.Reset()
+	if err := Encode(&buf, f2); err != nil {
+		t.Fatal(err)
+	}
+	got2, err := Decode(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back2 MkdirReq
+	if err := got2.Unmarshal(&back2); err != nil {
+		t.Fatal(err)
+	}
+	if back2.As == nil {
+		t.Fatal("As = nil, want a populated owner")
+	}
+	if back2.As.UID != 500 || back2.As.GID != -1 || back2.As.Mode != 0o770 {
+		t.Fatalf("As = %+v, want {UID:500 GID:-1 Mode:0770}", back2.As)
+	}
+}
+
 func TestOversizedFrameRejected(t *testing.T) {
 	// A hostile or corrupt length prefix must be refused before the reader
 	// allocates it, and the body must never be read.

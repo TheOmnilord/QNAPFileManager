@@ -67,8 +67,13 @@ type Backend interface {
 // its errors unchanged, mapped to the shared vocabulary by fsx.Code.
 type Mutator interface {
 	// Mkdir creates <dir>/<name> and returns the new entry. mode 0 means 0755
-	// (less the worker's umask); parents creates missing intermediates.
-	Mkdir(ctx context.Context, who Principal, dir, name string, mode os.FileMode, parents bool) (fsx.Entry, error)
+	// (less the worker's umask); parents creates missing intermediates. as, when
+	// non-nil, asks the worker to chown/chmod the created directory to the given
+	// owner after creating it — the admin-as-real-user case (routes_mutate.go);
+	// nil keeps the default root-owned, umask-applied create. It is only
+	// meaningful for a root (admin) worker, since the kernel refuses a non-root
+	// process that chowns to another uid (INV-2).
+	Mkdir(ctx context.Context, who Principal, dir, name string, mode os.FileMode, parents bool, as *wproto.CreateAs) (fsx.Entry, error)
 	// Rename moves from to to, which may be in different directories. An
 	// existing destination is refused unless overwrite is set; a rename across
 	// filesystems is fsx.ErrCrossDevice.

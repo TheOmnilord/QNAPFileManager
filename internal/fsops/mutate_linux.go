@@ -28,7 +28,20 @@ const atRemoveDir = 0x200
 // O_NOFOLLOW so nothing is resolved by name and no symlink can redirect the
 // walk. resolve() has already followed every symlink on parentRel, so the only
 // components without a descriptor are the ones parents is being asked to make.
-func mkdirAt(j fsx.Jail, parentRel, name string, mode os.FileMode, parents bool) error {
+//
+// When as is non-nil the just-created leaf is chowned (and, for a non-zero
+// Mode, chmod'd) to the requested owner through the SAME parent descriptor the
+// mkdirat used: the leaf is re-opened relative to parent with O_NOFOLLOW, never
+// by re-resolving its pathname, so a symlink swapped in between the mkdirat and
+// the chown cannot redirect it (the descriptor discipline the trash hardening
+// uses, PLAN.md §2.7). A chown/chmod failure leaves the created directory in
+// place, root-owned, and is returned so the front-end can report it.
+//
+// Only the leaf is chowned. parents is never combined with as on the one path
+// that sets as today (the UI creates a single folder, and routes_mutate.go
+// refuses parents in M1), so intermediate directories created by a parents walk
+// are left root-owned — a noted residual rather than a silent partial chown.
+func mkdirAt(j fsx.Jail, parentRel, name string, mode os.FileMode, parents bool, as *Owner) error {
 	parent, err := openParentDir(j, parentRel, mode, parents)
 	if err != nil {
 		return err
@@ -37,7 +50,62 @@ func mkdirAt(j fsx.Jail, parentRel, name string, mode os.FileMode, parents bool)
 	if err := mkdiratIn(parent, name, syscallMode(mode)); err != nil {
 		return &fs.PathError{Op: "mkdirat", Path: relJoin(parentRel, name), Err: err}
 	}
+	if as != nil {
+		if err := chownChmodLeaf(parent, name, as); err != nil {
+			return &fs.PathError{Op: "fchown", Path: relJoin(parentRel, name), Err: err}
+		}
+	}
 	return nil
+}
+
+// chownChmodLeaf sets the owner (and, for a non-zero Mode, the mode) of the
+// directory named by name inside parent, addressing it by a descriptor opened
+// relative to parent rather than by its pathname. The open is
+// O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC — not O_PATH, because fchown/fchmod on an
+// O_PATH descriptor is EBADF — so a symlink substituted for the leaf is refused
+// (ENOTDIR/ELOOP) instead of followed, and the chown lands on the inode the
+// mkdirat created and no other.
+//
+// The kernel enforces everything: a non-root worker that reached here (it never
+// does — the front-end gates on root) would get EPERM from fchown, exactly as
+// INV-2 requires. -1 for UID or GID leaves that id alone, per chown(2).
+func chownChmodLeaf(parent *os.File, name string, as *Owner) error {
+	fd, err := openatIn(parent, name, syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC)
+	if err != nil {
+		return err
+	}
+	defer syscall.Close(fd)
+	if as.UID != -1 || as.GID != -1 {
+		if err := fchownRetry(fd, as.UID, as.GID); err != nil {
+			return err
+		}
+	}
+	if as.Mode != 0 {
+		if err := fchmodRetry(fd, syscallMode(as.Mode)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// fchownRetry is fchown(2) retried over EINTR.
+func fchownRetry(fd, uid, gid int) error {
+	for {
+		err := syscall.Fchown(fd, uid, gid)
+		if err != syscall.EINTR {
+			return err
+		}
+	}
+}
+
+// fchmodRetry is fchmod(2) retried over EINTR.
+func fchmodRetry(fd int, mode uint32) error {
+	for {
+		err := syscall.Fchmod(fd, mode)
+		if err != syscall.EINTR {
+			return err
+		}
+	}
 }
 
 // renameNoReplace is RENAME_NOREPLACE, the renameat2(2) flag that makes the

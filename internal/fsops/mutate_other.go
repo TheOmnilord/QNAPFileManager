@@ -23,7 +23,12 @@ import (
 // missing intermediate directories of parentRel first when parents is set. The
 // final component keeps O_EXCL semantics: os.Root.Mkdir reports an existing
 // name as fs.ErrExist rather than succeeding.
-func mkdirAt(j fsx.Jail, parentRel, name string, mode os.FileMode, parents bool) error {
+//
+// The as owner is ignored off Linux: there is no uid model and no chown here
+// (this is the Windows dev box and the in-process worker the tests use), which
+// is why the admin-as-real-user behaviour is only ever exercised on Linux
+// (INV-2).
+func mkdirAt(j fsx.Jail, parentRel, name string, mode os.FileMode, parents bool, _ *Owner) error {
 	child := relJoin(parentRel, name)
 	if parents && parentRel != "." && parentRel != "" {
 		if err := j.MkdirAll(parentRel, mode); err != nil {

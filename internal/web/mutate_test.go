@@ -17,6 +17,7 @@ import (
 	"qnapfilemanager/internal/config"
 	"qnapfilemanager/internal/fsx"
 	"qnapfilemanager/internal/guard"
+	"qnapfilemanager/internal/wproto"
 )
 
 // resolveStub overrides the fake backend's Resolve to model a worker resolving a
@@ -163,6 +164,76 @@ func TestConfirmRequiredThenSucceeds(t *testing.T) {
 	}
 	if fi, err := os.Stat(filepath.Join(b.dir, "etc", "config", "new")); err != nil || !fi.IsDir() {
 		t.Fatalf("confirmed directory not created: %v", err)
+	}
+}
+
+// TestMkdirOwnerByClassification is the web half of the admin-as-real-user fix:
+// an admin (root) session creating a folder in an ORDINARY (guard-normal)
+// location sends an owner of {real uid, GID -1, 0770} so the root worker chowns
+// it to the signed-in user like File Station; the same admin creating in a
+// guard-warn (system) location sends no owner, so it stays root-owned; and a
+// NON-admin session sends no owner either, since its worker already runs as the
+// user (a non-root chown to another uid is EPERM anyway).
+func TestMkdirOwnerByClassification(t *testing.T) {
+	s, b := fixture(t, true) // pinned admin/root session, UID 1000
+	s.guard.SetReadOnly(false)
+	// A guard-normal parent (an ordinary user area, like a share) and a guard-warn
+	// parent (a system location). "/" itself is protected, so it is not "normal".
+	if err := os.MkdirAll(filepath.Join(b.dir, "home", "admin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(b.dir, "etc", "config"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c, csrf := sessionCookie(t, s)
+	// An administrator session operates as root (decision 6): who.Root is the
+	// admin flag. New() forces the pinned principal's Root to false, so set the
+	// admin/root session explicitly, the way the full-auth path derives it.
+	s.sessions[c.Value].admin = true
+	s.sessions[c.Value].who.Root = true
+
+	// Admin, normal location: owner = {1000, -1, 0770}.
+	b.lastAs = nil
+	if resp := post(s, "/api/fs/mkdir", c, csrf, `{"dir":"/home/admin","name":"normal-owned"}`); resp.StatusCode != 200 {
+		t.Fatalf("normal mkdir status %d", resp.StatusCode)
+	}
+	if b.lastAs == nil {
+		t.Fatal("admin mkdir in a normal path must send an owner, got nil")
+	}
+	if b.lastAs.UID != 1000 || b.lastAs.GID != -1 || b.lastAs.Mode != 0o770 {
+		t.Fatalf("owner = %+v, want {UID:1000 GID:-1 Mode:0770}", b.lastAs)
+	}
+
+	// Admin, warn location (/etc/config): no owner — it stays root-owned. The
+	// warn class demands a confirmation token first.
+	b.lastAs = &wproto.CreateAs{UID: -999} // sentinel: must be overwritten to nil
+	resp := post(s, "/api/fs/mkdir", c, csrf, `{"dir":"/etc/config","name":"sys"}`)
+	if resp.StatusCode != 409 {
+		t.Fatalf("warn mkdir first status %d, want 409", resp.StatusCode)
+	}
+	var first struct {
+		Confirm struct{ Token string }
+	}
+	json.NewDecoder(resp.Body).Decode(&first)
+	if first.Confirm.Token == "" {
+		t.Fatal("no confirmation token for the warn path")
+	}
+	body, _ := json.Marshal(map[string]any{"dir": "/etc/config", "name": "sys", "confirm": first.Confirm.Token})
+	if resp2 := post(s, "/api/fs/mkdir", c, csrf, string(body)); resp2.StatusCode != 200 {
+		t.Fatalf("confirmed warn mkdir status %d", resp2.StatusCode)
+	}
+	if b.lastAs != nil {
+		t.Fatalf("admin mkdir in a warn path must send no owner, got %+v", b.lastAs)
+	}
+
+	// Non-admin session: no owner, even in a normal location.
+	s.sessions[c.Value].who.Root = false
+	b.lastAs = &wproto.CreateAs{UID: -999} // sentinel
+	if resp := post(s, "/api/fs/mkdir", c, csrf, `{"dir":"/","name":"user-owned"}`); resp.StatusCode != 200 {
+		t.Fatalf("non-admin mkdir status %d", resp.StatusCode)
+	}
+	if b.lastAs != nil {
+		t.Fatalf("a non-admin mkdir must send no owner, got %+v", b.lastAs)
 	}
 }
 

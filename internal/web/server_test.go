@@ -24,14 +24,16 @@ import (
 	"qnapfilemanager/internal/idmap"
 	"qnapfilemanager/internal/platform"
 	"qnapfilemanager/internal/qtsauth"
+	"qnapfilemanager/internal/wproto"
 )
 
 // fakeBackend intentionally uses os only in the test package. No fsops import:
 // production web code must have no route around the Backend identity boundary.
 type fakeBackend struct {
-	dir  string
-	last backend.Principal
-	opts fsx.ListOptions
+	dir    string
+	last   backend.Principal
+	lastAs *wproto.CreateAs // the owner the most recent Mkdir was asked to apply
+	opts   fsx.ListOptions
 }
 
 func (b *fakeBackend) osPath(p string) string {
@@ -118,8 +120,9 @@ func (b *fakeBackend) List(ctx context.Context, p backend.Principal, name string
 
 // The Mutator half of the fake backend: real os operations under the temp dir,
 // so mkdir/rename/delete are exercised end to end without the worker pool.
-func (b *fakeBackend) Mkdir(ctx context.Context, p backend.Principal, dir, name string, mode os.FileMode, parents bool) (fsx.Entry, error) {
+func (b *fakeBackend) Mkdir(ctx context.Context, p backend.Principal, dir, name string, mode os.FileMode, parents bool, as *wproto.CreateAs) (fsx.Entry, error) {
 	b.last = p
+	b.lastAs = as
 	target := fsx.Join(dir, name)
 	if mode == 0 {
 		mode = 0o755

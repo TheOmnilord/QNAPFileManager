@@ -36,7 +36,7 @@ func TestMkdirCreatesAndReturnsEntry(t *testing.T) {
 	mkdir(t, base, "parent")
 	r := newRoot(t, base)
 
-	e, err := Mkdir(context.Background(), r, "/parent", "child", 0, false)
+	e, err := Mkdir(context.Background(), r, "/parent", "child", 0, false, nil)
 	if err != nil {
 		t.Fatalf("Mkdir: %v", err)
 	}
@@ -57,7 +57,7 @@ func TestMkdirRefusesAnExistingName(t *testing.T) {
 	mkdir(t, base, "here")
 	r := newRoot(t, base)
 
-	_, err := Mkdir(context.Background(), r, "/", "here", 0, false)
+	_, err := Mkdir(context.Background(), r, "/", "here", 0, false, nil)
 	if !errors.Is(err, fs.ErrExist) {
 		t.Fatalf("Mkdir of an existing name = %v, want fs.ErrExist", err)
 	}
@@ -70,7 +70,7 @@ func TestMkdirParentsCreatesIntermediates(t *testing.T) {
 	base := tempDir(t)
 	r := newRoot(t, base)
 
-	e, err := Mkdir(context.Background(), r, "/a/b/c", "d", 0, true)
+	e, err := Mkdir(context.Background(), r, "/a/b/c", "d", 0, true, nil)
 	if err != nil {
 		t.Fatalf("Mkdir with parents: %v", err)
 	}
@@ -85,7 +85,7 @@ func TestMkdirParentsCreatesIntermediates(t *testing.T) {
 
 	// Without parents the same missing chain is a not_found, not a silent
 	// creation.
-	_, err = Mkdir(context.Background(), r, "/x/y", "z", 0, false)
+	_, err = Mkdir(context.Background(), r, "/x/y", "z", 0, false, nil)
 	if !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("Mkdir into a missing parent without parents = %v, want fs.ErrNotExist", err)
 	}
@@ -94,7 +94,7 @@ func TestMkdirParentsCreatesIntermediates(t *testing.T) {
 func TestMkdirRejectsBadName(t *testing.T) {
 	r := newRoot(t, tempDir(t))
 	for _, name := range []string{"", ".", "..", "a/b"} {
-		if _, err := Mkdir(context.Background(), r, "/", name, 0, false); !errors.Is(err, fsx.ErrBadName) {
+		if _, err := Mkdir(context.Background(), r, "/", name, 0, false, nil); !errors.Is(err, fsx.ErrBadName) {
 			t.Errorf("Mkdir name %q = %v, want ErrBadName", name, err)
 		}
 	}

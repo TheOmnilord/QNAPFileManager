@@ -34,7 +34,7 @@ func TestMkdirThroughASearchOnlyParent(t *testing.T) {
 	}
 	r := newRoot(t, base)
 
-	e, err := Mkdir(context.Background(), r, "/outer/inner", "made", 0, false)
+	e, err := Mkdir(context.Background(), r, "/outer/inner", "made", 0, false, nil)
 	if err != nil {
 		t.Fatalf("Mkdir under a search-only ancestor: %v", err)
 	}
@@ -43,6 +43,55 @@ func TestMkdirThroughASearchOnlyParent(t *testing.T) {
 	}
 	if fi, serr := os.Stat(filepath.Join(base, "outer", "inner", "made")); serr != nil || !fi.IsDir() {
 		t.Fatalf("the directory was not created: %v", serr)
+	}
+}
+
+// TestMkdirWithOwnerChownsTheLeaf is the admin-as-real-user fix (owner hardware
+// report): when an Owner is passed, the just-created directory is chowned to
+// the requested uid and chmod'd to the exact mode, defeating the umask — the
+// behaviour File Station gives, so a real-uid user can write into a folder an
+// admin's root worker made. Handing an inode to another uid needs root, so this
+// runs only in the test-linux-root CI job (INV-2: the kernel, not a simulation,
+// does the chown). Without an Owner the create is unchanged: root-owned, umask
+// mode.
+func TestMkdirWithOwnerChownsTheLeaf(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("chowning a new directory to another uid needs root; the test-linux-root job runs this one")
+	}
+	const fixtureUID = 65534 // nobody on every distribution the NAS resembles
+	base := tempDir(t)
+	mkdir(t, base, "area")
+	r := newRoot(t, base)
+
+	// With an Owner: the leaf is chowned to the fixture uid, its group left as the
+	// parent supplied it (GID -1), and its mode set to exactly 0770.
+	if _, err := Mkdir(context.Background(), r, "/area", "owned", 0, false, &Owner{UID: fixtureUID, GID: -1, Mode: 0o770}); err != nil {
+		t.Fatalf("Mkdir with an owner: %v", err)
+	}
+	var st syscall.Stat_t
+	if err := syscall.Lstat(filepath.Join(base, "area", "owned"), &st); err != nil {
+		t.Fatalf("lstat the owned directory: %v", err)
+	}
+	if int(st.Uid) != fixtureUID {
+		t.Errorf("owner uid = %d, want %d", st.Uid, fixtureUID)
+	}
+	if st.Mode&0o777 != 0o770 {
+		t.Errorf("mode = %#o, want 0770 (umask defeated)", st.Mode&0o777)
+	}
+	if int(st.Gid) != 0 {
+		t.Errorf("gid = %d, want 0 kept from the parent (GID -1 leaves it)", st.Gid)
+	}
+
+	// Without an Owner: unchanged. The root worker created it, so it is root-owned.
+	if _, err := Mkdir(context.Background(), r, "/area", "plain", 0, false, nil); err != nil {
+		t.Fatalf("Mkdir without an owner: %v", err)
+	}
+	var pst syscall.Stat_t
+	if err := syscall.Lstat(filepath.Join(base, "area", "plain"), &pst); err != nil {
+		t.Fatalf("lstat the plain directory: %v", err)
+	}
+	if int(pst.Uid) != 0 {
+		t.Errorf("plain owner uid = %d, want 0 (unchanged, root-owned)", pst.Uid)
 	}
 }
 

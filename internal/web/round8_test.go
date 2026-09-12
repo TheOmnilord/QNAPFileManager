@@ -17,6 +17,7 @@ import (
 	"qnapfilemanager/internal/config"
 	"qnapfilemanager/internal/fsx"
 	"qnapfilemanager/internal/guard"
+	"qnapfilemanager/internal/wproto"
 )
 
 // TestConcurrentReadOnlyTogglesStayConsistent proves the standard-P1/adv-1 fix:
@@ -137,7 +138,7 @@ type leakyMutator struct {
 	*fakeBackend
 }
 
-func (l leakyMutator) Mkdir(context.Context, backend.Principal, string, string, os.FileMode, bool) (fsx.Entry, error) {
+func (l leakyMutator) Mkdir(context.Context, backend.Principal, string, string, os.FileMode, bool, *wproto.CreateAs) (fsx.Entry, error) {
 	return fsx.Entry{}, fmt.Errorf("mkdir /private/resolved/target: %w", fs.ErrExist)
 }
 

@@ -96,6 +96,25 @@ func ResolvePath(ctx context.Context, r fsx.Root, apiPath string, followLeaf boo
 	return tg.api, nil
 }
 
+// Owner requests that freshly created content be chowned (and optionally
+// chmod'd) after it is created, so an administrator session's root worker can
+// make content owned by the real signed-in user — the way File Station does —
+// instead of leaving it root-owned. UID or GID of -1 leaves that id alone, the
+// same meaning chown(2) gives -1 (so GID -1 keeps the group the parent's setgid
+// bit supplied, i.e. administrators); Mode 0 leaves the mode the umask
+// produced. A nil *Owner is the unchanged behaviour: root-owned, umask-applied.
+//
+// It is only meaningful for the root worker: the kernel refuses a non-root
+// process that tries to chown an inode to another uid (EPERM), so the front-end
+// only ever sets it for an admin (root) session (INV-2). wproto.CreateAs is its
+// wire form; the worker translates one into the other so internal/fsops keeps
+// its import graph (it does not import internal/wproto).
+type Owner struct {
+	UID  int
+	GID  int
+	Mode os.FileMode
+}
+
 // Mkdir creates <dir>/<name> and returns the new entry.
 //
 // The name is validated as a single component; dir is resolved (following the
@@ -108,7 +127,14 @@ func ResolvePath(ctx context.Context, r fsx.Root, apiPath string, followLeaf boo
 //
 // mode 0 means 0755; the worker's umask is applied by the kernel on the
 // mkdirat, so the stored mode is 0755 &^ umask without this code touching it.
-func Mkdir(ctx context.Context, r fsx.Root, dir, name string, mode os.FileMode, parents bool) (fsx.Entry, error) {
+//
+// as, when non-nil, chowns (and, for a non-zero Mode, chmods) the just-created
+// leaf to the requested owner AFTER creating it, through the held parent
+// descriptor and never a re-resolved name (mutate_linux.go). If that chown or
+// chmod fails the directory has already been created and is left in place,
+// root-owned; the error is returned so the front-end can report that the owner
+// could not be set. On non-Linux hosts as is ignored (no uid/chown).
+func Mkdir(ctx context.Context, r fsx.Root, dir, name string, mode os.FileMode, parents bool, as *Owner) (fsx.Entry, error) {
 	if err := fsx.ValidName(name); err != nil {
 		return fsx.Entry{}, err
 	}
@@ -132,7 +158,7 @@ func Mkdir(ctx context.Context, r fsx.Root, dir, name string, mode os.FileMode, 
 	if err := ctx.Err(); err != nil {
 		return fsx.Entry{}, err
 	}
-	if err := mkdirAt(tg.jail, tg.rel, name, mode, parents); err != nil {
+	if err := mkdirAt(tg.jail, tg.rel, name, mode, parents, as); err != nil {
 		return fsx.Entry{}, err
 	}
 	// Report the requested child path, the way Stat reports the requested path

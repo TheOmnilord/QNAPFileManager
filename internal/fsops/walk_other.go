@@ -65,7 +65,7 @@ func (d *dirRef) close() error { return d.f.Close() }
 
 // mkdir creates a subdirectory of this one.
 func (d *dirRef) mkdir(name string, mode os.FileMode) error {
-	return mkdirAt(d.j, d.rel, name, mode, false)
+	return mkdirAt(d.j, d.rel, name, mode, false, nil)
 }
 
 // openFile opens (or creates) a file inside this directory. os.Root.OpenFile

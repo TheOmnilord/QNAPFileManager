@@ -11,11 +11,11 @@ import (
 
 // TestMkdirAsOwnerRoundTrips proves the MkdirReq.As owner survives the wire and
 // reaches fsops, which applies it. It runs unprivileged by asking for the
-// worker's OWN uid (a chown to self is permitted without root) and an explicit
-// mode the umask alone would not produce, so the post-create mode is the
-// load-bearing assertion: 0700 can only come from the fchmod fsops does when As
-// is honoured, not from a umask-trimmed 0755. GID -1 leaves the group alone.
-// Linux-only because the owner is ignored off Linux (no uid/chown; INV-2).
+// worker's OWN uid (a chown to self is permitted without root), so the post-create
+// uid is the load-bearing assertion: the chown reached fsops and landed on the
+// new leaf. The create path never chmods (findings B/D), so the mode is whatever
+// the umask produced and is deliberately not asserted. GID -1 leaves the group
+// alone. Linux-only because the owner is ignored off Linux (no uid/chown; INV-2).
 func TestMkdirAsOwnerRoundTrips(t *testing.T) {
 	base := fixture(t)
 	tr, _ := dial(t, base)
@@ -27,7 +27,7 @@ func TestMkdirAsOwnerRoundTrips(t *testing.T) {
 	f := req(t, tr, 2, wproto.OpMkdir, wproto.MkdirReq{
 		Dir:  []byte("/"),
 		Name: []byte("owned"),
-		As:   &wproto.CreateAs{UID: self, GID: -1, Mode: 0o700},
+		As:   &wproto.CreateAs{UID: self, GID: -1},
 	})
 	if f.Kind != wproto.KindOK {
 		t.Fatalf("mkdir with an owner = %+v", f.Err)
@@ -39,8 +39,5 @@ func TestMkdirAsOwnerRoundTrips(t *testing.T) {
 	}
 	if int(st.Uid) != self {
 		t.Errorf("owner uid = %d, want %d (the As uid reached fsops)", st.Uid, self)
-	}
-	if st.Mode&0o777 != 0o700 {
-		t.Errorf("mode = %#o, want 0700 (As.Mode reached fsops and defeated the umask)", st.Mode&0o777)
 	}
 }

@@ -81,6 +81,7 @@ export function actionMessage(err) {
   not_empty:'The folder is not empty. Use Delete, which removes a folder and its contents.',
   permission:'The system refused the change (permission denied).',
   exists:'A file or folder with that name already exists here.',
+  owner_unset:'The folder was created but could not be assigned to you; it is owned by the system — check it or delete it.',
   cross_device:'The source and destination are on different volumes.',
   no_trash:'There is no Trash on this volume, so deleting here is permanent.',
   queue_full:'Too many operations are already queued. Wait for some to finish, then try again.',
@@ -102,6 +103,20 @@ function afterMutation(message) {
 
 function currentDirArg() { return state.pathB64 ? {dirB64:state.pathB64} : {dir:state.path}; }
 
+// onNewFolderError is newFolder's failure path, factored out so it is unit
+// testable without a DOM (finding E). Whatever the error, it REFRESHES the
+// listing first: mkdir can fail AFTER the folder was created — the root worker
+// made it but could not chown it to the user (code owner_unset) or a concurrent
+// change was detected — so the folder exists even though the request "failed".
+// Refreshing makes that created-but-not-adopted folder visible rather than
+// hidden behind an error (and a blind retry then hitting "already exists"). The
+// deliberate no-rollback behaviour is kept: nothing is deleted here. Then the
+// error is reported; actionMessage gives owner_unset its own clear sentence.
+export function onNewFolderError(err,{refresh=()=>{ loadList(); loadTree(); },report=actionError}={}) {
+ refresh();
+ report(err);
+}
+
 export async function newFolder() {
  if (!state.session?.canWrite) return;
  const name=await promptDialog({title:'New folder',label:'Folder name',value:''});
@@ -112,7 +127,7 @@ export async function newFolder() {
   if (!valid()) return;
   if (res===null) return;
   afterMutation(`Created ${name}.`);
- } catch(err) { if (valid()) actionError(err); }
+ } catch(err) { if (valid()) onNewFolderError(err); }
 }
 
 export async function renameEntry(entry) {

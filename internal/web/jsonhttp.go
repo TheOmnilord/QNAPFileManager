@@ -23,6 +23,11 @@ func statusCode(code string) int {
 		return 404
 	case "exists", "not_empty", "cross_device", "conflict":
 		return 409
+	case "owner_unset":
+		// The folder was created but its owner could not be set (finding E): the
+		// request partially completed and the folder exists, root-owned, so this is
+		// a state conflict the user must resolve (check or delete it), not a 500.
+		return 409
 	case "no_trash":
 		// There is no same-device trash for this location, so the delete the
 		// client asked for cannot be made reversible. It re-asks as a permanent

@@ -487,22 +487,42 @@ func (s *Server) mkdir(w http.ResponseWriter, r *http.Request, sess *session) {
 	// which File Station's real-uid users then cannot write into (owner hardware
 	// report). So, ONLY for a root session AND ONLY in an ordinary (guard-normal)
 	// location, ask the worker to chown the created folder to the real signed-in
-	// user and set it group-writable (0770), matching File Station; the inherited
-	// group is kept (GID -1), so a setgid parent keeps it in administrators. A
-	// guard-warn or protected parent (/etc/config, the install tree, mount roots,
-	// /proc, ...) is a genuine system location and stays root-owned — the
-	// classification is taken on the RESOLVED parent, consistent with the
-	// dispatch below. A non-admin worker already runs as the user, so its content
-	// is user-owned and As stays nil (a non-root worker chowning to another uid
-	// is EPERM anyway). The front-end only ever names the session's OWN uid.
+	// user; the inherited group is kept (GID -1), so a setgid parent keeps it in
+	// administrators, and NO mode is requested (Mode left 0) — chowning alone
+	// makes the admin the owner (owner rwx in the umask mode) while the setgid bit
+	// and any ACLs are left intact (findings B/D). BOTH spellings must classify
+	// normal: the requested parent AND the resolved one (finding C). A warn or
+	// protected requested parent that is a symlink into a normal location (e.g.
+	// /etc/config -> an ordinary dir) resolves normal, and adopting that to the
+	// admin's uid would be wrong — the stricter-of-both policy (§2.0/§2.5) governs
+	// here too. A guard-warn or protected parent (/etc/config, the install tree,
+	// mount roots, /proc, ...) is a genuine system location and stays root-owned.
+	// A non-admin worker already runs as the user, so its content is user-owned
+	// and As stays nil (a non-root worker chowning to another uid is EPERM
+	// anyway). The front-end only ever names the session's OWN uid.
 	var as *wproto.CreateAs
-	if sess.who.Root && s.guard.Classify(resolvedDir) == "normal" {
-		as = &wproto.CreateAs{UID: sess.who.UID, GID: -1, Mode: 0o770}
+	if sess.who.Root && s.guard.Classify(dir) == "normal" && s.guard.Classify(resolvedDir) == "normal" {
+		as = &wproto.CreateAs{UID: sess.who.UID, GID: -1} // Mode 0: chown only, never chmod
 	}
 	// Dispatch against the resolved parent, binding the operation as tightly as
 	// possible to what was guarded (adv 1b / standard P1); see the residual-race
 	// note in PLAN.md §2.0.
 	entry, err := s.mutator.Mkdir(r.Context(), sess.who, resolvedDir, body.Name, os.FileMode(0), body.Parents, as)
+	// When the chown or its provenance check fails AFTER the mkdirat, the folder
+	// exists but is root-owned — not adopted to the user (finding E). Report that
+	// partial state honestly with a distinct code so the UI can refresh and tell
+	// the user rather than showing a bare refusal (and a retry then hitting
+	// EEXIST). The deliberate no-rollback behaviour is kept: the folder stays. A
+	// genuine name collision (code "exists") is NOT this case. Confirm as the user
+	// that the folder really landed before claiming it.
+	if err != nil && as != nil && fsx.Code(err) != "exists" {
+		if _, statErr := s.backend.Stat(r.Context(), sess.who, target); statErr == nil {
+			s.logRaw(r, m.op, m.path, err) // the raw error may name the resolved path
+			s.writeAudit(sess, r, m, "result", "error", "owner_unset", "folder created but owner could not be set", false)
+			s.fail(w, r, "owner_unset", "The folder was created but could not be assigned to you; it is owned by the system — check it or delete it.", target, "")
+			return
+		}
+	}
 	if !s.finish(w, r, sess, m, err, false) {
 		return
 	}

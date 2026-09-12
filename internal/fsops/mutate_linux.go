@@ -2,6 +2,7 @@ package fsops
 
 import (
 	"errors"
+	"io"
 	"io/fs"
 	"os"
 	"runtime"
@@ -10,6 +11,17 @@ import (
 
 	"qnapfilemanager/internal/fsx"
 )
+
+// errLeafSubstituted reports that the just-created leaf is not the empty,
+// root-owned directory mkdirat made — a concurrent change, or a pre-existing
+// directory an attacker renamed over the leaf name between the mkdirat and the
+// openat (finding A). O_NOFOLLOW refuses a symlink swapped over the leaf but NOT
+// a directory substitution, so provenance is established on the descriptor
+// before any chown; when it fails the owner is deliberately NOT set and the
+// directory is left exactly as found, so a substituted directory holding real
+// data is never handed to another uid. It maps to no kernel errno, so fsx.Code
+// classifies it "internal" and the front-end reports the partial state.
+var errLeafSubstituted = errors.New("the new directory was changed before its owner could be set")
 
 // atRemoveDir is AT_REMOVEDIR, the unlinkat flag that turns an unlink into an
 // rmdir. The value is stable across Linux architectures; the syscall package
@@ -29,13 +41,19 @@ const atRemoveDir = 0x200
 // walk. resolve() has already followed every symlink on parentRel, so the only
 // components without a descriptor are the ones parents is being asked to make.
 //
-// When as is non-nil the just-created leaf is chowned (and, for a non-zero
-// Mode, chmod'd) to the requested owner through the SAME parent descriptor the
-// mkdirat used: the leaf is re-opened relative to parent with O_NOFOLLOW, never
-// by re-resolving its pathname, so a symlink swapped in between the mkdirat and
-// the chown cannot redirect it (the descriptor discipline the trash hardening
-// uses, PLAN.md §2.7). A chown/chmod failure leaves the created directory in
-// place, root-owned, and is returned so the front-end can report it.
+// When as is non-nil the just-created leaf is chowned to the requested owner
+// through the SAME parent descriptor the mkdirat used: the leaf is re-opened
+// relative to parent with O_NOFOLLOW, never by re-resolving its pathname, so a
+// symlink swapped in between the mkdirat and the chown cannot redirect it (the
+// descriptor discipline the trash hardening uses, PLAN.md §2.7). Before the
+// chown, provenance is proven on the descriptor (chownLeaf): an attacker who can
+// rename entries in the parent can slide a pre-existing directory over the leaf
+// name — O_NOFOLLOW stops a symlink, not a directory swap — so root would
+// otherwise chown a foreign directory. There is no chmod: leaving the mode the
+// umask produced keeps the parent's inherited setgid bit and any ACLs intact
+// (findings B/D, PLAN decision 12). A chown or provenance failure leaves the
+// created directory in place, root-owned, and is returned — phase-labelled
+// (Op "fchown" vs "provenance") — so the front-end can report it.
 //
 // Only the leaf is chowned. parents is never combined with as on the one path
 // that sets as today (the UI creates a single folder, and routes_mutate.go
@@ -51,57 +69,119 @@ func mkdirAt(j fsx.Jail, parentRel, name string, mode os.FileMode, parents bool,
 		return &fs.PathError{Op: "mkdirat", Path: relJoin(parentRel, name), Err: err}
 	}
 	if as != nil {
-		if err := chownChmodLeaf(parent, name, as); err != nil {
-			return &fs.PathError{Op: "fchown", Path: relJoin(parentRel, name), Err: err}
+		if err := chownLeaf(parent, name, as); err != nil {
+			// Label the phase so the front-end reports accurately (finding E): a
+			// refused provenance check is a concurrent change / substitution, not a
+			// chown failure.
+			op := "fchown"
+			if errors.Is(err, errLeafSubstituted) {
+				op = "provenance"
+			}
+			return &fs.PathError{Op: op, Path: relJoin(parentRel, name), Err: err}
 		}
 	}
 	return nil
 }
 
-// chownChmodLeaf sets the owner (and, for a non-zero Mode, the mode) of the
-// directory named by name inside parent, addressing it by a descriptor opened
-// relative to parent rather than by its pathname. The open is
-// O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC — not O_PATH, because fchown/fchmod on an
-// O_PATH descriptor is EBADF — so a symlink substituted for the leaf is refused
-// (ENOTDIR/ELOOP) instead of followed, and the chown lands on the inode the
-// mkdirat created and no other.
+// chownLeaf sets the owner of the directory named by name inside parent,
+// addressing it by a descriptor opened relative to parent rather than by its
+// pathname. The open is O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC — not O_PATH, because
+// fchown on an O_PATH descriptor is EBADF — so a symlink substituted for the
+// leaf is refused (ENOTDIR/ELOOP) instead of followed.
+//
+// O_NOFOLLOW rejects a symlink but NOT a real directory renamed over the leaf
+// name by an attacker who can rename entries in the parent, so before chowning,
+// leafProvenance proves on the descriptor alone that this is the empty,
+// root-owned directory the mkdirat just made (finding A). Only then is it
+// chowned. It is deliberately NOT chmod'd (findings B/D): on a QNAP ACL share an
+// fchmod could widen the POSIX ACL mask or, on a hero dataset with
+// aclmode=discard, drop inherited ACLs without the level-2 confirmation PLAN
+// decision 12 requires, and it would clear the parent's inherited setgid bit.
+// Chowning alone fixes the reported bug — the admin becomes the owner (owner rwx
+// in the umask-produced mode), so they can write — while the setgid bit, the
+// group (GID -1 keeps it) and any ACLs are left untouched. Owner.Mode is
+// reserved for the M3 permissions feature and applied on no path in M1.
 //
 // The kernel enforces everything: a non-root worker that reached here (it never
 // does — the front-end gates on root) would get EPERM from fchown, exactly as
 // INV-2 requires. -1 for UID or GID leaves that id alone, per chown(2).
-func chownChmodLeaf(parent *os.File, name string, as *Owner) error {
+func chownLeaf(parent *os.File, name string, as *Owner) error {
 	fd, err := openatIn(parent, name, syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC)
 	if err != nil {
 		return err
 	}
 	defer syscall.Close(fd)
+	if err := leafProvenance(fd); err != nil {
+		return err
+	}
 	if as.UID != -1 || as.GID != -1 {
 		if err := fchownRetry(fd, as.UID, as.GID); err != nil {
 			return err
 		}
 	}
-	if as.Mode != 0 {
-		if err := fchmodRetry(fd, syscallMode(as.Mode)); err != nil {
-			return err
-		}
+	return nil
+}
+
+// leafProvenance proves, on the descriptor fd ALONE (never by re-resolving the
+// name), that fd refers to the directory the root worker just created and may
+// safely adopt: it is a directory, owned by uid 0, and EMPTY. This defeats the
+// directory-substitution TOCTOU (finding A) — an attacker who can rename entries
+// in the parent could slide a pre-existing, possibly root-owned and data-bearing
+// directory under the leaf name, which root would then chown away. Emptiness is
+// the security-relevant property: we only ever adopt a brand-new empty
+// directory, so a substituted directory holding real data is refused and a
+// substituted empty one exposes nothing.
+//
+// An mtime-freshness test is deliberately NOT used: it caused slow-filesystem
+// false failures (§2.7), and here it would wrongly leave a legitimate folder
+// root-owned — the very bug this change fixes.
+func leafProvenance(fd int) error {
+	var st syscall.Stat_t
+	if err := syscall.Fstat(fd, &st); err != nil {
+		return err
+	}
+	if st.Mode&syscall.S_IFMT != syscall.S_IFDIR {
+		return errLeafSubstituted
+	}
+	if st.Uid != 0 {
+		return errLeafSubstituted
+	}
+	// Read the directory through a CLOEXEC dup of the held descriptor, so closing
+	// the os.File does not close fd (which the chown still needs). Readdirnames
+	// filters "." and ".."; a freshly created directory yields none, so any name
+	// means something is already inside it — not the empty leaf we made.
+	dup, err := dupCloexec(fd)
+	if err != nil {
+		return err
+	}
+	f := os.NewFile(uintptr(dup), "leaf")
+	defer f.Close()
+	names, err := f.Readdirnames(1)
+	if err != nil && err != io.EOF {
+		return err
+	}
+	if len(names) > 0 {
+		return errLeafSubstituted
 	}
 	return nil
+}
+
+// dupCloexec duplicates fd with the close-on-exec flag set atomically
+// (F_DUPFD_CLOEXEC), the stdlib-only shape for a dup that no concurrent fork can
+// leak. The syscall package exposes F_DUPFD_CLOEXEC but not a helper for it, so
+// the fcntl is made by hand, the same way the other raw *at calls here are.
+func dupCloexec(fd int) (int, error) {
+	r1, _, errno := syscall.Syscall(syscall.SYS_FCNTL, uintptr(fd), syscall.F_DUPFD_CLOEXEC, 0)
+	if errno != 0 {
+		return -1, errno
+	}
+	return int(r1), nil
 }
 
 // fchownRetry is fchown(2) retried over EINTR.
 func fchownRetry(fd, uid, gid int) error {
 	for {
 		err := syscall.Fchown(fd, uid, gid)
-		if err != syscall.EINTR {
-			return err
-		}
-	}
-}
-
-// fchmodRetry is fchmod(2) retried over EINTR.
-func fchmodRetry(fd int, mode uint32) error {
-	for {
-		err := syscall.Fchmod(fd, mode)
 		if err != syscall.EINTR {
 			return err
 		}

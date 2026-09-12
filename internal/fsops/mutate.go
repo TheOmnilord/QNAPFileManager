@@ -96,13 +96,20 @@ func ResolvePath(ctx context.Context, r fsx.Root, apiPath string, followLeaf boo
 	return tg.api, nil
 }
 
-// Owner requests that freshly created content be chowned (and optionally
-// chmod'd) after it is created, so an administrator session's root worker can
-// make content owned by the real signed-in user — the way File Station does —
-// instead of leaving it root-owned. UID or GID of -1 leaves that id alone, the
-// same meaning chown(2) gives -1 (so GID -1 keeps the group the parent's setgid
-// bit supplied, i.e. administrators); Mode 0 leaves the mode the umask
-// produced. A nil *Owner is the unchanged behaviour: root-owned, umask-applied.
+// Owner requests that freshly created content be chowned after it is created,
+// so an administrator session's root worker can make content owned by the real
+// signed-in user — the way File Station does — instead of leaving it root-owned.
+// UID or GID of -1 leaves that id alone, the same meaning chown(2) gives -1 (so
+// GID -1 keeps the group the parent's setgid bit supplied, i.e. administrators).
+// A nil *Owner is the unchanged behaviour: root-owned, umask-applied.
+//
+// Mode is RESERVED and applied on no path in M1: mkdir chowns only and never
+// chmods, because an fchmod on a QNAP ACL share can widen the POSIX ACL mask or,
+// on a hero dataset with aclmode=discard, drop inherited ACLs without the
+// level-2 confirmation PLAN decision 12 requires, and would clear the parent's
+// inherited setgid bit (findings B/D). Group-write and ACL changes are the M3
+// permissions feature; the field is kept so those create paths can carry intent
+// without a wire change.
 //
 // It is only meaningful for the root worker: the kernel refuses a non-root
 // process that tries to chown an inode to another uid (EPERM), so the front-end
@@ -112,7 +119,7 @@ func ResolvePath(ctx context.Context, r fsx.Root, apiPath string, followLeaf boo
 type Owner struct {
 	UID  int
 	GID  int
-	Mode os.FileMode
+	Mode os.FileMode // reserved; mkdir does not chmod (see above). M3 will use it.
 }
 
 // Mkdir creates <dir>/<name> and returns the new entry.
@@ -128,12 +135,13 @@ type Owner struct {
 // mode 0 means 0755; the worker's umask is applied by the kernel on the
 // mkdirat, so the stored mode is 0755 &^ umask without this code touching it.
 //
-// as, when non-nil, chowns (and, for a non-zero Mode, chmods) the just-created
-// leaf to the requested owner AFTER creating it, through the held parent
-// descriptor and never a re-resolved name (mutate_linux.go). If that chown or
-// chmod fails the directory has already been created and is left in place,
-// root-owned; the error is returned so the front-end can report that the owner
-// could not be set. On non-Linux hosts as is ignored (no uid/chown).
+// as, when non-nil, chowns the just-created leaf to the requested owner AFTER
+// creating it, through the held parent descriptor and never a re-resolved name,
+// and only after provenance is proven on that descriptor (mutate_linux.go). It
+// never chmods (findings B/D). If that chown or the provenance check fails the
+// directory has already been created and is left in place, root-owned; the error
+// is returned so the front-end can report that the owner could not be set. On
+// non-Linux hosts as is ignored (no uid/chown).
 func Mkdir(ctx context.Context, r fsx.Root, dir, name string, mode os.FileMode, parents bool, as *Owner) (fsx.Entry, error) {
 	if err := fsx.ValidName(name); err != nil {
 		return fsx.Entry{}, err

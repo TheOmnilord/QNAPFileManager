@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"io/fs"
 	"net/http"
@@ -200,8 +201,10 @@ func TestMkdirOwnerByClassification(t *testing.T) {
 	if b.lastAs == nil {
 		t.Fatal("admin mkdir in a normal path must send an owner, got nil")
 	}
-	if b.lastAs.UID != 1000 || b.lastAs.GID != -1 || b.lastAs.Mode != 0o770 {
-		t.Fatalf("owner = %+v, want {UID:1000 GID:-1 Mode:0770}", b.lastAs)
+	// Mode is 0: the create path chowns only and never chmods (findings B/D), so
+	// the inherited setgid bit and any ACLs survive.
+	if b.lastAs.UID != 1000 || b.lastAs.GID != -1 || b.lastAs.Mode != 0 {
+		t.Fatalf("owner = %+v, want {UID:1000 GID:-1 Mode:0}", b.lastAs)
 	}
 
 	// Admin, warn location (/etc/config): no owner — it stays root-owned. The
@@ -234,6 +237,98 @@ func TestMkdirOwnerByClassification(t *testing.T) {
 	}
 	if b.lastAs != nil {
 		t.Fatalf("a non-admin mkdir must send no owner, got %+v", b.lastAs)
+	}
+}
+
+// TestMkdirOwnerRequiresBothSpellingsNormal is finding C: the owner chown is
+// applied only when BOTH the requested parent AND the resolved parent classify
+// normal. A warn/protected requested parent that is a symlink into a normal
+// location (/etc/config -> an ordinary dir) resolves normal; adopting the folder
+// to the admin's uid there would be wrong, so As must stay nil and the folder
+// stays root-owned. Before the fix only the resolved spelling was checked, so
+// this aliased warn parent wrongly got an owner.
+func TestMkdirOwnerRequiresBothSpellingsNormal(t *testing.T) {
+	s, b := fixture(t, true)
+	s.guard.SetReadOnly(false)
+	// A normal target directory, and /etc/config as a SYMLINK to it. The requested
+	// spelling /etc/config classifies warn; it resolves to the normal /srv/pub.
+	if err := os.MkdirAll(filepath.Join(b.dir, "srv", "pub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(b.dir, "etc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustSymlink(t, filepath.Join(b.dir, "srv", "pub"), filepath.Join(b.dir, "etc", "config"))
+	c, csrf := sessionCookie(t, s)
+	s.sessions[c.Value].admin = true
+	s.sessions[c.Value].who.Root = true
+
+	// The requested parent is warn, so the first POST is a confirmation demand.
+	b.lastAs = &wproto.CreateAs{UID: -999} // sentinel: must be overwritten to nil
+	resp := post(s, "/api/fs/mkdir", c, csrf, `{"dir":"/etc/config","name":"x"}`)
+	if resp.StatusCode != 409 {
+		t.Fatalf("aliased warn mkdir status %d, want 409", resp.StatusCode)
+	}
+	var first struct {
+		Confirm struct{ Token string }
+	}
+	json.NewDecoder(resp.Body).Decode(&first)
+	if first.Confirm.Token == "" {
+		t.Fatal("no confirmation token for the aliased warn path")
+	}
+	body, _ := json.Marshal(map[string]any{"dir": "/etc/config", "name": "x", "confirm": first.Confirm.Token})
+	if resp2 := post(s, "/api/fs/mkdir", c, csrf, string(body)); resp2.StatusCode != 200 {
+		t.Fatalf("confirmed aliased warn mkdir status %d", resp2.StatusCode)
+	}
+	// Requested parent classifies warn → no owner, even though it resolves normal.
+	if b.lastAs != nil {
+		t.Fatalf("an admin mkdir whose requested parent is warn must send no owner, got %+v", b.lastAs)
+	}
+}
+
+// createThenFailBackend models the worker's partial state for finding E: the
+// mkdirat succeeds and the folder lands on disk, but the subsequent chown (or
+// its provenance check) fails, so the error comes back with the folder already
+// created and root-owned. Everything else defers to the embedded fakeBackend,
+// so the handler's own Stat confirms the folder exists.
+type createThenFailBackend struct {
+	*fakeBackend
+}
+
+func (c *createThenFailBackend) Mkdir(ctx context.Context, p backend.Principal, dir, name string, mode os.FileMode, parents bool, as *wproto.CreateAs) (fsx.Entry, error) {
+	if _, err := c.fakeBackend.Mkdir(ctx, p, dir, name, mode, parents, as); err != nil {
+		return fsx.Entry{}, err
+	}
+	return fsx.Entry{}, &fs.PathError{Op: "provenance", Path: fsx.Join(dir, name), Err: errors.New("a concurrent change was detected")}
+}
+
+// TestMkdirOwnerUnsetReportsPartialState is finding E: when the folder is
+// created but its owner cannot be set, the handler reports a distinct
+// owner_unset code (not a bare 500) so the UI can refresh and tell the user the
+// folder exists but is system-owned. The folder is deliberately NOT rolled back.
+func TestMkdirOwnerUnsetReportsPartialState(t *testing.T) {
+	s, b := fixture(t, true)
+	s.guard.SetReadOnly(false)
+	s.mutator = &createThenFailBackend{b}
+	if err := os.MkdirAll(filepath.Join(b.dir, "home", "admin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c, csrf := sessionCookie(t, s)
+	s.sessions[c.Value].admin = true
+	s.sessions[c.Value].who.Root = true
+
+	resp := post(s, "/api/fs/mkdir", c, csrf, `{"dir":"/home/admin","name":"stuck"}`)
+	if resp.StatusCode != 409 {
+		t.Fatalf("owner-unset mkdir status %d, want 409", resp.StatusCode)
+	}
+	var e apiEnvelope
+	json.NewDecoder(resp.Body).Decode(&e)
+	if e.Error.Code != "owner_unset" {
+		t.Fatalf("code %q, want owner_unset", e.Error.Code)
+	}
+	// No rollback: the created folder is still there for the user to check/delete.
+	if _, err := os.Stat(filepath.Join(b.dir, "home", "admin", "stuck")); err != nil {
+		t.Fatalf("the created folder was rolled back: %v", err)
 	}
 }
 

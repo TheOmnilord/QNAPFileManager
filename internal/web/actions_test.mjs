@@ -1,7 +1,7 @@
 // Run with: node --test internal/web/actions_test.mjs
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
-import {runMutation, actionMessage, deleteGrade, trashOutcome, undoRestore, PERMANENT_WARNING} from './static/js/actions.js';
+import {runMutation, actionMessage, onNewFolderError, deleteGrade, trashOutcome, undoRestore, PERMANENT_WARNING} from './static/js/actions.js';
 import {update} from './static/js/state.js';
 
 test('runMutation drives the server confirmation-token flow', async t => {
@@ -49,6 +49,25 @@ test('actionMessage falls back to the code message when no blockers are present'
  assert.match(actionMessage({code:'not_empty'}), /removes a folder and its contents/);
  assert.match(actionMessage({code:'protected'}), /protected system path/);
  assert.match(actionMessage({code:'no_trash'}), /no Trash on this volume/);
+});
+
+test('actionMessage explains the owner_unset partial state (finding E)', () => {
+ // The folder was created but could not be chowned to the user; the message says
+ // it exists and is system-owned rather than reading as a flat failure.
+ const msg = actionMessage({code:'owner_unset'});
+ assert.match(msg, /created but could not be assigned to you/);
+ assert.match(msg, /check it or delete it/);
+});
+
+test('onNewFolderError refreshes the listing before reporting (finding E)', () => {
+ // mkdir can fail AFTER the folder was created (owner_unset, or a detected
+ // concurrent change), so the failure path must still re-list so the
+ // created-but-not-adopted folder becomes visible — and it must refresh BEFORE
+ // the error is reported. No rollback happens here.
+ const calls=[];
+ const err={code:'owner_unset',message:'stuck'};
+ onNewFolderError(err,{refresh:()=>calls.push('refresh'),report:e=>calls.push(['report',e])});
+ assert.deepEqual(calls,[ 'refresh', ['report',err] ]);
 });
 
 test('deleteGrade is the confirmation ladder', () => {

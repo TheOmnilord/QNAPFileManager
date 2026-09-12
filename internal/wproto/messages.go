@@ -52,23 +52,28 @@ type StatResp struct {
 	Entry fsx.Entry `json:"e"`
 }
 
-// CreateAs asks the worker to chown (and optionally chmod) freshly created
-// content after it is created, so an administrator session's root worker can
-// make content owned by the real signed-in user — the way File Station does —
-// instead of leaving it root-owned. UID or GID of -1 leaves that id as the
-// kernel set it (so GID -1 keeps the group the parent's setgid bit supplied,
-// i.e. administrators); Mode 0 leaves the mode the umask produced. A nil
-// *CreateAs is the unchanged behaviour: root-owned, umask-applied.
+// CreateAs asks the worker to chown freshly created content after it is created,
+// so an administrator session's root worker can make content owned by the real
+// signed-in user — the way File Station does — instead of leaving it root-owned.
+// UID or GID of -1 leaves that id as the kernel set it (so GID -1 keeps the
+// group the parent's setgid bit supplied, i.e. administrators). A nil *CreateAs
+// is the unchanged behaviour: root-owned, umask-applied.
+//
+// Mode is RESERVED; mkdir does not chmod — group-write/ACL changes are the M3
+// permissions feature. An fchmod on the create path could widen a POSIX ACL mask
+// or, on a hero dataset with aclmode=discard, drop inherited ACLs without the
+// level-2 confirmation PLAN decision 12 requires, and clear the parent's setgid
+// bit (findings B/D), so no M1 path applies it. The field is kept so the M2/M3
+// create paths (copy, upload, chmod) can carry intent without a wire change.
 //
 // It is only meaningful for the root worker: a non-root worker asked to chown
 // to another uid is refused by the kernel (EPERM), which is why the front-end
 // sets it solely for an admin (root) session in an ordinary (guard-normal)
-// location (see internal/web/routes_mutate.go). It is carried on MkdirReq here
-// and reserved for the M2 create paths (copy, upload) as they land.
+// location (see internal/web/routes_mutate.go).
 type CreateAs struct {
 	UID  int    `json:"u"`
 	GID  int    `json:"g"`
-	Mode uint32 `json:"m"`
+	Mode uint32 `json:"m"` // reserved; mkdir does not chmod (M3 permissions feature)
 }
 
 type MkdirReq struct {

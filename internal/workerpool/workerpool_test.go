@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1625,5 +1626,30 @@ func TestAFailedWriteRetiresTheWorker(t *testing.T) {
 			t.Fatal("the worker was never taken out of the pool's accounting")
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestRemoteErrorReconstructsOwnerUnset guards the worker->pool boundary the
+// in-process fake mutator bypasses (high-effort review): an owner_unset error
+// (a create that succeeded but whose chown to the real user failed) must keep
+// that code across the wire, or the front-end's partial-create warning surfaces
+// as a 500 on the real NAS. It exercises both halves: wproto.NewErr classifies
+// the joined error, and remoteError reconstructs a value fsx.Code reads back.
+func TestRemoteErrorReconstructsOwnerUnset(t *testing.T) {
+	worker := errors.Join(fsx.ErrOwnerUnset, &fs.PathError{Op: "fchown", Path: "/share/x/new", Err: syscall.EPERM})
+	frame := wproto.NewErr(7, worker, []byte("/share/x/new"))
+	if frame.Err == nil || frame.Err.Code != "owner_unset" {
+		t.Fatalf("NewErr wire code = %+v, want owner_unset", frame.Err)
+	}
+	got := remoteError(frame.Err)
+	if !errors.Is(got, fsx.ErrOwnerUnset) {
+		t.Fatalf("reconstructed error does not Is fsx.ErrOwnerUnset: %v", got)
+	}
+	if code := fsx.Code(got); code != "owner_unset" {
+		t.Fatalf("fsx.Code(reconstructed) = %q, want owner_unset", code)
+	}
+	// A different code must not collide.
+	if code := fsx.Code(remoteError(&wproto.Err{Code: "worker_gone", Message: "gone"})); code != "worker_gone" {
+		t.Fatalf("worker_gone round trip = %q", code)
 	}
 }

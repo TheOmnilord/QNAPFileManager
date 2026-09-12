@@ -616,6 +616,12 @@ func (e *RemoteError) Unwrap() error {
 		return fsx.ErrConfirmRequired
 	case "queue_full":
 		return fsx.ErrQueueFull
+	case "owner_unset":
+		// A create that succeeded but whose chown to the real user failed (the
+		// admin-as-real-user mkdir). Without this case fsx.Code(reassembled) is
+		// "internal", so the front-end's partial-create warning would surface as a
+		// 500 on the real NAS while the in-process fake passed (high-effort review).
+		return fsx.ErrOwnerUnset
 	case "worker_gone":
 		return fsx.ErrWorkerGone
 	case "cancelled":

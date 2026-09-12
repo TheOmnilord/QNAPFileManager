@@ -452,7 +452,14 @@ func TestDeleteIntentNamesItsTargetsAndCorrelates(t *testing.T) {
 		case "intent":
 			intent = &e
 		case "result":
-			result = &e
+			// A permanent delete writes an async "denied/confirm_required"
+			// challenge line for the first (token-less) POST before the redeemed
+			// POST runs. That async line and the job's own durable result line have
+			// no fixed order in the log (they raced visibly on the Windows CI job),
+			// so skip the challenge and keep only the real terminal result.
+			if e.Result != "denied" {
+				result = &e
+			}
 		}
 	}
 	if intent == nil || result == nil {

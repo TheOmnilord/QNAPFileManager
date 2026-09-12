@@ -143,7 +143,14 @@ func leafProvenance(fd int) error {
 	if st.Mode&syscall.S_IFMT != syscall.S_IFDIR {
 		return errLeafSubstituted
 	}
-	if st.Uid != 0 {
+	// Owned by THIS worker — the process that just created it — not a hard-coded
+	// uid 0. In production the chown path only ever runs in the root worker
+	// (the front-end sets As solely for an admin/root session; a non-root worker
+	// asked to chown is EPERM anyway), so this is 0 there; keying on the worker's
+	// own euid instead makes the provenance correct for whatever uid created the
+	// leaf and is what lets the non-root CI job exercise it. A directory owned by
+	// anyone else at this name is a substitution, refused.
+	if st.Uid != uint32(os.Geteuid()) {
 		return errLeafSubstituted
 	}
 	// Read the directory through a CLOEXEC dup of the held descriptor, so closing

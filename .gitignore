@@ -21,3 +21,6 @@ self-signed.key
 .vscode/
 .idea/
 Thumbs.db
+
+# Codex review scratch space
+.review-tmp/

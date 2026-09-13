@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -245,5 +246,121 @@ func TestZFSFixtureMoveAcrossPoolsCopiesThenDeletes(t *testing.T) {
 	}
 	if _, err := os.Lstat(src); !os.IsNotExist(err) {
 		t.Fatalf("the source survived a verified cross-pool move: %v", err)
+	}
+}
+
+// TestZFSFixtureSearchCrossesDatasetsOnlyWhenAsked is PLAN.md decision 9 on the
+// search path, against real mount boundaries. Every share of one pool is its own
+// dataset, so "include mounted sub-folders" is the difference between searching
+// a volume root and searching one empty directory — and a dev box has no way to
+// produce the boundary at all (INV-2).
+func TestZFSFixtureSearchCrossesDatasetsOnlyWhenAsked(t *testing.T) {
+	plat := zfsFixture(t)
+	ctx := context.Background()
+	var r fsx.Root
+
+	probe := filepath.Join(zfsPublic, ".qfm-search-probe.txt")
+	t.Cleanup(func() { _ = os.Remove(probe) })
+	if err := os.WriteFile(probe, []byte("x"), 0o644); err != nil {
+		t.Fatalf("building the probe: %v", err)
+	}
+
+	req := wproto.SearchReq{Roots: [][]byte{[]byte(zfsVol1)}, Query: "qfm-search-probe", Hidden: true}
+	res, err := Search(ctx, r, plat, req, Emit{})
+	if err != nil {
+		t.Fatalf("Search without CrossMounts: %v", err)
+	}
+	for _, h := range res.Hits {
+		if strings.Contains(h.Path, ".qfm-search-probe") {
+			t.Fatalf("the search crossed into %s without being asked: %+v", zfsPublic, h)
+		}
+	}
+
+	req.CrossMounts = true
+	res, err = Search(ctx, r, plat, req, Emit{})
+	if err != nil {
+		t.Fatalf("Search with CrossMounts: %v", err)
+	}
+	found := false
+	for _, h := range res.Hits {
+		if h.Path == probe {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("with CrossMounts the probe in %s must be found; hits = %d", zfsPublic, len(res.Hits))
+	}
+}
+
+// TestZFSFixtureArchiveOfADataset streams a real dataset and reads it back with
+// archive/zip, which is what the client will do. It is here rather than in
+// archive_test.go because a dataset is a mount point, and a mount point is the
+// one thing the dev box cannot produce.
+func TestZFSFixtureArchiveOfADataset(t *testing.T) {
+	plat := zfsFixture(t)
+	ctx := context.Background()
+	var r fsx.Root
+
+	dir := filepath.Join(zfsPublic, ".qfm-archive-probe")
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	_ = os.RemoveAll(dir)
+	if err := os.MkdirAll(filepath.Join(dir, "sub"), 0o755); err != nil {
+		t.Fatalf("building the probe tree: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "sub", "deep.txt"), []byte("deeper"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &sink{}
+	req := wproto.ArchiveReq{Paths: [][]byte{[]byte(dir)}, Format: ArchiveZip}
+	if _, err := Archive(ctx, r, plat, req, mustPlan(t, r, plat, req), s); err != nil {
+		t.Fatalf("Archive of a dataset: %v", err)
+	}
+	m := zipMembers(t, s.buf.Bytes())
+	if m[".qfm-archive-probe/sub/deep.txt"] == nil {
+		t.Fatalf("members = %v", memberNames(m))
+	}
+	if got := zipContent(t, m[".qfm-archive-probe/sub/deep.txt"]); got != "deeper" {
+		t.Errorf("content = %q", got)
+	}
+	if m["ERROR.txt"] != nil {
+		t.Errorf("a clean archive has no ERROR.txt: %s", zipContent(t, m["ERROR.txt"]))
+	}
+}
+
+// TestZFSFixtureUploadIntoADataset is the whole upload shape against a real ZFS
+// dataset: O_TMPFILE, the linkat that publishes it, and the ACLs a hero dataset
+// hands a new file. All three are filesystem behaviour rather than this code's.
+func TestZFSFixtureUploadIntoADataset(t *testing.T) {
+	plat := zfsFixture(t)
+	ctx := context.Background()
+	var r fsx.Root
+
+	name := ".qfm-upload-probe.txt"
+	target := filepath.Join(zfsPublic, name)
+	t.Cleanup(func() { _ = os.Remove(target) })
+	_ = os.Remove(target)
+
+	f, h, err := OpenWrite(ctx, r, plat, wproto.OpenWriteReq{
+		Dir: []byte(zfsPublic), Name: []byte(name), Size: 5,
+	})
+	if err != nil {
+		t.Fatalf("OpenWrite into a dataset: %v", err)
+	}
+	if _, err := f.Write([]byte("hello")); err != nil {
+		h.Close()
+		t.Fatal(err)
+	}
+	f.Close()
+	resp, err := Finalize(ctx, h, wproto.FinalizeReq{Final: []byte(name)})
+	if err != nil {
+		t.Fatalf("Finalize into a dataset: %v", err)
+	}
+	if string(resp.Path) != target {
+		t.Errorf("Path = %q, want %q", resp.Path, target)
+	}
+	b, rerr := os.ReadFile(target)
+	if rerr != nil || string(b) != "hello" {
+		t.Fatalf("the published file is %q (%v)", b, rerr)
 	}
 }

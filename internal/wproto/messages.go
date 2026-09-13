@@ -176,6 +176,15 @@ type OpenWriteReq struct {
 	MTime    int64     `json:"mt,omitempty"`
 	Conflict string    `json:"c,omitempty"`
 	As       *CreateAs `json:"as,omitempty"`
+	// DirIdentity is the identity Dir had when the front end authorized this
+	// upload. The worker opens the destination only when the file part's
+	// headers arrive, and the client controls the gap in between: rename the
+	// authorized directory away, put a symlink to somewhere else in its place,
+	// then send the body. Binding the open to the inode closes that window —
+	// the worker refuses with "changed" when the directory it opens is not the
+	// one that was cleared. Nil means the caller could not identify it and no
+	// binding is asked for.
+	DirIdentity *FSIdentityResp `json:"di,omitempty"`
 }
 
 // OpenWriteResp.Tmp is an opaque handle the worker keeps for the open inode
@@ -215,9 +224,33 @@ type ArchiveReq struct {
 	CrossMounts bool     `json:"x,omitempty"`
 }
 
-// ArchiveResp names the archive the front-end should offer for download.
+// ArchiveResp names the archive the front-end should offer for download, and
+// identifies the producer so its outcome can be asked for afterwards.
 type ArchiveResp struct {
 	Name []byte `json:"n"`
+	// ID names this archive's producer inside the worker, for OpArchiveStatus.
+	// It is empty only from a worker too old to have one.
+	ID string `json:"id,omitempty"`
+}
+
+// ArchiveStatusReq asks what became of one archive (OpArchiveStatus).
+type ArchiveStatusReq struct {
+	ID string `json:"id"`
+}
+
+// ArchiveStatusResp is the producer's verdict.
+//
+// Done is false while it is still writing, which is the honest answer to a
+// front-end that asks too early. Truncated says the client's copy is NOT the
+// whole archive: the walk was stopped by a fatal failure, by cancellation or by
+// the member bound, and the trailer was deliberately not written — so an
+// audit record must say "truncated" rather than "ok" however cleanly the pipe
+// ended. Error carries the reason for a log; it is never shown verbatim.
+type ArchiveStatusResp struct {
+	Done      bool   `json:"d"`
+	Truncated bool   `json:"t,omitempty"`
+	Bytes     int64  `json:"b,omitempty"`
+	Error     string `json:"e,omitempty"`
 }
 
 // SearchReq is the body of a JobSearch (M2-C contract §3). Query is a
@@ -325,6 +358,49 @@ type FSIdentityResp struct {
 	HasMount bool   `json:"hm,omitempty"`
 	Dev      uint64 `json:"d"`
 	Dir      bool   `json:"dir"`
+	// Ino names the entry itself rather than the filesystem holding it. Same
+	// device and same inode is the same directory, whatever it is now called
+	// and whatever a symlink of that name points at today — which is what lets
+	// an upload be bound to the directory that was authorized rather than to
+	// the pathname that was authorized (M2-C round-13 P1).
+	Ino uint64 `json:"i"`
+	// Btime is the object's creation time in unix nanoseconds (statx
+	// STATX_BTIME), and HasBtime says the filesystem gave one.
+	//
+	// It exists because device and inode identify an object perfectly while it
+	// exists and not at all across a gap, and the gaps here are the client's to
+	// choose: it decides when an upload's body arrives, and an archive reaches
+	// its later roots minutes after they were authorized. An inode number is
+	// freed with its object and may be handed straight back, so somebody who
+	// can remove and recreate an entry can loop until the number repeats and
+	// the identity check agrees about the wrong object (M2-C round-14
+	// adversarial). Birth time is set once at creation and no interface
+	// changes it, so a recycled number carries a different one.
+	//
+	// Where the filesystem does not record it — HasBtime false on EITHER side —
+	// the comparison degrades to device and inode, which is what it was before.
+	// ext4, XFS, btrfs and ZFS all record it; the degradation is for the ones
+	// that do not, and for a kernel too old for statx.
+	Btime    int64 `json:"bt,omitempty"`
+	HasBtime bool  `json:"hb,omitempty"`
+}
+
+// SameInode reports whether two identities name the same ENTRY: the same inode
+// on the same device. Same is the weaker question — one filesystem — and the
+// two are not interchangeable: every directory on a volume answers Same, and
+// only one answers SameInode.
+// Birth time is compared as well when both sides have one, because an inode
+// number alone is only an identity while the object is alive: freed, it can be
+// handed back to the next thing created at that name, and a client that
+// controls the gap can make that happen on purpose (round 14 adversarial).
+func (a FSIdentityResp) SameInode(b FSIdentityResp) bool {
+	if a.Dev != b.Dev || a.Ino != b.Ino || a.Ino == 0 {
+		return false
+	}
+	if a.HasBtime && b.HasBtime {
+		return a.Btime == b.Btime
+	}
+	return true
 }
 
 // Same reports whether two identities name one filesystem: by mount id when

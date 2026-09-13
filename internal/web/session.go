@@ -68,6 +68,7 @@ func (s *Server) removeSessionLocked(old *session) {
 	}
 	old.dead.Store(true)
 	delete(s.sessions, old.id)
+	delete(s.archiveSelections, old.id)
 	if s.byCredential[old.binding] == old {
 		delete(s.byCredential, old.binding)
 	}

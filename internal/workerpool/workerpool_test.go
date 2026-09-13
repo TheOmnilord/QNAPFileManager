@@ -1670,3 +1670,19 @@ func TestRemoteErrorReconstructsInvalidTarget(t *testing.T) {
 		t.Fatalf("fsx.Code(reconstructed) = %q, want invalid_target", code)
 	}
 }
+
+// TestRemoteErrorReconstructsChanged is the same boundary guard for the
+// upload's "what arrived is not what was declared" refusal (M2-C).
+func TestRemoteErrorReconstructsChanged(t *testing.T) {
+	frame := wproto.NewErr(9, fmt.Errorf("upload of %q: %w", "/share/x/f", fsx.ErrChanged), []byte("/share/x/f"))
+	if frame.Err == nil || frame.Err.Code != "changed" {
+		t.Fatalf("NewErr wire code = %+v, want changed", frame.Err)
+	}
+	got := remoteError(frame.Err)
+	if !errors.Is(got, fsx.ErrChanged) {
+		t.Fatalf("reconstructed error does not Is fsx.ErrChanged: %v", got)
+	}
+	if code := fsx.Code(got); code != "changed" {
+		t.Fatalf("fsx.Code(reconstructed) = %q, want changed", code)
+	}
+}

@@ -53,6 +53,24 @@ type Server struct {
 	// front-end's own bookkeeping (queue, progress, cancellation, retention).
 	jobRunner backend.Jobs
 	jobMgr    *jobs.Manager
+	// searchRetained budgets the bytes every FINISHED search job's hits still
+	// hold, which is the one part of a retained job that is unbounded; see
+	// routes_search.go. It has its own mutex and is usable zero.
+	searchRetained searchRetention
+	// bulkReads bounds how many large single-job results may be in flight at
+	// once, which is what the retention ledger cannot see; see routes_search.go.
+	// Its limits are settable before serving, for tests; usable zero.
+	bulkReads bulkReadLimiter
+	// archiveReads bounds concurrent archive downloads and how long one chunk
+	// write may stall; see routes_archive.go. Same type, separate pool: an
+	// archive and a search result bound different resources, and sharing one
+	// would let either starve the other. Usable zero (New sets its wording).
+	archiveReads bulkReadLimiter
+	// uploads bounds how many upload requests may be in flight (per session and
+	// process-wide) and how long one may go silent before it is dropped; see
+	// routes_upload.go. Its limits are settable before serving, for tests; it
+	// has its own mutex and is usable zero.
+	uploads uploadLimiter
 	// ensureTrash is trashroot.Ensure, indirected so a test can drive the
 	// trash-root creation path (and its audit milestone) on a host whose mount
 	// table has no storage mounts. Never nil after New.
@@ -70,11 +88,12 @@ type Server struct {
 	Root  fsx.Root
 	cfgMu sync.Mutex // serialises read-only toggles and their persistence
 
-	mu           sync.Mutex
-	sessions     map[string]*session
-	byCredential map[string]*session
-	byUser       map[string]*list.List
-	sessionOrder list.List
+	mu                sync.Mutex
+	archiveSelections map[string]map[string]archiveSelection // session ID -> token; guarded by mu
+	sessions          map[string]*session
+	byCredential      map[string]*session
+	byUser            map[string]*list.List
+	sessionOrder      list.List
 	// Set before serving; nonpositive limits select the defaults.
 	MaxSessions, MaxSessionsPerUser int
 	sessionLookups                  uint64 // indexed lookups, guarded by mu
@@ -114,6 +133,9 @@ func New(cfg config.Config, b backend.Backend, v *qtsauth.Verifier, ids *idmap.M
 	}
 	s.mutator = mutator
 	s.ensureTrash = trashroot.Ensure
+	s.archiveReads.what = "archive downloads"
+	s.archiveReads.perSessionLimit = maxArchiveDownloadsPerSession
+	s.archiveReads.totalLimit = maxArchiveDownloadsTotal
 	// The same pool that implements Backend and Mutator implements Jobs; type-
 	// assert it so cmd can wire the job manager alone (SetJobs).
 	if j, ok := b.(backend.Jobs); ok {
@@ -150,7 +172,9 @@ var routes = map[string][]string{
 	"/api/settings": {"GET", "POST"}, "/api/audit": {"GET"}, "/api/audit/export": {"GET"},
 	"/api/jobs": {"GET"}, "/api/jobs/delete": {"POST"}, "/api/jobs/size": {"POST"},
 	"/api/jobs/copy": {"POST"}, "/api/jobs/move": {"POST"},
-	"/api/trash": {"GET"}, "/api/trash/restore": {"POST"}, "/api/trash/empty": {"POST"},
+	"/api/fs/upload": {"POST"}, "/api/fs/archive": {"GET"}, "/api/jobs/search": {"POST"},
+	"/api/fs/archive/select": {"POST"},
+	"/api/trash":             {"GET"}, "/api/trash/restore": {"POST"}, "/api/trash/empty": {"POST"},
 }
 
 // routeFor resolves a request path to the methods it answers. Literal routes
@@ -230,16 +254,51 @@ func squeezeSlashes(p string) string {
 	return p
 }
 
+// bodiedRead reports a GET or HEAD that claims to carry a request body.
+//
+// Such a request is not merely odd, it is a lever. net/http drains an unread
+// request body — up to 256 KiB — before it writes the response headers, unless
+// the response is already closeAfterReply, and nothing arms a read deadline for
+// that drain. So a GET with "Content-Length: 1" and no body blocks the handler
+// at its FIRST WRITE, holding whatever that handler is holding: an archive's
+// admission slot, its worker hold and its pipe with the audit pair unfinished,
+// or a bulk-result slot. A handful of them empties the global pools while the
+// attacker sends nothing at all (round-13 P1).
+//
+// No legitimate client sends one: a body on a GET has no defined meaning, and
+// this app's own UI never does it. Refusing early costs nothing and the refusal
+// carries Connection: close, which is also what lets net/http skip the drain.
+func bodiedRead(r *http.Request) bool {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		return false
+	}
+	return r.ContentLength != 0 || len(r.TransferEncoding) > 0
+}
+
 func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	api := r.URL.Path == "/api" || strings.HasPrefix(r.URL.Path, "/api/")
 	if api || r.URL.Path == "/" || r.URL.Path == "/index.html" {
 		w.Header().Set("Cache-Control", "no-store")
+	}
+	// Before routing, before authentication, before any handler can take a slot
+	// or a worker hold: a read that claims a body never reaches one.
+	if bodiedRead(r) {
+		w.Header().Set("Connection", "close")
+		s.logger.Printf("request ip=%q method=%s op=%q code=bad_request path=\"\" (read with a body)", ClientIP(r), r.Method, r.URL.Path)
+		writeError(w, http.StatusBadRequest, "bad_request", "A GET or HEAD request must not carry a body.", "", r.URL.Path, "")
+		return
 	}
 	if !api {
 		// Embedded assets contain no user data. Let the shell load even with
 		// stale QTS credentials; api/session drives the sign-in notice.
 		s.static(w, r)
 		return
+	}
+	// For upload POST, wrap the ResponseWriter early so any error (auth, method, etc)
+	// gets Connection: close before being sent. This prevents large unauthenticated
+	// uploads from sending the entire body before getting a 401 response.
+	if r.URL.Path == "/api/fs/upload" && r.Method == http.MethodPost {
+		w = uploadRefusal{w}
 	}
 	timeout := s.AuthTimeout
 	if timeout <= 0 {
@@ -298,7 +357,9 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, "unauthorized", "Sign in to QTS to continue.", "", "")
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	if r.URL.Path != "/api/fs/upload" && r.URL.Path != "/api/fs/archive" {
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	}
 	methods, ok := routeFor(r.URL.Path)
 	if !ok {
 		s.fail(w, r, "not_found", "No such endpoint.", "", "")
@@ -309,9 +370,9 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 405, "bad_request", "Method not allowed.", "", r.URL.Path, "")
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
-	defer cancel()
-	if r.URL.Path != "/api/fs/download" {
+	if r.URL.Path != "/api/fs/download" && r.URL.Path != "/api/fs/upload" && r.URL.Path != "/api/fs/archive" {
+		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+		defer cancel()
 		r = r.WithContext(ctx)
 	}
 	switch r.URL.Path {
@@ -327,6 +388,14 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		s.roots(w, r, sess)
 	case "/api/fs/download":
 		s.download(w, r, sess)
+	case "/api/fs/upload":
+		s.upload(w, r, sess)
+	case "/api/fs/archive":
+		s.archive(w, r, sess)
+	case "/api/fs/archive/select":
+		s.archiveSelect(w, r, sess)
+	case "/api/jobs/search":
+		s.jobSearch(w, r, sess)
 	case "/api/fs/text":
 		s.text(w, r, sess)
 	case "/api/ids":

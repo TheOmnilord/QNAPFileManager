@@ -58,7 +58,28 @@ type Backend interface {
 	// the principal's worker into a pipe whose read end is returned (M2-C
 	// contract §2). The caller copies it to the response and must Close it —
 	// closing early is how a departed client stops the worker's walk.
-	Archive(ctx context.Context, who Principal, req wproto.ArchiveReq) (io.ReadCloser, wproto.ArchiveResp, error)
+	Archive(ctx context.Context, who Principal, req wproto.ArchiveReq) (ArchiveStream, wproto.ArchiveResp, error)
+}
+
+// ArchiveStream is an archive being produced: the bytes, and the one question a
+// pipe cannot answer.
+//
+// A stream that ends because the walk was cancelled, hit its item bound or
+// failed mid-way closes exactly the way a complete one does — clean EOF — so a
+// route that audited "ok" on EOF was recording a truncated download as a
+// successful one (M2-C review round 1 adversarial, finding 6). Outcome asks the
+// worker that produced it what actually happened, and it is asked AFTER the
+// copy loop ends: before that the honest answer is "still producing"
+// (ArchiveStatusResp.Done false).
+//
+// Close releases the worker the producer is running on and must be called
+// exactly once, whether the download completed or the client disconnected.
+type ArchiveStream interface {
+	io.ReadCloser
+	// Outcome reports what became of the archive. It may be called before or
+	// after Close; after is the ordinary case, because the copy loop is what
+	// ends first.
+	Outcome(ctx context.Context) (wproto.ArchiveStatusResp, error)
 }
 
 // Mutator executes the M1 filesystem mutations as a principal: create a

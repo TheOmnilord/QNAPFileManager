@@ -1042,3 +1042,52 @@ type codedError struct {
 func (e codedError) Error() string     { return "refused" }
 func (e codedError) Unwrap() error     { return e.err }
 func (e codedError) ErrorCode() string { return e.code }
+
+// TestReplaceResultOnlyRewritesFinishedJobs is the contract the web layer's
+// retained-search budget leans on: a finished job's payload may be released,
+// and a live one's may never be, because its work function still owns it.
+func TestReplaceResultOnlyRewritesFinishedJobs(t *testing.T) {
+	m, _ := newManager(t, Limits{})
+
+	if n, ok := m.ReplaceResult("0123456789abcdef", map[string]int{"files": 1}); ok || n != 0 {
+		t.Fatalf("an unknown job was rewritten: %d %t", n, ok)
+	}
+
+	release := make(chan struct{})
+	live, err := m.Submit(KindSize, "live", Meta{}, func(context.Context, *Progress) (any, error) {
+		<-release
+		return map[string]int{"files": 7}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, m, live.ID, StateRunning)
+	if _, ok := m.ReplaceResult(live.ID, map[string]int{"files": 0}); ok {
+		t.Fatal("a running job's result was rewritten")
+	}
+	close(release)
+	done := waitState(t, m, live.ID, StateDone)
+	if string(done.Result) != `{"files":7}` {
+		t.Fatalf("result = %s", done.Result)
+	}
+
+	n, ok := m.ReplaceResult(live.ID, map[string]any{"files": 7, "detail": "released"})
+	after, present := m.Get(live.ID)
+	if !ok || n != len(after.Result) || !present {
+		t.Fatalf("replace: %d %t %t", n, ok, present)
+	}
+	if string(after.Result) != `{"detail":"released","files":7}` {
+		t.Fatalf("rewritten result = %s", after.Result)
+	}
+	// Nothing but the payload moves.
+	if after.State != done.State || after.Title != done.Title || !after.FinishedAt.Equal(done.FinishedAt) {
+		t.Fatalf("replace disturbed the job: %+v", after)
+	}
+	// A nil result clears it outright.
+	if n, ok := m.ReplaceResult(live.ID, nil); !ok || n != 0 {
+		t.Fatalf("clear: %d %t", n, ok)
+	}
+	if cleared, _ := m.Get(live.ID); len(cleared.Result) != 0 {
+		t.Fatalf("result survived a nil replace: %s", cleared.Result)
+	}
+}

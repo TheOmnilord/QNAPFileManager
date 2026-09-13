@@ -195,6 +195,16 @@ type Pool struct {
 	budgets  map[string]*budget
 	closed   bool
 
+	// pins holds one entry per upload handle a worker is still holding an inode
+	// for, keyed by the handle the worker chose (stream.go). The hold on the
+	// client belongs to the pin, so an upload keeps its worker alive between
+	// OpenWrite and Finalize — which is the only way Finalize can reach the
+	// process that has the inode. It has its own mutex rather than sharing
+	// p.mu: release() may stop a superseded worker, and the pool lock is never
+	// held across that.
+	pinsMu sync.Mutex
+	pins   map[string]*uploadPin
+
 	// stagedExe is the tmpfs copy of the worker binary. It is created lazily by
 	// workerExes and cached only on success, so a transient failure (a full
 	// /tmp) does not disable non-root workers until a restart.
@@ -290,6 +300,7 @@ func NewWithOptions(o Options) *Pool {
 		spawning:     map[string]*startup{},
 		retiring:     map[*client]struct{}{},
 		budgets:      map[string]*budget{},
+		pins:         map[string]*uploadPin{},
 		stopJanitor:  make(chan struct{}),
 		janitorGone:  make(chan struct{}),
 		shutdownDone: make(chan struct{}),
@@ -326,6 +337,11 @@ func (p *Pool) janitor() {
 			return
 		case <-t.C:
 			p.reapIdle()
+			// Beside the reap, and before it in importance: a pin is what keeps
+			// a worker OUT of the reap, so the thing that expires pins has to
+			// run on the same tick or an abandoned upload would hold a worker
+			// for the life of the daemon (stream.go).
+			p.sweepUploadPins()
 		}
 	}
 }
@@ -451,6 +467,11 @@ func (p *Pool) runShutdown() {
 
 	close(p.stopJanitor)
 	<-p.janitorGone
+
+	// Before anything is collected: a pin holds a worker in flight, and letting
+	// go of it after the shutdown has started terminating that worker would be
+	// racing the termination it is supposed to precede (stream.go).
+	p.dropUploadPins()
 
 	var wg sync.WaitGroup
 	for {
@@ -668,74 +689,131 @@ func (p *Pool) OpenRead(ctx context.Context, who backend.Principal, path string)
 // reverse. The worker's walk ends when the archive is complete, when it must
 // give up (it appends ERROR.txt and closes without the trailer), or when this
 // end is closed, which is how a departed client stops it.
-func (p *Pool) Archive(ctx context.Context, who backend.Principal, req wproto.ArchiveReq) (io.ReadCloser, wproto.ArchiveResp, error) {
+//
+// The worker is HELD until the returned reader is closed (stream.go). The reply
+// is only the beginning of an archive — the producer goes on walking the tree
+// for as long as the download lasts — so releasing here would have let the
+// janitor reap the very worker that is still writing, and the client would have
+// got a truncated zip with nothing anywhere to say why. The caller must close
+// the reader; that is what stops the producer (EPIPE) and what lets the worker
+// go.
+func (p *Pool) Archive(ctx context.Context, who backend.Principal, req wproto.ArchiveReq) (backend.ArchiveStream, wproto.ArchiveResp, error) {
 	c, err := p.acquire(ctx, who)
 	if err != nil {
 		return nil, wproto.ArchiveResp{}, err
 	}
-	defer p.release(c)
 	if p.opts.Mode == ModeInProcess {
+		p.release(c)
 		return nil, wproto.ArchiveResp{}, fmt.Errorf("archive in the in-process mode: %w", fsx.ErrUnsupported)
 	}
 	f, files, err := p.call(ctx, c, wproto.OpArchive, req)
 	if err != nil {
+		p.release(c)
 		return nil, wproto.ArchiveResp{}, err
 	}
 	if len(files) != 1 {
 		closeAll(files)
+		p.release(c)
 		return nil, wproto.ArchiveResp{}, fmt.Errorf("the worker returned %d descriptors for the archive: %w", len(files), wproto.ErrFDMismatch)
 	}
 	var resp wproto.ArchiveResp
 	if err := f.Unmarshal(&resp); err != nil {
 		closeAll(files)
+		p.release(c)
 		return nil, wproto.ArchiveResp{}, err
 	}
-	return files[0], resp, nil
+	return p.heldStream(c, files[0], resp.ID), resp, nil
 }
 
 // OpenWrite asks the principal's worker to create an upload's file as the
 // user and hand back its descriptor with the worker's handle for the inode
 // (M2-C contract §1). The front-end streams the body into the descriptor;
 // Finalize publishes or discards the handle.
+//
+// The worker is PINNED to the handle it hands back (stream.go) and stays held
+// until a Finalize claims it, because the inode the handle names exists only
+// inside that one process: a worker reaped or evicted in between would take the
+// upload with it, and the Finalize would reach a stranger that had never heard
+// of the handle. The caller MUST call Finalize — with Discard when it gives up
+// — or the pool's own backstop releases the pin after uploadPinTimeout.
 func (p *Pool) OpenWrite(ctx context.Context, who backend.Principal, req wproto.OpenWriteReq) (*os.File, wproto.OpenWriteResp, error) {
 	c, err := p.acquire(ctx, who)
 	if err != nil {
 		return nil, wproto.OpenWriteResp{}, err
 	}
-	defer p.release(c)
 	if p.opts.Mode == ModeInProcess {
+		p.release(c)
 		return nil, wproto.OpenWriteResp{}, fmt.Errorf("upload in the in-process mode: %w", fsx.ErrUnsupported)
 	}
 	f, files, err := p.call(ctx, c, wproto.OpOpenWrite, req)
 	if err != nil {
+		p.release(c)
 		return nil, wproto.OpenWriteResp{}, err
 	}
 	if len(files) != 1 {
 		closeAll(files)
+		p.release(c)
 		return nil, wproto.OpenWriteResp{}, fmt.Errorf("the worker returned %d descriptors for the upload: %w", len(files), wproto.ErrFDMismatch)
 	}
 	var resp wproto.OpenWriteResp
 	if err := f.Unmarshal(&resp); err != nil {
 		closeAll(files)
+		p.release(c)
 		return nil, wproto.OpenWriteResp{}, err
 	}
+	if len(resp.Tmp) == 0 {
+		// Without a handle there is nothing to pin the hold to and nothing a
+		// Finalize could ever name, so the upload is over before it started.
+		closeAll(files)
+		p.release(c)
+		return nil, wproto.OpenWriteResp{}, fmt.Errorf("the worker returned no handle for the upload: %w", wproto.ErrProtocol)
+	}
+	p.pinUpload(string(resp.Tmp), who, c)
 	return files[0], resp, nil
 }
 
 // Finalize publishes or discards an upload handle (M2-C contract §1.3).
+//
+// It goes to the worker the handle was opened on and to no other: claimUpload
+// hands back that exact client, together with the hold OpenWrite took, which is
+// released here whatever the outcome. A handle this pool is not holding — one
+// that expired, one whose worker died, one belonging to another session — is
+// worker_gone, so the route tells the user the upload failed instead of quietly
+// asking a process that never had the inode.
 func (p *Pool) Finalize(ctx context.Context, who backend.Principal, req wproto.FinalizeReq) (wproto.FinalizeResp, error) {
-	c, err := p.acquire(ctx, who)
-	if err != nil {
-		return wproto.FinalizeResp{}, err
-	}
-	defer p.release(c)
 	if p.opts.Mode == ModeInProcess {
 		return wproto.FinalizeResp{}, fmt.Errorf("upload in the in-process mode: %w", fsx.ErrUnsupported)
 	}
-	f, files, err := p.call(ctx, c, wproto.OpFinalize, req)
+	// Checked before the claim, not after. A caller whose context is already
+	// done never reaches the worker — p.call refuses to send — so consuming the
+	// pin here would have thrown the upload away without telling the worker
+	// anything, and the route's follow-up Discard would then find nothing and
+	// report worker_gone over an inode the worker was still holding
+	// (adversarial finding 2).
+	if err := ctx.Err(); err != nil {
+		return wproto.FinalizeResp{}, err
+	}
+	id := string(req.Tmp)
+	c, err := p.claimUpload(id, who)
 	if err != nil {
 		return wproto.FinalizeResp{}, err
 	}
+	f, files, err := p.call(ctx, c, wproto.OpFinalize, req)
+	if err != nil {
+		if keptTheHandle(ctx, err) {
+			// The worker never ran the finalizer, so it is still holding the
+			// inode: the handle goes back into the table — with its hold — and
+			// a retry, or the Discard the route sends when it gives up, still
+			// reaches the worker that has it. A pin restored over a Finalize
+			// the worker DID receive costs one "not found" on the next attempt,
+			// which is the cheap half of this trade.
+			p.repinUpload(id, who, c)
+			return wproto.FinalizeResp{}, err
+		}
+		p.release(c)
+		return wproto.FinalizeResp{}, err
+	}
+	p.release(c)
 	closeAll(files)
 	var resp wproto.FinalizeResp
 	if err := f.Unmarshal(&resp); err != nil {

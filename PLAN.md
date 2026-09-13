@@ -194,6 +194,46 @@ share can be refused; a real inherited NFSv4 ACL is the case CI cannot stage. Th
 cross-dataset move is predicted in the dialog and completes; conflict policies; Ctrl+C/X/V; an admin's copy is owned
 by the real user.
 
+**M2-C status (2026-09-13):** upload, archive download and search implemented against
+`docs/design/m2c-contract.md`. Upload: the worker creates the file unnamed (`O_TMPFILE`) as the user, proves the
+empty inode, installs the admin-as-real-user owner, and passes the descriptor to the front-end, which streams the
+request body into it; `Finalize` fsyncs, checks the declared length, stamps the mtime and links the inode into
+place under skip / overwrite / keep-both — a named `.part` is the fallback where the kernel has no `O_TMPFILE`.
+Handles expire after ten minutes and on session end. Archive: `GET /api/fs/archive` streams a zip or tar.gz the
+worker writes into a pipe while walking the trees as the user (symlinks as members, never followed; a fatal error
+appends `ERROR.txt` and drops the trailer so the client's unzip reports truncation). Search: a bounded job (1000
+hits / 500 000 visited / 60 s), case-folded substring or glob, hits held in a web-side retention ledger (32 MiB / 256 jobs; the list never carries them, the single-job GET
+splices them under admission and a write deadline) and a results view in the UI (Ctrl+F). **Extract is deferred**
+(no design for zip-slip/conflicts yet).
+
+**M2-C review (2026-09-13):** fifteen gpt-6-astra rounds at high effort (the owner's ceiling), normal plus
+adversarial, 74 findings accepted and fixed, none rejected — `docs/reviews/m2c-round1..15.md`. Linux CI (race,
+root, ZFS, Windows) green per round via a throwaway draft PR. What the loop settled, in order of weight: every
+web-supplied path reaches the worker as the guard's canonical spelling and the worker walks it `O_NOFOLLOW` per
+component from the jail root (a symlink in a canonical path means the tree changed after authorization — refused
+`changed`, never followed); an upload is bound to the directory identity (dev, inode, statx birth time) taken at
+authorization and `Finalize` publishes through the dirfd held since `OpenWrite`; archive roots and their parents are
+identity-proved on the descriptor that is enumerated; admission slots and deadlines bound every streaming and bulk
+response (uploads 4/32 with an idle read window cleared before `Finalize` and a bounded tail drain; archives 2/4 per
+session with a rolling 60 s per-write deadline; bulk search results 2/6 measured on the payload served; GET/HEAD
+with a body refused before routing); search eviction always leaves a loss notice and a reaped job answers 404. The
+last round still found two real P1s (a cancel response carrying hits; birth-time probing keyed on the mount-id
+probe), so the ceiling — not a clean round — is what ended the loop; the residual risk is listed for hardware.
+
+**To confirm on hardware first (both units), M2-C:** a share reached through a symlink (`/share/Public` →
+`/share/CACHEDEV1_DATA/Public`) uploads, archives and searches normally — the guard resolves it before the worker's
+`O_NOFOLLOW` walk, and a `changed` refusal on a plain share means that resolution is not happening; then a 1 GB
+upload finishes without a 408 or 409, keep-both names the file and the audit says so, an archive of a mixed
+selection downloads and unzips, a cancelled search shows a small response, and `FSIdentity` reports a birth time
+on ext4 and on ZFS (the inode-reuse guard degrades silently without one).
+
+**M3 contract drafted 2026-09-13:** `docs/design/m3-contract.md` (Opus draft accepted by Fable; the gpt-6-astra
+review of it is pending while Astra is paused). Decisions it fixes beyond this plan: mode changes travel as
+`{mask, value}`; a new stdlib-only `internal/perm` holds the arithmetic, capability hints, the post-call diff and the
+NFSv4 trivial/non-trivial judgement; the ACL badge reports a state (`none|posix|nfs4|nfs4-trivial|unknown`), not a
+boolean; an unknown `aclmode` is treated as `discard`; a recursive chmod may clear but never set a special bit; M3
+adds no wire error codes and pays for that with a code-coverage table test.
+
 - **No automatic trash sweeper yet** (owner, 2026-09-13: "defer janitor"). `trash.days` is validated and carried
   in the config but nothing enforces it; Trash empties only through "Empty Trash…". Trash ownership is left as is.
 

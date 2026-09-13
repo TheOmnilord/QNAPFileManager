@@ -11,8 +11,9 @@ reverse proxy. Everything File Station cannot reach (`/`, `/etc`, `.qpkg`, raw v
 
 - **Claude Fable 5.1 is orchestrator and conductor.** It decomposes work, judges every review finding (agreeing or
   rejecting with a stated reason), and owns commits.
-- **Opus is the orchestra.** For M1 (owner, 2026-09-10) implementation is fanned out to Opus subagents (`model: opus`)
-  only; do **not** use gpt-6-astra to write code. (In M0 gpt-6-astra also implemented; that changed for M1.)
+- **Opus is the orchestra.** Implementation is fanned out to Opus subagents (`model: opus`) only; do **not** use
+  gpt-6-astra to write code (owner, 2026-09-13: "only use Astra for reviews"; it implemented in M0 and briefly in
+  M2-B/M2-C, and that is over).
 - **gpt-6-astra reviews everything Claude produces**, with a normal review and an adversarial review, iteratively, up to
   ten rounds per piece of work. Effort: **high** going forward (owner, 2026-09-12). Was low for M2-A; was high in M0.
   Dispatch reviews with `-c model_reasoning_effort="high"`.

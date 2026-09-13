@@ -1,6 +1,7 @@
 package web
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -142,13 +143,68 @@ func (s *Server) jobAudit(ctx context.Context, who jobActor, ev audit.Event, mil
 // deliberately terse on the wire (single-letter keys); this is the UI-facing
 // spelling, and it is where the trash ids an Undo needs are surfaced.
 type jobResultView struct {
-	Files    int64    `json:"files"`
-	Dirs     int64    `json:"dirs,omitempty"`
-	Bytes    int64    `json:"bytes"`
-	Skipped  int64    `json:"skipped,omitempty"`
-	Warnings int      `json:"warnings,omitempty"`
-	Detail   string   `json:"detail,omitempty"`
-	TrashIDs []string `json:"trashIds,omitempty"`
+	Hits     []fsx.Entry `json:"hits,omitempty"`
+	Files    int64       `json:"files"`
+	Dirs     int64       `json:"dirs,omitempty"`
+	Bytes    int64       `json:"bytes"`
+	Skipped  int64       `json:"skipped,omitempty"`
+	Warnings int         `json:"warnings,omitempty"`
+	Detail   string      `json:"detail,omitempty"`
+	TrashIDs []string    `json:"trashIds,omitempty"`
+}
+
+// ForList returns a copy of the result suitable for list responses, omitting hits to reduce bandwidth.
+func (v jobResultView) ForList() jobResultView {
+	return jobResultView{
+		Files:    v.Files,
+		Dirs:     v.Dirs,
+		Bytes:    v.Bytes,
+		Skipped:  v.Skipped,
+		Warnings: v.Warnings,
+		Detail:   v.Detail,
+		TrashIDs: v.TrashIDs,
+		// Hits intentionally omitted.
+	}
+}
+
+// hitsKey is how a result that still carries hits begins. jobResultView declares
+// Hits first and omits it when empty, so a settled search result does not
+// contain these bytes anywhere.
+var hitsKey = []byte(`"hits":`)
+
+// jobListView keeps hits out of a list response.
+//
+// It used to do that by decoding every job's result and re-encoding it without
+// the hits, which was the expensive half of the polling problem: the hits were
+// in the manager, Manager.List copied them into every snapshot, and this then
+// allocated them again to discard them. The hits are in the retention ledger
+// now (routes_search.go), so for every settled job this is a scan of a few
+// hundred bytes that finds nothing and marshals the job as it stands.
+//
+// The decode is kept for one narrow case rather than deleted: a search's result
+// carries its hits from the instant the work function returns until the finish
+// hook moves them, and a poll landing in that window would otherwise ship a
+// megabyte of hits to a client that did not ask for them.
+type jobListView struct {
+	jobs.Job
+}
+
+func (v jobListView) MarshalJSON() ([]byte, error) {
+	j := v.Job
+	if bytes.Contains(j.Result, hitsKey) {
+		var result *jobResultView
+		if err := json.Unmarshal(j.Result, &result); err != nil {
+			return nil, err
+		}
+		if result != nil {
+			var err error
+			j.Result, err = json.Marshal(result.ForList())
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	return json.Marshal(j)
 }
 
 func viewOf(res wproto.JobResult) jobResultView {
@@ -316,6 +372,8 @@ func jobWarnMessage(code string) string {
 		return "The source and destination are on different volumes."
 	case "capped":
 		return "The scan hit its limit; the totals are a minimum."
+	case "truncated":
+		return "The search reached its limit; only partial results are shown."
 	case "unverified":
 		return "The copy could not be verified in time, so the original was kept."
 	case "too_many":
@@ -905,10 +963,15 @@ func (s *Server) failJobSubmit(w http.ResponseWriter, r *http.Request, sess *ses
 
 // writeJob answers a submitted job with 202 Accepted: the work has been
 // accepted, not done, and the client polls /api/jobs for the rest.
+//
+// The snapshot Submit hands back has no result yet, so the hit-free view costs
+// a scan of a few dozen bytes that finds nothing. It is written this way so the
+// rule holds by construction rather than by timing: the single-job GET is the
+// only route that serves hits, because it is the only one that pays for them.
 func (s *Server) writeJob(w http.ResponseWriter, job jobs.Job) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusAccepted)
-	_ = json.NewEncoder(w).Encode(map[string]any{"job": job})
+	_ = json.NewEncoder(w).Encode(map[string]any{"job": jobListView{Job: job}})
 }
 
 // jobSize measures trees for the properties dialog. It is a read, so there is
@@ -949,7 +1012,12 @@ func (s *Server) jobSize(w http.ResponseWriter, r *http.Request, sess *session) 
 		s.fail(w, r, "internal", "The size request could not be prepared.", "", err.Error())
 		return
 	}
-	title := "Calculating size: " + fsx.Base(paths[0])
+	// bodyPath bounds every component at NAME_MAX, so this is bounded already;
+	// clipping is for the row itself, and keeps the rule uniform with search's
+	// title (round-7 sweep). A size job is the one job route that never resolves
+	// its paths through the worker, so it never had the kernel's refusal to lean
+	// on the way delete, copy, move, search and archive do.
+	title := "Calculating size: " + clipUTF8(fsx.Base(paths[0]), maxJobTitleBytes)
 	if len(paths) > 1 {
 		title = fmt.Sprintf("Calculating size: %d items", len(paths))
 	}
@@ -989,10 +1057,10 @@ func (s *Server) jobList(w http.ResponseWriter, r *http.Request, sess *session) 
 		return
 	}
 	all := s.jobMgr.List() // newest first
-	out := make([]jobs.Job, 0, len(all))
+	out := make([]jobListView, 0, len(all))
 	for _, j := range all {
 		if maySeeJob(sess, j) {
-			out = append(out, j)
+			out = append(out, jobListView{Job: j})
 		}
 	}
 	writeJSON(w, map[string]any{"jobs": out})
@@ -1002,11 +1070,39 @@ func (s *Server) jobGet(w http.ResponseWriter, r *http.Request, sess *session, i
 	if !s.jobsReady(w, r) {
 		return
 	}
+	// Belt to the middleware's braces (bodiedRead in server.go): a read with a
+	// body must not block this handler at its first write while it holds a
+	// bulk-result slot.
+	if r.ContentLength != 0 {
+		w.Header().Set("Connection", "close")
+	}
 	j, ok := s.jobMgr.Get(id)
 	if !ok || !maySeeJob(sess, j) {
 		s.fail(w, r, "not_found", "No such job.", "", "")
 		return
 	}
+	// A search's hits live in the retention ledger, not in the manager, so that
+	// a poll of the whole list never touches them (routes_search.go). This is the
+	// one request that asks about a single job, so it is the one that pays — and
+	// paying is bounded: a large result is admitted a few at a time and written
+	// under a deadline, or the buffers it needs are held by however many
+	// requests a client cares to open and never read (round-11 P1).
+	// Built FIRST, then admitted on what it actually weighs. Admitting on what
+	// the ledger holds instead left a hole: a GET landing after a search went
+	// terminal but before the finish hook recorded it found an empty ledger,
+	// skipped the slot and the deadline, and then served the hits out of the
+	// manager's own copy anyway (round-12 P1).
+	result, live := s.searchResultOf(j)
+	if !live {
+		s.fail(w, r, "not_found", "This job is no longer available.", "", "")
+		return
+	}
+	j.Result = result
+	done, ok := s.admitBulkResult(w, r, sess, len(j.Result))
+	if !ok {
+		return
+	}
+	defer done()
 	writeJSON(w, map[string]any{"job": j})
 }
 
@@ -1036,5 +1132,13 @@ func (s *Server) jobCancel(w http.ResponseWriter, r *http.Request, sess *session
 	}
 	s.writeAudit(sess, r, mutation{op: "cancel"}, "result", "ok", "", "cancel requested for job "+id, false)
 	after, _ := s.jobMgr.Get(id)
-	writeJSON(w, map[string]any{"ok": cancelled, "job": after})
+	// The cancel reply never carries hits. GET /api/jobs/<id> is the ONE route
+	// that serves a search's hits, and it pays for them: it is admitted a few at
+	// a time and written under a deadline (admitBulkResult). Cancel has neither,
+	// and it serialises whatever the manager holds — so a cancel arriving after
+	// a search went terminal but before the finish hook moved the hits into the
+	// retention ledger shipped the whole result, unbounded and unadmitted (879
+	// KiB in the reproduction). The list view is the same hit-free spelling the
+	// polling route uses, and for the same reason.
+	writeJSON(w, map[string]any{"ok": cancelled, "job": jobListView{Job: after}})
 }

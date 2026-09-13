@@ -48,8 +48,39 @@ func bodyPath(p, pathB64 string) (string, error) {
 		if component == "." || component == ".." {
 			return "", fmt.Errorf("path contains a dot component: %w", fsx.ErrBadName)
 		}
+		if len(component) > maxComponentBytes {
+			return "", errLongComponent
+		}
 	}
 	return fsx.Clean(p)
+}
+
+// maxComponentBytes is NAME_MAX: the kernel's own limit on one path component,
+// 255 bytes on every filesystem QTS and QuTS hero carry. fsx.Clean deliberately
+// leaves length to the kernel (INV-2: the app predicts, the kernel decides), and
+// that is right for a spelling the kernel is about to see — but the front end
+// builds job titles, audit lines and confirmation tokens out of these components
+// BEFORE the worker ever looks at them, and those are retained. A component past
+// NAME_MAX is one the kernel would refuse with ENAMETOOLONG anyway, so refusing
+// it here costs nothing a caller could have used and bounds everything derived
+// from it by construction (round-7 sweep: /api/jobs/size built a job title, and
+// jobIntentDetail a durable audit line, out of an unbounded base name).
+const maxComponentBytes = 255
+
+var errLongComponent = fmt.Errorf("a name in the path is longer than %d bytes: %w", maxComponentBytes, fsx.ErrBadName)
+
+// validNewName is fsx.ValidName plus the same NAME_MAX bound bodyPath applies,
+// for the routes that take a bare new name rather than a path: a folder to
+// create, an entry to rename. Without it the one component a client invents
+// outright would be the only one still unbounded.
+func validNewName(name string) error {
+	if err := fsx.ValidName(name); err != nil {
+		return err
+	}
+	if len(name) > maxComponentBytes {
+		return errLongComponent
+	}
+	return nil
 }
 
 // decodeBody reads a small JSON request body into v, rejecting unknown fields
@@ -111,7 +142,7 @@ func (s *Server) auditAuthDenied(r *http.Request, sess *session, code, detail st
 // authentication failure reaching it is worth a denial audit line (adv 10).
 func isMutationRoute(p string) bool {
 	switch p {
-	case "/api/fs/mkdir", "/api/fs/rename", "/api/fs/delete", "/api/settings",
+	case "/api/fs/mkdir", "/api/fs/rename", "/api/fs/delete", "/api/settings", "/api/fs/upload", "/api/jobs/search",
 		"/api/jobs/delete", "/api/jobs/copy", "/api/jobs/move", "/api/trash/restore", "/api/trash/empty":
 		return true
 	}
@@ -443,7 +474,7 @@ func (s *Server) mkdir(w http.ResponseWriter, r *http.Request, sess *session) {
 		s.fail(w, r, "bad_request", "Creating intermediate parent directories is not supported.", dir, "parents is not allowed in M1")
 		return
 	}
-	if err := fsx.ValidName(body.Name); err != nil {
+	if err := validNewName(body.Name); err != nil {
 		s.fail(w, r, "bad_request", "Supply a valid folder name.", dir, err.Error())
 		return
 	}
@@ -576,7 +607,7 @@ func (s *Server) rename(w http.ResponseWriter, r *http.Request, sess *session) {
 			return
 		}
 	} else {
-		if err := fsx.ValidName(toRaw); err != nil {
+		if err := validNewName(toRaw); err != nil {
 			s.fail(w, r, "bad_request", "Supply a valid new name.", from, err.Error())
 			return
 		}

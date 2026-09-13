@@ -43,8 +43,18 @@ const (
 	// pipe whose read end rides on the OK frame (M2-C contract §2): every byte
 	// is read by the worker as the user, and nothing touches the disk.
 	OpArchive Op = "archive"
-	OpPing    Op = "ping"
-	OpBye     Op = "bye" // graceful shutdown: finish nothing new, exit
+	// OpArchiveStatus asks what became of an archive the worker produced, by
+	// the id its reply carried (M2-C review round 1 adversarial, finding 6).
+	//
+	// It exists because a pipe cannot carry an outcome. The producer runs long
+	// after the reply, and a stream that ends because the walk failed or hit a
+	// bound closes exactly the way a complete one does — clean EOF — so a
+	// front-end that audited "ok" on EOF recorded a truncated download as a
+	// successful one. The worker keeps each producer's verdict for a bounded
+	// time after it ends, and this is how the front-end asks for it.
+	OpArchiveStatus Op = "archivestatus"
+	OpPing          Op = "ping"
+	OpBye           Op = "bye" // graceful shutdown: finish nothing new, exit
 )
 
 // Frame kinds. A request gets exactly one terminal frame (KindOK or KindErr)

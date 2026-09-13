@@ -269,6 +269,31 @@ func (p *Platform) For(osPath string) FSCaps {
 	return FSCaps{}
 }
 
+// ForLiteral is For without the normalisation: the longest mount point that is
+// the path or a path-boundary prefix of it, matched byte for byte. It exists
+// for the one question that must be answered before anything is resolved or
+// stat'ed — "is this root inside a mount we must never touch?" (a dead hard NFS
+// mount hangs any lookup) — where For's backslash-to-slash and Clean would let
+// a Linux name such as "remote\backup" fall through to the enclosing local
+// filesystem (M2-C review round 3). A spelling that is not already absolute
+// and canonical matches only what it literally is, which is the safe answer:
+// the caller then goes on to the descriptor-based checks.
+func (p *Platform) ForLiteral(osPath string) (FSCaps, bool) {
+	p.maybeRefresh()
+	key := literalMountKey(osPath)
+	if key == "" {
+		return FSCaps{}, false
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for _, mp := range p.order {
+		if pathHasPrefix(key, mp) {
+			return p.caps[mp], true
+		}
+	}
+	return FSCaps{}, false
+}
+
 // MountByLiteralPath returns the capabilities of the mount whose mount point is
 // EXACTLY osPath, comparing the bytes the kernel wrote rather than a tidied-up
 // spelling of them.

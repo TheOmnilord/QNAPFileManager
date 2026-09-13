@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 
 	"net/http"
 	"net/http/httptest"
@@ -72,7 +71,7 @@ func (b *fakeBackend) OpenRead(ctx context.Context, p backend.Principal, name st
 
 // The M2-C operations are declared on the interfaces before their routes
 // exist; the fake refuses them until a test teaches it otherwise.
-func (b *fakeBackend) Archive(_ context.Context, p backend.Principal, _ wproto.ArchiveReq) (io.ReadCloser, wproto.ArchiveResp, error) {
+func (b *fakeBackend) Archive(_ context.Context, p backend.Principal, _ wproto.ArchiveReq) (backend.ArchiveStream, wproto.ArchiveResp, error) {
 	b.last = p
 	return nil, wproto.ArchiveResp{}, fsx.ErrUnsupported
 }

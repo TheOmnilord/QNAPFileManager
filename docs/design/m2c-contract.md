@@ -150,3 +150,75 @@ descriptors on job frames.
   spellings + ramdisk + Contains, conflict codes, client disconnect → Discard, audit pairing; archive route
   streaming + flushing + guard + audit; search route (caps sent, roots guarded, hits in the job view).
 - node: upload queue/progress/conflict helpers; search results view helpers; archive menu enablement.
+
+## 7. Amendments from the review loop (2026-09-13)
+
+- **Archive selection ticket** (round 4): a selection whose GET URL would exceed the server's header limit is
+  submitted as `POST /api/fs/archive/select` (JSON, CSRF as every unsafe method) → `201 {sel}`, then
+  `GET /api/fs/archive?sel=<token>`. The store keeps the REQUESTED spellings only, per session, bounded (16 entries,
+  256 KiB per ticket, 8 MiB store-wide → `429 queue_full`), 60 s, single use, reaped on every select/consume and
+  from the daemon's minute ticker; consumption runs the identical resolve + guard + containment pipeline as the
+  direct form (`authorizeArchive`) — nothing decided at select time is trusted at stream time (round 5).
+- The download `name` is capped at 255 bytes (`413 too_large`) on both entry points.
+- The polled job list omits a search's `hits`; `GET /api/jobs/{id}` carries them (round 4).
+- `Connection: close` on every upload refusal written before the body is consumed, installed before
+  authentication for the upload path (rounds 1–2).
+- The archive route audits the producer's real outcome via `OpArchiveStatus`, asked before the worker is released;
+  this end's own abort/error takes precedence (rounds 1–2).
+- **Retained search results** are bounded process-wide (32 MiB, 256 jobs); the oldest results are released first
+  and the job's `Detail` then says "results no longer available (memory limit); run the search again"
+  (`jobs.Manager.ReplaceResult`, round 6). The worker charges hits by encoded bytes against an 8 MiB budget and an
+  oversized job reply is a `too_large` error, never a disconnect.
+- The search `query` is capped at 1024 bytes (`400 bad_request`); job titles are display-clipped to 80 bytes and
+  audit details are bounded. Every path component in a request body is capped at NAME_MAX (255 bytes) in
+  `bodyPath`, and so are the names mkdir and rename invent (round 7).
+- Upload admission: 4 concurrent uploads per session, 32 process-wide (`429 queue_full`, the UI backs off and
+  retries); the copy buffer is allocated only once bytes flow; a body that stalls for 30 s is dropped as
+  `cancelled` (round 9).
+- **Bulk result reads** (round 11): a search's hits live in the web layer's retention ledger, not in
+  `jobs.Manager`, so `GET /api/jobs` copies only summaries. `GET /api/jobs/{id}` splices the hits back in, and a
+  response carrying more than 64 KiB of them is *admitted*: 2 per session, 6 process-wide, otherwise
+  `429 queue_full` with `Retry-After` and `Connection: close` — the same shape as the upload refusal. Each admitted
+  response is written under a deadline (30 s plus 1 s per MiB, capped at 5 minutes) that is cleared on the way out,
+  because the daemon sets no `WriteTimeout` and a client that stops reading would otherwise pin a complete copy of
+  the result for the life of the process. The ledger bounds what is *held*; this bounds what is *in flight*.
+- **Eviction wins the handoff** (round 11): a search records its hits in the ledger, drops the lock and only then
+  rewrites the manager's copy. A newer search can evict it inside that gap and write its loss notice, so the
+  rewrite is followed by a second look at the ledger's per-job `dropped` mark: if the job was released meanwhile the
+  notice is re-applied. `noteSearchResultDropped` is idempotent and always wins, so a job whose hits are gone can
+  never read back as a search that simply found nothing.
+- **Bulk admission follows the payload** (round 12): `GET /api/jobs/{id}` builds the spliced result first and admits on
+  what that response actually weighs. Admitting on what the ledger held left a hole — a GET landing after a search went
+  terminal but before the finish hook's ledger insert found nothing recorded, skipped the slot and the deadline, and
+  served the hits out of `jobs.Manager`'s own copy unbounded. One code path, one measurement.
+- **The response carries the eviction notice** (round 12): `searchResultOf` applies "results no longer available" from
+  the ledger's per-job `dropped` mark rather than assuming the job snapshot in hand already has it. A snapshot taken
+  before the eviction landed would otherwise describe a search that found nothing.
+- **Archive downloads are admitted and time out on silence** (round 12): 2 per session, 4 process-wide
+  (`429 queue_full` + `Retry-After` + `Connection: close`), the slot held until the handler returns — past `closeReader`,
+  so it covers the worker hold and the pipe descriptors, not merely the 1 MiB copy buffer. The worker's own
+  two-producer bound governs production only: its semaphore is released when the last byte reaches the pipe, while this
+  end may still be blocked writing to a client that stopped reading (32 such responses were observed with no producer
+  active). Each chunk write re-arms a 60 s deadline (`archiveWriter.arm`), so it is an idle limit and not a total: a
+  genuine multi-gigabyte download over a slow link keeps extending it, and only silence ends it — as `aborted`, with
+  the reader closed and the worker released.
+- **A read that claims a body is refused before routing** (round 13): any GET or HEAD with `ContentLength != 0` or a
+  `Transfer-Encoding` gets `400 bad_request` + `Connection: close` from the request pipeline (`bodiedRead` in
+  server.go), before authentication and before any handler can take a slot. net/http drains an unread request body —
+  up to 256 KiB — before writing response headers unless the response is already closeAfterReply, and nothing arms a
+  read deadline for that drain: a GET with `Content-Length: 1` and no body therefore blocked its handler at the first
+  write, holding an archive's admission slot, worker hold and pipe (audit pair unfinished) or a bulk-result slot. The
+  archive and single-job-GET routes also set `Connection: close` themselves when a body is announced, so the drain is
+  skipped even if a future entry point bypasses the middleware.
+- **An upload is bound to the directory, not to its name** (round 13): `wproto.FSIdentityResp` gains `Ino` and
+  `SameInode`, and `OpenWriteReq` gains `DirIdentity`. The front end takes the resolved directory's identity at
+  authorization time — before any part is read — and the worker refuses with `changed` (409) if the directory it
+  opens is not that inode. Authorization clears a pathname; the worker opens only when the file part's headers
+  arrive, and the client owns the gap: rename the authorized directory away, put a symlink to the install tree in its
+  place, then send the body. A front end that cannot identify the directory refuses the upload rather than proceeding
+  unbound; a build with no job spine sends no identity and the worker opens by name as before.
+- **A reaped search answers 404** (round 13): if the ledger has no entry AND the manager no longer has the job,
+  `GET /api/jobs/{id}` answers `404 not_found` ("This job is no longer available."). The janitor can reap a job and
+  prune its entry between the handler's snapshot and its hit lookup, and serving the stale summary then reports a
+  successful search that found nothing — for a search that found matches. A job the manager still holds, with hits in
+  its own copy, is served as before.

@@ -330,6 +330,16 @@ func utimesEntry(dir *dirRef, name string, f *os.File, link bool, atime, mtime t
 		// the by-name form, whose residual is named in setTimes: losing that
 		// race costs a wrong timestamp on an object somebody else already
 		// controls, never a change of ownership.
+		if name == "" {
+			// Except when there is no name to fall back to. An UNNAMED file
+			// (O_TMPFILE) has none before it is published, and utimensat with an
+			// empty pathname is futimens on the DIRFD — which would stamp the
+			// destination DIRECTORY with the file's modification time. Reporting
+			// the failure is the honest answer; the caller treats a timestamp it
+			// could not set as a warning, never as a reason to lose the file
+			// (upload.go's setMTime, copier.setTimes).
+			return &fs.PathError{Op: "futimens", Path: dir.rel, Err: serr}
+		}
 	}
 	rc, err := dir.f.SyscallConn()
 	if err != nil {

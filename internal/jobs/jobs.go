@@ -522,6 +522,43 @@ func (m *Manager) Get(id string) (Job, bool) {
 	return e.snapshot(), true
 }
 
+// ReplaceResult swaps the recorded result of a job that has already FINISHED,
+// and reports how many bytes are now stored for it and whether there was such a
+// job to rewrite. It exists for one reason: a job's Result is the only part of a
+// finished job that is unbounded in size — a search holds every hit it found —
+// and the manager's retention policy is a time window and a count, neither of
+// which knows anything about bytes. The web layer budgets those bytes across
+// every retained search and calls this to release the oldest payloads while
+// keeping the job itself, its counts and its history (routes_search.go). The
+// caller is expected to leave a Detail behind that says the results are gone.
+//
+// A live job is never rewritten: its work function still owns its result, and
+// a half-finished job's summary is not the caller's to edit. Nothing else about
+// the job changes — not its state, its counts, its timestamps or its warnings.
+func (m *Manager) ReplaceResult(id string, res any) (int, bool) {
+	m.mu.Lock()
+	e := m.jobs[id]
+	m.mu.Unlock()
+	if e == nil {
+		return 0, false
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.job.State.Terminal() {
+		return len(e.job.Result), false
+	}
+	if res == nil {
+		e.job.Result = nil
+		return 0, true
+	}
+	b, err := json.Marshal(res)
+	if err != nil {
+		return len(e.job.Result), false
+	}
+	e.job.Result = b
+	return len(b), true
+}
+
 // List returns copies of every job the manager still holds, newest first.
 func (m *Manager) List() []Job {
 	m.mu.Lock()

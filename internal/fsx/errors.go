@@ -43,6 +43,22 @@ var (
 	// code alone, never inferring it from an item merely existing (which a
 	// pre-existing file plus an unrelated create failure would falsely satisfy).
 	ErrOwnerUnset = errors.New("the item was created but its owner could not be set")
+	// ErrTooLarge: the answer will not fit in what carries it. Today that is one
+	// case only — a job result whose encoded terminal frame exceeds
+	// wproto.MaxFrame — and it exists so that such a reply can be refused as an
+	// error for that ONE job instead of tearing down the worker serving every
+	// other request of the same user (M2-C review round 6). The code is already
+	// in the §4.2 vocabulary and already a 413 in the front-end.
+	ErrTooLarge = errors.New("the result is too large to send")
+	// ErrChanged: what arrived is not what was promised. It is the upload's
+	// refusal (M2-C contract §1.3) — a body that ended short of, or ran past,
+	// the declared length, or a staging name that stopped referring to the
+	// inode the bytes were written through — and it is deliberately its own
+	// code rather than bad_request: nothing about the request was malformed,
+	// the transfer simply did not deliver what it said it would, and the client
+	// is being told to send it again. "changed" is already the word the job
+	// warnings use for the same fact about a copy (copy.go, warnChanged).
+	ErrChanged = errors.New("what arrived is not what was declared")
 	// ErrInvalidTarget: the destination of a copy or move is the source itself
 	// or lies inside it (M2-B contract §1.7). The route refuses it lexically on
 	// both spellings; the engine refuses it again by descriptor identity
@@ -82,6 +98,10 @@ func Code(err error) string {
 		return "owner_unset"
 	case errors.Is(err, ErrInvalidTarget):
 		return "invalid_target"
+	case errors.Is(err, ErrChanged):
+		return "changed"
+	case errors.Is(err, ErrTooLarge):
+		return "too_large"
 	case errors.Is(err, ErrUnsupported):
 		return "unsupported"
 	case errors.Is(err, ErrCrossDevice):

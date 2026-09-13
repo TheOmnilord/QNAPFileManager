@@ -160,6 +160,19 @@ func (s *session) jobWork(ctx context.Context, req wproto.JobReq, e *progEmitter
 		}
 		return fsops.Size(ctx, s.root, s.plat, pathsOf(body.Paths), body.CrossMounts, emit)
 
+	case wproto.JobSearch:
+		var body wproto.SearchReq
+		if err := jobBody(req.Body, &body); err != nil {
+			return wproto.JobResult{}, err
+		}
+		// The request is handed over whole: the roots (still []byte, so a
+		// non-UTF-8 Linux filename survives the round trip — fsops converts them
+		// exactly as pathsOf does), the query and the caps. The worker clamps
+		// those caps to its own maxima rather than trusting the request to carry
+		// them, which is the rule List already follows for ListMax (M2-C
+		// contract §3.2).
+		return fsops.Search(ctx, s.root, s.plat, body, emit)
+
 	case wproto.JobTrashRestore:
 		var body wproto.TrashRestoreReq
 		if err := jobBody(req.Body, &body); err != nil {

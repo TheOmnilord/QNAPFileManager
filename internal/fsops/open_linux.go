@@ -196,6 +196,66 @@ func (ref *itemRef) close() {
 	}
 }
 
+// refFD is the descriptor behind a held item, for the callers that address it
+// with AT_EMPTY_PATH instead of by name (the copy engine's chown and utimensat).
+// Off Linux there is no descriptor and this is nil.
+func refFD(ref *itemRef) *os.File {
+	if ref == nil {
+		return nil
+	}
+	return ref.f
+}
+
+// itemRefIn opens and holds one entry of an ALREADY HELD directory, with
+// openat(O_PATH|O_NOFOLLOW|O_CLOEXEC) relative to that directory's descriptor.
+//
+// It is openItemRef without the pathname walk, and that is the whole point: the
+// copy engine holds the directory it is working in, so the entry it pins is an
+// entry of THAT object and not of whatever the directory's name means by now.
+// The trash's openItemRef still walks, because it starts from a request path;
+// this one starts from a descriptor.
+func itemRefIn(d *dirRef, name string) (*itemRef, error) {
+	fd, err := openatIn(d.f, name, oPath|syscall.O_NOFOLLOW|syscall.O_CLOEXEC)
+	if err != nil {
+		return nil, &fs.PathError{Op: "openat", Path: relJoin(d.rel, name), Err: err}
+	}
+	f := os.NewFile(uintptr(fd), relJoin(d.rel, name))
+	fi, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	return &itemRef{f: f, fi: fi}, nil
+}
+
+// itemIdentityOf reads the mount identity of a HELD item descriptor, exactly as
+// identityOf reads a directory's (walk_linux.go): the kernel's mount id first,
+// because two bind mounts of one device share a st_dev and QTS builds its share
+// layout out of bind mounts, and st_dev as the fallback.
+//
+// It is the same measurement the walk makes its crossing decisions from, which
+// is the point: the move pre-flight's prediction and the engine's own behaviour
+// have to be derived from one notion of "the same filesystem" or the dialog
+// would describe a job the worker does not perform.
+//
+// An O_PATH descriptor answers both halves — statx(AT_EMPTY_PATH) and
+// /proc/self/fdinfo work on one — so nothing here opens the file itself.
+func itemIdentityOf(ref *itemRef) mountIdentity {
+	var id mountIdentity
+	if ref == nil {
+		return id
+	}
+	if ref.fi != nil {
+		id.dev, id.hasDev = devOf(ref.fi)
+	}
+	if ref.f != nil {
+		if mnt, ok := mountIDOf(ref.f); ok {
+			id.mnt, id.hasMnt = mnt, true
+		}
+	}
+	return id
+}
+
 // readlinkAt is readlink(2) for an already-resolved path, through the same
 // O_PATH walk and for the same reason: naming a link inside a search-only
 // directory is not a listing.

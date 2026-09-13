@@ -43,15 +43,20 @@ function promptDialog({title,label,value=''}) {
 }
 
 // confirmDialog resolves to true only when confirmed. When phrase is set, the
-// OK button stays disabled until the typed text matches it exactly.
-export function confirmDialog({title,body,why='',danger=false,phrase=''}) {
+// OK button stays disabled until the typed text matches it exactly. okLabel
+// names the button for callers whose dangerous action is not a delete — an
+// overwriting copy is danger-styled but says "Copy", not "Delete".
+export function confirmDialog({title,body,why='',danger=false,phrase='',okLabel=''}) {
  return new Promise(resolve => {
   const dlg=$('#dlgConfirm'),ok=$('#confirmOK'),input=$('#confirmPhrase'),phraseLabel=$('#confirmPhraseLabel');
   $('#confirmTitle').textContent=title; $('#confirmBody').textContent=body;
   $('#confirmWhy').textContent=why; $('#confirmWhy').hidden=!why;
   const needPhrase=!!phrase; phraseLabel.hidden=!needPhrase; input.value='';
   $('#confirmPhraseName').textContent=phrase;
-  ok.textContent=danger?'Delete':'Confirm';
+  ok.textContent=okLabel || (danger?'Delete':'Confirm');
+  // The danger styling #dlgConfirm.danger already defines, now actually applied:
+  // an overwriting copy destroys what is there and must not look routine.
+  dlg.classList.toggle('danger',!!danger);
   const validate=() => { ok.disabled=needPhrase && input.value!==phrase; };
   validate();
   const cleanup=() => { ok.removeEventListener('click',onOK); input.removeEventListener('input',validate); dlg.removeEventListener('close',onClose); };
@@ -83,6 +88,7 @@ export function actionMessage(err) {
   exists:'A file or folder with that name already exists here.',
   owner_unset:'The folder was created but could not be assigned to you; it is owned by the system — check it or delete it.',
   cross_device:'The source and destination are on different volumes.',
+  invalid_target:'The destination is inside the folder being copied.',
   no_trash:'There is no Trash on this volume, so deleting here is permanent.',
   queue_full:'Too many operations are already queued. Wait for some to finish, then try again.',
  };

@@ -92,7 +92,22 @@ const readSidecarFlags = os.O_RDONLY
 // directory. Both sides belong to the same os.Root, which resolves each name
 // against the root descriptor.
 func (d *dirRef) renameInto(fromJail fsx.Jail, fromParentRel, fromName, toName string) error {
-	return renameAt(fromJail, fromParentRel, fromName, d.j, d.rel, toName, true)
+	return d.renameFrom(fromJail, fromParentRel, fromName, toName, true)
+}
+
+// renameFrom is renameInto with the no-overwrite guarantee as a parameter; see
+// the Linux half for why the copy engine needs both answers. Off Linux both go
+// through os.Root, which resolves each name against the root descriptor.
+func (d *dirRef) renameFrom(fromJail fsx.Jail, fromParentRel, fromName, toName string, noReplace bool) error {
+	return renameAt(fromJail, fromParentRel, fromName, d.j, d.rel, toName, noReplace)
+}
+
+// renameFromDir renames between two directories this process is holding. Off
+// Linux "holding" is a jail-relative name and os.Root resolves both ends, so
+// this is renameFrom with the source spelled from the held ref — the same
+// degradation every helper here accepts (INV-2).
+func (d *dirRef) renameFromDir(fromDir *dirRef, fromName, toName string, noReplace bool) error {
+	return renameAt(fromDir.j, fromDir.rel, fromName, d.j, d.rel, toName, noReplace)
 }
 
 // renameOver renames one entry of this directory over another name in the same

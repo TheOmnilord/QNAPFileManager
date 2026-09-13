@@ -170,6 +170,30 @@ Decisions made for M2-A:
   (-1), never a floor; an empty invalidates a known size before its first removal. Six high-effort review rounds
   (`docs/reviews/trash-size-round*.md`, 16 findings) hardened the walker (Network mounts are never touched when they
   cannot be crossed; checked accumulation; root identity from the enumerated descriptor) along the way.
+**M2-B status (2026-09-13, overnight autonomous run):** copy/move implemented against
+`docs/design/m2b-contract.md` — the engine (`internal/fsops/copy*.go`, `fsid.go`, `acl*.go`, `unnamed_linux.go`),
+worker dispatch, `internal/web/routes_transfer.go` with `guard.Contains`, and the transfer dialog with the tree
+picker and Ctrl+C/X/V. Reviewed by gpt-6-astra at high effort, normal + adversarial, for **18 rounds** (the owner's
+budget of ten, extended to fifteen, then three verification passes) — every finding accepted and fixed
+(`docs/reviews/m2b-round1..18.md`), Linux CI executed after each round via a throwaway draft PR. What the loop
+settled: a move deletes its source only after every regular file is byte-verified against its copy (§2.6 "copy,
+verify, then delete" taken literally); the metadata ledger (identity, size, mtime, ctime settled on the source
+filesystem's own clock, mode, uid, gid) is the pre-filter; both trees are walked on held descriptors with the whole
+ancestor chain re-proved before each copy and each removal; files are created unnamed (`O_TMPFILE`) and linked into
+place after ownership, bytes, fsync and verification; directories and symlinks are staged in a private per-directory
+staging directory proved once (0700, creator, empty, gid, inherited setgid, no write-capable ACE for a non-owner,
+inheritable ACL equal to the destination's) and renamed into place; a legitimately shared-writable destination builds
+at the final name under the stat proofs with one `shared_destination` warning. Accepted residuals are listed in
+`copy.go`'s header (the two-syscall check-then-act windows Linux offers no way to close, a `MAP_SHARED` writer,
+a same-tick rewrite of a tiny file during a plain copy, the shared-writable destination, `grpid` mounts). Cost:
+a cross-filesystem move reads twice and fsyncs per file and per directory; a renaming move pays none of it.
+
+**To confirm on hardware first (both units):** that an ordinary QuTS hero share lands in the "shared, warn once"
+category, not the "refuse as unverified" one — the staging proof grew over three rounds and each addition is a way a
+share can be refused; a real inherited NFSv4 ACL is the case CI cannot stage. Then: same-dataset move is instant;
+cross-dataset move is predicted in the dialog and completes; conflict policies; Ctrl+C/X/V; an admin's copy is owned
+by the real user.
+
 - **No automatic trash sweeper yet** (owner, 2026-09-13: "defer janitor"). `trash.days` is validated and carried
   in the config but nothing enforces it; Trash empties only through "Empty Trash…". Trash ownership is left as is.
 

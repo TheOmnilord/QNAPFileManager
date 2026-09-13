@@ -16,7 +16,7 @@
   <button id="btnMkdir" disabled>New folder</button>
   <button id="btnUpload" disabled aria-disabled="true" title="Uploads are not available in this version.">Upload</button>
   <button id="btnDownload" disabled>Download</button><button id="btnView" disabled>View text</button><button id="btnProps" disabled>Properties</button>
-  <button id="btnRename" disabled>Rename</button><button id="btnDelete" disabled>Delete</button>
+  <button id="btnRename" disabled>Rename</button><button id="btnCopy" disabled>Copy to…</button><button id="btnMove" disabled>Move to…</button><button id="btnDelete" disabled>Delete</button>
   <button id="btnTrash">Trash</button><button id="btnJobs" aria-controls="jobsPanel" aria-expanded="false">Operations</button>
   <label class="filter"><span class="visually-hidden">Filter loaded names</span><input id="searchBox" type="text" placeholder="Filter loaded names (/)"></label>
   <label><input id="chkHidden" type="checkbox"> Hidden</label><button id="btnShortcuts" title="Keyboard shortcuts (?)">?</button>
@@ -48,6 +48,19 @@
  <p id="delCrossRow" hidden><label><input type="checkbox" id="delCross" checked> Include mounted sub-folders</label></p>
  <label id="delPhraseLabel" for="delPhrase" hidden>Type <b id="delPhraseName"></b> to confirm <input id="delPhrase" type="text"></label>
  <div class="bar"><button id="delOK">Move to Trash</button><button data-close>Cancel</button></div></dialog>
+<dialog id="dlgTransfer" aria-labelledby="xferTitle"><h2 id="xferTitle">Copy to…</h2>
+ <nav id="xferTree" role="tree" aria-label="Destination folders"></nav>
+ <label for="xferPath">Destination folder</label><input id="xferPath" type="text" placeholder="/share/Public" autocomplete="off" spellcheck="false">
+ <fieldset id="xferConflict"><legend>If a name is already taken there</legend>
+  <label><input type="radio" name="xferConflict" value="skip" checked> Skip existing</label>
+  <label><input type="radio" name="xferConflict" value="overwrite"> Overwrite</label>
+  <label><input type="radio" name="xferConflict" value="rename"> Keep both</label>
+ </fieldset>
+ <p id="xferCrossRow" hidden><label><input type="checkbox" id="xferCross" checked> Include mounted sub-folders</label></p>
+ <p id="xferWhy" class="hint" hidden></p>
+ <p id="xferSummary" role="status"></p>
+ <p id="xferError" class="banner" role="alert" hidden></p>
+ <div class="bar"><button id="xferOK">Copy</button><button data-close>Cancel</button></div></dialog>
 <dialog id="dlgTrash" aria-labelledby="trashTitle"><h2 id="trashTitle">Trash</h2>
  <p id="trashWhere" class="hint">Trash lives in .@qfm_trash on each volume.</p>
  <div id="trashWrap"><table id="trashTable"><thead><tr><th><input type="checkbox" id="trashAll" aria-label="Select all"></th><th>Name</th><th>Original location</th><th>Deleted</th><th>Size</th></tr></thead><tbody id="trashRows"></tbody></table></div>
@@ -67,5 +80,5 @@
 <dialog id="dlgPrompt" aria-labelledby="promptTitle"><h2 id="promptTitle">Name</h2><label id="promptLabel" for="promptInput">Name</label><input id="promptInput" type="text"><div class="bar"><button id="promptOK">OK</button><button data-close>Cancel</button></div></dialog>
 <dialog id="dlgConfirm" aria-labelledby="confirmTitle"><h2 id="confirmTitle">Confirm</h2><p id="confirmBody"></p><p id="confirmWhy" class="hint" hidden></p><label id="confirmPhraseLabel" for="confirmPhrase" hidden>Type <b id="confirmPhraseName"></b> to confirm <input id="confirmPhrase" type="text"></label><div class="bar"><button id="confirmOK">Confirm</button><button data-close>Cancel</button></div></dialog>
 <dialog id="dlgSession" aria-labelledby="sessionTitle"><h2 id="sessionTitle">Session</h2><p id="sessionDetails"></p><button id="btnLogout">Sign out of this app</button><button data-close>Close</button></dialog>
-<dialog id="dlgShortcuts" aria-labelledby="shortcutsTitle"><h2 id="shortcutsTitle">Browse with the keyboard</h2><p>↑ ↓ / Home / End / Page Up / Page Down: move<br>Shift + movement: extend selection<br>Ctrl + movement: keep selection<br>Space: toggle · Ctrl+A: select all<br>Enter: open · F4: view text · Alt+Enter: properties<br>Delete: move the selection to Trash<br>Backspace: parent · Alt+←/→: back/forward<br>Ctrl+L: edit path · /: filter loaded names<br>Ctrl+H: hidden files · F5: refresh<br>Shift+F10 / Menu: actions · Esc: clear or close<br>?: shortcuts</p><button data-close>Close</button></dialog>
+<dialog id="dlgShortcuts" aria-labelledby="shortcutsTitle"><h2 id="shortcutsTitle">Browse with the keyboard</h2><p>↑ ↓ / Home / End / Page Up / Page Down: move<br>Shift + movement: extend selection<br>Ctrl + movement: keep selection<br>Space: toggle · Ctrl+A: select all<br>Enter: open · F4: view text · Alt+Enter: properties<br>Delete: move the selection to Trash<br>Ctrl+C / Ctrl+X: mark to copy / move · Ctrl+V: paste here<br>Backspace: parent · Alt+←/→: back/forward<br>Ctrl+L: edit path · /: filter loaded names<br>Ctrl+H: hidden files · F5: refresh<br>Shift+F10 / Menu: actions · Esc: clear or close<br>?: shortcuts</p><button data-close>Close</button></dialog>
 </body></html>

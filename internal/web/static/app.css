@@ -41,7 +41,17 @@ dialog { border:1px solid var(--line); border-radius:10px; padding:1.4rem; max-w
 #auditTable th { position:sticky; top:0; background:var(--panel); }
 #dlgConfirm.danger,#dlgDelete.danger { border-color:var(--fail); }
 #dlgConfirm.danger #confirmOK,#dlgDelete.danger #delOK { background:var(--danger-bg); color:#fff; }
-#confirmPhrase,#promptInput,#delPhrase { width:100%; margin:.4rem 0; }
+#confirmPhrase,#promptInput,#delPhrase,#xferPath { width:100%; margin:.4rem 0; }
+/* Transfer dialog — the destination picker is the same tree renderer, bounded
+   so the dialog never grows past the conflict choices and the OK button. */
+#xferTree { max-height:15rem; overflow:auto; margin:.5rem 0; padding:.4rem; background:var(--panel); border:1px solid var(--line); border-radius:6px; }
+#xferTree [role=group] { padding-left:1rem; }
+#xferTree .treeLine.picked { background:var(--sel-bg); outline:1px solid var(--focus); border-radius:4px; }
+#xferConflict { display:flex; flex-wrap:wrap; gap:.4rem 1.1rem; align-items:center; margin:.6rem 0; padding:.3rem .7rem .6rem; border:1px solid var(--line); border-radius:6px; }
+#xferConflict legend { padding:0 .3rem; font-size:.85rem; opacity:.8; }
+#xferConflict label,#xferCrossRow label { white-space:nowrap; }
+#xferSummary { margin:.4rem 0; overflow-wrap:anywhere; }
+#xferError { margin:.4rem 0; border-color:var(--fail); color:var(--fail); background:#cf222e22; }
 /* Jobs panel — a right-side drawer inside main, so the list keeps its own scroll. */
 #jobsPanel { width:min(26rem,80vw); flex-shrink:0; overflow:auto; padding:.6rem .8rem; background:var(--panel); border-left:1px solid var(--line); }
 .jobsBar { display:flex; align-items:center; gap:.4rem; } .jobsBar h2 { flex:1; margin:.2rem 0; }

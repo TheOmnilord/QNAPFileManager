@@ -5,6 +5,7 @@ import {initList,loadList} from './list.js';
 import {loadTree} from './tree.js';
 import {initViewer} from './viewer.js';
 import {initActions,deleteSelection} from './actions.js';
+import {initTransfer,markClipboard,pasteHere} from './transfer.js';
 import {initJobs,pollJobs} from './jobs.js';
 import {initTrash} from './trash.js';
 import {initSettings,loadAudit} from './settings.js';
@@ -61,7 +62,7 @@ function showSession(session) {
   if (session.groupsIncomplete) $('#announce').textContent='Warning: supplementary groups are incomplete.';
   navigate(); loadTree(); pollJobs();
 }
-initList(); initViewer(); initActions(); initJobs(); initTrash(); initSettings();
+initList(); initViewer(); initActions(); initTransfer(); initJobs(); initTrash(); initSettings();
 $('.skip').addEventListener('click',ev => { ev.preventDefault(); $('#list').focus(); });
 window.addEventListener('hashchange',navigate);
 $('#btnRetry').addEventListener('click',connect);
@@ -83,11 +84,21 @@ $('#btnLogout').addEventListener('click',async () => {
  try { await request; } catch(err) { if (valid()) error(err); }
 });
 document.addEventListener('keydown',ev => {
- const editing=ev.target.matches('input,textarea,select'),ctrl=ev.ctrlKey || ev.metaKey;
+ // isContentEditable as well as the form controls: a key that means "copy" must
+ // never be taken from somewhere the user is typing.
+ const editing=ev.target.matches('input,textarea,select') || ev.target.isContentEditable,ctrl=ev.ctrlKey || ev.metaKey;
  if (document.querySelector('dialog[open]')) return;
  if (ctrl && ev.key.toLowerCase()==='l') { ev.preventDefault(); $('#pathEdit').focus(); $('#pathEdit').select(); return; }
  if (editing) return;
- if (ctrl && ev.key.toLowerCase()==='h') { ev.preventDefault(); $('#chkHidden').checked=!state.hidden; hidden(); }
+ if (ctrl && !ev.altKey && !ev.shiftKey && ev.key.length===1 && 'cxv'.includes(ev.key.toLowerCase())) {
+  // A text selection means the user is copying TEXT; the browser's own
+  // clipboard keeps the keys in that case.
+  if (window.getSelection?.()?.toString()) return;
+  const key=ev.key.toLowerCase();
+  ev.preventDefault();
+  if (key==='v') pasteHere(); else markClipboard(key==='c' ? 'copy' : 'move');
+ }
+ else if (ctrl && ev.key.toLowerCase()==='h') { ev.preventDefault(); $('#chkHidden').checked=!state.hidden; hidden(); }
  else if (ev.key==='Delete') { ev.preventDefault(); deleteSelection(); }
  else if (ev.key==='F5') { ev.preventDefault(); loadList(); }
  else if (ev.key==='Backspace') { ev.preventDefault(); up(); }

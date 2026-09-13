@@ -149,13 +149,58 @@ const readSidecarFlags = os.O_RDONLY | syscall.O_NONBLOCK
 // volume, and a pathname re-resolved at rename time is a pathname somebody else
 // can have swapped in the meantime.
 func (d *dirRef) renameInto(fromJail fsx.Jail, fromParentRel, fromName, toName string) error {
+	return d.renameFrom(fromJail, fromParentRel, fromName, toName, true)
+}
+
+// renameFrom is renameInto with the no-overwrite guarantee as a parameter,
+// because the move half of the copy engine needs both answers (M2-B contract
+// §1.1 and §1.3).
+//
+// noReplace is the trash's rule and the default: RENAME_NOREPLACE, so the
+// kernel itself refuses an existing destination in the one syscall and there is
+// no check-then-act window to lose. It is dropped for exactly one case — the
+// `overwrite` conflict policy moving a NON-DIRECTORY onto an existing
+// non-directory of the same kind — where replacing is what the user asked for
+// and renameat's replacement is atomic: a reader sees the old file or the new
+// one and never a half file.
+//
+// A directory is never renamed over anything: a directory meeting an existing
+// directory is a merge (the copy path), and every other pairing is a type
+// mismatch the engine refuses before it gets here.
+// renameFromDir is renameFrom between two descriptors this process is ALREADY
+// holding, with no pathname walk at either end.
+//
+// It is what the copy engine's move uses. renameFrom has to re-walk the source
+// parent's pathname, and the move holds that directory open for the whole root
+// anyway — so re-resolving it would reopen a window the engine had already
+// closed, on the one operation that moves a whole tree in a single syscall.
+func (d *dirRef) renameFromDir(fromDir *dirRef, fromName, toName string, noReplace bool) error {
+	var err error
+	if noReplace {
+		err = renameNoReplaceIn(fromDir.f, fromName, d.f, toName)
+	} else {
+		err = renameatIn(fromDir.f, fromName, d.f, toName, false)
+	}
+	if err != nil {
+		return &fs.PathError{Op: "renameat", Path: relJoin(fromDir.rel, fromName), Err: err}
+	}
+	return nil
+}
+
+func (d *dirRef) renameFrom(fromJail fsx.Jail, fromParentRel, fromName, toName string, noReplace bool) error {
 	fromDir, err := walkOPath(fromJail, fromParentRel)
 	if err != nil {
 		return err
 	}
 	defer fromDir.Close()
-	if err := renameNoReplaceIn(fromDir, fromName, d.f, toName); err != nil {
-		return &fs.PathError{Op: "renameat", Path: relJoin(fromParentRel, fromName), Err: err}
+	var rerr error
+	if noReplace {
+		rerr = renameNoReplaceIn(fromDir, fromName, d.f, toName)
+	} else {
+		rerr = renameatIn(fromDir, fromName, d.f, toName, false)
+	}
+	if rerr != nil {
+		return &fs.PathError{Op: "renameat", Path: relJoin(fromParentRel, fromName), Err: rerr}
 	}
 	return nil
 }

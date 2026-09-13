@@ -136,6 +136,10 @@ export function refreshToolbar() {
  $('#btnRename').title = !canWrite ? ro : (!one ? 'Select one item to rename.' : 'Rename');
  $('#btnDelete').disabled = !canWrite || n < 1;
  $('#btnDelete').title = !canWrite ? ro : (n < 1 ? 'Select items to delete.' : 'Delete');
+ for (const [id,verb] of [['#btnCopy','copy'],['#btnMove','move']]) {
+  $(id).disabled = !canWrite || n < 1;
+  $(id).title = !canWrite ? ro : (n < 1 ? `Select items to ${verb}.` : `${verb==='copy' ? 'Copy' : 'Move'} to another folder (Ctrl+${verb==='copy' ? 'C' : 'X'}, then Ctrl+V)`);
+ }
 }
 
 export function render() {
@@ -214,7 +218,7 @@ export function contextMenu(e) {
 
 export function initList() {
  subscribe(() => {
-  if (!state.session) { for (const id of ['#btnDownload','#btnView','#btnProps','#btnMkdir','#btnRename','#btnDelete']) $(id).disabled=true; topHeight?.(0); bottomHeight?.(0); }
+  if (!state.session) { for (const id of ['#btnDownload','#btnView','#btnProps','#btnMkdir','#btnRename','#btnDelete','#btnCopy','#btnMove']) $(id).disabled=true; topHeight?.(0); bottomHeight?.(0); }
   else refreshToolbar();
  });
  topHeight = heightRule('#listSpacer'); bottomHeight = heightRule('#listTail');

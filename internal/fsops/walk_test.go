@@ -524,7 +524,7 @@ func TestWalkReportsTheIdentityOfTheDirectoryItOpened(t *testing.T) {
 
 	opened := map[string]os.FileInfo{}
 	err := Walk(context.Background(), r, nil, "/a", WalkOptions{}, Visitor{
-		Opened: func(it WalkItem, info os.FileInfo) { opened[it.Path] = info },
+		Opened: func(it WalkItem, info os.FileInfo) error { opened[it.Path] = info; return nil },
 	})
 	if err != nil {
 		t.Fatalf("Walk: %v", err)

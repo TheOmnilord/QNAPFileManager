@@ -138,7 +138,7 @@ let primed = false;
 
 // REFRESH_KINDS are the kinds whose completion changes what the list and the
 // tree show, so finishing one reloads both.
-const REFRESH_KINDS = new Set(['delete','trash-restore','trash-empty']);
+const REFRESH_KINDS = new Set(['delete','trash-restore','trash-empty','copy','move']);
 
 function panelOpen(open) {
  $('#jobsPanel').hidden = !open;

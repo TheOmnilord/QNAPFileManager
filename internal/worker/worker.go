@@ -537,6 +537,8 @@ func (s *session) dispatch(ctx context.Context, f wproto.Frame) {
 		s.openRead(ctx, f)
 	case wproto.OpTrashList:
 		s.trashList(ctx, f)
+	case wproto.OpFSIdentity:
+		s.fsIdentity(ctx, f)
 	default:
 		s.replyErr(f.ID, fmt.Errorf("the %q operation is not implemented by this worker: %w", f.Op, fsx.ErrUnsupported), nil)
 	}

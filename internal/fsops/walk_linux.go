@@ -102,6 +102,16 @@ func (d *dirRef) stat() (os.FileInfo, error) { return d.f.Stat() }
 
 func (d *dirRef) close() error { return d.f.Close() }
 
+// syncDir gets this directory's own entries onto the disk — the names, not the
+// files they point at.
+//
+// fsync on a directory descriptor is what makes a rename durable. A file's own
+// fsync only promises its contents; the link that publishes it under a name
+// lives in the directory, and a filesystem is free to write the two in either
+// order. The trash's sidecar rewrite depends on the rename being on the disk
+// before the removals that follow it (rewriteTrashMeta), so it asks for it.
+func syncDir(d *dirRef) error { return d.f.Sync() }
+
 // mkdir creates a subdirectory of this one, with mkdirat relative to the held
 // descriptor (F2). Nothing is named: whatever the pathname of this directory
 // meant when it was opened, the entry lands inside the object the descriptor
@@ -146,6 +156,26 @@ func (d *dirRef) renameInto(fromJail fsx.Jail, fromParentRel, fromName, toName s
 	defer fromDir.Close()
 	if err := renameNoReplaceIn(fromDir, fromName, d.f, toName); err != nil {
 		return &fs.PathError{Op: "renameat", Path: relJoin(fromParentRel, fromName), Err: err}
+	}
+	return nil
+}
+
+// renameOver renames one entry of this directory over another name in the SAME
+// directory, replacing whatever is there — both sides of the renameat are this
+// one held descriptor (F2).
+//
+// It is the opposite of every other rename here, and the one place replacing is
+// what is wanted: it publishes a rewritten trash sidecar (trash.go), where the
+// name being replaced is one this worker wrote seconds earlier inside its own
+// 0700 entry directory, and where a reader must see the old sidecar or the new
+// one and never a half-written file.
+//
+// renameatIn holds both descriptors at once, and here they are the same one.
+// That is safe rather than a deadlock: SyscallConn's Control takes a reference
+// on the descriptor, not a lock, so the inner Control simply counts one more.
+func (d *dirRef) renameOver(fromName, toName string) error {
+	if err := renameatIn(d.f, fromName, d.f, toName, false); err != nil {
+		return &fs.PathError{Op: "renameat", Path: relJoin(d.rel, fromName), Err: err}
 	}
 	return nil
 }

@@ -56,6 +56,30 @@ func statAt(j fsx.Jail, rel string) (os.FileInfo, error) {
 	return j.Lstat(rel)
 }
 
+// itemRef off Linux holds nothing. There is no O_PATH here to open an inode
+// without opening the file, and a Windows handle on a directory is a handle that
+// can stand in the way of renaming it — which is precisely what the trash is
+// about to do with the item this would be pinning.
+//
+// Nothing is lost that this platform had: the identity comparison the pin exists
+// to protect cannot be made off Linux at all (sameObject reports nothing), so a
+// reference that is only a stat is exactly as far as the dev box ever gets.
+// INV-2 — the CI Linux jobs hold the real descriptor.
+type itemRef struct {
+	fi os.FileInfo
+}
+
+// openItemRef off Linux is statAt with somewhere to put the answer.
+func openItemRef(j fsx.Jail, rel string) (*itemRef, error) {
+	fi, err := statAt(j, rel)
+	if err != nil {
+		return nil, err
+	}
+	return &itemRef{fi: fi}, nil
+}
+
+func (ref *itemRef) close() {}
+
 // readlinkAt off Linux is os.Root's own readlink.
 func readlinkAt(j fsx.Jail, rel string) (string, error) {
 	return j.Readlink(rel)

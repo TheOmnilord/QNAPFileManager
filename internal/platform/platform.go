@@ -269,6 +269,39 @@ func (p *Platform) For(osPath string) FSCaps {
 	return FSCaps{}
 }
 
+// MountByLiteralPath returns the capabilities of the mount whose mount point is
+// EXACTLY osPath, comparing the bytes the kernel wrote rather than a tidied-up
+// spelling of them.
+//
+// It exists for one caller — the walk's pre-lstat mount check (fsops), which
+// must decide "is this name a mount point" before it is allowed to touch the
+// name at all — and the exactness is the whole point of it. Every other lookup
+// here goes through normalizePath, which turns a backslash into a separator and
+// then Cleans the result; on Linux a backslash is an ORDINARY CHARACTER in a
+// filename, so a regular file called `..\export` normalises to "/export" and
+// would be mistaken for a mount of that name, while a real mount point with a
+// backslash in it would never match its own row. A check made before the item
+// can be stat'ed cannot afford either mistake: the first hides a file from a
+// delete, the second lets a walk reach the syscall it was supposed to avoid.
+//
+// The map keys are the mount points as mountinfo spells them, with the kernel's
+// octal escapes already decoded (unescapeOctal), so an exact match against a
+// path built the same way — a directory's own mount-table spelling plus one
+// entry name — is a match on the kernel's own bytes. The normalisation off Linux
+// stays, because there the caller's paths are the dev box's and not a kernel's
+// (INV-2); literalMountKey is where that difference is stated.
+func (p *Platform) MountByLiteralPath(osPath string) (FSCaps, bool) {
+	key := literalMountKey(osPath)
+	if key == "" {
+		return FSCaps{}, false
+	}
+	p.maybeRefresh()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	c, ok := p.caps[key]
+	return c, ok
+}
+
 // MountFor returns the mount holding osPath, or false when none matches.
 func (p *Platform) MountFor(osPath string) (Mount, bool) {
 	p.maybeRefresh()

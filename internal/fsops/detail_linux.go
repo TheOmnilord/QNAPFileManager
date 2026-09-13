@@ -20,6 +20,31 @@ func statDetail(fi os.FileInfo) (uid, gid int, nlink uint64, ok bool) {
 	return int(st.Uid), int(st.Gid), uint64(st.Nlink), true
 }
 
+// sameObject reports whether two FileInfos describe one and the same object —
+// the same inode on the same device — and whether the question could be answered
+// at all.
+//
+// It is how the trash proves that the tree it measured is the payload that
+// landed in the entry (trash.go): the scan and the rename each looked the item
+// up by NAME, and a name is a thing another writer can re-point in between.
+// os.SameFile answers the same question, but only for a FileInfo the os package
+// produced; this package's lstat wrappers are the ones in play here, and being
+// explicit about the two fields is also what makes the "could not tell" case
+// visible to the caller instead of silently false.
+func sameObject(a, b os.FileInfo) (same, known bool) {
+	if a == nil || b == nil {
+		return false, false
+	}
+	sa, aok := a.Sys().(*syscall.Stat_t)
+	sb, bok := b.Sys().(*syscall.Stat_t)
+	if !aok || !bok || sa == nil || sb == nil {
+		return false, false
+	}
+	// Converted explicitly, like every other field in this file: the widths of
+	// Dev and Ino are the architecture's, and amd64 and arm64 are both targets.
+	return uint64(sa.Dev) == uint64(sb.Dev) && uint64(sa.Ino) == uint64(sb.Ino), true
+}
+
 // devOf pulls the device number out of a FileInfo the walk already obtained.
 // It is how a mount point is recognised without asking the kernel about a
 // pathname: the entry's device against its parent directory's, both stat'ed

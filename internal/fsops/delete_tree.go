@@ -85,9 +85,24 @@ func DeleteTree(ctx context.Context, r fsx.Root, plat *platform.Platform, paths 
 		if err != nil {
 			return d.res, err
 		}
+		// capped and nothing else. A scan that merely could not read part of the
+		// tree (scanResult.incomplete) still gives the progress bar a denominator
+		// worth having: the delete is about to meet the very same unreadable
+		// subdirectory and will warn about it then, and a bar that went
+		// indeterminate because one file in a million was refused would tell the
+		// user less than a total that is slightly short. The trash sidecar is the
+		// caller that cannot live with "slightly short", because it persists the
+		// number instead of showing it for a minute (trashSizeOf).
 		if !scan.capped {
 			d.filesTotal = scan.files + scan.dirs
 			d.bytesTotal = scan.bytes
+		} else {
+			// The bar goes indeterminate, and the reason is said once rather than
+			// left to be guessed at. The pre-scan itself is quiet — the delete is
+			// about to walk the same tree and report the same per-item failures —
+			// but this is not a per-item failure: it is why the job has no
+			// denominator, and it is the same sentence a size job gives.
+			warnScanCapped(emit)
 		}
 	}
 

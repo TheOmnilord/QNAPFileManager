@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"unicode/utf8"
 
@@ -241,8 +242,36 @@ func (s *Server) trashEmpty(w http.ResponseWriter, r *http.Request, sess *sessio
 	summary := guard.Summary{Warnings: []string{permanentWarning}}
 	if resp, err := s.jobRunner.TrashList(r.Context(), sess.who); err == nil {
 		summary.Files = int64(len(resp.Items))
+		unknown, overflowed := 0, false
 		for _, it := range resp.Items {
-			summary.Bytes += it.Size
+			switch {
+			case it.Size < 0:
+				// The worker saying it does not know: a directory whose tree was
+				// too large to count inside the scan's bound, or one trashed by a
+				// build that never counted it. Adding it would subtract a byte from
+				// the total, and silently dropping it would state a total that is
+				// not one — so it is left out and then said out loud.
+				unknown++
+			case overflowed || summary.Bytes > math.MaxInt64-it.Size:
+				// Each item's size fits in an int64 and their sum need not: two
+				// measured five-exabyte trees are enough, and a wrapped total is
+				// NEGATIVE — which would reach the dialog, the mutation record and
+				// the audit line as a fact. Once the sum stops being representable
+				// nothing more is added to it, and everything left over is counted
+				// as unknown.
+				overflowed = true
+				unknown++
+			default:
+				summary.Bytes += it.Size
+			}
+		}
+		switch {
+		case overflowed:
+			summary.Warnings = append(summary.Warnings,
+				fmt.Sprintf("The sizes add up to more than can be counted, so the total shown is a minimum and leaves out %d item(s).", unknown))
+		case unknown > 0:
+			summary.Warnings = append(summary.Warnings,
+				fmt.Sprintf("The size of %d item(s) is not known, so the total shown is a minimum.", unknown))
 		}
 	}
 	m.files, m.bytes = summary.Files, summary.Bytes

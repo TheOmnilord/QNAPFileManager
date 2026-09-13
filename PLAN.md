@@ -164,6 +164,14 @@ Decisions made for M2-A:
   the audit log is the durable record.
 - **`worker.jobsInOwnProcess`** (identity plan §2.8) is deferred; the worker serves requests concurrently, so a job
   does not block that user's browsing.
+- **A trashed folder's size is measured at trash time** (2026-09-13, hardware finding: the panel showed "—" and
+  Empty Trash counted 4096 bytes per folder). The worker runs the bounded pre-scan before writing the sidecar and
+  records bytes + entry count; anything short of a complete, identity-verified measurement is recorded as unknown
+  (-1), never a floor; an empty invalidates a known size before its first removal. Six high-effort review rounds
+  (`docs/reviews/trash-size-round*.md`, 16 findings) hardened the walker (Network mounts are never touched when they
+  cannot be crossed; checked accumulation; root identity from the enumerated descriptor) along the way.
+- **No automatic trash sweeper yet** (owner, 2026-09-13: "defer janitor"). `trash.days` is validated and carried
+  in the config but nothing enforces it; Trash empties only through "Empty Trash…". Trash ownership is left as is.
 
 ## Milestones
 

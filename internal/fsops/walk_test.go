@@ -3,6 +3,7 @@ package fsops
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"path"
 	"path/filepath"
@@ -353,6 +354,255 @@ func TestWalkMountCrossingRule(t *testing.T) {
 	}
 	if indexOf(onto.pre, api+"/a/sub/inside.txt") >= 0 {
 		t.Errorf("the walk crossed into a RAM disk")
+	}
+}
+
+// TestWalkNeverTouchesANetworkMountItMayNotEnter is the hang the mount table can
+// prevent: a hard NFS mount whose server has gone parks the caller inside lstat
+// or openat indefinitely, where no deadline in this process can reach it — so a
+// child the walk was never going to enter must not be stat'ed at all when the
+// table already names it as a network mount.
+//
+// identityFor is the proof. It is only reachable through a descriptor for the
+// child, so being asked about that child at all means the child was opened.
+func TestWalkNeverTouchesANetworkMountItMayNotEnter(t *testing.T) {
+	base := tempDir(t)
+	mkdir(t, base, "a/export")
+	write(t, base, "a/one.txt", "one")
+	r, api := hostRoot(t, base)
+	plat := synthPlatform(t,
+		synthMount{mountPoint: api, fsType: "ext4", dev: "8:1"},
+		synthMount{mountPoint: api + "/a/export", fsType: "nfs4", dev: "0:42", source: "nas:/export"},
+	)
+
+	var asked []string
+	prev := identityFor
+	identityFor = func(d *dirRef) mountIdentity {
+		asked = append(asked, d.rel)
+		return prev(d)
+	}
+	t.Cleanup(func() { identityFor = prev })
+
+	// Both ways round: with CrossMounts off nothing may be entered, and with it
+	// on a network mount is still refused (MayCross), so neither may touch it.
+	for _, cross := range []bool{false, true} {
+		asked = nil
+		var rec recorder
+		if err := Walk(context.Background(), r, plat, api+"/a", WalkOptions{CrossMounts: cross}, rec.visitor()); err != nil {
+			t.Fatalf("crossMounts=%v Walk: %v", cross, err)
+		}
+		for _, rel := range asked {
+			if rel == "export" || strings.HasSuffix(rel, "/export") {
+				t.Errorf("crossMounts=%v: the network mount was opened (%q)", cross, rel)
+			}
+		}
+		if indexOf(rec.pre, api+"/a/export") >= 0 {
+			t.Errorf("crossMounts=%v: the network mount was described rather than left alone", cross)
+		}
+		if indexOf(rec.warns, api+"/a/export") < 0 {
+			t.Errorf("crossMounts=%v: a mount left untouched must still be reported: warns = %v", cross, rec.warns)
+		}
+		// And the rest of the directory is walked exactly as before.
+		if indexOf(rec.pre, api+"/a/one.txt") < 0 {
+			t.Errorf("crossMounts=%v: the walk stopped at the mount: pre = %v", cross, rec.pre)
+		}
+	}
+}
+
+// TestWalkStillVisitsALocalMountItMayNotEnter: the table-only refusal above is
+// for the class of mount that can block a syscall forever, and nothing else.
+// Decision 9 says a local mount point the walk does not cross is still visited
+// as the item it is — a size counts the directory itself — and that answer needs
+// the lstat the network case skips.
+func TestWalkStillVisitsALocalMountItMayNotEnter(t *testing.T) {
+	base := tempDir(t)
+	mkdir(t, base, "a/sub")
+	write(t, base, "a/sub/inside.txt", "inside")
+	r, api := hostRoot(t, base)
+	plat := synthPlatform(t,
+		synthMount{mountPoint: api, fsType: "ext4", dev: "8:1"},
+		synthMount{mountPoint: api + "/a/sub", fsType: "ext4", dev: "8:2", source: "/dev/sdb1"},
+	)
+	var rec recorder
+	if err := Walk(context.Background(), r, plat, api+"/a", WalkOptions{}, rec.visitor()); err != nil {
+		t.Fatalf("Walk: %v", err)
+	}
+	if indexOf(rec.mount, api+"/a/sub") < 0 {
+		t.Fatalf("a local mount point must still be visited as one: pre = %v warns = %v", rec.pre, rec.warns)
+	}
+	if indexOf(rec.pre, api+"/a/sub/inside.txt") >= 0 {
+		t.Error("visited is not entered")
+	}
+}
+
+// TestWalkTreatsABackslashAsAnOrdinaryCharacter: the pre-lstat mount check must
+// compare the kernel's bytes and nothing else. A backslash is an ordinary
+// character in a Linux filename, so a regular file called `..\export` is a file
+// — but a lookup that normalises backslashes into separators and then cleans the
+// result turns its path into "/export", and with an NFS mount of that name in
+// the table the walk would skip somebody's file as somebody else's mount:
+// invisible to a size, and left behind by a recursive delete.
+func TestWalkTreatsABackslashAsAnOrdinaryCharacter(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("a backslash cannot be part of a Windows filename, so there is nothing to confuse here")
+	}
+	base := tempDir(t)
+	mkdir(t, base, "tree")
+	const name = `..\export`
+	if err := os.WriteFile(filepath.Join(base, "tree", name), []byte("mine"), 0o644); err != nil {
+		t.Skipf("this filesystem refuses a backslash in a name: %v", err)
+	}
+	r, api := hostRoot(t, base)
+	// The trap: the mount is at the path the name NORMALISES to.
+	plat := synthPlatform(t,
+		synthMount{mountPoint: api, fsType: "ext4", dev: "8:1"},
+		synthMount{mountPoint: api + "/export", fsType: "nfs4", dev: "0:42", source: "nas:/export"},
+	)
+	var rec recorder
+	if err := Walk(context.Background(), r, plat, api+"/tree", WalkOptions{}, rec.visitor()); err != nil {
+		t.Fatalf("Walk: %v", err)
+	}
+	if indexOf(rec.pre, api+"/tree/"+name) < 0 {
+		t.Fatalf("a file whose name holds a backslash was taken for a mount: pre = %v warns = %v", rec.pre, rec.warns)
+	}
+}
+
+// TestWalkRefusesAMountWhoseNameHasABackslash is the same rule the other way
+// round: mountinfo spells a mount point in the kernel's own bytes (octal escapes
+// decoded), so a real mount whose name contains a backslash has to match its own
+// row — a normalising lookup would miss it and let the walk reach the very lstat
+// that can block forever.
+func TestWalkRefusesAMountWhoseNameHasABackslash(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("a backslash cannot be part of a Windows directory name")
+	}
+	base := tempDir(t)
+	const name = `back\slash`
+	if err := os.Mkdir(filepath.Join(base, "tree"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(base, "tree", name), 0o755); err != nil {
+		t.Skipf("this filesystem refuses a backslash in a name: %v", err)
+	}
+	r, api := hostRoot(t, base)
+	plat := synthPlatform(t,
+		synthMount{mountPoint: api, fsType: "ext4", dev: "8:1"},
+		synthMount{mountPoint: api + "/tree/" + name, fsType: "nfs4", dev: "0:42", source: "nas:/export"},
+	)
+	var asked []string
+	prev := identityFor
+	identityFor = func(d *dirRef) mountIdentity {
+		asked = append(asked, d.rel)
+		return prev(d)
+	}
+	t.Cleanup(func() { identityFor = prev })
+
+	var rec recorder
+	if err := Walk(context.Background(), r, plat, api+"/tree", WalkOptions{}, rec.visitor()); err != nil {
+		t.Fatalf("Walk: %v", err)
+	}
+	if indexOf(rec.warns, api+"/tree/"+name) < 0 {
+		t.Fatalf("the network mount was not refused: warns = %v pre = %v", rec.warns, rec.pre)
+	}
+	for _, rel := range asked {
+		if strings.HasSuffix(rel, name) {
+			t.Errorf("the network mount was opened (%q)", rel)
+		}
+	}
+}
+
+// TestWalkReportsTheIdentityOfTheDirectoryItOpened: WalkItem.Info is an lstat of
+// a PATHNAME, taken before the directory is opened, so it cannot say which
+// object was then enumerated — swap the name in between and the two are
+// different directories. The Opened hook answers from the descriptor itself,
+// which is what a caller comparing identities afterwards has to be given.
+func TestWalkReportsTheIdentityOfTheDirectoryItOpened(t *testing.T) {
+	base := tempDir(t)
+	mkdir(t, base, "a/sub")
+	write(t, base, "a/one.txt", "one")
+	r := newRoot(t, base)
+
+	opened := map[string]os.FileInfo{}
+	err := Walk(context.Background(), r, nil, "/a", WalkOptions{}, Visitor{
+		Opened: func(it WalkItem, info os.FileInfo) { opened[it.Path] = info },
+	})
+	if err != nil {
+		t.Fatalf("Walk: %v", err)
+	}
+	for _, want := range []string{"/a", "/a/sub"} {
+		info, ok := opened[want]
+		if !ok || info == nil || !info.IsDir() {
+			t.Fatalf("opened[%q] = %v (present: %v), want the directory's own stat", want, info, ok)
+		}
+	}
+	if _, ok := opened["/a/one.txt"]; ok {
+		t.Error("the walk never opens a file, so it can never report one as opened")
+	}
+	// And it really is that directory: on Linux the two describe one object.
+	real, err := os.Lstat(filepath.Join(base, "a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if same, known := sameObject(opened["/a"], real); known && !same {
+		t.Error("the identity reported is not the directory that was walked")
+	}
+}
+
+// TestSizeSaysWhenItsScanWasCapped: Size asks for no bound, so the only thing
+// that can stop it early is the byte total outgrowing an int64 — and that stops
+// the WHOLE pass, remaining selected paths included. A floor reported as a total
+// is what a Properties panel would then render as fact, so the reason goes out
+// as a warning.
+func TestSizeSaysWhenItsScanWasCapped(t *testing.T) {
+	base := deleteFixture(t) // /a/one.txt (3), /a/sub/two.txt (6), /a/sub/deep/
+	r := newRoot(t, base)
+	prev := sizeScanLimits
+	sizeScanLimits = scanLimits{maxEntries: 2}
+	t.Cleanup(func() { sizeScanLimits = prev })
+
+	var log jobLog
+	res, err := Size(context.Background(), r, nil, []string{"/a"}, false, log.emit())
+	if err != nil {
+		t.Fatalf("Size: %v", err)
+	}
+	if res.Files+res.Dirs > 2 {
+		t.Fatalf("result = %+v, want the pass stopped at its bound", res)
+	}
+	if indexOf(log.codes(), scanCappedCode) < 0 {
+		t.Fatalf("warn codes = %v, want the capped scan reported", log.codes())
+	}
+}
+
+// TestScanBytesNeverWrap is the overflow: a sparse file may declare any length
+// the filesystem allows and nothing bounds how many times a tree can name one,
+// so the accumulator has to refuse rather than wrap. A wrapped total is smaller
+// than the truth and completely plausible, which is the one failure a size must
+// not have.
+func TestScanBytesNeverWrap(t *testing.T) {
+	cases := []struct {
+		name  string
+		start int64
+		add   int64
+		ok    bool
+		want  int64
+	}{
+		{name: "an ordinary sum", start: 10, add: 5, ok: true, want: 15},
+		{name: "exactly full", start: math.MaxInt64 - 5, add: 5, ok: true, want: math.MaxInt64},
+		{name: "one byte past full", start: math.MaxInt64 - 5, add: 6, ok: false, want: math.MaxInt64 - 5},
+		// Four hard links to one 4 EiB sparse file, which is all it takes.
+		{name: "sparse exabytes", start: 3 << 61, add: 3 << 61, ok: false, want: 3 << 61},
+		{name: "a size no kernel reports", start: 10, add: -1, ok: false, want: 10},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			res := scanResult{bytes: c.start}
+			if got := res.addBytes(c.add); got != c.ok {
+				t.Errorf("addBytes(%d) on %d = %v, want %v", c.add, c.start, got, c.ok)
+			}
+			if res.bytes != c.want {
+				t.Errorf("bytes = %d, want %d: a refused addition must change nothing", res.bytes, c.want)
+			}
+		})
 	}
 }
 

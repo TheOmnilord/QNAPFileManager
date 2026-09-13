@@ -2,7 +2,7 @@ import {api} from './api.js';
 import {$,el,error,announce,openDialog} from './dom.js';
 import {state,sessionGuard} from './state.js';
 import {confirmDialog,PERMANENT_WARNING} from './actions.js';
-import {trackJob} from './jobs.js';
+import {trackJob,formatBytes} from './jobs.js';
 
 // The trash panel (ui-ux §4.4). It lists only the caller's own items — the
 // kernel's sticky bit on .@qfm_trash is what makes that true, not this code —
@@ -23,7 +23,13 @@ function trashRow(item) {
  row.append(el('td',{title:item.name},item.name));
  row.append(el('td',{title:item.origPath},item.origPath));
  row.append(el('td',{},item.deletedAt ? new Date(item.deletedAt*1000).toLocaleString() : '—'));
- row.append(el('td',{},item.type==='dir' ? '—' : Number(item.size||0).toLocaleString()));
+ // The size is the whole item's — the whole tree, for a folder, which the
+ // worker counted when it moved it — and -1 is the worker saying it does not
+ // know. A folder used to be shown as "—" always, because the only number there
+ // was the directory inode's own (4 096 bytes, whatever the tree held).
+ const size = Number(item.size);
+ const known = Number.isFinite(size) && size >= 0;
+ row.append(el('td',known ? {title:`${size.toLocaleString()} bytes`} : {},known ? formatBytes(size) : '—'));
  return row;
 }
 
@@ -68,7 +74,11 @@ async function empty() {
   if (!valid()) return;
   if (err.code!=='confirm_required' || !err.confirm?.token) { error(err); return; }
   const s = err.confirm.summary||{};
-  const why = [...(s.warnings||[]),`${(s.files||0).toLocaleString()} item(s), ${(s.bytes||0).toLocaleString()} byte(s).`]
+  // The server's own warnings come first; the count and the size follow. The
+  // size is read in units rather than in raw bytes, and it is what the server
+  // could actually total — any item it could not measure is one of the warnings
+  // above this line.
+  const why = [...(s.warnings||[]),`${(s.files||0).toLocaleString()} item(s), ${formatBytes(s.bytes||0)}.`]
    .filter((line,index,all) => line && all.indexOf(line)===index).join(' · ');
   const approved = await confirmDialog({
    title:'Empty Trash',

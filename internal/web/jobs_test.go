@@ -1020,6 +1020,99 @@ func TestTrashEmptyIsGradeTwoAndAudited(t *testing.T) {
 	}
 }
 
+// TestTrashEmptySummaryLeavesOutWhatItCannotMeasure: the worker reports a size
+// of -1 for an item whose size it does not know — a folder whose tree was too
+// large to count inside the scan's bound, or one trashed by a build that only
+// ever recorded the directory inode's own size. Adding that to the total would
+// subtract a byte from it, and dropping it silently would state a total that is
+// not one, so it is left out of the sum and said out loud in the summary.
+func TestTrashEmptySummaryLeavesOutWhatItCannotMeasure(t *testing.T) {
+	s, _, c, csrf := trashFixture(t)
+	env := challenge(t, s, c, csrf, "/api/trash/empty", `{}`)
+	// The fixture's two items are 12 and 3 bytes, both known.
+	if env.Confirm.Summary.Files != 2 || env.Confirm.Summary.Bytes != 15 {
+		t.Fatalf("summary with every size known = %+v", env.Confirm.Summary)
+	}
+	for _, warning := range env.Confirm.Summary.Warnings {
+		if strings.Contains(warning, "not known") {
+			t.Fatalf("nothing is unmeasured here, yet the summary says %q", warning)
+		}
+	}
+
+	s2, fj2, c2, csrf2 := trashFixture(t)
+	fj2.trash = wproto.TrashListResp{Items: []wproto.TrashItem{
+		{ID: "1700000000-abcdef01", Name: []byte("notes.txt"), OrigPath: []byte("/notes.txt"), Type: "file", Size: 12, Files: 1, DeletedAt: 1700000000},
+		{ID: "1700000001-abcdef02", Name: []byte("photos"), OrigPath: []byte("/photos"), Type: "dir", Size: -1, Files: -1, DeletedAt: 1700000001},
+	}}
+	read2 := withAudit(t, s2)
+	env = challenge(t, s2, c2, csrf2, "/api/trash/empty", `{}`)
+	summary := env.Confirm.Summary
+	if summary.Files != 2 || summary.Bytes != 12 {
+		t.Fatalf("summary = %+v, want both items counted and only the known bytes summed", summary)
+	}
+	var said, permanent bool
+	for _, warning := range summary.Warnings {
+		said = said || strings.Contains(warning, "The size of 1 item(s) is not known")
+		permanent = permanent || warning == permanentWarning
+	}
+	if !said || !permanent {
+		t.Fatalf("warnings = %v, want the permanent sentence and the unknown-size one", summary.Warnings)
+	}
+	// And the durable record states the same total: a -1 must never reach it.
+	job := acceptedJob(t, post(s2, "/api/trash/empty", c2, csrf2, fmt.Sprintf(`{"confirm":%q}`, env.Confirm.Token)))
+	awaitTerminal(t, s2, job.ID)
+	found := false
+	for _, ev := range read2() {
+		if ev.Op == "trash-empty" && ev.Phase == "intent" {
+			found = true
+			if !strings.Contains(ev.Detail, "2 item(s), 12 byte(s)") {
+				t.Fatalf("intent detail = %q, want the item count and the summed bytes", ev.Detail)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("the empty wrote no intent line")
+	}
+}
+
+// TestTrashEmptySummaryCannotOverflow: each item's size fits in an int64 and
+// their sum need not — two measured five-exabyte trees are enough. A wrapped
+// total is NEGATIVE, and it would reach the confirmation dialog, the mutation
+// record and the audit line as a fact, so the sum stops at what is
+// representable and says that it did.
+func TestTrashEmptySummaryCannotOverflow(t *testing.T) {
+	s, fj, c, csrf := trashFixture(t)
+	const huge = int64(5) << 60 // 5 EiB, and two of them do not fit
+	fj.trash = wproto.TrashListResp{Items: []wproto.TrashItem{
+		{ID: "1700000000-abcdef01", Name: []byte("one"), OrigPath: []byte("/one"), Type: "dir", Size: huge, Files: 3, DeletedAt: 1700000000},
+		{ID: "1700000001-abcdef02", Name: []byte("two"), OrigPath: []byte("/two"), Type: "dir", Size: huge, Files: 3, DeletedAt: 1700000001},
+	}}
+	read := withAudit(t, s)
+	env := challenge(t, s, c, csrf, "/api/trash/empty", `{}`)
+	summary := env.Confirm.Summary
+	if summary.Bytes < 0 {
+		t.Fatalf("the summary total wrapped: %+v", summary)
+	}
+	if summary.Bytes != huge || summary.Files != 2 {
+		t.Fatalf("summary = %+v, want both items counted and the total stopped at what fits", summary)
+	}
+	said := false
+	for _, warning := range summary.Warnings {
+		said = said || strings.Contains(warning, "more than can be counted")
+	}
+	if !said {
+		t.Fatalf("warnings = %v, want the total declared a minimum", summary.Warnings)
+	}
+	// The durable record gets the same non-negative total.
+	job := acceptedJob(t, post(s, "/api/trash/empty", c, csrf, fmt.Sprintf(`{"confirm":%q}`, env.Confirm.Token)))
+	awaitTerminal(t, s, job.ID)
+	for _, ev := range read() {
+		if ev.Op == "trash-empty" && ev.Phase == "intent" && !strings.Contains(ev.Detail, fmt.Sprintf("%d byte(s)", huge)) {
+			t.Fatalf("intent detail = %q, want the summed bytes that fit", ev.Detail)
+		}
+	}
+}
+
 func TestTrashEmptyRejectsAnotherOperationsToken(t *testing.T) {
 	s, _, c, csrf := trashFixture(t)
 	env := challenge(t, s, c, csrf, "/api/jobs/delete", `{"paths":[{"path":"/a.txt"}],"mode":"permanent"}`)

@@ -127,15 +127,45 @@ func openatIn(dir *os.File, name string, flags int) (int, error) {
 // and resolve() is the only thing here that knows how; statPath re-resolves
 // rather than asking for a stat that follows (see statFollowing).
 func statAt(j fsx.Jail, rel string) (os.FileInfo, error) {
+	if rel == "." || rel == "" {
+		// The jail base itself: the one path with nothing above it to walk, and
+		// nothing to look up either. The lookup that would answer it lives in the
+		// base's parent, which is outside the jail, so the answer comes from an
+		// fstat on the handle.
+		return j.StatBase()
+	}
+	ref, err := openItemRef(j, rel)
+	if err != nil {
+		return nil, err
+	}
+	defer ref.close()
+	return ref.fi, nil
+}
+
+// itemRef is one item HELD open: an O_PATH descriptor for the final component
+// and the fstat taken on it.
+//
+// O_PATH is the whole reason this is affordable. It opens nothing — no read
+// permission is charged, no fifo can block, no device is activated — and yet it
+// is a reference to the INODE rather than to the name, which buys the two
+// properties a check across a window needs: the object cannot be freed while it
+// is held, so its (dev, ino) cannot be handed to a different file underneath the
+// checker, and the fstat describes what the descriptor refers to rather than
+// whatever now answers to the pathname.
+type itemRef struct {
+	f  *os.File
+	fi os.FileInfo
+}
+
+// openItemRef opens one already-resolved path with O_PATH|O_NOFOLLOW|O_CLOEXEC
+// and keeps it. The final component is kept literal, so a symlink describes
+// itself and is never followed.
+//
+// The caller MUST close it. Holding it is not free — it is an open descriptor
+// per held item — and the trash holds exactly one at a time (trashOne).
+func openItemRef(j fsx.Jail, rel string) (*itemRef, error) {
 	dir, base := splitFinal(rel)
 	if base == "" || base == "." || base == ".." {
-		if rel == "." || rel == "" {
-			// The jail base itself: the one path with nothing above it to walk,
-			// and nothing to look up either. The lookup that would answer it
-			// lives in the base's parent, which is outside the jail, so the
-			// answer comes from an fstat on the handle.
-			return j.StatBase()
-		}
 		// A trailing "." or ".." is not a name openat can address here, and
 		// resolve() never produces one: it applies both itself, component by
 		// component, with the kernel's own permission checks.
@@ -152,8 +182,18 @@ func statAt(j fsx.Jail, rel string) (os.FileInfo, error) {
 		return nil, &fs.PathError{Op: "statat", Path: rel, Err: err}
 	}
 	f := os.NewFile(uintptr(fd), rel)
-	defer f.Close()
-	return f.Stat()
+	fi, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	return &itemRef{f: f, fi: fi}, nil
+}
+
+func (ref *itemRef) close() {
+	if ref != nil && ref.f != nil {
+		_ = ref.f.Close()
+	}
 }
 
 // readlinkAt is readlink(2) for an already-resolved path, through the same

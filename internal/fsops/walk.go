@@ -122,10 +122,18 @@ func (it WalkItem) isDir() bool { return it.Info != nil && it.Info.IsDir() }
 //
 // An error other than fs.SkipDir from Pre, or other than errRetryDir from Post,
 // ends the walk and is returned by Walk.
+// Opened, when set, is called for each directory the walk actually OPENS, with
+// the fstat of the held descriptor — not of the pathname it was reached by.
+// That distinction is the only way to know which object is being enumerated: the
+// Info in a WalkItem comes from an lstat made before the open, and between the
+// two a name can be re-pointed at something else. A caller that has to prove
+// afterwards that it counted the object it is still acting on (the trash's
+// sidecar, trash.go) takes its identity from here.
 type Visitor struct {
-	Pre  func(it WalkItem) error
-	Post func(it WalkItem) error
-	Warn func(apiPath string, err error)
+	Pre    func(it WalkItem) error
+	Post   func(it WalkItem) error
+	Opened func(it WalkItem, info os.FileInfo)
+	Warn   func(apiPath string, err error)
 }
 
 // dirOpener opens (or re-opens) one directory of the walk. A re-open is what
@@ -276,6 +284,17 @@ func (w *walker) visit(ctx context.Context, it WalkItem, open dirOpener) error {
 			w.warn(it.Path, err)
 			return nil
 		}
+		if w.v.Opened != nil {
+			// The fstat of the descriptor about to be enumerated. A failure here
+			// is a per-item warning like any other, and the visitor is simply not
+			// told — which leaves a caller that needed the identity without one,
+			// exactly as it should.
+			if fi, serr := d.stat(); serr == nil {
+				w.v.Opened(it, fi)
+			} else {
+				w.warn(it.Path, serr)
+			}
+		}
 		err = w.children(ctx, d, it)
 		closeErr := d.close()
 		if err != nil {
@@ -325,6 +344,12 @@ func (w *walker) children(ctx context.Context, d *dirRef, parent WalkItem) error
 				w.warn(childPath, neverWriteErr(childPath, reason))
 				continue
 			}
+			if err := w.refusedByTable(parentOS, name, childPath); err != nil {
+				// Not even lstat'ed: see refusedByTable. The item is reported the
+				// way any refused crossing is and the walk moves on.
+				w.warn(childPath, err)
+				continue
+			}
 			fi, err := d.lstat(name)
 			if err != nil {
 				// Unlinked between getdents and the stat: an ordinary race in a
@@ -364,6 +389,72 @@ func (w *walker) children(ctx context.Context, d *dirRef, parent WalkItem) error
 			return nil
 		}
 	}
+}
+
+// refusedByTable is the one decision this walk makes from the mount table ALONE,
+// before the child has been touched at all — no lstat, no openat.
+//
+// It does not weaken F4/B4/B5 and is not allowed to: it can only REFUSE, never
+// authorise, and every child that gets past it is still opened and judged on its
+// own descriptor by openChild exactly as before.
+//
+// It exists because of what one lstat costs on a NETWORK mount whose server has
+// gone. A hard NFS mount parks the caller inside the syscall indefinitely — no
+// deadline in this process can reach a thread in uninterruptible sleep, and the
+// scan's own deadline is only read between items — so a single unreachable NFS
+// mount underneath a folder was enough to hang a size job, a delete's pre-scan
+// and (since the trash measures what it moves) a delete to trash, on a path the
+// walk was never going to enter in the first place. Asking the mount table
+// whether that name is a mount point costs no syscall at all.
+//
+// It is deliberately NOT applied to a local mount. Decision 9 says a mount point
+// the walk does not cross is still VISITED as the item it is — a size counts the
+// directory itself, and TestSizeAppliesTheCrossingRule pins that — and the lstat
+// this would skip is what supplies it. An ext4 or ZFS mount answers that lstat
+// without blocking, so refusing to look would cost a real answer and buy
+// nothing. The class that can block forever is the networked one, and that is
+// the class this refuses.
+//
+// It is asked of every entry, files included, because "is this a directory" is
+// itself the lstat being protected. That costs one map lookup under a read lock
+// per entry, against the openat-and-fstat the walk is about to make anyway.
+//
+// The name is joined onto the parent's own mount-table spelling and looked up
+// EXACTLY (MountByLiteralPath). Going through the ordinary lookups would have
+// been a second bug in the shape of a fix: they normalise, and on Linux a
+// backslash is an ordinary character in a filename, so a regular file called
+// `..\export` would normalise to "/export" and be skipped as somebody else's
+// NFS mount — invisible to a size and left behind by a recursive delete — while
+// a genuine mount point with a backslash in its name would never match its own
+// row and would still reach the lstat this exists to avoid.
+func (w *walker) refusedByTable(parentOS, name, childPath string) error {
+	if w.plat == nil || parentOS == "" {
+		return nil
+	}
+	caps, ok := w.plat.MountByLiteralPath(literalChild(parentOS, name))
+	if !ok || !caps.Network {
+		return nil
+	}
+	if w.opts.CrossMounts && w.plat.MayCross(w.plat.For(parentOS), caps) {
+		// Unreachable while MayCross refuses every network mount, and written out
+		// anyway: the refusal has to stay a CONSEQUENCE of the crossing rule
+		// rather than a second copy of it that could drift.
+		return nil
+	}
+	return fmt.Errorf("%q is a %s mount this walk may not enter, and it was left untouched: %w",
+		childPath, caps.FSType, fsx.ErrProtected)
+}
+
+// literalChild joins a directory's OS path with one entry name, byte for byte
+// and with nothing cleaned away. The name comes straight out of getdents, so
+// whatever it contains — a backslash, a dot, a newline — stays exactly what the
+// kernel handed over; the only thing added is the separator the table's own keys
+// use.
+func literalChild(parentOS, name string) string {
+	if parentOS != "" && os.IsPathSeparator(parentOS[len(parentOS)-1]) {
+		return parentOS + name
+	}
+	return parentOS + "/" + name
 }
 
 // directory handles one child directory: it is OPENED first and the crossing

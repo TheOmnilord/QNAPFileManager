@@ -63,6 +63,14 @@ func (d *dirRef) stat() (os.FileInfo, error) { return statAt(d.j, d.rel) }
 
 func (d *dirRef) close() error { return d.f.Close() }
 
+// syncDir does nothing off Linux. There is no directory fsync here — Windows
+// refuses FlushFileBuffers on a directory handle — so asking for one would turn
+// every sidecar rewrite on the dev box into a reported failure for a durability
+// guarantee this platform expresses differently. INV-2: the kernel that has to
+// order a rename against the writes after it is the NAS's, and the CI Linux jobs
+// are where that is exercised.
+func syncDir(*dirRef) error { return nil }
+
 // mkdir creates a subdirectory of this one.
 func (d *dirRef) mkdir(name string, mode os.FileMode) error {
 	return mkdirAt(d.j, d.rel, name, mode, false, nil)
@@ -85,6 +93,14 @@ const readSidecarFlags = os.O_RDONLY
 // against the root descriptor.
 func (d *dirRef) renameInto(fromJail fsx.Jail, fromParentRel, fromName, toName string) error {
 	return renameAt(fromJail, fromParentRel, fromName, d.j, d.rel, toName, true)
+}
+
+// renameOver renames one entry of this directory over another name in the same
+// directory, replacing what is there. It is what publishes a rewritten trash
+// sidecar atomically (trash.go); os.Root.Rename replaces, which is the whole
+// point here and the reason the noreplace flag is false.
+func (d *dirRef) renameOver(fromName, toName string) error {
+	return renameAt(d.j, d.rel, fromName, d.j, d.rel, toName, false)
 }
 
 // renameOut renames one entry out of this directory to an already-resolved

@@ -337,11 +337,18 @@ type TrashListReq struct{}
 // TrashItem is one entry under <trash>/<uid>/. ID is the entry directory's
 // name ("<unix>-<8hex>"); the original path and stat come from its sidecar.
 type TrashItem struct {
-	ID        string `json:"i"`
-	Name      []byte `json:"n"` // original basename
-	OrigPath  []byte `json:"o"` // original API path
-	Type      string `json:"t"` // "dir" | "file" | "symlink" | ...
-	Size      int64  `json:"s"`
+	ID       string `json:"i"`
+	Name     []byte `json:"n"` // original basename
+	OrigPath []byte `json:"o"` // original API path
+	Type     string `json:"t"` // "dir" | "file" | "symlink" | ...
+	// Size is the bytes of the whole item — the whole tree, for a directory —
+	// and -1 when they are not known: the worker's trash-time scan hit its bound,
+	// or the sidecar was written by a build that recorded only the directory
+	// inode's own size. -1 is "unknown", never "empty", and never a floor.
+	Size int64 `json:"s"`
+	// Files is how many entries those bytes are: 1 for a single item, and for a
+	// directory everything under it including itself. -1 when unknown.
+	Files     int64  `json:"f"`
 	DeletedAt int64  `json:"d"` // unix seconds
 	Trash     []byte `json:"r"` // API path of the .@qfm_trash root holding it
 }

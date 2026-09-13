@@ -372,3 +372,42 @@ func TestTrashEmptyKeepsAnEntryTheKernelWillNotEmpty(t *testing.T) {
 		t.Errorf("warn codes = %v, want the entry reported as kept", empty.codes())
 	}
 }
+
+// TestTrashHoldsTheItemItMeasured: the reference the three-way identity check is
+// made against is a HELD O_PATH descriptor, not a stat taken and let go.
+//
+// The difference is the whole point. A stat is a snapshot of a NAME: the inode
+// behind it can be unlinked while the scan runs and its (dev, ino) handed
+// straight back to a file somebody else creates, at which point two entirely
+// different objects compare equal and the check passes a sidecar describing
+// another tree. A descriptor is a reference to the inode, so while the trash
+// holds it the number cannot be reused — which is what this asserts, by taking
+// the name away underneath it.
+func TestTrashHoldsTheItemItMeasured(t *testing.T) {
+	base := tempDir(t)
+	write(t, base, "doc.txt", "hello")
+	r := newRoot(t, base)
+	tg, err := resolve(r, "/doc.txt", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, err := openItemRef(tg.jail, tg.rel)
+	if err != nil {
+		t.Fatalf("openItemRef: %v", err)
+	}
+	defer ref.close()
+	if ref.f == nil {
+		t.Fatal("the reference must hold a descriptor, not just a stat")
+	}
+	if err := os.Remove(filepath.Join(base, "doc.txt")); err != nil {
+		t.Fatal(err)
+	}
+	// The name is gone; the object is not, and it is still the same one.
+	again, err := ref.f.Stat()
+	if err != nil {
+		t.Fatalf("the held descriptor stopped describing its object: %v", err)
+	}
+	if same, known := sameObject(ref.fi, again); !known || !same {
+		t.Errorf("the held descriptor changed object when the name did (comparable: %v)", known)
+	}
+}

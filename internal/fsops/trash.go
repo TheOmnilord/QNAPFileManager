@@ -65,6 +65,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -79,6 +80,28 @@ const (
 	TrashDirName = ".@qfm_trash"
 	// trashMetaName is the sidecar inside one entry directory.
 	trashMetaName = "meta.json"
+	// trashMetaTmpPrefix and trashMetaTmpSuffix bracket the name a REWRITTEN
+	// sidecar is built under before it replaces the one beside it
+	// (rewriteTrashMeta): "meta.json.<pid>-<8 hex>.new".
+	//
+	// The unique middle is not decoration. Two of this user's own jobs can be
+	// emptying the same trash at once — the manager runs four metadata jobs in
+	// parallel — and with ONE fixed temporary name they interleave: A writes its
+	// temporary, B unlinks that name and creates its own empty one, and A then
+	// renames B's unwritten file over meta.json. What is published is a sidecar
+	// that will not parse, and the entry it describes is about to lose its
+	// payload. A name only one invocation can have makes that impossible, and the
+	// O_EXCL create means a collision fails rather than clobbers.
+	trashMetaTmpPrefix = trashMetaName + "."
+	trashMetaTmpSuffix = ".new"
+	// trashMetaTmpHex is how many hex characters name the random half: four
+	// bytes, eight characters (trashMetaTmpName), and the count is spelled out
+	// here because isTrashMetaTmp has to demand exactly that many.
+	trashMetaTmpHex = 8
+	// trashMetaTmpPIDDigits bounds the decimal pid in the middle. Ten digits
+	// hold every pid a 32-bit pid_t can produce, and a bound is what keeps the
+	// predicate from accepting an arbitrarily long run of digits somebody chose.
+	trashMetaTmpPIDDigits = 10
 	// trashItemName is the FIXED internal name the trashed item itself is stored
 	// under inside its entry directory (F9).
 	//
@@ -153,8 +176,18 @@ type trashMeta struct {
 	UID         int    `json:"uid"`
 	GID         int    `json:"gid"`
 	MTime       int64  `json:"mtime"`
-	Size        int64  `json:"size"`
-	DeletedAt   int64  `json:"deletedAt"`
+	// Size is the bytes of the WHOLE item — the whole tree, for a directory —
+	// and -1 when they could not be counted. Files is how many entries that is:
+	// 1 for a plain file, and for a directory the count of everything under it
+	// INCLUDING itself, so a measured directory is never 0.
+	//
+	// Size used to be fi.Size() of the item itself, which for a directory is the
+	// inode's own size (4096 on ext4) and not the size of anything a user asked
+	// about; trashSizeOf measures the tree instead, and trashItemOf is where an
+	// older build's sidecar — one with no "files" at all — is recognised.
+	Size      int64 `json:"size"`
+	Files     int64 `json:"files"`
+	DeletedAt int64 `json:"deletedAt"`
 }
 
 // orig returns the original API path as the bytes it really was.
@@ -410,6 +443,128 @@ func writeTrashMeta(entry *dirRef, m trashMeta) error {
 	if err != nil {
 		return err
 	}
+	return writeAndSync(f, data)
+}
+
+// rewriteTrashMeta replaces an entry's existing sidecar, through that entry's
+// held descriptor.
+//
+// It is written to a temporary name in the same directory and RENAMED over
+// meta.json rather than truncated in place, and the reason is F14's: a reader
+// must see the old sidecar or the new one and never a half-written file. A
+// truncate that is interrupted — a crash, a full filesystem — leaves a sidecar
+// that will not parse, and an entry whose sidecar will not parse is one
+// TrashList skips: the payload is still sitting there holding the user's data
+// and nothing can name it or restore it any more. The rename cannot do that;
+// its own failure leaves the ORIGINAL sidecar exactly as it was.
+//
+// Only the temporary THIS invocation created is ever unlinked, and it is
+// unlinked on every failure path. The one window that outlives this process is a
+// crash between the create and the rename, which leaves a stray
+// meta.json.<pid>-<hex>.new behind; an empty recognises those and clears them
+// (removeSidecarLitter), and until one runs the entry is listable and restorable
+// throughout. That residual is the class PLAN.md §2.4 accepts: narrow,
+// disclosed, and far less dangerous than what it replaces.
+//
+// The size of the REPLACEMENT is checked before anything is published. A sidecar
+// is accepted up to maxTrashMeta and re-marshalling can grow one — JSON escapes
+// what the kernel allows in a name, and a re-escaped near-limit sidecar can
+// cross it — and publishing an oversized one would make readTrashMeta refuse the
+// entry from then on: listing, restore and the empty's own B6 check all reject
+// it, which for a payload that is still there is exactly the loss F14 exists to
+// prevent. Refusing to publish keeps the original, which is merely out of date.
+func rewriteTrashMeta(entry *dirRef, m trashMeta) error {
+	data, err := json.Marshal(m)
+	if err != nil {
+		return err
+	}
+	if len(data) > maxTrashMeta {
+		return fmt.Errorf("the rewritten sidecar would be %d bytes, more than the %d a sidecar may be: %w",
+			len(data), maxTrashMeta, fsx.ErrUnsupported)
+	}
+	tmp, err := trashMetaTmpName()
+	if err != nil {
+		return err
+	}
+	f, err := entry.openFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := writeAndSync(f, data); err != nil {
+		_ = entry.unlink(tmp, false)
+		return err
+	}
+	if err := entry.renameOver(tmp, trashMetaName); err != nil {
+		_ = entry.unlink(tmp, false)
+		return err
+	}
+	// The file's own fsync put its BYTES on the disk; this one puts the rename
+	// there. Without it a filesystem that does not order the two can come back
+	// from a power cut having kept the removals that follow and lost the sidecar
+	// that was supposed to precede them — the old, whole-tree total standing
+	// beside a half-emptied entry, which is the single state this rewrite exists
+	// to make impossible.
+	return syncDir(entry)
+}
+
+// trashMetaTmpName is one invocation's private name for a sidecar being
+// rewritten. The pid names the process and the random half separates two
+// rewrites inside it, so no two can collide and each can only ever remove its
+// own.
+func trashMetaTmpName() (string, error) {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return trashMetaTmpPrefix + strconv.Itoa(os.Getpid()) + "-" + hex.EncodeToString(b[:]) + trashMetaTmpSuffix, nil
+}
+
+// isTrashMetaTmp recognises a sidecar temporary by name alone.
+//
+// It demands the WHOLE shape trashMetaTmpName produces — "meta.json.", a
+// decimal pid, "-", exactly eight lowercase hex characters, ".new" — and
+// nothing else, because the one thing this predicate is used for is deciding
+// what removeSidecarLitter may unlink. A prefix-and-suffix test would have
+// accepted "meta.json.backup.new", a name this package can never write and a
+// user's file might be; matching only what a rewrite can actually leave behind
+// means the sweep can only ever clear up after itself.
+//
+// The name is still not authority on its own: what is removed is also decided
+// on the lstat (a regular file, this uid's).
+func isTrashMetaTmp(name string) bool {
+	mid, ok := strings.CutPrefix(name, trashMetaTmpPrefix)
+	if !ok {
+		return false
+	}
+	mid, ok = strings.CutSuffix(mid, trashMetaTmpSuffix)
+	if !ok {
+		return false
+	}
+	pid, random, ok := strings.Cut(mid, "-")
+	if !ok || pid == "" || len(pid) > trashMetaTmpPIDDigits || len(random) != trashMetaTmpHex {
+		return false
+	}
+	for i := 0; i < len(pid); i++ {
+		if pid[i] < '0' || pid[i] > '9' {
+			return false
+		}
+	}
+	for i := 0; i < len(random); i++ {
+		// Lowercase only: hex.EncodeToString writes lowercase, so anything else
+		// is a name this package did not make.
+		if c := random[i]; (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// writeAndSync writes one sidecar's bytes and gets them onto the disk, closing
+// the file whatever happens. The fsync is the same one writeTrashMeta makes and
+// for the same reason: the ordering this file depends on is program order, and
+// program order survives a power cut only for data that actually reached the
+// platter.
+func writeAndSync(f *os.File, data []byte) error {
 	if _, err := f.Write(data); err != nil {
 		f.Close()
 		return err
@@ -551,8 +706,135 @@ func trustedSidecar(entry *dirRef, entryAPI string, uid int) error {
 	return checkTrashMeta(fi, entryAPI, uid)
 }
 
-// metaFor describes an item about to be trashed.
-func metaFor(apiPath string, fi os.FileInfo) trashMeta {
+// trashScanMaxEntries bounds the trash-time measurement of a directory. It is
+// the recursive delete's own pre-scan bound (backend plan §3), because it is the
+// same pass and a user waiting for a number has the same patience either way.
+//
+// It is a variable solely so that this package's own tests can drive the capped
+// branch without building half a million files — the same reason trashRootUID is
+// one. Production never assigns to it.
+var trashScanMaxEntries int64 = scanMaxEntries
+
+// trashSize is one trash-time measurement: the numbers, and the object they
+// were actually taken from.
+//
+// scanned is what makes the second half possible, and it is the fstat of the
+// DESCRIPTOR the scan enumerated (Visitor.Opened) rather than of the pathname it
+// was reached by. The scan reaches the tree by NAME (Walk re-resolves the path
+// it is given) and the rename looks the item up by name again, so the thing
+// counted and the thing moved are separate lookups with a gap between them —
+// and a pre-open lstat would not even prove which of them the scan itself
+// counted.
+type trashSize struct {
+	bytes   int64
+	files   int64
+	scanned os.FileInfo
+}
+
+// unknown reports a measurement that never produced a number, so there is
+// nothing for the identity check to protect.
+func (s trashSize) unknown() bool { return s.files < 0 }
+
+// describes reports whether this measurement really is of payload — the item
+// that ended up in the trash entry — given the reference the trash is holding.
+//
+// All three have to be one object: the held O_PATH descriptor the item was
+// selected through, the descriptor the scan enumerated, and the payload lstat'ed
+// through the entry's own descriptor after the rename. Anything else means
+// somebody moved a directory aside between two of those lookups and the numbers
+// describe a tree that is not the one now in the trash.
+//
+// A MISSING half is a refusal on every platform, and that is a contract rather
+// than an accident: a payload nothing could describe is not the object that was
+// measured, whatever the host can or cannot compare. The unanswerable case is
+// only the one where two real objects cannot be told apart — off Linux
+// sameObject reports nothing, and a question that cannot be asked must not be
+// answered "no", or the dev box would rewrite every sidecar as unknown (INV-2;
+// the CI Linux jobs make the real comparison).
+func (s trashSize) describes(selected, payload os.FileInfo) bool {
+	if s.scanned == nil || selected == nil || payload == nil {
+		return false
+	}
+	for _, other := range []os.FileInfo{selected, payload} {
+		same, known := sameObject(s.scanned, other)
+		if known && !same {
+			return false
+		}
+	}
+	return true
+}
+
+// trashSizeOf measures what the sidecar is about to record: the bytes of the
+// item and how many entries those bytes are.
+//
+// Anything that is not a directory is already answered by the stat it was
+// reached with — one item, st_size bytes, which for a symlink is the length of
+// its link text exactly as everywhere else here.
+//
+// A directory is the case this function exists for. The rename moves the whole
+// tree, so the honest size of a trashed folder is the tree's, and this is the
+// only moment it can be taken: the sidecar is written BEFORE the rename (the
+// ordering the whole file depends on), and afterwards the item lives under a
+// fixed internal name inside an entry directory. The tree is therefore counted
+// here, with the bounded pass a recursive delete uses for its denominator —
+// 30 s or trashScanMaxEntries entries, whichever comes first.
+//
+// Past either bound, or on ANY incompleteness at all — a subdirectory that could
+// not be read, a tree deeper than maxWalkDepth, a network mount left untouched,
+// a root that could not be reached — the answer is UNKNOWN and not a floor: a
+// partial total presented as a size would be a smaller and far more plausible
+// lie than the 4096 this replaces, so both halves come back as -1 and every
+// layer above says so. That is the difference between this caller and the other
+// two: Size and the delete pre-scan SHOW their number for a minute beside the
+// warnings that explain it, and this one writes it into a sidecar that will be
+// read for as long as the entry exists.
+//
+// Three things the scan is deliberately not given:
+//
+//   - crossMounts is false. Anything mounted underneath the item is another
+//     filesystem's data: emptying the trash refuses to cross into it
+//     (removeTrashTree), so counting it would promise bytes that emptying can
+//     never free. It does not follow that what is left is a whole answer, and
+//     this is where the trash parts company with a size job: Linux refuses to
+//     rename a mount point ITSELF (EBUSY) and not an ancestor of one, so a tree
+//     with a mount inside it moves — and a mount over a populated directory
+//     hides files that are on this very volume, move with the rename, and were
+//     never counted. A mount the scan did not enter therefore makes the
+//     measurement incomplete, and incomplete means unknown.
+//   - ProtectSnapshots, which is Size's rule and not a delete's: this counts,
+//     it never writes. ".zfs" is skipped — a snapshot directory holds the whole
+//     history of a share — and "@Recycle" is counted, because its bytes really
+//     are inside the tree that is about to move.
+//   - a silent Emit. These counters belong to the sidecar, not to the job:
+//     restarting them for each selected item would walk the panel's progress
+//     backwards, and an EACCES on one file inside the tree is not a failure of
+//     THIS trash — the rename moves the tree whole whatever the scan could read.
+//     What such a failure does change is the answer: the scan comes back
+//     incomplete and the size is recorded as unknown, which says so without
+//     claiming the delete went wrong.
+//
+// The error return is cancellation and nothing else.
+func trashSizeOf(ctx context.Context, r fsx.Root, plat *platform.Platform, apiPath string, fi os.FileInfo) (trashSize, error) {
+	if !fi.IsDir() {
+		return trashSize{bytes: fi.Size(), files: 1, scanned: fi}, nil
+	}
+	lim := scanLimits{deadline: time.Now().Add(scanMaxDuration), maxEntries: trashScanMaxEntries}
+	scan, serr := scanTrees(ctx, r, plat, []string{apiPath}, false, Emit{}, lim, true, ProtectSnapshots)
+	if cerr := ctx.Err(); cerr != nil {
+		return trashSize{}, cerr
+	}
+	if serr != nil || scan.capped || scan.incomplete || scan.rootInfo == nil {
+		return trashSize{bytes: -1, files: -1}, nil
+	}
+	// The named directory is counted itself, as in Size, so a directory that was
+	// really measured always has at least one entry. That is what lets a files of
+	// zero mean "a build that never measured wrote this" in trashItemOf.
+	return trashSize{bytes: scan.bytes, files: scan.files + scan.dirs, scanned: scan.rootInfo}, nil
+}
+
+// metaFor describes an item about to be trashed. bytes and files are what
+// trashSizeOf found, both -1 when the tree could not be counted.
+func metaFor(apiPath string, fi os.FileInfo, bytes, files int64) trashMeta {
 	name := fsx.Base(apiPath)
 	m := trashMeta{
 		OrigPath:  apiPath,
@@ -562,7 +844,8 @@ func metaFor(apiPath string, fi os.FileInfo) trashMeta {
 		UID:       -1,
 		GID:       -1,
 		MTime:     fi.ModTime().Unix(),
-		Size:      fi.Size(),
+		Size:      bytes,
+		Files:     files,
 		DeletedAt: time.Now().Unix(),
 	}
 	if !utf8.ValidString(apiPath) {
@@ -643,7 +926,7 @@ func Trash(ctx context.Context, r fsx.Root, plat *platform.Platform, uid int, pa
 			res.Skipped++
 			continue
 		}
-		if err := trashOne(r, loc, uid, clean, name, &res, emit); err != nil {
+		if err := trashOne(ctx, r, plat, loc, uid, clean, name, &res, emit); err != nil {
 			return res, err
 		}
 	}
@@ -653,7 +936,8 @@ func Trash(ctx context.Context, r fsx.Root, plat *platform.Platform, uid int, pa
 // trashOne moves one item, through held descriptors at every step (F2). Every
 // failure after the entry directory exists removes it again, so a refusal leaves
 // no litter behind.
-func trashOne(r fsx.Root, loc trashLoc, uid int, clean, name string, res *wproto.JobResult, emit Emit) error {
+func trashOne(ctx context.Context, r fsx.Root, plat *platform.Platform, loc trashLoc, uid int,
+	clean, name string, res *wproto.JobResult, emit Emit) error {
 	root, err := loc.open()
 	if err != nil {
 		trashWarn(emit, clean, err)
@@ -668,11 +952,34 @@ func trashOne(r fsx.Root, loc trashLoc, uid int, clean, name string, res *wproto
 		res.Skipped++
 		return nil
 	}
-	fi, err := statAt(src.jail, relJoin(src.rel, name))
+	// The selected item is opened O_PATH|O_NOFOLLOW and HELD from here until this
+	// function returns — past the scan, past the rename, past the check that
+	// compares them (verifyTrashPayload).
+	//
+	// A stat would not have been enough. It is a snapshot of a name: the inode it
+	// described can be unlinked while the scan runs and its (dev, ino) handed
+	// straight back to a file somebody else creates, at which point comparing
+	// identities compares two different objects that agree. A held O_PATH
+	// descriptor is a reference to the inode itself, so for as long as this
+	// function runs that number cannot be reused, and its fstat is the one
+	// identity everything else here is measured against.
+	ref, err := trashItemRefOf(src.jail, relJoin(src.rel, name))
 	if err != nil {
 		emit.warnErr(clean, err)
 		res.Skipped++
 		return nil
+	}
+	defer ref.close()
+	fi := ref.fi
+	// The tree is measured here, before anything has been created. It has to
+	// happen before the sidecar is written, because the sidecar is what carries
+	// the number and it is written before the rename; doing it before the entry
+	// directory exists as well means a cancellation in the middle of a long scan
+	// leaves no half-made entry behind for TrashEmpty to tidy up.
+	size, err := trashSizeOf(ctx, r, plat, clean, fi)
+	if err != nil {
+		// Cancellation and nothing else: the item has not been touched.
+		return err
 	}
 
 	user, err := userDirIn(root, loc.api, uid)
@@ -696,7 +1003,8 @@ func trashOne(r fsx.Root, loc trashLoc, uid int, clean, name string, res *wproto
 	// cannot be removed.
 	defer entry.close()
 
-	if err := writeTrashMeta(entry, metaFor(clean, fi)); err != nil {
+	meta := metaFor(clean, fi, size.bytes, size.files)
+	if err := writeTrashMeta(entry, meta); err != nil {
 		removeEntryDir(user, entry, id)
 		trashWarn(emit, clean, err)
 		res.Skipped++
@@ -719,6 +1027,7 @@ func trashOne(r fsx.Root, loc trashLoc, uid int, clean, name string, res *wproto
 		res.Skipped++
 		return nil
 	}
+	verifyTrashPayload(entry, fsx.Join(userAPI, id), meta, size, fi, clean, emit)
 	if fi.IsDir() {
 		res.Dirs++
 	} else {
@@ -736,6 +1045,65 @@ func trashOne(r fsx.Root, loc trashLoc, uid int, clean, name string, res *wproto
 		Phase:   wproto.PhaseWorking,
 	})
 	return nil
+}
+
+// trashItemRefOf opens and holds the item a trash is about to move, and
+// trashPayloadOf lstats the payload that landed in the entry afterwards. They
+// are the two ends of the identity check.
+//
+// Both are variables for one reason: the race they exist to catch needs a second
+// process swapping a directory for another between two syscalls, which a test
+// cannot stage reliably, so a test hands back a different object instead and
+// proves the sidecar is rewritten (the same reason identityFor and liveTableOf
+// are variables). Production never assigns to either.
+var trashItemRefOf = openItemRef
+
+// trashPayloadOf lstats the payload that landed in an entry, through that
+// entry's own held descriptor.
+var trashPayloadOf = func(entry *dirRef) (os.FileInfo, error) { return entry.lstat(trashItemName) }
+
+// verifyTrashPayload proves that the numbers just written into the sidecar
+// describe the item that is actually in the entry, and rewrites them as unknown
+// when it cannot.
+//
+// This is F2 carried one step further than the rename. The measurement resolved
+// the item by NAME and so did the rename, which leaves a gap another writer on
+// the same volume can use: move the selected directory aside between the two and
+// what gets renamed into the trash is a different tree, described by a sidecar
+// that states somebody else's totals as fact. The payload is therefore lstat'ed
+// through the entry descriptor — the one object nothing can swap — and compared
+// with the stat the trash started from and the root the scan really opened.
+//
+// A mismatch is not a failure of the trash: the item is in the trash, it is
+// listable and it is restorable, and the ONLY thing that can be wrong is the
+// size. So the size alone is corrected, to -1/-1, which is what every layer
+// above already renders as "not known".
+//
+// A rewrite that fails is a warning and nothing more. Losing the entry over a
+// wrong byte count would be the cure killing the patient — the sidecar that
+// stays is the one that makes the user's data restorable — so the old number
+// survives, disclosed through the warning rather than hidden.
+func verifyTrashPayload(entry *dirRef, entryAPI string, m trashMeta, size trashSize, selected os.FileInfo, apiPath string, emit Emit) {
+	if size.unknown() {
+		// Nothing was measured, so there is nothing that could describe the wrong
+		// tree.
+		return
+	}
+	payload, err := trashPayloadOf(entry)
+	if err == nil && size.describes(selected, payload) {
+		return
+	}
+	m.Size, m.Files = -1, -1
+	if rerr := rewriteTrashMeta(entry, m); rerr != nil {
+		emit.warnErr(apiPath, fmt.Errorf(
+			"%q was moved to the trash, but its recorded size could not be corrected and may describe a different folder: %w",
+			apiPath, rerr))
+		return
+	}
+	// The wording covers both ways in: the payload was a different object, or it
+	// could not be described at all. Either way the number is not this item's.
+	emit.warn(apiPath, "conflict", fmt.Sprintf(
+		"%q could not be matched to the tree that was measured, so %s records its size as unknown", apiPath, entryAPI), 0)
 }
 
 // removeEntryDir undoes a half-made trash entry: the sidecar, then the
@@ -898,15 +1266,41 @@ func trashItemOf(user *dirRef, loc trashLoc, userAPI, id string, uid int) (wprot
 	if _, err := entry.lstat(trashItemName); err != nil {
 		return wproto.TrashItem{}, false
 	}
+	size, files := trashSizeOfMeta(meta)
 	return wproto.TrashItem{
 		ID:        id,
 		Name:      []byte(itemName),
 		OrigPath:  raw,
 		Type:      meta.Type,
-		Size:      meta.Size,
+		Size:      size,
+		Files:     files,
 		DeletedAt: meta.DeletedAt,
 		Trash:     []byte(loc.api),
 	}, true
+}
+
+// trashSizeOfMeta is the ONE place a sidecar's size is turned into the size the
+// rest of the app reports, because it is also the one place an older sidecar has
+// to be recognised.
+//
+// Builds before this change recorded fi.Size() of the item itself. For a file
+// that is still exactly right and always will be. For a DIRECTORY it was the
+// inode's own size — 4096 on ext4 — presented to the user as the size of a
+// folder, and there are sidecars like that on real NAS boxes right now. They can
+// be told apart with certainty and without a version stamp: they carry no
+// "files" field at all, and a directory this build measured always counts at
+// least itself (trashSizeOf), so files == 0 on a directory means "written before
+// the tree was ever counted". The honest answer for those is that the size is
+// not known — not the inode figure, which describes nothing the user can see.
+func trashSizeOfMeta(m trashMeta) (size, files int64) {
+	if m.Type != "dir" {
+		// A single item is one item whether or not the sidecar spells it out.
+		return m.Size, 1
+	}
+	if m.Files == 0 {
+		return -1, -1
+	}
+	return m.Size, m.Files
 }
 
 // TrashRestore moves items back to where they came from.
@@ -1129,6 +1523,12 @@ func restoreOne(r fsx.Root, loc trashLoc, user, entry *dirRef, id string, uid in
 // directory, is reported as a warning, and is still there — listed and
 // restorable — when the empty finishes. Cancellation is the same story for every
 // entry the job never reached.
+//
+// An entry that survives like that is no longer the tree its sidecar measured,
+// which is why the SIZE is invalidated before the first removal rather than
+// corrected afterwards (invalidateTrashSize): "afterwards" is a moment a
+// cancellation or a crash can land in front of, and what it would leave behind
+// is a half-emptied entry still claiming the total it had when it was whole.
 func TrashEmpty(ctx context.Context, r fsx.Root, plat *platform.Platform, uid int, emit Emit) (wproto.JobResult, error) {
 	var res wproto.JobResult
 	for _, loc := range trashRoots(r, plat) {
@@ -1278,6 +1678,19 @@ func emptyEntry(ctx context.Context, user *dirRef, userAPI, id string, uid int, 
 		return false, nil
 	}
 
+	// The recorded size stops being true the moment anything under the entry
+	// goes, so it is given up BEFORE the first removal rather than corrected
+	// after the last one. A failure here is a warning and the empty carries on:
+	// see invalidateTrashSize for why refusing to empty would be the worse of the
+	// two, and stale is what makes the consequence visible if the entry survives.
+	stale := false
+	if err := invalidateTrashSize(entry, entryAPI, uid); err != nil {
+		emit.warn(fsx.Join(entryAPI, trashMetaName), fsx.Code(err),
+			fmt.Sprintf("the recorded size of %q could not be updated before it was emptied, so it may be larger than what is left: %v",
+				entryAPI, err), fsx.Errno(err))
+		stale = true
+	}
+
 	// The order F14 exists for. Everything below is reported through warnings
 	// that leave the entry exactly as listable and as restorable as it was.
 	if err := emptyItem(ctx, entry, entryAPI, res, emit); err != nil {
@@ -1285,11 +1698,19 @@ func emptyEntry(ctx context.Context, user *dirRef, userAPI, id string, uid int, 
 		if cerr := ctx.Err(); cerr != nil {
 			return false, cerr
 		}
-		emit.warn(entryAPI, "not_empty",
-			fmt.Sprintf("%q could not be emptied, so its record was kept and it can still be restored from the Trash", entryAPI),
-			fsx.Errno(err))
+		msg := fmt.Sprintf("%q could not be emptied, so its record was kept and it can still be restored from the Trash", entryAPI)
+		if stale {
+			// The one case where a size on display can now be wrong, said out loud
+			// at the only moment it can be known: the entry is still here.
+			msg += ", though its recorded size could not be updated and may be larger than what is left"
+		}
+		emit.warn(entryAPI, "not_empty", msg, fsx.Errno(err))
 		return false, nil
 	}
+	// The payload is gone, so the entry is going. Anything a crashed rewrite left
+	// beside the sidecar goes with it, or the rmdir below would refuse this
+	// directory for as long as it exists.
+	removeSidecarLitter(entry, uid)
 	if err := entry.unlink(trashMetaName, false); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		entry.close()
 		emit.warnErr(fsx.Join(entryAPI, trashMetaName), err)
@@ -1307,6 +1728,149 @@ func emptyEntry(ctx context.Context, user *dirRef, userAPI, id string, uid int, 
 	res.Dirs++
 	emptyProgress(res, emit, entryAPI)
 	return true, nil
+}
+
+// invalidateTrashSize gives up an entry's recorded size before an empty starts
+// taking the tree it describes apart.
+//
+// The number in the sidecar is the size of a WHOLE item, and an empty is the one
+// operation that can leave a part of one behind: a protected component inside it
+// (F10), one file the kernel will not let go, a cancellation between two
+// unlinks. Correcting it afterwards would be correcting it at a moment a crash
+// or a cancellation can land in front of, so it is given up first — one rename
+// per entry actually being emptied — and the panel then says "—" for an entry
+// that is no longer what it was measured as.
+//
+// Two narrowings keep the cost where the risk is:
+//
+//   - only a DIRECTORY payload can be partly removed. A file or a symlink goes
+//     in one unlink that either happens or does not, so its recorded size is
+//     true in both outcomes.
+//   - only a sidecar whose measurement is KNOWN to a reader (trashSizeOfMeta) is
+//     worth rewriting. One that already reports unknown — an older build's, or
+//     one this build could not measure — has nothing on display to correct, and
+//     one that cannot be read at all is an entry TrashList already refuses to
+//     show.
+//
+// A failure to rewrite is a warning and not a refusal to empty the entry, and
+// that is a deliberate trade. The rewrite CREATES a small file, which is exactly
+// what a full volume refuses — and a full volume is when a user empties their
+// trash. Making the one operation that frees space conditional on a few hundred
+// bytes being writable would take the escape hatch away at the moment it is
+// needed, to protect a number on a panel. The residual is that a size may read
+// high for an entry the empty could not finish, which is said out loud at the
+// only moment it can be known (emptyEntry); an entry that IS fully removed takes
+// its sidecar with it and leaves nothing to be wrong about.
+//
+// TrashRestore needs none of this. It renames the payload out whole and removes
+// the entry in the same breath, so there is no state in which a record survives
+// describing a tree that is no longer what it says: either the entry is still
+// there untouched, or it is gone.
+func invalidateTrashSize(entry *dirRef, entryAPI string, uid int) error {
+	fi, err := entry.lstat(trashItemName)
+	switch {
+	case err == nil:
+	case noTrashPayload(err):
+		return nil
+	default:
+		// The payload could not be described — EMFILE, EIO — which is not the
+		// same as there being nothing to describe. Treating it as "nothing to
+		// invalidate" would let the empty take a tree apart underneath a sidecar
+		// still claiming the whole of it, which is precisely the state this
+		// function exists to prevent, so the caller is told instead.
+		return err
+	}
+	if !fi.IsDir() {
+		return nil
+	}
+	meta, err := readTrashMeta(entry, entryAPI, uid)
+	if err != nil {
+		if sidecarNotOnDisplay(err) {
+			return nil
+		}
+		// Everything else is the read failing rather than the record being
+		// unusable — EIO on the block that holds it, EMFILE because this worker is
+		// out of descriptors. The sidecar is still there, TrashList still shows the
+		// number in it, and the empty is about to make that number wrong: the
+		// caller is told so rather than being left to assume there was nothing to
+		// correct.
+		return err
+	}
+	if size, files := trashSizeOfMeta(meta); size < 0 && files < 0 {
+		return nil
+	}
+	meta.Size, meta.Files = -1, -1
+	return rewriteTrashMeta(entry, meta)
+}
+
+// noTrashPayload reports that an entry holds nothing a removal could take apart
+// PART of, so there is no recorded size an empty could make untrue.
+//
+// ENOENT is the orphan sidecar a crash between the sidecar and the rename leaves
+// behind: there is no payload at all. ENOTDIR and ELOOP say the name does not
+// lead to a directory, and anything that is not a directory goes in one unlink
+// that either happens or does not — its size is true in both outcomes.
+//
+// Everything else is the lstat FAILING rather than answering, and that is not a
+// reason to skip an invalidation.
+func noTrashPayload(err error) bool {
+	return errors.Is(err, fs.ErrNotExist) ||
+		errors.Is(err, syscall.ENOTDIR) ||
+		errors.Is(err, syscall.ELOOP)
+}
+
+// sidecarNotOnDisplay reports that a sidecar which could not be read is one no
+// reader was showing anyway, so there is no number in a panel to correct.
+//
+// Three things qualify, and they are the three TrashList itself refuses: no
+// sidecar at all (the orphan payload a crashed trash leaves), one that is not
+// this uid's or is otherwise untrusted (F8, B2), and one whose contents are not
+// the JSON this wrote. Anything else — an I/O error, a descriptor limit — is the
+// READ failing, not the record being unusable, and must not be mistaken for
+// "nothing to do".
+func sidecarNotOnDisplay(err error) bool {
+	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, ErrUntrustedTrash) {
+		return true
+	}
+	var syntax *json.SyntaxError
+	var mismatch *json.UnmarshalTypeError
+	return errors.As(err, &syntax) || errors.As(err, &mismatch)
+}
+
+// removeSidecarLitter clears sidecar temporaries out of an entry that is being
+// emptied: the meta.json.<pid>-<hex>.new a crash between a rewrite's create and
+// its rename leaves behind (rewriteTrashMeta).
+//
+// Without it that litter is permanent in the only way that matters — the entry's
+// final rmdir reports the directory as not empty, for ever, and the user is left
+// with a trash entry nothing can clear. It is cleared here rather than anywhere
+// else because this is the one moment the entry is known to be going.
+//
+// The name is only a filter. What is actually removed has to be a REGULAR file
+// (so never a directory to recurse into, and the lstat does not follow a
+// symlink) that belongs to the uid doing the removing — the same two questions
+// every other consuming path in this file asks, because the entry directory is
+// 0700 but its name was once creatable by anybody in a 1777 trash.
+func removeSidecarLitter(entry *dirRef, uid int) {
+	for {
+		names, readErr := entry.names(readChunk)
+		for _, name := range names {
+			if !isTrashMetaTmp(name) {
+				continue
+			}
+			fi, err := entry.lstat(name)
+			if err != nil || !fi.Mode().IsRegular() {
+				continue
+			}
+			if owner, _, _, ok := statDetail(fi); ok && owner != uid {
+				continue
+			}
+			_ = entry.unlink(name, false)
+		}
+		if readErr != nil || len(names) == 0 {
+			return
+		}
+	}
 }
 
 // emptyItem removes the payload of one entry — the fixed-name item, recursively

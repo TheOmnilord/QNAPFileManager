@@ -64,6 +64,19 @@ const (
 	bigDeleteBytes = 1 << 30 // 1 GiB
 )
 
+// The three doors an identity can arrive through (M4 contract §6.1).
+//
+// DoorQTS is the QTS session on the main listener; DoorCredential is the
+// credential-proxy form (authLogin.cgi?user=&pwd=) on the same listener;
+// DoorLocal is the break-glass bcrypt account, which exists on the break-glass
+// listener alone. They never mix: one door per listener, and the local account
+// has no route on the main one.
+const (
+	DoorQTS        = "qts"
+	DoorCredential = "credential"
+	DoorLocal      = "local"
+)
+
 // Event is one line of the audit log. Path and Dst hold UTF-8 paths; a value
 // that is not valid UTF-8 is moved to PathB64 / DstB64 (base64 of the raw bytes)
 // by prepare so it survives JSON round-tripping, which would otherwise replace
@@ -71,24 +84,30 @@ const (
 // destination distinguishes the target and an overwrite may destroy an existing
 // entry (round-12).
 type Event struct {
-	T       time.Time `json:"t"`
-	Actor   string    `json:"actor"`
-	UID     int       `json:"uid"`
-	Admin   bool      `json:"admin"`
-	Root    bool      `json:"root"`
-	IP      string    `json:"ip"`
-	Op      string    `json:"op"`
-	Path    string    `json:"path"`
-	PathB64 string    `json:"pathB64,omitempty"`
-	Dst     string    `json:"dst,omitempty"`
-	DstB64  string    `json:"dstB64,omitempty"`
-	Job     string    `json:"job,omitempty"`
-	Phase   string    `json:"phase"`  // "intent" | "result"
-	Result  string    `json:"result"` // "ok" | "error" | "denied" | "cancelled"
-	Code    string    `json:"code,omitempty"`
-	Files   int64     `json:"files,omitempty"`
-	Bytes   int64     `json:"bytes,omitempty"`
-	Detail  string    `json:"detail,omitempty"`
+	T     time.Time `json:"t"`
+	Actor string    `json:"actor"`
+	UID   int       `json:"uid"`
+	Admin bool      `json:"admin"`
+	Root  bool      `json:"root"`
+	IP    string    `json:"ip"`
+	// Door is which door the acting session came through: DoorQTS, DoorCredential
+	// or DoorLocal. It is set once at session creation and stamped on every event
+	// that session produces (M4 contract §6.1). Without it the log cannot answer
+	// the one question an operator actually asks after an incident: which door
+	// did this come through?
+	Door    string `json:"door,omitempty"`
+	Op      string `json:"op"`
+	Path    string `json:"path"`
+	PathB64 string `json:"pathB64,omitempty"`
+	Dst     string `json:"dst,omitempty"`
+	DstB64  string `json:"dstB64,omitempty"`
+	Job     string `json:"job,omitempty"`
+	Phase   string `json:"phase"`  // "intent" | "result"
+	Result  string `json:"result"` // "ok" | "error" | "denied" | "cancelled"
+	Code    string `json:"code,omitempty"`
+	Files   int64  `json:"files,omitempty"`
+	Bytes   int64  `json:"bytes,omitempty"`
+	Detail  string `json:"detail,omitempty"`
 
 	// ForceMilestone marks an event a milestone regardless of the automatic
 	// classification (isMilestone). It is a decision flag, never serialised.
@@ -587,6 +606,11 @@ func message(ev Event) string {
 	}
 	if ev.Actor != "" {
 		fmt.Fprintf(&b, " by %s (uid %d)", ev.Actor, ev.UID)
+	}
+	if ev.Door != "" {
+		// The QuLog line has to answer "which door" on its own: an operator
+		// scanning QuLog Center is not reading the JSON beside it.
+		fmt.Fprintf(&b, " via %s", ev.Door)
 	}
 	if ev.Root {
 		b.WriteString(" [root]")

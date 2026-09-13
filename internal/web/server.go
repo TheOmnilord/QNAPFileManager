@@ -80,6 +80,13 @@ type Server struct {
 	// file /api/audit/export streams. Both are set by the caller after New.
 	ConfigPath string
 	AuditPath  string
+	// Dev mirrors `serve -dev`. It selects config.LoadDev's relaxations wherever
+	// this process re-reads its own configuration file — the settings route's
+	// read-modify-write, above all — because a daemon started on a development
+	// configuration (auth.mode "local") would otherwise be unable to save the
+	// very file it started from (round-2 P3-6). Set by the caller after New,
+	// before serving.
+	Dev bool
 	// Root is the -jail API↔OS mapping the guard uses to resolve parent
 	// symlinks before a mutation (resolveForGuard). The zero value is the
 	// identity mapping production uses; a jailed dev loop or a test sets it so
@@ -104,6 +111,12 @@ type Server struct {
 	authFailures      failureLimiter
 	authAdmission     authAdmission
 	authTransportOnce sync.Once
+
+	// bg is the break-glass door (M4 contract §2): its own credential source,
+	// its own bounds and its own session store. Nil until EnableBreakGlass, and
+	// nil forever on a Server whose listener is disabled — with it nil the
+	// break-glass handler refuses everything and the main listener is unchanged.
+	bg *breakGlassDoor
 }
 
 func New(cfg config.Config, b backend.Backend, v *qtsauth.Verifier, ids *idmap.Map, p *platform.Platform, pinned *backend.Principal, version string, logger *log.Logger, g *guard.Guard, auditor *audit.Logger, mutator backend.Mutator) *Server {
@@ -300,6 +313,19 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		s.static(w, r)
 		return
 	}
+	// One door per listener, and they never mix (contract §2.1). On the
+	// break-glass listener qtsauth.FromRequest is never reached: the local door
+	// resolves the session (or answers the login route) and the request joins
+	// the SAME dispatch below, because the listener decides only who you are,
+	// never what you may do.
+	if breakGlassRequest(r) {
+		sess, ok := s.breakGlassAuth(w, r)
+		if !ok {
+			return
+		}
+		s.dispatch(w, r, sess)
+		return
+	}
 	// For upload POST, wrap the ResponseWriter early so any error (auth, method, etc)
 	// gets Connection: close before being sent. This prevents large unauthenticated
 	// uploads from sending the entire body before getting a 401 response.
@@ -363,6 +389,13 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, "unauthorized", "Sign in to QTS to continue.", "", "")
 		return
 	}
+	s.dispatch(w, r, sess)
+}
+
+// dispatch is the one API surface both listeners share: the same route table,
+// guard, readOnly, confirmation ladder, audit and worker pool. A second route
+// table would be a second place to forget a check (contract §2.3).
+func (s *Server) dispatch(w http.ResponseWriter, r *http.Request, sess *session) {
 	if r.URL.Path != "/api/fs/upload" && r.URL.Path != "/api/fs/archive" {
 		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	}
@@ -454,8 +487,17 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	case "/api/trash/empty":
 		s.trashEmpty(w, r, sess)
 	case "/api/logout":
-		s.destroy(sess.id)
-		s.cookie(w, r, "", -1)
+		// Each door destroys its own session in its own store and clears its
+		// own cookie; there is no path by which one can revoke the other's.
+		if sess.door == audit.DoorLocal {
+			if s.bg != nil {
+				s.bg.destroy(sess.id)
+				s.bg.clearCookie(w)
+			}
+		} else {
+			s.destroy(sess.id)
+			s.cookie(w, r, "", -1)
+		}
 		writeJSON(w, map[string]bool{"authenticated": false})
 	default:
 		// The two job-id forms; routeFor has already vetted the shape and the
@@ -498,7 +540,7 @@ func (s *Server) static(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if name == "index.html" {
-		data = s.shellWithBase(data)
+		data = s.shellWithBaseAt(data, s.baseFor(r))
 	}
 	w.Header().Set("Content-Type", ct)
 	if r.Method != "HEAD" {
@@ -516,10 +558,30 @@ func (s *Server) readOnly() bool {
 	return s.cfg.ReadOnly
 }
 
-// basePath is the absolute path every asset and API URL is built under:
-// QPKG_PROXY_PATH plus a slash behind the QTS proxy, "/" otherwise.
+// basePath is the absolute path every asset and API URL is built under on the
+// MAIN listener: QPKG_PROXY_PATH plus a slash behind the QTS proxy, "/"
+// otherwise.
 func (s *Server) basePath() string {
 	return strings.TrimSuffix(s.cfg.Web.ProxyPrefix, "/") + "/"
+}
+
+// baseFor is basePath per LISTENER, and the distinction is load-bearing.
+//
+// The proxy prefix describes where QTS's Apache mounts this app on the QTS
+// origin; it has nothing to do with the break-glass listener, which the
+// operator reaches directly at https://<nas>:8771/ precisely BECAUSE Apache may
+// be what is broken. BreakGlassHandler therefore installs no prefix mux — so a
+// shell served there with the global base would point at
+// "/qnapfilemanager/app.css" and "/qnapfilemanager/api/session", neither of
+// which exists on that listener, and the emergency door would answer 404 for
+// its own stylesheet, its own script and every API call. The prefix comes from
+// the QPKG service script in production (-proxy-prefix /qnapfilemanager), so
+// this is the configuration that actually ships.
+func (s *Server) baseFor(r *http.Request) string {
+	if breakGlassRequest(r) {
+		return "/"
+	}
+	return s.basePath()
 }
 
 // shellWithBase rewrites the shell's two asset references to absolute URLs
@@ -533,7 +595,12 @@ func (s *Server) basePath() string {
 // still work on the loopback port, where the mux serves the prefix too. The
 // base travels as a meta element rather than <base>, which the CSP forbids.
 func (s *Server) shellWithBase(shell []byte) []byte {
-	base := s.basePath()
+	return s.shellWithBaseAt(shell, s.basePath())
+}
+
+// shellWithBaseAt is shellWithBase against an explicit base, so each listener
+// can render the shell for its own mount point (see baseFor).
+func (s *Server) shellWithBaseAt(shell []byte, base string) []byte {
 	out := string(shell)
 	out = strings.Replace(out, `href="app.css"`, `href="`+base+`app.css"`, 1)
 	out = strings.Replace(out, `src="js/app.js"`, `src="`+base+`js/app.js"`, 1)

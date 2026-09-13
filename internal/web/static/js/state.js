@@ -17,7 +17,23 @@ const listeners = new Set();
 // (and finish) while the first is still walking; only the latest may paint.
 // `seq` is the SUBMISSION ticket, not the order the 202s came back in — see
 // claimResults in search.js for why those are not the same order.
-export const state = {session:null,sessionGeneration:0,path:'/share',pathB64:'',sort:'name',desc:false,hidden:false,total:0,pages:new Map(),selection:new Set(),exclude:false,focus:0,anchor:0,filter:'',generation:0,loading:false,clipboard:null,searchResults:null,pendingReveal:null,searchJob:null};
+//
+// listener is which listener answered /api/session — 'local' at the emergency
+// door, '' or 'main' elsewhere. It is remembered because a 401 arriving later
+// has no payload of its own, and it is what decides which sign-in is shown:
+// the QTS notice must never appear on the emergency listener (M4 contract §2).
+//
+// dirClass is the guard's classification of the CURRENT folder — 'protected',
+// 'warn' or '' — as the listing reported it. It is the `guard` cause of the
+// reason table (M4 contract §7.1): inside a protected region nothing may be
+// created, and an empty state that offered "New folder" there would be offering
+// a button the server answers 403 to (round 2, finding 2).
+//
+// listError is why the CURRENT folder has no rows, or null. An empty list and a
+// list the kernel refused must never look the same (M4 contract §8.1), and the
+// only place that difference is known is the failed request — so it is kept
+// rather than reported once and thrown away.
+export const state = {session:null,sessionGeneration:0,path:'/share',pathB64:'',sort:'name',desc:false,hidden:false,total:0,pages:new Map(),selection:new Set(),exclude:false,focus:0,anchor:0,filter:'',generation:0,loading:false,clipboard:null,searchResults:null,pendingReveal:null,searchJob:null,listError:null,listener:'',dirClass:''};
 // Capture before awaiting: even signing back in as the same user invalidates old work.
 export function sessionGuard() { const generation=state.sessionGeneration; return () => generation===state.sessionGeneration; }
 

@@ -1,8 +1,10 @@
 import {api} from './api.js';
-import {$,el,error,announce,openDialog} from './dom.js';
+import {$,el,error,announce,applyWhy,openDialog} from './dom.js';
+import {whyDisabled} from './why.js';
 import {state,sessionGuard} from './state.js';
 import {confirmDialog,PERMANENT_WARNING} from './actions.js';
 import {trackJob,formatBytes} from './jobs.js';
+import {emptyState,volumeOf} from './empty.js';
 
 // The trash panel (ui-ux §4.4). It lists only the caller's own items — the
 // kernel's sticky bit on .@qfm_trash is what makes that true, not this code —
@@ -42,13 +44,30 @@ export async function loadTrash() {
   if (!valid()) return;
   items = data.items || [];
   $('#trashRows').replaceChildren(...items.map(trashRow));
-  $('#trashEmpty').hidden = items.length > 0;
+  // The volume is the one the user is standing on: "Trash is empty" is a
+  // sentence about a place, and naming it is what stops it reading as "your
+  // Trash is empty everywhere" (§8.1). The detail line then says the panel
+  // covers every volume, so naming one cannot mislead.
+  const nothing = emptyState('trash',{items:items.length,dirName:data.dirName || '.@qfm_trash',volume:volumeOf(state.path)});
+  $('#trashEmpty').hidden = !nothing;
+  if (nothing) $('#trashEmpty').textContent = [nothing.sentence,nothing.detail].filter(Boolean).join(' ');
   $('#trashStatus').textContent = `${items.length.toLocaleString()} item(s) in Trash.`;
   $('#trashWhere').textContent = `Trash lives in ${data.dirName || '.@qfm_trash'} on each volume.`;
+  paintTrashActions();
  } catch(err) { if (valid()) { $('#trashStatus').textContent = err.message; error(err); } }
 }
 
 function picked() { return [...document.querySelectorAll('.trashPick')].filter(box => box.checked).map(box => box.value); }
+
+// paintTrashActions puts the panel's two buttons through the same reason table
+// as everything else (M4 contract §7.1): read-only first, then "there is
+// nothing selected" — and, for Empty Trash, "there is nothing in it", which is
+// a different sentence and a different situation.
+function paintTrashActions() {
+ const readOnly = !state.session?.canWrite;
+ applyWhy('#btnTrashRestore',whyDisabled('trashRestore',{readOnly,count:picked().length}));
+ applyWhy('#btnTrashEmpty',whyDisabled('trashEmpty',{readOnly,count:items.length}));
+}
 
 async function restore() {
  const ids = picked();
@@ -110,5 +129,8 @@ export function initTrash() {
  $('#btnTrashRefresh').addEventListener('click',loadTrash);
  $('#btnTrashRestore').addEventListener('click',restore);
  $('#btnTrashEmpty').addEventListener('click',empty);
- $('#trashAll').addEventListener('change',ev => { for (const box of document.querySelectorAll('.trashPick')) box.checked = ev.target.checked; });
+ $('#trashAll').addEventListener('change',ev => { for (const box of document.querySelectorAll('.trashPick')) box.checked = ev.target.checked; paintTrashActions(); });
+ // One delegated listener, so a row added by a refresh needs no wiring of its
+ // own and the two buttons always describe the CURRENT selection.
+ $('#trashRows').addEventListener('change',paintTrashActions);
 }

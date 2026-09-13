@@ -1,7 +1,7 @@
 // Run with: node --test internal/web/list_test.mjs
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
-import {initList,render,selectedOne,refreshToolbar} from './static/js/list.js';
+import {initList,render,selectedOne,refreshToolbar,paintEmpty} from './static/js/list.js';
 import {state,update} from './static/js/state.js';
 
 // Minimal element doubles: no browser or DOM dependency required.
@@ -132,6 +132,30 @@ test('Rename targets the selected entry, not a focused-but-unselected one (round
  assert.equal(selectedOne(),null,'no single selected+focused entry after Ctrl+Arrow');
  refreshToolbar();
  assert.equal(get('#btnRename').disabled,true,'Rename disabled: it must not target the focused-but-unselected row');
+});
+
+test('an empty folder offers New folder only where the table allows it (round 2, finding 2)', () => {
+ setup(0);
+ update({session:{family:'test',canWrite:true},dirClass:''});
+ const normal = paintEmpty();
+ assert.equal(normal.state,'folder-empty');
+ assert.deepEqual(normal.action,{id:'btnMkdir',label:'New folder'});
+ assert.equal(get('#listEmptyAction').hidden,false);
+ // A protected folder is a guard denial: the offer is withdrawn rather than
+ // forwarding to a button the server would answer 403 to.
+ update({dirClass:'protected'});
+ const guarded = paintEmpty();
+ assert.equal(guarded.state,'folder-empty');
+ assert.equal(guarded.action,null);
+ assert.equal(get('#listEmptyAction').hidden,true);
+ assert.equal(get('#listEmptyText').textContent,'This folder is empty.','the sentence is unchanged; only the offer goes');
+ // 'warn' is not a denial — the server still decides there.
+ update({dirClass:'warn'});
+ assert.deepEqual(paintEmpty().action,{id:'btnMkdir',label:'New folder'});
+ // Read-only withdraws it too, through the same table.
+ update({dirClass:'',session:{family:'test',canWrite:false}});
+ assert.equal(paintEmpty().action,null);
+ update({session:{family:'test'},dirClass:''});
 });
 
 test('virtual scrolling and data renders rebuild rows with current selection and focus', async () => {

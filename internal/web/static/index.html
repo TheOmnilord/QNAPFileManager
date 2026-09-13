@@ -6,10 +6,20 @@
  <script type="module" src="js/app.js"></script>
 </head>
 <body>
-<a class="skip" href="#list">Skip to files</a>
+<a class="skip" id="skipLink" href="#list">Skip to files</a>
 <div id="app">
  <header id="hdr"><h1>QNAPFileManager</h1><span id="chipReadonly" class="chip">Read-only browse</span><span id="identity"></span><button id="btnSettings">Settings</button><button id="userMenu" aria-haspopup="dialog">Session</button></header>
  <section id="signin" role="alert" hidden><h2>Sign in to QTS to continue</h2><p>Your QTS session is unavailable or has expired. Sign in on the QTS desktop, then retry here.</p><button id="btnRetry">Retry connection</button></section>
+ <!-- The emergency door's own sign-in (M4 contract §2, §8.4). It is shown ONLY
+      on the break-glass listener, where the QTS desktop may be exactly what is
+      broken and "sign in on the QTS desktop" is an instruction nobody can
+      follow. -->
+ <section id="bgSignin" hidden aria-labelledby="bgTitle" aria-describedby="bgIntro"><h2 id="bgTitle">Emergency access</h2>
+  <p id="bgIntro">This is the local administrator door. It does not use your QTS account, and everything you create through it will be owned by root.</p>
+  <form id="bgForm"><label for="bgPassword">Local administrator password</label>
+   <input id="bgPassword" type="password" autocomplete="current-password" spellcheck="false" required>
+   <button id="bgSubmit" type="submit">Sign in</button></form>
+  <p id="bgError" class="banner" role="alert" hidden></p></section>
  <nav id="toolbar" aria-label="File actions">
   <button id="btnTree" aria-controls="tree" aria-expanded="false">Folders</button>
   <button id="btnBack" title="Back (Alt+Left)">←</button><button id="btnFwd" title="Forward (Alt+Right)">→</button><button id="btnUp" title="Parent folder (Backspace)">↑</button><button id="btnRefresh" title="Refresh (F5)">↻</button>
@@ -21,41 +31,50 @@
   <button id="btnRename" disabled>Rename</button><button id="btnCopy" disabled>Copy to…</button><button id="btnMove" disabled>Move to…</button><button id="btnDelete" disabled>Delete</button>
   <button id="btnSearch" disabled title="Search this folder and below (Ctrl+F)">Search…</button><button id="btnResults" hidden>Results</button>
   <button id="btnTrash">Trash</button><button id="btnJobs" aria-controls="jobsPanel" aria-expanded="false">Operations</button>
+  <span class="split"><button id="btnMore" aria-haspopup="menu" aria-expanded="false" aria-label="More actions" title="More actions" hidden>⋯</button>
+   <div id="moreMenu" role="menu" aria-label="More actions" hidden></div></span>
   <label class="filter"><span class="visually-hidden">Filter loaded names</span><input id="searchBox" type="text" placeholder="Filter loaded names (/)"></label>
-  <label><input id="chkHidden" type="checkbox"> Hidden</label><button id="btnShortcuts" title="Keyboard shortcuts (?)">?</button>
+  <label><input id="chkHidden" type="checkbox"> Hidden</label><button id="btnShortcuts" title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">?</button>
  </nav>
  <div class="pathbar"><nav id="crumbs" aria-label="Breadcrumb"></nav><label class="visually-hidden" for="pathEdit">Absolute path</label><input id="pathEdit" type="text" aria-label="Absolute path (Ctrl+L)" value="/share"></div>
  <div id="pathNotice" class="banner" hidden></div>
+ <div id="bannerReadonly" class="banner bannerBar" role="status" hidden><span class="bannerMark" aria-hidden="true">🔒</span><span id="bannerReadonlyText"></span> <span id="bannerReadonlyTail" class="bannerTail"></span> <button id="bannerReadonlySettings" hidden>Open Settings</button></div>
+ <div id="bannerBreakGlass" class="banner bannerBar bannerWarn" role="status" hidden><span class="bannerMark" aria-hidden="true">⚠</span><span id="bannerBreakGlassText"></span></div>
  <main>
   <nav id="tree" role="tree" aria-label="Folders"></nav>
   <section id="list" role="grid" aria-label="Files" aria-multiselectable="true" aria-rowcount="1" tabindex="0">
    <div id="listHead" class="fileRow" role="row" aria-rowindex="1"><span role="columnheader" aria-sort="ascending"><button data-sort="name">Name ↑</button></span><span role="columnheader"><button data-sort="size">Size</button></span><span role="columnheader" class="extra"><button data-sort="type">Kind</button></span><span role="columnheader"><button data-sort="mtime">Modified</button></span><span role="columnheader" class="extra">Mode</span><span role="columnheader" class="extra">Owner</span></div>
-   <div id="listViewport"><div id="listSpacer" aria-hidden="true"></div><div id="listRows" role="rowgroup"></div><div id="listTail" aria-hidden="true"></div><p id="listEmpty" hidden>This folder is empty.</p></div>
+   <div id="listViewport"><div id="listSpacer" aria-hidden="true"></div><div id="listRows" role="rowgroup"></div><div id="listTail" aria-hidden="true"></div>
+    <div id="listEmpty" class="emptyState" role="status" hidden><p id="listEmptyText"></p><p id="listEmptyDetail" class="hint" hidden></p><button id="listEmptyAction" hidden></button></div></div>
    <details id="mountGroup" hidden><summary>⏏ Volume mounts</summary><div id="mountLinks"></div></details>
   </section>
   <section id="results" role="grid" aria-label="Search results" hidden>
    <div class="resultsBar"><h2 id="resultsTitle">Search results</h2><button id="btnResultsBack">Back to folder</button></div>
    <div id="resultsHead" class="resultRow" role="row"><span role="columnheader">Name</span><span role="columnheader">In folder</span><span role="columnheader">Size</span><span role="columnheader">Modified</span></div>
    <div id="resultsRows" role="rowgroup"></div>
-   <p id="resultsEmpty" hidden>Nothing matched.</p>
+   <p id="resultsEmpty" class="emptyState" role="status" hidden></p>
   </section>
   <aside id="jobsPanel" aria-label="Operations" hidden>
    <div class="jobsBar"><h2>Operations</h2><button id="btnJobsClear">Clear finished</button><button id="btnJobsClose">Close</button></div>
    <div id="jobsList"></div>
-   <p id="jobsEmpty">Nothing is running.</p>
+   <p id="jobsEmpty" class="emptyState" role="status">Nothing is running.</p>
   </aside>
  </main>
  <div id="toast" role="status" hidden></div>
  <footer id="status" role="status" aria-live="polite">Connecting…</footer>
  <div id="ctxMenu" role="menu" aria-label="File actions" hidden></div>
  <div id="announce" class="visually-hidden" aria-live="polite"></div>
+ <!-- whyNotes holds one hidden node per control, carrying the same sentence its
+      title does, so aria-describedby reaches a screen reader on a control a
+      title alone cannot (M4 contract §7.1). -->
+ <div id="whyNotes" class="visually-hidden"></div>
 </div>
-<dialog id="dlgViewer" aria-labelledby="viewerTitle"><h2 id="viewerTitle">Text viewer</h2><p id="viewerNote"></p><pre id="viewerContent" tabindex="0"></pre><div class="bar"><button id="viewerDownload">Download</button><button data-close>Close</button></div></dialog>
+<dialog id="dlgViewer" aria-labelledby="viewerTitle" aria-describedby="viewerNote"><h2 id="viewerTitle">Text viewer</h2><p id="viewerNote"></p><pre id="viewerContent" tabindex="0"></pre><div class="bar"><button id="viewerDownload">Download</button><button data-close>Close</button></div></dialog>
 <dialog id="dlgProps" aria-labelledby="propsTitle"><h2 id="propsTitle">Properties</h2>
  <div id="propsContent"></div>
  <h3>Size</h3><p id="propsSize" role="status"></p>
  <div class="bar"><button id="btnCalcSize">Recount</button><button id="btnStopSize" disabled>Stop</button><button id="propPerms">Permissions…</button><button data-close>Close</button></div></dialog>
-<dialog id="dlgPerms" aria-labelledby="permsTitle"><h2 id="permsTitle">Permissions</h2>
+<dialog id="dlgPerms" aria-labelledby="permsTitle" aria-describedby="permsApplies"><h2 id="permsTitle">Permissions</h2>
  <p id="permsApplies"></p>
  <p id="pAcl" class="banner" hidden></p>
  <p id="pCaps" class="hint" hidden></p>
@@ -89,12 +108,12 @@
  <div id="pDiff" class="banner" role="status" hidden></div>
  <p id="permsError" class="banner" role="alert" hidden></p>
  <div class="bar"><button id="pApply">Apply</button><button id="pRecount">Recount</button><button id="pStopImpact">Stop</button><button data-close>Cancel</button></div></dialog>
-<dialog id="dlgDelete" aria-labelledby="delTitle"><h2 id="delTitle">Move to Trash</h2><p id="delBody"></p><p id="delNote" class="banner" hidden></p><p id="delWhy" class="hint" hidden></p>
+<dialog id="dlgDelete" aria-labelledby="delTitle" aria-describedby="delBody"><h2 id="delTitle">Move to Trash</h2><p id="delBody"></p><p id="delNote" class="banner" hidden></p><p id="delWhy" class="hint" hidden></p>
  <p><label><input type="checkbox" id="delPermanent"> Delete permanently (cannot be undone)</label></p>
  <p id="delCrossRow" hidden><label><input type="checkbox" id="delCross" checked> Include mounted sub-folders</label></p>
  <label id="delPhraseLabel" for="delPhrase" hidden>Type <b id="delPhraseName"></b> to confirm <input id="delPhrase" type="text"></label>
  <div class="bar"><button id="delOK">Move to Trash</button><button data-close>Cancel</button></div></dialog>
-<dialog id="dlgTransfer" aria-labelledby="xferTitle"><h2 id="xferTitle">Copy to…</h2>
+<dialog id="dlgTransfer" aria-labelledby="xferTitle" aria-describedby="xferSummary"><h2 id="xferTitle">Copy to…</h2>
  <nav id="xferTree" role="tree" aria-label="Destination folders"></nav>
  <label for="xferPath">Destination folder</label><input id="xferPath" type="text" placeholder="/share/Public" autocomplete="off" spellcheck="false">
  <fieldset id="xferConflict"><legend>If a name is already taken there</legend>
@@ -107,7 +126,7 @@
  <p id="xferSummary" role="status"></p>
  <p id="xferError" class="banner" role="alert" hidden></p>
  <div class="bar"><button id="xferOK">Copy</button><button data-close>Cancel</button></div></dialog>
-<dialog id="dlgSearch" aria-labelledby="searchTitle"><h2 id="searchTitle">Search</h2>
+<dialog id="dlgSearch" aria-labelledby="searchTitle" aria-describedby="searchWhy"><h2 id="searchTitle">Search</h2>
  <label for="searchQuery">Find</label><input id="searchQuery" type="text" placeholder="part of a name" autocomplete="off" spellcheck="false">
  <label for="searchRoot">Search in</label><input id="searchRoot" type="text" placeholder="/share" autocomplete="off" spellcheck="false">
  <fieldset id="searchKindSet"><legend>What to find</legend>
@@ -121,12 +140,12 @@
  <p id="searchWhy" class="hint">Names are matched without regard to case. Long searches run in Operations and can be cancelled there.</p>
  <p id="searchError" class="banner" role="alert" hidden></p>
  <div class="bar"><button id="searchOK">Search</button><button data-close>Cancel</button></div></dialog>
-<dialog id="dlgUpConflict" aria-labelledby="upConflictTitle"><h2 id="upConflictTitle">A file with that name is already there</h2>
+<dialog id="dlgUpConflict" aria-labelledby="upConflictTitle" aria-describedby="upConflictBody"><h2 id="upConflictTitle">A file with that name is already there</h2>
  <p id="upConflictBody"></p>
  <p id="upConflictMore" class="hint" hidden></p>
  <p id="upAllRow" hidden><label><input type="checkbox" id="upAll"> Apply to all remaining files in this batch</label></p>
  <div class="bar"><button id="upSkip">Skip</button><button id="upOverwrite">Overwrite</button><button id="upRename">Keep both</button><button data-close>Cancel</button></div></dialog>
-<dialog id="dlgTrash" aria-labelledby="trashTitle"><h2 id="trashTitle">Trash</h2>
+<dialog id="dlgTrash" aria-labelledby="trashTitle" aria-describedby="trashWhere"><h2 id="trashTitle">Trash</h2>
  <p id="trashWhere" class="hint">Trash lives in .@qfm_trash on each volume.</p>
  <div id="trashWrap"><table id="trashTable"><thead><tr><th><input type="checkbox" id="trashAll" aria-label="Select all"></th><th>Name</th><th>Original location</th><th>Deleted</th><th>Size</th></tr></thead><tbody id="trashRows"></tbody></table></div>
  <p id="trashEmpty" hidden>Your Trash is empty.</p><p id="trashStatus" role="status"></p>
@@ -143,7 +162,42 @@
  </section>
  <button data-close>Close</button></dialog>
 <dialog id="dlgPrompt" aria-labelledby="promptTitle"><h2 id="promptTitle">Name</h2><label id="promptLabel" for="promptInput">Name</label><input id="promptInput" type="text"><div class="bar"><button id="promptOK">OK</button><button data-close>Cancel</button></div></dialog>
-<dialog id="dlgConfirm" aria-labelledby="confirmTitle"><h2 id="confirmTitle">Confirm</h2><p id="confirmBody"></p><p id="confirmWhy" class="hint" hidden></p><label id="confirmPhraseLabel" for="confirmPhrase" hidden>Type <b id="confirmPhraseName"></b> to confirm <input id="confirmPhrase" type="text"></label><div class="bar"><button id="confirmOK">Confirm</button><button data-close>Cancel</button></div></dialog>
-<dialog id="dlgSession" aria-labelledby="sessionTitle"><h2 id="sessionTitle">Session</h2><p id="sessionDetails"></p><button id="btnLogout">Sign out of this app</button><button data-close>Close</button></dialog>
-<dialog id="dlgShortcuts" aria-labelledby="shortcutsTitle"><h2 id="shortcutsTitle">Browse with the keyboard</h2><p>↑ ↓ / Home / End / Page Up / Page Down: move<br>Shift + movement: extend selection<br>Ctrl + movement: keep selection<br>Space: toggle · Ctrl+A: select all<br>Enter: open · F4: view text · Alt+Enter: properties<br>F9: permissions<br>Delete: move the selection to Trash<br>Ctrl+C / Ctrl+X: mark to copy / move · Ctrl+V: paste here<br>Backspace: parent · Alt+←/→: back/forward<br>Ctrl+L: edit path · /: filter loaded names<br>Ctrl+F: search this folder and below<br>Ctrl+H: hidden files · F5: refresh<br>Shift+F10 / Menu: actions · Esc: clear or close<br>?: shortcuts</p><button data-close>Close</button></dialog>
+<dialog id="dlgConfirm" aria-labelledby="confirmTitle" aria-describedby="confirmBody"><h2 id="confirmTitle">Confirm</h2><p id="confirmBody"></p><p id="confirmWhy" class="hint" hidden></p><label id="confirmPhraseLabel" for="confirmPhrase" hidden>Type <b id="confirmPhraseName"></b> to confirm <input id="confirmPhrase" type="text"></label><div class="bar"><button id="confirmOK">Confirm</button><button data-close>Cancel</button></div></dialog>
+<dialog id="dlgSession" aria-labelledby="sessionTitle" aria-describedby="sessionDetails"><h2 id="sessionTitle">Session</h2><p id="sessionDetails"></p><button id="btnLogout">Sign out of this app</button><button data-close>Close</button></dialog>
+<dialog id="dlgShortcuts" aria-labelledby="shortcutsTitle" aria-describedby="shortcutsIntro"><h2 id="shortcutsTitle">Browse with the keyboard</h2>
+ <p id="shortcutsIntro">Every shortcut has a mouse equivalent, because the QTS desktop swallows some chords. This table is the map: js/keys.js and internal/web/keys_test.mjs keep it and the handlers identical.</p>
+ <div class="tableWrap"><table id="shortcutsTable"><caption class="visually-hidden">Keyboard shortcuts</caption>
+  <thead><tr><th scope="col">Keys</th><th scope="col">What it does</th><th scope="col">Where</th></tr></thead>
+  <tbody>
+   <tr><th scope="row">↑ ↓</th><td>Move the focused row</td><td>File list</td></tr>
+   <tr><th scope="row">Home / End</th><td>First or last row</td><td>File list</td></tr>
+   <tr><th scope="row">Page Up / Page Down</th><td>Move a screen at a time</td><td>File list</td></tr>
+   <tr><th scope="row">Shift + movement</th><td>Extend the selection</td><td>File list</td></tr>
+   <tr><th scope="row">Ctrl + movement</th><td>Move without changing the selection</td><td>File list</td></tr>
+   <tr><th scope="row">Space</th><td>Select or deselect the focused row</td><td>File list</td></tr>
+   <tr><th scope="row">Ctrl+A</th><td>Select everything in this folder</td><td>File list</td></tr>
+   <tr><th scope="row">Enter</th><td>Open the folder or file</td><td>File list</td></tr>
+   <tr><th scope="row">Alt+Enter</th><td>Properties</td><td>File list</td></tr>
+   <tr><th scope="row">F4</th><td>View the file as text</td><td>File list</td></tr>
+   <tr><th scope="row">Shift+F10 / Menu</th><td>Actions for the focused row</td><td>File list</td></tr>
+   <tr><th scope="row">Esc</th><td>Clear the selection</td><td>File list</td></tr>
+   <tr><th scope="row">Type a name</th><td>Jump to the first loaded match</td><td>File list</td></tr>
+   <tr><th scope="row">Delete</th><td>Move the selection to Trash</td><td>Anywhere</td></tr>
+   <tr><th scope="row">F9</th><td>Permissions</td><td>Anywhere</td></tr>
+   <tr><th scope="row">Ctrl+C</th><td>Mark the selection to copy</td><td>Anywhere</td></tr>
+   <tr><th scope="row">Ctrl+X</th><td>Mark the selection to move</td><td>Anywhere</td></tr>
+   <tr><th scope="row">Ctrl+V</th><td>Paste into this folder</td><td>Anywhere</td></tr>
+   <tr><th scope="row">Ctrl+F</th><td>Search this folder and below</td><td>Anywhere</td></tr>
+   <tr><th scope="row">Ctrl+L</th><td>Edit the path</td><td>Anywhere</td></tr>
+   <tr><th scope="row">/</th><td>Filter the names loaded so far</td><td>Anywhere</td></tr>
+   <tr><th scope="row">Ctrl+H</th><td>Show or hide hidden items</td><td>Anywhere</td></tr>
+   <tr><th scope="row">Backspace</th><td>Go to the parent folder</td><td>Anywhere</td></tr>
+   <tr><th scope="row">Alt+←</th><td>Back</td><td>Anywhere</td></tr>
+   <tr><th scope="row">Alt+→</th><td>Forward</td><td>Anywhere</td></tr>
+   <tr><th scope="row">F5</th><td>Refresh this folder</td><td>Anywhere</td></tr>
+   <tr><th scope="row">Esc</th><td>Close the results, the actions menu or the folder drawer</td><td>Anywhere</td></tr>
+   <tr><th scope="row">?</th><td>Open this keyboard map</td><td>Anywhere</td></tr>
+   <tr><th scope="row">Ctrl+R</th><td>Reload the page — always the browser’s own, never intercepted</td><td>Browser</td></tr>
+  </tbody></table></div>
+ <div class="bar"><button data-close>Close</button></div></dialog>
 </body></html>

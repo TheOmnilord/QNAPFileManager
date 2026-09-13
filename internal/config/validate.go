@@ -6,6 +6,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // ErrInvalid wraps every validation failure so a caller can tell a bad config
@@ -16,7 +17,13 @@ var ErrInvalid = errors.New("invalid configuration")
 // deliberately strict: this process runs as root, and a listen address that
 // quietly fell back to 0.0.0.0 because it was unparsable is exactly the kind
 // of failure nobody notices until it matters.
-func (c Config) Validate() error {
+func (c Config) Validate() error { return c.ValidateDev(false) }
+
+// ValidateDev is Validate with the two development relaxations named in the M4
+// contract: auth.mode may be "local" or "both" (§2.2), which exist only for the
+// Windows dev loop. The loopback rule on web.listen is NOT relaxed — there is
+// no override key for it anywhere, in any mode (§13.1).
+func (c Config) ValidateDev(dev bool) error {
 	var problems []string
 	add := func(format string, args ...any) {
 		problems = append(problems, fmt.Sprintf(format, args...))
@@ -25,6 +32,13 @@ func (c Config) Validate() error {
 	if c.Web.Listen == "" {
 		add("web.listen is empty")
 	} else if err := checkAddr(c.Web.Listen); err != nil {
+		add("web.listen: %v", err)
+	} else if err := checkLoopback(c.Web.Listen); err != nil {
+		// The main listener carries the QTS cookie door and is reached through
+		// the QTS reverse proxy; exposing it is exposing the whole app to the
+		// LAN. The break-glass listener is the ONE sanctioned non-loopback
+		// surface, and a second way to expose this one would be a second way to
+		// get it wrong — so there is deliberately no override key (§13.1).
 		add("web.listen: %v", err)
 	}
 	if c.Web.BreakGlass.Enabled {
@@ -46,9 +60,16 @@ func (c Config) Validate() error {
 	}
 
 	switch c.Auth.Mode {
-	case AuthQTS, AuthLocal, AuthBoth:
+	case AuthQTS:
+	case AuthLocal, AuthBoth:
+		// M4 §2.2: the local account moved entirely to its own listener, so it
+		// is no longer a door on the main one. Refused outside -dev, where it
+		// survives only because the Windows loop has no QTS to talk to.
+		if !dev {
+			add("auth.mode %q is refused: the local account is served by the break-glass listener (web.breakGlass), not by web.listen; use %q", c.Auth.Mode, AuthQTS)
+		}
 	case "":
-		add("auth.mode is empty; use %q, %q or %q", AuthQTS, AuthLocal, AuthBoth)
+		add("auth.mode is empty; use %q", AuthQTS)
 	default:
 		add("auth.mode %q is not one of %q, %q, %q", c.Auth.Mode, AuthQTS, AuthLocal, AuthBoth)
 	}
@@ -58,6 +79,14 @@ func (c Config) Validate() error {
 	// advance — the point is that it still works when Apache is broken.
 	if c.Auth.QTSPort < 0 || c.Auth.QTSPort > 65535 {
 		add("auth.qtsPort %d is not a port (0 means read it from uLinux.conf)", c.Auth.QTSPort)
+	}
+	if c.Auth.Local.Cost != 0 && (c.Auth.Local.Cost < MinLocalCost || c.Auth.Local.Cost > MaxLocalCost) {
+		add("auth.local.cost %d is outside %d-%d (0 means %d)", c.Auth.Local.Cost, MinLocalCost, MaxLocalCost, DefaultLocalCost)
+	}
+	if c.Auth.Local.Updated != "" {
+		if _, err := time.Parse(time.RFC3339, c.Auth.Local.Updated); err != nil {
+			add("auth.local.updated %q is not an RFC3339 timestamp", c.Auth.Local.Updated)
+		}
 	}
 
 	if c.Trash.Days < 0 {
@@ -126,6 +155,25 @@ func checkAddr(addr string) error {
 			// being repaired.
 			return fmt.Errorf("%q is not an IP address; use 127.0.0.1 or 0.0.0.0", host)
 		}
+	}
+	return nil
+}
+
+// checkLoopback refuses any address that is not a loopback literal. It is
+// deliberately a whole-address check rather than a host one so the empty host
+// (":8770") — which binds every interface — is caught alongside "0.0.0.0" and
+// "[::]". checkAddr has already rejected hostnames by the time this runs.
+func checkLoopback(addr string) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("%q is not host:port (%v)", addr, err)
+	}
+	if host == "" {
+		return fmt.Errorf("%q binds every interface; the main listener must be loopback (127.0.0.1 or [::1])", addr)
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return fmt.Errorf("%q is not a loopback address; the main listener is reached through the QTS proxy and must bind 127.0.0.0/8 or ::1 (the break-glass listener is the only LAN-facing one)", addr)
 	}
 	return nil
 }

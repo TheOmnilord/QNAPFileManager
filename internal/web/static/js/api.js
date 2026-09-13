@@ -1,6 +1,15 @@
 import {state,update,sessionGuard} from './state.js';
 import {$,announce} from './dom.js';
+import {signInView,showLocalSignIn,hideLocalSignIn,localNotice} from './breakglass.js';
+// atThisDoor is which sign-in the CURRENT listener calls for when there is no
+// session. One classifier, asked by both notices, so the two cannot disagree
+// about which door this page is standing at.
+const atThisDoor = () => signInView({authenticated:false,listener:state.listener});
 export function connectionNotice(title,message) {
+ // At the emergency door a connection failure belongs under the password field.
+ // The QTS panel is not merely unhelpful there — it names a remedy (the QTS
+ // desktop) that may be the very thing the operator came here to repair.
+ if (!state.session && atThisDoor()==='local') { showLocalSignIn(); localNotice(message); return; }
  $('#signin').hidden = false;
  $('#signin h2').textContent = title;
  $('#signin p').textContent = message;
@@ -8,15 +17,24 @@ export function connectionNotice(title,message) {
 }
 export function signInNotice() {
  update({session:null,pages:new Map(),selection:new Set(),total:0,exclude:false,generation:state.generation+1});
- $('#signin').hidden = false;
+ // Which door this page is standing at was answered by the server the last time
+ // /api/session was read, and it does not change under a running page. On the
+ // emergency listener the QTS notice is the one thing that must NEVER appear:
+ // "sign in on the QTS desktop" is the instruction nobody there can follow.
+ $('#signin').hidden = atThisDoor()==='local';
  $('#listRows').replaceChildren(); $('#tree').replaceChildren();
  for (const dialog of document.querySelectorAll('dialog[open]')) dialog.close();
  $('#viewerContent').textContent = ''; $('#propsContent').textContent = '';
  $('#viewerTitle').textContent = ''; $('#viewerNote').textContent = '';
  $('#identity').textContent = ''; $('#sessionDetails').textContent = '';
  $('#pathNotice').textContent = ''; $('#pathNotice').hidden = true;
+ // The two persistent bars describe a SESSION; with no session they describe
+ // nothing (M4 contract §8.3/§8.4). showSession paints them again on the way in.
+ $('#bannerReadonly').hidden = true; $('#bannerBreakGlass').hidden = true;
  $('#mountLinks').replaceChildren(); $('#mountGroup').hidden = true;
  $('#ctxMenu').replaceChildren(); $('#ctxMenu').hidden = true;
+ if (atThisDoor()==='local') { showLocalSignIn(); return; }
+ hideLocalSignIn();
  connectionNotice('Sign in to QTS to continue','Your session has ended. Sign in on the QTS desktop, then retry here.');
 }
 // The server injects the absolute base ("/qnapfilemanager/" behind the QTS

@@ -33,7 +33,65 @@ export function toast(message, actionLabel, onAction, ms = 15000, {warn = false}
  toastTimer = setTimeout(hide, ms);
 }
 export function error(err) { $('#status').textContent = err.message || String(err); announce(err.message || String(err)); }
-export function openDialog(id) { const dialog = $(id); if (!dialog.open) dialog.showModal(); }
+// openDialog remembers the control that opened the dialog so focus can go back
+// to it when the dialog closes (M4 contract §9.2). A keyboard user who pressed
+// F9 on a row must land back on that row, not at the top of the document.
+const dialogOpeners = new WeakMap();
+export function openDialog(id) {
+ const dialog = $(id);
+ if (!dialog || dialog.open) return;
+ dialogOpeners.set(dialog, document.activeElement || null);
+ dialog.showModal();
+}
+// restoreFocus is spent on the dialog's `close` event — the one place every way
+// of closing arrives (Escape, the Close button, a session change closing them
+// all). It is a no-op when the opener has since left the document.
+export function restoreFocus(dialog) {
+ const opener = dialogOpeners.get(dialog);
+ dialogOpeners.delete(dialog);
+ opener?.focus?.();
+}
+// applyWhy puts one whyDisabled verdict on one control, in all four spellings
+// the contract asks for (§7.1): `disabled`, `aria-disabled`, `title`, and an
+// `aria-describedby` pointing at a visually hidden node holding the same
+// sentence — a `title` alone reaches neither a keyboard user nor a screen
+// reader on a disabled button.
+//
+// `also` is a second, control-specific reason to disable — a phrase that has
+// not been typed yet, a destination that is not set, a request in flight. Pass
+// it as the SENTENCE for that reason, because that sentence is then what the
+// control says: describing a button disabled for the phrase with the verdict's
+// "Delete" would be a control that is grey while claiming to be ready (round 1,
+// finding 2). A bare `true` still disables, with a neutral line, so a caller
+// cannot produce a silent grey button by accident.
+export const WHY_UNAVAILABLE = 'This is not available yet.';
+const whyNotes = new Map();
+export function applyWhy(selector, verdict, also = false) {
+ const node = $(selector);
+ if (!node) return verdict;
+ const blocked = also === true ? WHY_UNAVAILABLE : (typeof also === 'string' ? also.trim() : '');
+ const off = !verdict.allowed || !!blocked;
+ // The verdict's own refusal outranks the dialog's: read-only mode is the
+ // reason nothing here can be pressed, whatever else is also unfinished.
+ const sentence = !verdict.allowed ? verdict.sentence : (blocked || verdict.sentence);
+ node.disabled = off;
+ node.setAttribute?.('aria-disabled', String(off));
+ node.title = sentence;
+ const id = `why-${String(selector).replace(/^#/, '')}`;
+ let note = whyNotes.get(id);
+ if (!note) {
+  const host = $('#whyNotes');
+  if (!host) return verdict;
+  note = el('span', {id, class: 'visually-hidden'});
+  host.append(note);
+  whyNotes.set(id, note);
+ }
+ // The described sentence is the one the control is actually showing, not the
+ // verdict's — they differ exactly when the dialog's own reason is what disables.
+ note.textContent = sentence;
+ node.setAttribute?.('aria-describedby', id);
+ return verdict;
+}
 export function pathArgs(entry) { return entry.pathB64 ? {pathB64:entry.pathB64} : {path:entry.path}; }
 export function route(entry) { return entry.pathB64 ? '#b64/' + entry.pathB64 : '#' + entry.path.split('/').map(encodeURIComponent).join('/'); }
 export function parseRoute(hash) {

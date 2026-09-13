@@ -127,7 +127,7 @@ func (s *Server) postSettings(w http.ResponseWriter, r *http.Request, sess *sess
 		// WriteSync's own writeSyncTimeout still bounds the wait.
 		return s.auditor.WriteSync(context.WithoutCancel(r.Context()), audit.Event{
 			Actor: sess.who.User, UID: sess.who.UID, Admin: sess.admin, Root: sess.who.Root,
-			IP: ClientIP(r), Op: "readonly", Phase: "result", Result: result, Code: code,
+			IP: ClientIP(r), Door: sess.door, Op: "readonly", Phase: "result", Result: result, Code: code,
 			Detail: detail, ForceMilestone: true,
 		})
 	}
@@ -137,7 +137,7 @@ func (s *Server) postSettings(w http.ResponseWriter, r *http.Request, sess *sess
 	if s.auditor != nil {
 		if err := s.auditor.WriteSync(r.Context(), audit.Event{
 			Actor: sess.who.User, UID: sess.who.UID, Admin: sess.admin, Root: sess.who.Root,
-			IP: ClientIP(r), Op: "readonly", Phase: "intent",
+			IP: ClientIP(r), Door: sess.door, Op: "readonly", Phase: "intent",
 			Detail: fmt.Sprintf("readOnly=%v", newVal), ForceMilestone: true,
 		}); err != nil {
 			s.fail(w, r, "audit_unavailable", "The change was refused: its audit record could not be saved.", "", err.Error())
@@ -152,11 +152,28 @@ func (s *Server) postSettings(w http.ResponseWriter, r *http.Request, sess *sess
 	//    ACTUALLY on disk (re-read; fail-closed if unreadable) before refusing, so
 	//    the guard and the config can never disagree even on this early-return path,
 	//    exactly as the rollback path does.
+	//
+	//    The value written is a READ-MODIFY-WRITE of the file, never s.cfg
+	//    (round-1 P1-3). s.cfg is the snapshot this process started with, and
+	//    `qnapfilemanager break-glass set-password` writes auth.local into the
+	//    same file from a different process: persisting the snapshot whole would
+	//    silently revert a password the operator had just set — or, worse,
+	//    restore one they had just disabled — as a side effect of flipping a
+	//    switch that has nothing to do with it. Only ReadOnly is ours to change
+	//    here; the daemon never writes auth.local at all.
+	//
+	//    The whole read-modify-write runs under config.Update's CROSS-PROCESS
+	//    lock, because `qnapfilemanager break-glass` writes the same file from
+	//    another process and nothing else makes the pair atomic (round-2 P3-5).
+	//    LoadDev's relaxations travel with it: a daemon started with -dev on an
+	//    auth.mode "local" configuration must still be able to save it
+	//    (round-2 P3-6).
 	if s.ConfigPath != "" {
-		c := s.cfg
-		c.ReadOnly = newVal
-		if err := config.Save(s.ConfigPath, c); err != nil {
-			effective := reconcileReadOnly(s.ConfigPath, prevVal, err, config.Load, s.logger.Printf)
+		if err := config.Update(s.ConfigPath, s.Dev, func(c *config.Config) error {
+			c.ReadOnly = newVal
+			return nil
+		}); err != nil {
+			effective := reconcileReadOnly(s.ConfigPath, prevVal, err, s.loadConfig, s.logger.Printf)
 			s.cfg.ReadOnly = effective
 			if s.guard != nil {
 				s.guard.SetReadOnly(effective)
@@ -186,10 +203,13 @@ func (s *Server) postSettings(w http.ResponseWriter, r *http.Request, sess *sess
 	if err := auditResult("ok", "", fmt.Sprintf("readOnly=%v", newVal)); err != nil {
 		effective := prevVal
 		if s.ConfigPath != "" {
-			c := s.cfg
-			c.ReadOnly = prevVal
-			serr := config.Save(s.ConfigPath, c)
-			effective = reconcileReadOnly(s.ConfigPath, prevVal, serr, config.Load, s.logger.Printf)
+			// The rollback re-reads too, for the same reason the write did: the
+			// file may hold a credential this process has never seen.
+			serr := config.Update(s.ConfigPath, s.Dev, func(c *config.Config) error {
+				c.ReadOnly = prevVal
+				return nil
+			})
+			effective = reconcileReadOnly(s.ConfigPath, prevVal, serr, s.loadConfig, s.logger.Printf)
 		}
 		s.cfg.ReadOnly = effective
 		if s.guard != nil {
@@ -255,4 +275,11 @@ func (s *Server) auditExport(w http.ResponseWriter, r *http.Request, sess *sessi
 	}
 	defer f.Close()
 	_, _ = io.Copy(w, f)
+}
+
+// loadConfig re-reads this daemon's own configuration file with the same
+// validation mode it started under, so a -dev run's reconciliation reads the
+// file rather than failing on it (round-2 P3-6).
+func (s *Server) loadConfig(path string) (config.Config, error) {
+	return config.LoadDev(path, s.Dev)
 }

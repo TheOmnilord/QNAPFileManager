@@ -1,4 +1,5 @@
-import {$,announce,error,openDialog,pathArgs,rawPath,toast} from './dom.js';
+import {$,announce,applyWhy,error,openDialog,pathArgs,rawPath,toast} from './dom.js';
+import {whyDisabled} from './why.js';
 import {state,update,subscribe,sessionGuard} from './state.js';
 import {selectionEntries,extraActions} from './list.js';
 import {renderTree} from './tree.js';
@@ -237,7 +238,16 @@ function paint() {
  const dest=destPath();
  $('#xferSummary').textContent=`${entries.length.toLocaleString()} item(s) → ${dest || 'choose a destination folder'}`;
  const ref=destFull(),bad=destinationInvalid(ref,entries);
- $('#xferOK').disabled=!okEnabled({dest:ref,entries,pending});
+ // The primary button asks the shared table (M4 contract §7.1); the
+ // destination's own validity is the dialog's reason to keep it disabled, and
+ // it says so in the dialog's own words rather than in the table's.
+ const blocked=pending ? 'This transfer is being prepared.'
+  : !dest ? 'Choose a destination folder first.'
+  : !dest.startsWith('/') ? 'Use an absolute path, starting with /.'
+  : bad ? `That folder is one of the items being ${mode==='move' ? 'moved' : 'copied'}, or inside one.`
+  : '';
+ applyWhy('#xferOK',whyDisabled(mode==='move' ? 'move' : 'copy',{readOnly:!state.session?.canWrite,count:entries.length}),
+  !okEnabled({dest:ref,entries,pending}) ? blocked || 'Choose a destination folder first.' : '');
  // A picked folder whose name the field cannot hold verbatim (a newline, and
  // anything an <input> normalises) is still the one that will be used — say so
  // rather than letting the box look authoritative when it is not.
@@ -408,8 +418,8 @@ export function initTransfer() {
  $('#btnCopy').addEventListener('click',() => transferSelection('copy'));
  $('#btnMove').addEventListener('click',() => transferSelection('move'));
  // Context-menu entries, contributed the way actions.js contributes its own.
- extraActions.push({label:'Copy to…',show:() => !!state.session?.canWrite,run:e => openTransfer({mode:'copy',entries:[e],start:state.path})});
- extraActions.push({label:'Move to…',show:() => !!state.session?.canWrite,run:e => openTransfer({mode:'move',entries:[e],start:state.path})});
+ extraActions.push({label:'Copy to…',action:'copy',run:e => openTransfer({mode:'copy',entries:[e],start:state.path})});
+ extraActions.push({label:'Move to…',action:'move',run:e => openTransfer({mode:'move',entries:[e],start:state.path})});
  $('#xferOK').addEventListener('click',() => submit());
  // Editing the field is the ONLY thing that gives up a picked reference.
  $('#xferPath').addEventListener('input',() => { picked=null; highlight(destText()); paint(); });

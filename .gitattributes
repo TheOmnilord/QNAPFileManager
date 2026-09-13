@@ -14,3 +14,5 @@ qpkg/qpkg.cfg text eol=lf
 *.css text eol=lf
 *.js text eol=lf
 *.mjs text eol=lf
+go.mod text eol=lf
+go.sum text eol=lf

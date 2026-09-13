@@ -763,7 +763,13 @@ func TestEmbeddedRouteContract(t *testing.T) {
 		data, _ := assets.ReadFile("static/js/" + file.Name())
 		for _, m := range re.FindAllStringSubmatch(string(data), -1) {
 			route := "/" + m[1]
-			if _, ok := routes[route]; !ok {
+			// Both tables: the break-glass door's two routes exist on the
+			// break-glass listener alone (M4 §2.1), so they are deliberately
+			// absent from the shared table — but the sign-in page that calls
+			// them is embedded like any other asset and must still be checked.
+			_, shared := routes[route]
+			_, door := bgRoutes[route]
+			if !shared && !door {
 				t.Errorf("%s calls unregistered %s", file.Name(), route)
 			}
 			used[route] = true

@@ -6,6 +6,7 @@ import {actionMessage,confirmDialog,runMutation} from './actions.js';
 import {awaitJob,trackJob} from './jobs.js';
 import {loadList,render,revealEntry} from './list.js';
 import {loadTree} from './tree.js';
+import {emptyState} from './empty.js';
 
 // Search (M2-C, contract §3.4). A search is a JOB — it walks trees that can take
 // a minute — so the dialog only submits it; the Operations panel owns the
@@ -331,6 +332,9 @@ async function submit() {
    // A cancelled search reports what it managed before it stopped; saying so is
    // better than throwing away hits the user can already use.
    detail:[result.detail,job.state==='cancelled' ? 'cancelled — partial results' : ''].filter(Boolean).join(' · '),
+   // How many entries the walk actually visited, so a search with no hits can
+   // say what it looked at rather than only what it failed to find (§8.2).
+   visited:Number(result.files) || 0,
    hits,
    // focus is the roving tabindex's position: which row owns the keyboard, and
    // which entry the single-item toolbar actions point at.
@@ -419,7 +423,11 @@ function paintResults() {
  });
  $('#resultsRows').replaceChildren(...rows);
  $('#results').setAttribute('aria-rowcount',String(found.hits.length+1));
- $('#resultsEmpty').hidden=found.hits.length>0;
+ // "No match under /share/Public. 312,004 entries were visited." — the count and
+ // the bound that stopped it, never "nothing found" on its own (§8.1, §8.2).
+ const nothing=emptyState('results',{hits:found.hits.length,root:found.root,visited:found.visited,detail:found.detail});
+ $('#resultsEmpty').hidden=!nothing;
+ if (nothing) $('#resultsEmpty').textContent=[nothing.sentence,nothing.detail].filter(Boolean).join(' ');
  $('#results').hidden=false; $('#list').hidden=true;
  $('#btnResults').hidden=false;
  $('#btnResults').textContent=`Results (${found.hits.length.toLocaleString()})`;

@@ -254,6 +254,29 @@ reporting `none`; (6) a recursive chmod over a hero share containing a nested da
 demands; (7) request 2755 on a file as a non-member owner — the dialog must show one sentence, the setgid one,
 and the audit line must carry the diff.
 
+**M4 status (2026-09-14):** implemented by three Opus agents against `docs/design/m4-contract.md` (backend:
+`internal/breakglass`, the 8771 listener and `break-glass` CLI, `audit.Event.Door`, config lock, loopback-only
+validation, CI single-dependency/`SHA256SUMS`/tag guard; UI: `why.js`, `empty.js`, `banners.js`, `keys.js`,
+`a11y.js`, `narrow.js`, the sign-in form; docs: `identity.md`, `qnap-install.md`, `keyboard.md`,
+`release-checklist.md`, `nas-checklist.md`, `CHANGELOG.md`, README). Four Opus adversarial rounds — 45 findings, all
+accepted and fixed — `docs/reviews/m4-round1..4.md`; **gpt-6-astra has reviewed none of M3 or M4** (paused by the
+owner). What the loop settled beyond the contract: the break-glass listener serves at `/` regardless of the proxy
+prefix; the door has a sign-in form; the daemon never writes `auth.local` and both writers serialise through a
+lock file; a declared-but-unsent body cannot park a connection on 8771 (the wrapper keys on body consumption, every
+route drains); only a wrong password advances the lockout ladder; the certificate is a leaf, generated when the
+password is set, and a running daemon binds the listener when a credential appears; the config lock is `flock`
+on Linux (no stale state), O_EXCL with an age-break only on the dev box. Open for the owner: no
+`LICENSE` file exists (`qpkg.cfg` says MIT); the v1.0.0 tag (annotated, from a green main SHA, never moved).
+
+**To confirm on hardware first (both units), M4:** (1) `break-glass set-password` as root prints a fingerprint and
+`status` agrees; (2) `https://<nas>:8771/` shows the local sign-in form (no QTS notice), the browser's certificate
+warning names the NAS, and a wrong password costs ~0.4 s while the sixth wrong one is announced as locked out; (3)
+signed in through the door, the emergency banner shows and a created folder is `root:root`; (4) the QTS desktop
+window is unaffected (main listener still loopback-only, `netstat` shows 8770 on 127.0.0.1 and 8771 on 0.0.0.0);
+(5) the read-only toggle in Settings does not disturb the break-glass password; (6) the ⋯ overflow at the QTS
+window's default width and every toolbar action reachable in it; (7) keyboard-only navigation of one dialog with
+a screen reader if one is at hand.
+
 - **No automatic trash sweeper yet** (owner, 2026-09-13: "defer janitor"). `trash.days` is validated and carried
   in the config but nothing enforces it; Trash empties only through "Empty Trash…". Trash ownership is left as is.
 

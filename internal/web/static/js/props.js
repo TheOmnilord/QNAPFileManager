@@ -3,7 +3,8 @@ import {$,el,error,announce,openDialog,pathArgs} from './dom.js';
 import {state,sessionGuard} from './state.js';
 import {isDirectory,isSymlink} from './badges.js';
 import {trackJob,awaitJob,cancelJob,formatBytes} from './jobs.js';
-import {aclBadge,capsFor,octal,parseOctal,symbolic} from './perm.js';
+import {aclBadge,octal,parseOctal,symbolic} from './perm.js';
+import {capsSentence} from './why.js';
 
 // The Properties dialog (#dlgProps, Alt+Enter — ui-ux §3.6, M3 contract §8).
 //
@@ -242,13 +243,12 @@ export async function properties(entry) {
 
 // capsHint is the §5.2 sentence, shown as an explanation of a likely refusal
 // and never as a lock: the grid stays editable and the kernel decides (INV-2).
-export function capsHint(session,entry,caps) {
- const resolved = caps && typeof caps.reason === 'string'
-  ? caps
-  : capsFor(session?.uid,session?.groups,!!session?.rootMode,entry || {});
- if (!resolved.reason) return '';
- return `${resolved.reason} You are signed in as ${session?.user ?? 'this user'}.`;
-}
+//
+// It IS the reason table's `capability` sentence (M4 contract §7.1), and there
+// is one of it: why.js owns the wording so the toolbar, the context menu and
+// this dialog cannot drift apart. The name stays because the permissions dialog
+// and its tests have always called it that.
+export function capsHint(session,entry,caps) { return capsSentence(session,entry,caps); }
 
 export function initProps() {
  // The size job belongs to the dialog, so it ends when the dialog does —

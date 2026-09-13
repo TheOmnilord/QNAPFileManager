@@ -157,9 +157,14 @@ func TestHelloThenServe(t *testing.T) {
 	}
 
 	// An op this worker does not implement is "unsupported", never silence.
-	// OpProps is still unimplemented (M3), so it is the honest stand-in now that
-	// mkdir/rename/delete are handled.
-	f = req(t, tr, 7, wproto.OpProps, wproto.StatReq{Path: []byte("/")})
+	//
+	// The op is INVENTED rather than borrowed from the real list. It used to be
+	// OpProps, which was unimplemented at the time — and when M3 implemented it,
+	// this assertion stopped testing anything and started asserting that a
+	// working properties call fails. A placeholder that becomes real is a test
+	// that quietly inverts (the same thing happened to
+	// TestUnknownOpIsUnsupported in internal/workerpool).
+	f = req(t, tr, 7, wproto.Op("no-such-operation"), wproto.StatReq{Path: []byte("/")})
 	if f.Kind != wproto.KindErr || f.Err.Code != "unsupported" {
 		t.Fatalf("unimplemented op = %+v", f)
 	}

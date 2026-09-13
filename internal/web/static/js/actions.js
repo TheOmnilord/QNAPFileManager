@@ -230,6 +230,13 @@ export function actionMessage(err) {
   // dialog offers would help here, so it says what is actually in the way.
   conflict:'Something else — a folder or a link — already has that name here.',
   no_space:'There is not enough free space on the volume for this upload.',
+  // M3. `unsupported` is the honest answer to an operation the system has no
+  // way to perform on THIS object — Linux has no lchmod, so a symlink's own
+  // mode cannot be changed at all; a chown of a link's target is refused
+  // because lchown is the only chown M3 has (contract §1.4) — and to a route
+  // to the inode that does not exist (a network mount, or a 0200 file with no
+  // /proc). It is not a permission problem and must not read like one.
+  unsupported:'The system cannot make that change to this kind of item. A symbolic link has no permissions of its own — change the item it points to instead.',
  };
  if (err.code==='not_empty' && Array.isArray(err.blockers) && err.blockers.length){
   const names = err.blockers.map(b=>b.name).join(', ') + (err.truncated ? ', …' : '');

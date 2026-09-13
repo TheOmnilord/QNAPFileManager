@@ -31,6 +31,11 @@ type resolveStub struct {
 	*fakeBackend
 	blocked string            // an API prefix the user cannot traverse
 	aliases map[string]string // requested dir -> resolved dir
+	// dangling names paths whose FULL resolution fails the way a dangling
+	// symlink's does — the parent resolves, the leaf's target does not. It is
+	// what lets a Windows test exercise the "cannot follow" branch without the
+	// symlink privilege (M3 round 2).
+	dangling map[string]bool
 }
 
 func (rs *resolveStub) Resolve(ctx context.Context, p backend.Principal, name string, followLeaf bool) (string, error) {
@@ -41,6 +46,9 @@ func (rs *resolveStub) Resolve(ctx context.Context, p backend.Principal, name st
 		return "", fs.ErrPermission
 	}
 	if followLeaf {
+		if rs.dangling[name] {
+			return "", fs.ErrNotExist
+		}
 		if v, ok := rs.aliases[name]; ok {
 			return v, nil
 		}

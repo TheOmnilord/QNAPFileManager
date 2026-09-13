@@ -17,7 +17,7 @@
   <button id="btnUpload" disabled>Upload</button><input id="upFile" type="file" multiple hidden>
   <span class="split"><button id="btnDownload" disabled>Download</button><button id="btnDownloadAs" disabled aria-haspopup="menu" aria-expanded="false" aria-label="Download as…" title="Download as…">▾</button>
    <div id="dlMenu" role="menu" aria-label="Download as" hidden><button id="dlZip" role="menuitem">Download as ZIP</button><button id="dlTgz" role="menuitem">Download as tar.gz</button></div></span>
-  <button id="btnView" disabled>View text</button><button id="btnProps" disabled>Properties</button>
+  <button id="btnView" disabled>View text</button><button id="btnProps" disabled>Properties</button><button id="btnPerms" disabled title="Permissions (F9)">Permissions</button>
   <button id="btnRename" disabled>Rename</button><button id="btnCopy" disabled>Copy to…</button><button id="btnMove" disabled>Move to…</button><button id="btnDelete" disabled>Delete</button>
   <button id="btnSearch" disabled title="Search this folder and below (Ctrl+F)">Search…</button><button id="btnResults" hidden>Results</button>
   <button id="btnTrash">Trash</button><button id="btnJobs" aria-controls="jobsPanel" aria-expanded="false">Operations</button>
@@ -51,7 +51,44 @@
  <div id="announce" class="visually-hidden" aria-live="polite"></div>
 </div>
 <dialog id="dlgViewer" aria-labelledby="viewerTitle"><h2 id="viewerTitle">Text viewer</h2><p id="viewerNote"></p><pre id="viewerContent" tabindex="0"></pre><div class="bar"><button id="viewerDownload">Download</button><button data-close>Close</button></div></dialog>
-<dialog id="dlgProps" aria-labelledby="propsTitle"><h2 id="propsTitle">Properties</h2><pre id="propsContent"></pre><p id="propsSize" role="status"></p><div class="bar"><button id="btnCalcSize">Calculate size</button><button data-close>Close</button></div></dialog>
+<dialog id="dlgProps" aria-labelledby="propsTitle"><h2 id="propsTitle">Properties</h2>
+ <div id="propsContent"></div>
+ <h3>Size</h3><p id="propsSize" role="status"></p>
+ <div class="bar"><button id="btnCalcSize">Recount</button><button id="btnStopSize" disabled>Stop</button><button id="propPerms">Permissions…</button><button data-close>Close</button></div></dialog>
+<dialog id="dlgPerms" aria-labelledby="permsTitle"><h2 id="permsTitle">Permissions</h2>
+ <p id="permsApplies"></p>
+ <p id="pAcl" class="banner" hidden></p>
+ <p id="pCaps" class="hint" hidden></p>
+ <table id="permsGrid"><caption class="visually-hidden">Permission bits</caption>
+  <thead><tr><td></td><th scope="col">Read</th><th scope="col">Write</th><th scope="col">Execute</th></tr></thead>
+  <tbody>
+   <tr><th scope="row">Owner</th><td><input type="checkbox" id="pOR" aria-label="Owner read"></td><td><input type="checkbox" id="pOW" aria-label="Owner write"></td><td><input type="checkbox" id="pOX" aria-label="Owner execute"></td></tr>
+   <tr><th scope="row">Group</th><td><input type="checkbox" id="pGR" aria-label="Group read"></td><td><input type="checkbox" id="pGW" aria-label="Group write"></td><td><input type="checkbox" id="pGX" aria-label="Group execute"></td></tr>
+   <tr><th scope="row">Others</th><td><input type="checkbox" id="pTR" aria-label="Others read"></td><td><input type="checkbox" id="pTW" aria-label="Others write"></td><td><input type="checkbox" id="pTX" aria-label="Others execute"></td></tr>
+  </tbody></table>
+ <fieldset id="pSpecialSet"><legend>Special</legend>
+  <label><input type="checkbox" id="pSUID"> setuid</label>
+  <label><input type="checkbox" id="pSGID"> setgid</label>
+  <label><input type="checkbox" id="pSTICKY"> sticky</label>
+ </fieldset>
+ <p class="permsOctal"><label for="pOctal">Octal</label> <input id="pOctal" type="text" inputmode="numeric" placeholder="mixed" autocomplete="off" spellcheck="false" maxlength="4"> <span>Symbolic: <span id="pSymbolic"></span></span></p>
+ <p class="permsId"><label for="pOwner">Owner</label> <select id="pOwner" disabled></select> <input id="pOwnerId" type="text" inputmode="numeric" aria-label="Owner id (uid)" placeholder="uid" autocomplete="off" disabled> <label><input type="checkbox" id="pOwnerChange"> Change owner</label></p>
+ <p class="permsId"><label for="pGroup">Group</label> <select id="pGroup" disabled></select> <input id="pGroupId" type="text" inputmode="numeric" aria-label="Group id (gid)" placeholder="gid" autocomplete="off" disabled> <label><input type="checkbox" id="pGroupChange"> Change group</label></p>
+ <p id="pIdsNote" class="hint" hidden></p>
+ <p><label><input type="checkbox" id="pRecursive"> Apply to all contents, recursively</label></p>
+ <fieldset id="pApplySet"><legend>Apply to</legend>
+  <label><input type="radio" name="pApply" id="pApplyAll" value="all" checked disabled> Everything</label>
+  <label><input type="radio" name="pApply" id="pApplyFiles" value="files" disabled> Files only</label>
+  <label><input type="radio" name="pApply" id="pApplyDirs" value="dirs" disabled> Folders only</label>
+ </fieldset>
+ <p><label><input type="checkbox" id="pSmartX" checked disabled> Use 0644 for files and 0755 for folders</label></p>
+ <p><label><input type="checkbox" id="pFollowLinks" disabled> Follow this symbolic link and change its target instead</label></p>
+ <p id="pRecursiveNote" class="hint" hidden>A recursive change follows the selected folder to its target but never follows symbolic links inside it, and there is no undo.</p>
+ <p id="pImpact" role="status"></p>
+ <p id="pWarn" class="banner" hidden></p>
+ <div id="pDiff" class="banner" role="status" hidden></div>
+ <p id="permsError" class="banner" role="alert" hidden></p>
+ <div class="bar"><button id="pApply">Apply</button><button id="pRecount">Recount</button><button id="pStopImpact">Stop</button><button data-close>Cancel</button></div></dialog>
 <dialog id="dlgDelete" aria-labelledby="delTitle"><h2 id="delTitle">Move to Trash</h2><p id="delBody"></p><p id="delNote" class="banner" hidden></p><p id="delWhy" class="hint" hidden></p>
  <p><label><input type="checkbox" id="delPermanent"> Delete permanently (cannot be undone)</label></p>
  <p id="delCrossRow" hidden><label><input type="checkbox" id="delCross" checked> Include mounted sub-folders</label></p>
@@ -108,5 +145,5 @@
 <dialog id="dlgPrompt" aria-labelledby="promptTitle"><h2 id="promptTitle">Name</h2><label id="promptLabel" for="promptInput">Name</label><input id="promptInput" type="text"><div class="bar"><button id="promptOK">OK</button><button data-close>Cancel</button></div></dialog>
 <dialog id="dlgConfirm" aria-labelledby="confirmTitle"><h2 id="confirmTitle">Confirm</h2><p id="confirmBody"></p><p id="confirmWhy" class="hint" hidden></p><label id="confirmPhraseLabel" for="confirmPhrase" hidden>Type <b id="confirmPhraseName"></b> to confirm <input id="confirmPhrase" type="text"></label><div class="bar"><button id="confirmOK">Confirm</button><button data-close>Cancel</button></div></dialog>
 <dialog id="dlgSession" aria-labelledby="sessionTitle"><h2 id="sessionTitle">Session</h2><p id="sessionDetails"></p><button id="btnLogout">Sign out of this app</button><button data-close>Close</button></dialog>
-<dialog id="dlgShortcuts" aria-labelledby="shortcutsTitle"><h2 id="shortcutsTitle">Browse with the keyboard</h2><p>↑ ↓ / Home / End / Page Up / Page Down: move<br>Shift + movement: extend selection<br>Ctrl + movement: keep selection<br>Space: toggle · Ctrl+A: select all<br>Enter: open · F4: view text · Alt+Enter: properties<br>Delete: move the selection to Trash<br>Ctrl+C / Ctrl+X: mark to copy / move · Ctrl+V: paste here<br>Backspace: parent · Alt+←/→: back/forward<br>Ctrl+L: edit path · /: filter loaded names<br>Ctrl+F: search this folder and below<br>Ctrl+H: hidden files · F5: refresh<br>Shift+F10 / Menu: actions · Esc: clear or close<br>?: shortcuts</p><button data-close>Close</button></dialog>
+<dialog id="dlgShortcuts" aria-labelledby="shortcutsTitle"><h2 id="shortcutsTitle">Browse with the keyboard</h2><p>↑ ↓ / Home / End / Page Up / Page Down: move<br>Shift + movement: extend selection<br>Ctrl + movement: keep selection<br>Space: toggle · Ctrl+A: select all<br>Enter: open · F4: view text · Alt+Enter: properties<br>F9: permissions<br>Delete: move the selection to Trash<br>Ctrl+C / Ctrl+X: mark to copy / move · Ctrl+V: paste here<br>Backspace: parent · Alt+←/→: back/forward<br>Ctrl+L: edit path · /: filter loaded names<br>Ctrl+F: search this folder and below<br>Ctrl+H: hidden files · F5: refresh<br>Shift+F10 / Menu: actions · Esc: clear or close<br>?: shortcuts</p><button data-close>Close</button></dialog>
 </body></html>

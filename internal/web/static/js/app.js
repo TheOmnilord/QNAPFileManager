@@ -4,6 +4,8 @@ import {state,update,sessionGuard,listingActions,sessionTransition} from './stat
 import {initList,loadList} from './list.js';
 import {loadTree} from './tree.js';
 import {initViewer} from './viewer.js';
+import {initProps} from './props.js';
+import {initPerms,openPermsForSelection} from './perms.js';
 import {initActions,deleteSelection} from './actions.js';
 import {initTransfer,markClipboard,pasteHere} from './transfer.js';
 import {initUpload} from './upload.js';
@@ -78,7 +80,9 @@ export function showSession(session) {
   if (session.groupsIncomplete) $('#announce').textContent='Warning: supplementary groups are incomplete.';
   navigate(); loadTree(); pollJobs();
 }
-initList(); initViewer(); initActions(); initTransfer(); initUpload(); initSearch(); initJobs(); initTrash(); initSettings();
+// initPerms runs after initActions so the context menu keeps the §3.3 order:
+// Rename… and Delete first, then Permissions… — extraActions is appended to.
+initList(); initViewer(); initProps(); initActions(); initPerms(); initTransfer(); initUpload(); initSearch(); initJobs(); initTrash(); initSettings();
 $('.skip').addEventListener('click',ev => { ev.preventDefault(); $('#list').focus(); });
 window.addEventListener('hashchange',navigate);
 $('#btnRetry').addEventListener('click',connect);
@@ -127,6 +131,10 @@ document.addEventListener('keydown',ev => {
  }
  else if (ctrl && ev.key.toLowerCase()==='h') { ev.preventDefault(); $('#chkHidden').checked=!state.hidden; hidden(); }
  else if (ev.key==='Delete') { ev.preventDefault(); deleteSelection(); }
+ // F9 is the permissions dialog (ui-ux §3.9). It lives here rather than in the
+ // list's own key handler because perms.js resolves the selection through
+ // list.js, and list.js importing it back would close a cycle for no gain.
+ else if (ev.key==='F9') { ev.preventDefault(); openPermsForSelection(); }
  else if (ev.key==='F5') { ev.preventDefault(); loadList(); }
  else if (ev.key==='Backspace') { ev.preventDefault(); up(); }
  else if (ev.altKey && ev.key==='ArrowLeft') { ev.preventDefault(); history.back(); }

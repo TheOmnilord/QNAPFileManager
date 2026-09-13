@@ -598,6 +598,15 @@ func (e *RemoteError) Unwrap() error {
 		return fs.ErrExist
 	case "not_empty":
 		return syscall.ENOTEMPTY
+	case "conflict":
+		// A job id that is already running on this worker (session.beginJob
+		// answers EBUSY, which fsx.Code calls "conflict"). It was the fourth
+		// instance of the owner_unset/too_large/changed gap and it was found by
+		// the M3 code-coverage table rather than by a NAS: without this case the
+		// front-end answered 500 for a collision it already knows how to report
+		// as 409. Like ENOTEMPTY above, syscall.EBUSY is defined on Windows too,
+		// so fsx.Code maps it back to "conflict" on both platforms.
+		return syscall.EBUSY
 	case "bad_request":
 		return fsx.ErrBadName
 	case "protected":

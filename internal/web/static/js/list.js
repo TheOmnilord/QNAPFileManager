@@ -2,7 +2,8 @@ import {api} from './api.js';
 import {$,el,error,pathArgs,route,heightRule,announce} from './dom.js';
 import {state,update,selected,countSelected,subscribe,sessionGuard,listingActions} from './state.js';
 import {nameCell,isDirectory,isReadable,isSymlink,hasTarget,fileTarget,actionHint,directoryNotice} from './badges.js';
-import {view,download,properties,downloadMode,downloadArchive} from './viewer.js';
+import {view,download,downloadMode,downloadArchive} from './viewer.js';
+import {properties} from './props.js';
 // pathBytes is the byte spelling of a path reference. It lives in transfer.js
 // because that is where the rule was first needed (a destination that IS one of
 // the copied items), and there must be exactly one of it: two implementations
@@ -208,6 +209,12 @@ export function refreshToolbar() {
  $('#btnUpload').title = canWrite ? 'Upload files into this folder (or drop them on the list)' : ro;
  // Searching is reading: it needs a session, never write permission.
  $('#btnSearch').disabled = false;
+ // Permissions acts on the WHOLE selection — a recursive chmod over several
+ // roots is one job — so it needs a selection and write permission, and never
+ // the owner arithmetic: that is a hint the dialog shows, not a lock (PLAN
+ // decision 12, M3 contract §5.2).
+ $('#btnPerms').disabled = !canWrite || n < 1;
+ $('#btnPerms').title = !canWrite ? ro : (n < 1 ? 'Select items to change permissions.' : 'Permissions (F9)');
  $('#btnRename').disabled = !canWrite || !one;
  $('#btnRename').title = !canWrite ? ro : (!one ? 'Select one item to rename.' : 'Rename');
  $('#btnDelete').disabled = !canWrite || n < 1;
@@ -420,7 +427,7 @@ export function contextMenu(e) {
 
 export function initList() {
  subscribe(() => {
-  if (!state.session) { for (const id of ['#btnDownload','#btnDownloadAs','#btnView','#btnProps','#btnMkdir','#btnUpload','#btnRename','#btnDelete','#btnCopy','#btnMove','#btnSearch']) $(id).disabled=true; topHeight?.(0); bottomHeight?.(0); }
+  if (!state.session) { for (const id of ['#btnDownload','#btnDownloadAs','#btnView','#btnProps','#btnPerms','#btnMkdir','#btnUpload','#btnRename','#btnDelete','#btnCopy','#btnMove','#btnSearch']) $(id).disabled=true; topHeight?.(0); bottomHeight?.(0); }
   else refreshToolbar();
  });
  topHeight = heightRule('#listSpacer'); bottomHeight = heightRule('#listTail');

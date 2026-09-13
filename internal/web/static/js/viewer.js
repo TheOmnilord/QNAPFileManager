@@ -159,21 +159,7 @@ export async function view(entry) {
   $('#viewerNote').textContent = `${data.bytes.toLocaleString()} bytes · ${data.mode} · read-only${data.truncated ? ' · Preview truncated' : ''}`;
  } catch(err) { if (valid() && $('#dlgViewer').open && current === entry) { $('#viewerContent').textContent = err.message; error(err); } }
 }
-// propsEntry is what the Properties dialog is currently showing, so "Calculate
-// size" (jobs.js) knows what to measure without viewer.js importing the job
-// module — which would close an import cycle through list.js.
-let propsEntry = null;
-export const propsTarget = () => propsEntry;
-export async function properties(entry) {
- if (!entry) return;
- const valid=sessionGuard();
- try {
-  const data = await api('api/fs/stat',pathArgs(entry));
-  if (!valid()) return;
-  propsEntry = entry;
-  $('#propsContent').textContent = Object.entries(data).map(([k,v]) => `${k}: ${v}`).join('\n');
-  $('#propsSize').textContent = ''; $('#btnCalcSize').disabled = false;
-  openDialog('#dlgProps');
- } catch(err) { if (valid()) error(err); }
-}
+// The Properties dialog moved to props.js in M3: it is no longer a dump of
+// /api/fs/stat but the structured §3.6 dialog over /api/fs/properties, with a
+// streaming size job of its own. Nothing here owned any of that.
 export function initViewer() { $('#viewerDownload').addEventListener('click',() => download(current)); }

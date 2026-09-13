@@ -1,9 +1,8 @@
 import {api} from './api.js';
-import {$,el,error,announce,pathArgs} from './dom.js';
+import {$,el,error,announce} from './dom.js';
 import {state,sessionGuard} from './state.js';
 import {loadList} from './list.js';
 import {loadTree} from './tree.js';
-import {propsTarget} from './viewer.js';
 import {mergeJobs} from './upload.js';
 
 // The jobs panel (ui-ux §3.4): a right-side drawer listing every operation this
@@ -147,7 +146,49 @@ let primed = false;
 // entry (below) and upload.js reloads the listing once when its queue drains —
 // the rule is the same rule, applied on the side that owns the work. `search`
 // is deliberately absent: it changes nothing (contract §3.4).
-const REFRESH_KINDS = new Set(['delete','trash-restore','trash-empty','copy','move','upload']);
+//
+// `chmod` and `chown` join it in M3: both change the Mode and Owner columns of
+// every row they touched, and a listing that still shows the old ones is a
+// listing that disagrees with the kernel about the thing this app exists to
+// show (M3 contract §12).
+const REFRESH_KINDS = new Set(['delete','trash-restore','trash-empty','copy','move','upload','chmod','chown']);
+
+// DETAIL_KINDS are the jobs whose warning list holds TWO different things, so
+// "warnings" would be wrong for half of it and "skipped items" for the other
+// half. Partial success is the normal outcome of a recursive permissions change
+// (contract §4.2) — "Changed 412 of 8,003 items. 7,591 are owned by other users
+// and were skipped." — but an `unchanged` line is not one of those 7,591: it is
+// an entry that WAS changed and on which the kernel landed somewhere else (a
+// dropped setgid, a groupmask chmod). Calling that a skip would tell an
+// operator the file was untouched when its mode had just been rewritten.
+const DETAIL_KINDS = new Set(['chmod','chown']);
+
+// warningsLabel is the expander's summary, capped at the first 100 warnings the
+// server folds into the result (WarnCap, §4.4).
+export function warningsLabel(job) {
+ const count = Number(job?.warningCount || 0);
+ return DETAIL_KINDS.has(job?.kind)
+  ? `Show details (${count.toLocaleString()})`
+  : `Show warnings (${count.toLocaleString()})`;
+}
+
+// warningCode picks the code out of a formatted warning line. jobs.formatWarn
+// writes "<path>: <message> (<code>)" and omits the parenthesis only when the
+// message IS the code, so the trailing group is the code whenever there is one.
+export function warningCode(warning) {
+ return /\(([a-z][a-z0-9_]*)\)\s*$/.exec(String(warning ?? ''))?.[1] || '';
+}
+
+// warningLine classifies one line of a job's warning list and gives it a word.
+// The word matters: §4.1 forbids a colour-only signal, and "changed" and
+// "skipped" are opposite facts about the same file.
+export function warningLine(job,warning) {
+ const text = String(warning ?? '');
+ if (!DETAIL_KINDS.has(job?.kind)) return {kind:'warning',tag:'',text};
+ return warningCode(text) === 'unchanged'
+  ? {kind:'unchanged',tag:'Changed, not as asked:',text}
+  : {kind:'skipped',tag:'Skipped:',text};
+}
 
 // localJobs are operations this TAB is performing that the server has no job
 // for — uploads, which are a stream of bytes into one route rather than a job
@@ -219,9 +260,15 @@ function jobRow(job) {
  if (job.error && job.state === 'failed') row.append(el('p',{class:'jobNote'},job.error));
  if (job.warningCount) {
   const box = el('details',{id:`jobErrors-${job.id}`,class:'errbox'});
-  box.append(el('summary',{},`Show warnings (${job.warningCount.toLocaleString()})`));
+  box.append(el('summary',{},warningsLabel(job)));
   const list = el('ul',{});
-  for (const warning of job.warnings || []) list.append(el('li',{},warning));
+  for (const warning of job.warnings || []) {
+   const {kind,tag,text} = warningLine(job,warning);
+   const item = el('li',{class:`warnItem warn-${kind}`});
+   if (tag) item.append(el('span',{class:'warnTag'},tag),' ');
+   item.append(text);
+   list.append(item);
+  }
   if (job.warningCount > (job.warnings || []).length) list.append(el('li',{},`… and ${(job.warningCount-(job.warnings||[]).length).toLocaleString()} more`));
   box.append(list); row.append(box);
  }
@@ -350,32 +397,14 @@ export async function awaitJob(id,{tries=1200,delay=500} = {}) {
  return null;
 }
 
-// calculateSize runs a size job for whatever the Properties dialog is showing
-// and fills the result in when it finishes (ui-ux §3.6). The job is visible in
-// the panel like any other, so a measurement of a huge tree can be cancelled.
-export async function calculateSize() {
- const entry = propsTarget();
- if (!entry) return;
- const valid = sessionGuard();
- $('#btnCalcSize').disabled = true; $('#propsSize').textContent = 'Calculating…';
- try {
-  const res = await api('api/jobs/size',{},{method:'POST',headers:{'Content-Type':'application/json'},
-   body:JSON.stringify({paths:[pathArgs(entry)],crossMounts:state.session?.family==='quts_hero'})});
-  if (!valid()) return;
-  trackJob(res.job);
-  const job = await awaitJob(res.job.id);
-  if (!valid() || propsTarget() !== entry) return;
-  if (!job) { $('#propsSize').textContent = 'Still measuring — see Operations.'; return; }
-  if (job.state !== 'done') { $('#propsSize').textContent = job.note || job.error || `Measurement ${job.state}.`; return; }
-  const result = job.result || {};
-  $('#propsSize').textContent = `${formatBytes(result.bytes||0)} in ${(result.files||0).toLocaleString()} file(s) and ${(result.dirs||0).toLocaleString()} folder(s)`;
- } catch(err) { if (valid()) { $('#propsSize').textContent = err.message; error(err); } }
- finally { if (valid()) $('#btnCalcSize').disabled = false; }
-}
+// The size job that fills the Properties dialog and #pImpact used to live here.
+// It moved to props.js (createSizeRunner) when M3 gave it a cancel-on-close and
+// a second caller: a runner that owns exactly one job, with its collaborators
+// injected, is testable — and "the du over a 12 TB share is still walking after
+// its dialog closed" is not a thing a screenshot shows.
 
 export function initJobs() {
  poller = createPoller({load:refreshJobs});
- $('#btnCalcSize').addEventListener('click',calculateSize);
  $('#btnJobs').addEventListener('click',() => { const open = $('#jobsPanel').hidden; panelOpen(open); if (open) pollJobs(); });
  $('#btnJobsClose').addEventListener('click',() => panelOpen(false));
  $('#btnJobsClear').addEventListener('click',async () => {

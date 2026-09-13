@@ -173,6 +173,34 @@ func (s *session) jobWork(ctx context.Context, req wproto.JobReq, e *progEmitter
 		// contract §3.2).
 		return fsops.Search(ctx, s.root, s.plat, body, emit)
 
+	case wproto.JobChmod:
+		var body wproto.ChmodJobReq
+		if err := jobBody(req.Body, &body); err != nil {
+			return wproto.JobResult{}, err
+		}
+		// The two specs go over whole: "apply to files only" is a zero mask on
+		// the other half, not a mode this has to interpret (M3 contract §1.2),
+		// and the recursive special-bit refusal is the engine's so that no
+		// caller — this one included — can route around it.
+		return fsops.ChmodTree(ctx, s.root, s.plat, pathsOf(body.Paths), fsops.ChmodOptions{
+			Files:       body.Files,
+			Dirs:        body.Dirs,
+			Recursive:   body.Recursive,
+			CrossMounts: body.CrossMounts,
+		}, emit)
+
+	case wproto.JobChown:
+		var body wproto.ChownJobReq
+		if err := jobBody(req.Body, &body); err != nil {
+			return wproto.JobResult{}, err
+		}
+		return fsops.ChownTree(ctx, s.root, s.plat, pathsOf(body.Paths), fsops.ChownOptions{
+			UID:         body.UID,
+			GID:         body.GID,
+			Recursive:   body.Recursive,
+			CrossMounts: body.CrossMounts,
+		}, emit)
+
 	case wproto.JobTrashRestore:
 		var body wproto.TrashRestoreReq
 		if err := jobBody(req.Body, &body); err != nil {

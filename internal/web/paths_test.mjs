@@ -4,7 +4,13 @@ import {test} from 'node:test';
 import {pathArgs,route,parseRoute,rawPath,bytePath} from './static/js/dom.js';
 import {fileTarget,isDirectory,isReadable} from './static/js/badges.js';
 import {contextMenu,open} from './static/js/list.js';
-import {download,view,properties} from './static/js/viewer.js';
+import {download,view} from './static/js/viewer.js';
+// The properties dialog moved to props.js in M3 (contract §8): it is no longer
+// a dump of /api/fs/stat but the structured §3.6 dialog over
+// /api/fs/properties. The byte rule it is asserted against is unchanged — the
+// request names the LINK, not the link's target, because properties describes
+// the entry that was asked about.
+import {properties} from './static/js/props.js';
 
 test('hash routes preserve authoritative bytes and accept text and legacy bookmarks', () => {
  const raw='/share/\xff/\xfe #?.txt', entry=bytePath(raw);

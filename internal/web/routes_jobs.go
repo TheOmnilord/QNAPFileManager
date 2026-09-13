@@ -334,10 +334,27 @@ func jobErrorMessage(code string) string {
 	return backendMessage(code)
 }
 
-// jobWarnMessage is the published wording for ONE item's failure. The worker's
+// jobWarnMessage is the published wording for ONE item's outcome. The worker's
 // own message is logged, never served: it is the kernel's text about a resolved
 // path (W4).
-func jobWarnMessage(code string) string {
+//
+// op is the JOB KIND, because several codes mean different things to different
+// engines and the wrong sentence is worse than none. "unsupported" from a copy
+// is "this kind of item cannot be copied"; from a chmod it is a symlink, which
+// has no mode of its own. "changed" from a copy is a file that moved under the
+// reader; from a permissions walk it is an entry that was replaced between the
+// scan and the call. A permissions job's own "unchanged" — the kernel did it,
+// but not as asked — has no generic wording at all and is handled by the caller
+// (modeWarnMessage), because the only honest sentence is the worker's own.
+func jobWarnMessage(op, code string) string {
+	if isModeJob(op) {
+		switch code {
+		case "unsupported":
+			return "This item was skipped: a symbolic link has no permissions of its own, or it is hard-linked elsewhere — change it by naming it directly."
+		case "changed":
+			return "This item changed while the job was running and was skipped."
+		}
+	}
 	switch code {
 	case "":
 		return "This item could not be processed."
@@ -404,11 +421,48 @@ func (s *Server) progressSink(jr jobRoots, p *jobs.Progress) func(wproto.Prog) {
 func (s *Server) warnSink(jr jobRoots, op, id string, p *jobs.Progress) func(wproto.Warn) {
 	return func(wn wproto.Warn) {
 		// The worker's spelling and its message stay server-side; the job
-		// publishes the requested path, the code, and the code's own wording.
+		// publishes the requested path, the code, and the code's own wording —
+		// except for a permissions job's per-entry DIFF, where the worker's
+		// sentence is the answer and a generic one would invert the meaning
+		// (M3 contract §3.3; see modeWarnMessage).
 		s.logger.Printf("job %s op=%q warning path=%q code=%q: %s", id, op, string(wn.Path), wn.Code, wn.Message)
-		p.Warn(jr.mapPath(string(wn.Path)), wn.Code, jobWarnMessage(wn.Code))
+		message := jobWarnMessage(op, wn.Code)
+		if isModeJob(op) && wn.Code == "unchanged" {
+			message = modeWarnMessage(wn.Message)
+		}
+		p.Warn(jr.mapPath(string(wn.Path)), wn.Code, message)
 	}
 }
+
+// isModeJob reports whether a job kind is one of M3's permissions walks, whose
+// per-entry vocabulary differs from the copy engine's.
+func isModeJob(op string) bool { return op == "chmod" || op == "chown" }
+
+// modeWarnMessage publishes the worker's own sentence for one entry the kernel
+// changed differently than asked (code "unchanged", M3 contract §3.3/§4.4).
+//
+// It is the ONE place a worker's Warn.Message is served rather than logged, and
+// it is deliberate: the sentence IS the finding — "the setgid bit was not
+// applied: you are not a member of group team" — and no code-derived wording can
+// say it. Publishing it as a generic failure would be the inversion §3.3 forbids:
+// a call that succeeded, reported as one that did not.
+//
+// Serving it is therefore fenced. The M3 sentences are path-free by construction
+// (perm.Diff carries modes and ids, never names), so a message that contains a
+// path separator is not one of them and is refused rather than trusted; so is an
+// empty one. What is served is clipped, because a Warn frame's length is the
+// worker's choice and the job view is retained.
+func modeWarnMessage(raw string) string {
+	const fallback = "The kernel did not apply this item's change exactly as asked."
+	if raw == "" || strings.ContainsAny(raw, "/\\") {
+		return fallback
+	}
+	return clipUTF8(raw, maxModeWarnBytes)
+}
+
+// maxModeWarnBytes bounds one published diff sentence. The contract's own are
+// well under it; anything longer is not a sentence.
+const maxModeWarnBytes = 240
 
 // --- the start-of-job guard re-check (finding W1) -----------------------------
 

@@ -1296,6 +1296,13 @@ func TestACancelledStartupStillChargesTheRestartBudget(t *testing.T) {
 	}
 }
 
+// TestUnknownOpIsUnsupported: the Op vocabulary is closed, so a frame naming
+// something this worker does not implement is refused rather than interpreted.
+//
+// The op is deliberately invented rather than borrowed from the real list. It
+// used to be OpChmod, which was unimplemented at the time — and when M3
+// implemented it, this test stopped testing anything and started performing a
+// real chmod inside the fixture instead.
 func TestUnknownOpIsUnsupported(t *testing.T) {
 	p, _ := testPool(t, nil)
 	c, err := p.acquire(context.Background(), alice())
@@ -1303,7 +1310,7 @@ func TestUnknownOpIsUnsupported(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer p.release(c)
-	_, _, err = p.call(context.Background(), c, wproto.OpChmod, wproto.ChmodReq{Path: []byte("/top.txt"), Mode: 0o644})
+	_, _, err = p.call(context.Background(), c, wproto.Op("no-such-operation"), struct{}{})
 	if !errors.Is(err, fsx.ErrUnsupported) {
 		t.Fatalf("err = %v, want ErrUnsupported", err)
 	}

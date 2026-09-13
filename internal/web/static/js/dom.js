@@ -9,11 +9,16 @@ export function announce(message) { $('#announce').textContent = message; }
 // toast shows a transient message with one optional action (ui-ux §4.4: a
 // trashed item's Undo lives here for 15 seconds). Only one is shown at a time;
 // a new one replaces the old, and dismissing cancels the timer.
+// `warn` marks a toast that reports something that did NOT go as asked — a
+// chmod whose setgid bit the kernel dropped, say (M3 contract §3.3). Such a
+// call succeeded, so it is not an error; it is also not a success, and showing
+// it in the same clothes as one would be the lie the diff exists to prevent.
 let toastTimer = null;
-export function toast(message, actionLabel, onAction, ms = 15000) {
+export function toast(message, actionLabel, onAction, ms = 15000, {warn = false} = {}) {
  const box = $('#toast'); if (!box) return;
  if (toastTimer) { clearTimeout(toastTimer); toastTimer = null; }
- const hide = () => { if (toastTimer) { clearTimeout(toastTimer); toastTimer = null; } box.hidden = true; box.replaceChildren(); };
+ const hide = () => { if (toastTimer) { clearTimeout(toastTimer); toastTimer = null; } box.hidden = true; box.replaceChildren(); box.classList.remove('warn'); };
+ box.classList.toggle('warn', !!warn);
  box.replaceChildren(el('span', {}, message));
  if (actionLabel && onAction) {
   const button = el('button', {class:'toastAction'}, actionLabel);

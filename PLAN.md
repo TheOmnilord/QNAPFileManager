@@ -234,6 +234,26 @@ NFSv4 trivial/non-trivial judgement; the ACL badge reports a state (`none|posix|
 boolean; an unknown `aclmode` is treated as `discard`; a recursive chmod may clear but never set a special bit; M3
 adds no wire error codes and pays for that with a code-coverage table test.
 
+**M3 status (2026-09-13/14):** implemented by three Opus agents against the contract (engine `internal/perm`,
+`fsops/mode*.go`, `props.go`, `aclstate*.go`; routes `routes_perm.go`; UI `perm.js`/`perms.js`/`props.js`).
+Reviewed in five Opus adversarial rounds — 31 findings, 30 accepted and fixed, one recorded as M1 behaviour —
+`docs/reviews/m3-round1..5.md`; **gpt-6-astra has reviewed neither the contract nor the change** (paused by the
+owner), so M3 is not hardware-signed until those passes run. What the loop settled beyond the contract: recursive
+roots resolve to their targets and mount-point roots are descended (every hero share is one); a root worker skips
+hard-linked files it did not name; with crossing, the ladder is the worst dataset below the roots and names it;
+chown ids are bounded to uid_t; the recursive job's diff sentences travel as details, not skips; `NFS4State`
+tolerates NUL-counted and unpadded encoders and refuses trailing bytes; the node tests run in CI.
+
+**To confirm on hardware first (both units), M3:** (1) `zfs get -Hp -o value aclmode` as root on hero for an
+ordinary share — an empty answer makes every hero chmod L2; (2) list an ordinary hero share and confirm the ACL
+badge is absent on plain files (`nfs4-trivial`) — if every row badges, the on-disk `system.nfs4_acl` encoding is
+the reason and `internal/perm.NFS4State` is the one-line fix; (3) the dataset name in an L2 sentence against
+`zfs list`; (4) a chmod through `/share/Public` → `/share/CACHEDEV1_DATA/Public` — a `changed` refusal means the
+front end's resolution is not happening; (5) a QTS share reporting `ACLBackend == "posix"` with an ordinary file
+reporting `none`; (6) a recursive chmod over a hero share containing a nested dataset — which grade the dialog
+demands; (7) request 2755 on a file as a non-member owner — the dialog must show one sentence, the setgid one,
+and the audit line must carry the diff.
+
 - **No automatic trash sweeper yet** (owner, 2026-09-13: "defer janitor"). `trash.days` is validated and carried
   in the config but nothing enforces it; Trash empties only through "Empty Trash…". Trash ownership is left as is.
 

@@ -119,7 +119,15 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request, sess *session) {
 		s.fail(w, r, "bad_request", "Invalid listing options.", p, "")
 		return
 	}
-	listing, err := s.backend.List(r.Context(), sess.who, p, fsx.ListOptions{Offset: offset, Limit: limit, Sort: sort, Desc: desc, ShowHidden: hidden, ShowVolumeRoots: volumes, ResolveLinks: true})
+	// ACLProbe fills Entry.ACL so the name cell can carry the ACL badge (M3
+	// contract §6.2). It is asked for unconditionally because the WORKER is what
+	// knows whether it is worth doing: it probes only where the mount has an ACL
+	// backend at all, and bounds the page at ACLProbeMaxEntries entries and
+	// ACLProbeMaxBytes of attribute data. On ext4 with no ACLs that is one
+	// lgetxattr per entry answering ENODATA; on a mount with no backend it is
+	// nothing. Without this the badge is inert, which is how it shipped in the
+	// first M3 round.
+	listing, err := s.backend.List(r.Context(), sess.who, p, fsx.ListOptions{Offset: offset, Limit: limit, Sort: sort, Desc: desc, ShowHidden: hidden, ShowVolumeRoots: volumes, ResolveLinks: true, ACLProbe: true})
 	if err != nil {
 		s.backendError(w, r, p, err)
 		return
@@ -359,16 +367,8 @@ func (s *Server) text(w http.ResponseWriter, r *http.Request, sess *session) {
 	writeJSON(w, map[string]any{"content": string(content), "bytes": len(content), "truncated": truncated, "binary": binary, "mode": e.Mode, "mtime": e.MTime, "etag": etag})
 }
 
-func (s *Server) identities(w http.ResponseWriter, r *http.Request) {
-	switch r.URL.Query().Get("kind") {
-	case "users":
-		writeJSON(w, s.ids.Users())
-	case "groups":
-		writeJSON(w, s.ids.Groups())
-	default:
-		s.fail(w, r, "bad_request", "Choose kind=users or kind=groups.", "", "")
-	}
-}
+// identities (GET /api/ids) moved to routes_perm.go in M3, where it was
+// narrowed to what the session may actually set.
 
 func (s *Server) isQTS() bool {
 	return s.platform.Family == platform.FamilyQTS || s.platform.Family == platform.FamilyHero

@@ -143,7 +143,11 @@ func (s *Server) auditAuthDenied(r *http.Request, sess *session, code, detail st
 func isMutationRoute(p string) bool {
 	switch p {
 	case "/api/fs/mkdir", "/api/fs/rename", "/api/fs/delete", "/api/settings", "/api/fs/upload", "/api/jobs/search",
-		"/api/jobs/delete", "/api/jobs/copy", "/api/jobs/move", "/api/trash/restore", "/api/trash/empty":
+		"/api/jobs/delete", "/api/jobs/copy", "/api/jobs/move", "/api/trash/restore", "/api/trash/empty",
+		// M3: the permission mutations, sync and as jobs (contract §10). The
+		// job forms join too, exactly as the delete/copy/move job routes do —
+		// an unauthenticated POST to one is as much a denial worth recording.
+		"/api/fs/chmod", "/api/fs/chown", "/api/jobs/chmod", "/api/jobs/chown":
 		return true
 	}
 	return false
@@ -273,7 +277,16 @@ func (s *Server) writeAudit(sess *session, r *http.Request, m mutation, phase, r
 // whose intent a crash could lose must not be dispatched. It returns true when
 // the intent was persisted and the caller may proceed.
 func (s *Server) auditIntent(w http.ResponseWriter, r *http.Request, sess *session, m mutation, milestone bool) bool {
-	if err := s.writeAudit(sess, r, m, "intent", "", "", "", milestone); err != nil {
+	return s.auditIntentDetail(w, r, sess, m, milestone, "")
+}
+
+// auditIntentDetail is auditIntent with a path-free DETAIL naming what is about
+// to be attempted. M3's sync routes use it so the durable record says what was
+// ASKED (a mode spec, a pair of ids) beside the result line that says what
+// landed (§11); the M1 routes, whose whole request is the path and the op, pass
+// nothing and are unchanged.
+func (s *Server) auditIntentDetail(w http.ResponseWriter, r *http.Request, sess *session, m mutation, milestone bool, detail string) bool {
+	if err := s.writeAudit(sess, r, m, "intent", "", "", detail, milestone); err != nil {
 		writeError(w, http.StatusInternalServerError, "audit_unavailable", "The change was refused: its audit record could not be saved.", m.path, m.op, err.Error())
 		return false
 	}
@@ -290,6 +303,17 @@ func (s *Server) auditIntent(w http.ResponseWriter, r *http.Request, sess *sessi
 // confirm flow for a scale threshold (guard.NeedsConfirm) even when the path
 // rules alone would allow the op.
 func (s *Server) authorize(w http.ResponseWriter, r *http.Request, sess *session, guardErr error, extraConfirm bool, m mutation, respPath string, tokenPaths []string, ordered bool, confirm string, summary guard.Summary) bool {
+	return s.authorizeGraded(w, r, sess, guardErr, extraConfirm, m, respPath, tokenPaths, ordered, confirm, summary, 0)
+}
+
+// authorizeGraded is authorize plus the confirmation GRADE (ui-ux §4.2) the
+// challenge carries. M3's aclmode ladder decides between a plain acknowledgement
+// and a typed phrase from facts only the route knows — the mount's ACL backend,
+// its aclmode, the entry's ACL state, the measured size of a recursion — and the
+// guard's token machinery is deliberately grade-blind (a token is a token), so
+// the grade travels beside the token rather than inside it. A zero grade omits
+// the field entirely, which is what every pre-M3 route passes.
+func (s *Server) authorizeGraded(w http.ResponseWriter, r *http.Request, sess *session, guardErr error, extraConfirm bool, m mutation, respPath string, tokenPaths []string, ordered bool, confirm string, summary guard.Summary, grade int) bool {
 	switch {
 	case errors.Is(guardErr, guard.ErrReadOnly):
 		s.writeAudit(sess, r, m, "result", "denied", "read_only", "read-only mode", false)
@@ -320,7 +344,7 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request, sess *session
 		// path-free reasons (guard.Reasons), so the client can explain why without a
 		// resolved spelling ever appearing (adv 2).
 		token, exp := s.guard.Issue(m.op, summary, tokenPaths, ordered)
-		writeConfirmRequired(w, m.op, respPath, "This change needs confirmation.", token, exp, summary)
+		writeConfirmRequiredGraded(w, m.op, respPath, "This change needs confirmation.", token, exp, summary, grade)
 		return false
 	case guardErr != nil:
 		code := fsx.Code(guardErr)
@@ -337,11 +361,23 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request, sess *session
 // backend-packaging-plan §6.3. The client re-posts the identical body with the
 // token in its "confirm" field.
 func writeConfirmRequired(w http.ResponseWriter, op, path, message, token string, exp time.Time, summary guard.Summary) {
+	writeConfirmRequiredGraded(w, op, path, message, token, exp, summary, 0)
+}
+
+// writeConfirmRequiredGraded is writeConfirmRequired with M3's explicit
+// confirmation grade. The grade is omitted when it is zero, so the envelope of
+// every pre-M3 route is byte-for-byte what it was and the client keeps grading
+// those from the summary's own sentences.
+func writeConfirmRequiredGraded(w http.ResponseWriter, op, path, message, token string, exp time.Time, summary guard.Summary, grade int) {
+	confirm := map[string]any{"token": token, "expires": exp, "summary": summary}
+	if grade > 0 {
+		confirm["grade"] = grade
+	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusConflict)
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"error":   map[string]string{"code": "confirm_required", "message": message, "path": path, "op": op},
-		"confirm": map[string]any{"token": token, "expires": exp, "summary": summary},
+		"confirm": confirm,
 	})
 }
 

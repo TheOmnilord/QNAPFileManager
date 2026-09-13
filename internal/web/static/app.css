@@ -99,3 +99,39 @@ dialog { border:1px solid var(--line); border-radius:10px; padding:1.4rem; max-w
 .resultParent { opacity:.8; }
 #resultsEmpty { padding:1rem; }
 @media(max-width:60rem) { .resultRow { grid-template-columns:minmax(140px,1.2fr) minmax(120px,1fr) 90px; } .resultRow > span:nth-child(4),#resultsHead span:nth-child(4) { display:none; } }
+/* Permissions and Properties (M3). The grid is a real table so a screen reader
+   reads "Group / Write" for a checkbox rather than nine anonymous boxes. */
+#permsGrid { border-collapse:collapse; margin:.5rem 0; }
+#permsGrid th,#permsGrid td { padding:.2rem .8rem; text-align:center; }
+#permsGrid th[scope=row] { text-align:left; font-weight:600; }
+#pSpecialSet,#pApplySet { display:flex; flex-wrap:wrap; gap:.4rem 1.1rem; align-items:center; margin:.6rem 0; padding:.3rem .7rem .6rem; border:1px solid var(--line); border-radius:6px; }
+#pSpecialSet legend,#pApplySet legend { padding:0 .3rem; font-size:.85rem; opacity:.8; }
+#pSpecialSet label,#pApplySet label { white-space:nowrap; }
+.permsOctal,.permsId { display:flex; flex-wrap:wrap; gap:.5rem; align-items:center; margin:.5rem 0; }
+.permsOctal label,.permsId > label:first-child { min-width:4rem; }
+#pOctal { width:6rem; font-variant-numeric:tabular-nums; }
+#pSymbolic { font:13px/1.5 ui-monospace,monospace; }
+#pOwnerId,#pGroupId { width:6rem; }
+#pOwner,#pGroup { max-width:18rem; }
+#permsError { border-color:var(--fail); color:var(--fail); background:#cf222e22; }
+#pDiff p { margin:.2rem 0; }
+#dlgPerms .bar,#dlgProps .bar { margin-top:.8rem; flex-wrap:wrap; }
+/* A diff is not a failure and not a success: the call landed, and something the
+   kernel decided differs from what was asked (contract §3.3). */
+#toast.warn { border-color:var(--warn); background:#b58a0022; }
+.propsRows { display:grid; grid-template-columns:minmax(7rem,auto) 1fr; gap:.15rem .8rem; margin:.3rem 0 .8rem; }
+.propsRows dt { font-weight:600; opacity:.85; }
+.propsRows dd { margin:0; overflow-wrap:anywhere; }
+.copyPath { padding:0 .35rem; font-size:.75rem; }
+#propsContent h3,#dlgProps h3 { margin:.7rem 0 .2rem; font-size:.95rem; }
+.badge.acl { font-weight:700; }
+/* A permissions job's detail list holds two opposite facts — an entry that was
+   skipped, and one that was changed but not as asked — so each line is tagged
+   in words, never by colour alone (§4.1). */
+.warnItem { margin:.1rem 0; }
+.warnTag { font-weight:600; opacity:.9; }
+.warn-unchanged .warnTag { color:var(--warn); }
+/* A diff's tone: a dropped special bit is the sharpest thing a permissions call
+   can report, an ordinary mode landing elsewhere is not. The words differ too —
+   the tone never carries the meaning on its own (§4.1). */
+#pDiff.diff-special { border-color:var(--fail); }

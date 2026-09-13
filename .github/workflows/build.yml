@@ -40,6 +40,9 @@ jobs:
       # Do not set CGO_ENABLED: the runner's default of 1 is what it needs, and
       # the package job sets 0 inline where it matters.
       - run: go test -race ./...
+      # The UI's node tests are the only M3 logic the dev box exercises without a
+      # kernel (m3-contract §14); ubuntu-latest ships node, no setup step needed.
+      - run: node --version && node --test internal/web/*.mjs
       # The three-GOOS sweep is mandatory, not belt and braces. Development
       # happens on Windows, where `go vet ./...` never compiles the _linux.go
       # files at all — including, in the sibling project, a type error that

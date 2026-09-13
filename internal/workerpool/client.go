@@ -622,6 +622,11 @@ func (e *RemoteError) Unwrap() error {
 		// "internal", so the front-end's partial-create warning would surface as a
 		// 500 on the real NAS while the in-process fake passed (high-effort review).
 		return fsx.ErrOwnerUnset
+	case "invalid_target":
+		// The engine's own "destination is inside the source" refusal (M2-B).
+		// Same lesson as owner_unset: a code the pool cannot reassemble is a
+		// 500 on the NAS and a pass in the in-process fake.
+		return fsx.ErrInvalidTarget
 	case "worker_gone":
 		return fsx.ErrWorkerGone
 	case "cancelled":

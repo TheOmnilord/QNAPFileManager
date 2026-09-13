@@ -25,6 +25,8 @@ func TestCode(t *testing.T) {
 		{"confirm required", ErrConfirmRequired, "confirm_required"},
 		{"queue full", ErrQueueFull, "queue_full"},
 		{"owner unset", ErrOwnerUnset, "owner_unset"},
+		{"invalid target", ErrInvalidTarget, "invalid_target"},
+		{"invalid target wrapped", fmt.Errorf("copy %q: %w", "/x", ErrInvalidTarget), "invalid_target"},
 		{"owner unset joined", errors.Join(ErrOwnerUnset, &fs.PathError{Op: "fchown", Path: "/x", Err: syscall.EPERM}), "owner_unset"},
 		{"unsupported", ErrUnsupported, "unsupported"},
 		{"cross device sentinel", ErrCrossDevice, "cross_device"},

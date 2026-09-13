@@ -1653,3 +1653,20 @@ func TestRemoteErrorReconstructsOwnerUnset(t *testing.T) {
 		t.Fatalf("worker_gone round trip = %q", code)
 	}
 }
+
+// TestRemoteErrorReconstructsInvalidTarget is the same boundary guard for the
+// M2-B engine's "destination is inside the source" refusal.
+func TestRemoteErrorReconstructsInvalidTarget(t *testing.T) {
+	worker := fmt.Errorf("copy %q into %q: %w", "/share/a", "/share/a/b", fsx.ErrInvalidTarget)
+	frame := wproto.NewErr(8, worker, []byte("/share/a/b"))
+	if frame.Err == nil || frame.Err.Code != "invalid_target" {
+		t.Fatalf("NewErr wire code = %+v, want invalid_target", frame.Err)
+	}
+	got := remoteError(frame.Err)
+	if !errors.Is(got, fsx.ErrInvalidTarget) {
+		t.Fatalf("reconstructed error does not Is fsx.ErrInvalidTarget: %v", got)
+	}
+	if code := fsx.Code(got); code != "invalid_target" {
+		t.Fatalf("fsx.Code(reconstructed) = %q, want invalid_target", code)
+	}
+}

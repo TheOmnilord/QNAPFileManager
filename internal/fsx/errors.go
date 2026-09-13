@@ -43,6 +43,12 @@ var (
 	// code alone, never inferring it from an item merely existing (which a
 	// pre-existing file plus an unrelated create failure would falsely satisfy).
 	ErrOwnerUnset = errors.New("the item was created but its owner could not be set")
+	// ErrInvalidTarget: the destination of a copy or move is the source itself
+	// or lies inside it (M2-B contract §1.7). The route refuses it lexically on
+	// both spellings; the engine refuses it again by descriptor identity
+	// before creating anything, because a symlink or a rename can make two
+	// different spellings one directory.
+	ErrInvalidTarget = errors.New("the destination is inside the folder being copied")
 )
 
 // Code maps an error to the API's error vocabulary, as fixed by
@@ -74,6 +80,8 @@ func Code(err error) string {
 		return "queue_full"
 	case errors.Is(err, ErrOwnerUnset):
 		return "owner_unset"
+	case errors.Is(err, ErrInvalidTarget):
+		return "invalid_target"
 	case errors.Is(err, ErrUnsupported):
 		return "unsupported"
 	case errors.Is(err, ErrCrossDevice):

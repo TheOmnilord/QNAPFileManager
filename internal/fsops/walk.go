@@ -108,6 +108,23 @@ type WalkItem struct {
 	// unexported on purpose: Walk itself is a read-only traversal, and the
 	// mutating callers (DeleteTree) live in this package.
 	remove func(isDir bool) error
+
+	// parent is the HELD descriptor of the directory this item was enumerated
+	// from — the very one remove() unlinks through — and it is nil only for the
+	// root of the walk, which was reached by resolving a pathname and has no
+	// enumerated parent.
+	//
+	// It exists for the copy engine (copy.go). A copy has to READ each item —
+	// openat a regular file, readlinkat a symlink — and doing that by a pathname
+	// rebuilt from the item's name would undo the whole point of the walk: the
+	// names come from one directory's getdents and the bytes would come from
+	// whatever answers to that name a moment later. Handing the visitor the same
+	// descriptor the walk is standing in keeps both halves on one object.
+	//
+	// It is unexported for the same reason remove is: Walk is a read-only
+	// traversal to anything outside this package, and the callers that need a
+	// descriptor live here.
+	parent *dirRef
 }
 
 // isDir reports whether the item is a directory, without following anything.
@@ -129,10 +146,17 @@ func (it WalkItem) isDir() bool { return it.Info != nil && it.Info.IsDir() }
 // two a name can be re-pointed at something else. A caller that has to prove
 // afterwards that it counted the object it is still acting on (the trash's
 // sidecar, trash.go) takes its identity from here.
+//
+// Opened may also STOP the walk by returning an error, and that is not a
+// convenience: it is the only hook that sees a directory's real identity BEFORE
+// a single one of its entries is enumerated. A caller that has to refuse a
+// particular object — the copy engine refusing to descend into its own output —
+// has to be able to refuse it there, because by the time Pre is called for the
+// first child the directory has already been read.
 type Visitor struct {
 	Pre    func(it WalkItem) error
 	Post   func(it WalkItem) error
-	Opened func(it WalkItem, info os.FileInfo)
+	Opened func(it WalkItem, info os.FileInfo) error
 	Warn   func(apiPath string, err error)
 }
 
@@ -185,6 +209,55 @@ func Walk(ctx context.Context, r fsx.Root, plat *platform.Platform, apiPath stri
 		},
 	}
 	return w.visit(ctx, root, func() (*dirRef, error) { return openDirRef(tg.jail, tg.rel) })
+}
+
+// walkFrom is Walk starting at a directory this process is ALREADY HOLDING.
+//
+// It exists because Walk's first act is to resolve a pathname, and a caller that
+// has gone to the trouble of holding a descriptor must not throw that away at
+// the one moment it matters most. The copy engine pins the source root through
+// its parent's descriptor and checks its identity; if the walk then re-opened
+// the same pathname, a rename of a component to a symlink in between would send
+// the whole traversal somewhere else — and for a MOVE, the delete that follows
+// with it. Nothing below the root was ever at risk (every level is an openat
+// from the level above); the root was the one gap.
+//
+// held is CONSUMED: the walker closes it when it is done enumerating, exactly
+// as it closes every directory it opens itself. A root whose Pre hook returns
+// fs.SkipDir never reaches that, so it is closed here instead.
+//
+// There is no re-read pass here. errRetryDir asks for the root to be opened
+// again, and re-opening it means naming it again, which is the thing this
+// exists to avoid; the mutating caller that needs retries (DeleteTree) uses
+// Walk, whose opener can. A Post hook asking for one is warned about and the
+// walk moves on.
+//
+// info is the root's own lstat, which the caller already has — it is what
+// proved the descriptor is the object it meant to walk.
+func walkFrom(ctx context.Context, r fsx.Root, plat *platform.Platform, held *dirRef,
+	apiPath string, info os.FileInfo, opts WalkOptions, v Visitor) error {
+
+	if err := ctx.Err(); err != nil {
+		held.close()
+		return err
+	}
+	w := &walker{r: r, plat: plat, opts: opts, v: v}
+	root := WalkItem{Path: apiPath, Name: fsx.Base(apiPath), Info: info, Depth: 0}
+	first := held
+	open := func() (*dirRef, error) {
+		if first != nil {
+			d := first
+			first = nil
+			return d, nil
+		}
+		return nil, fmt.Errorf("%q cannot be read again without naming it: %w", apiPath, fsx.ErrUnsupported)
+	}
+	err := w.visit(ctx, root, open)
+	if first != nil {
+		// Pre returned fs.SkipDir, so the descriptor was never consumed.
+		first.close()
+	}
+	return err
 }
 
 type walker struct {
@@ -290,7 +363,12 @@ func (w *walker) visit(ctx context.Context, it WalkItem, open dirOpener) error {
 			// told — which leaves a caller that needed the identity without one,
 			// exactly as it should.
 			if fi, serr := d.stat(); serr == nil {
-				w.v.Opened(it, fi)
+				if oerr := w.v.Opened(it, fi); oerr != nil {
+					// The visitor refused this object, before any of its entries
+					// was read. Nothing below it is visited and the walk ends.
+					d.close()
+					return oerr
+				}
 			} else {
 				w.warn(it.Path, serr)
 			}
@@ -366,6 +444,7 @@ func (w *walker) children(ctx context.Context, d *dirRef, parent WalkItem) error
 				Info:   fi,
 				Depth:  parent.Depth + 1,
 				remove: func(isDir bool) error { return d.unlink(name, isDir) },
+				parent: d,
 			}
 			if !fi.IsDir() {
 				if err := w.visit(ctx, it, nil); err != nil {

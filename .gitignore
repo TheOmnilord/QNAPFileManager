@@ -24,3 +24,4 @@ Thumbs.db
 
 # Codex review scratch space
 .review-tmp/
+.tmp-go-cache/

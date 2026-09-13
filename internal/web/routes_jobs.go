@@ -293,6 +293,35 @@ func jobWarnMessage(code string) string {
 		return "An item with that name already exists."
 	case "cancelled":
 		return "The operation was cancelled."
+	// The copy/move engine's per-item outcomes (M2-B). Each is the one line a
+	// user reads under the job, so it says what happened to THIS item, not
+	// what the engine did about it.
+	case "kept":
+		return "The source was kept because part of it could not be copied."
+	case "changed":
+		return "This file changed while it was being copied."
+	case "times_unset":
+		return "The item was copied but its timestamps could not be set."
+	case "conflict":
+		return "An item of a different kind already has this name; it was skipped."
+	case "owner_unset":
+		return "The item was created but its owner could not be set."
+	case "no_space":
+		return "There is not enough free space, or the quota is full."
+	case "unsupported":
+		return "This kind of item cannot be copied."
+	case "invalid_target":
+		return "The destination is inside the folder being copied."
+	case "cross_device":
+		return "The source and destination are on different volumes."
+	case "capped":
+		return "The scan hit its limit; the totals are a minimum."
+	case "unverified":
+		return "The copy could not be verified in time, so the original was kept."
+	case "too_many":
+		return "Too many folders to track safely; this item was skipped."
+	case "shared_destination":
+		return "The destination can be written by other users, so protection against a folder being swapped in during the copy is reduced."
 	}
 	return backendMessage(code)
 }

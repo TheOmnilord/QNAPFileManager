@@ -149,6 +149,7 @@ var routes = map[string][]string{
 	"/api/fs/mkdir": {"POST"}, "/api/fs/rename": {"POST"}, "/api/fs/delete": {"POST"},
 	"/api/settings": {"GET", "POST"}, "/api/audit": {"GET"}, "/api/audit/export": {"GET"},
 	"/api/jobs": {"GET"}, "/api/jobs/delete": {"POST"}, "/api/jobs/size": {"POST"},
+	"/api/jobs/copy": {"POST"}, "/api/jobs/move": {"POST"},
 	"/api/trash": {"GET"}, "/api/trash/restore": {"POST"}, "/api/trash/empty": {"POST"},
 }
 
@@ -355,6 +356,10 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		s.jobList(w, r, sess)
 	case "/api/jobs/delete":
 		s.jobDelete(w, r, sess)
+	case "/api/jobs/copy":
+		s.jobTransfer(w, r, sess, "copy")
+	case "/api/jobs/move":
+		s.jobTransfer(w, r, sess, "move")
 	case "/api/jobs/size":
 		s.jobSize(w, r, sess)
 	case "/api/trash":

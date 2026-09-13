@@ -179,6 +179,45 @@ func (g *Guard) isInstallAncestor(p string) bool {
 	return strictAncestor(p, g.installDir) || strictAncestor(p, g.installDirCanon)
 }
 
+// Containment describes the most specific protected location beneath a root.
+// Reason is the same path-free explanation used by Reasons; Prefix is metadata
+// for callers, and must not disclose a resolved spelling in a client summary.
+type Containment struct {
+	Prefix string
+	Deny   bool
+	Reason string
+}
+
+// Contains reports static protection strictly beneath an already-cleaned API
+// path. Any deny wins over all warnings; within that severity the longest
+// prefix wins (table order breaks ties). This is deliberately independent of
+// the root operation: a recursive transfer can read, create and remove entries
+// that its root check never names. Exact rules count only when their named
+// location is beneath p, never because p is inside or equal to that location.
+// Canonicalized rules and both installation spellings participate. Dynamic
+// mount roots and never-write components are not a finite prefix table and
+// remain the responsibility of Check and the worker's write protection.
+func (g *Guard) Contains(p string) (deepest Containment, ok bool) {
+	consider := func(prefix string, deny bool, reason string) {
+		if !strictAncestor(p, prefix) {
+			return
+		}
+		if !ok || deny && !deepest.Deny || deny == deepest.Deny && len(prefix) > len(deepest.Prefix) {
+			deepest = Containment{Prefix: prefix, Deny: deny, Reason: reason}
+			ok = true
+		}
+	}
+	for _, r := range g.rules {
+		if r.Deny != 0 || r.Warn != 0 {
+			consider(r.Prefix, r.Deny != 0, r.Reason)
+		}
+	}
+	for _, install := range []string{g.installDir, g.installDirCanon} {
+		consider(install, true, "the file manager's own installation directory")
+	}
+	return deepest, ok
+}
+
 // SetReadOnly turns global read-only mode on or off. When on, Check refuses
 // every mutating op regardless of path, so no route can forget the toggle.
 func (g *Guard) SetReadOnly(v bool) { g.readOnly.Store(v) }

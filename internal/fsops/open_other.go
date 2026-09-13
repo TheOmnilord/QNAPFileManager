@@ -80,6 +80,40 @@ func openItemRef(j fsx.Jail, rel string) (*itemRef, error) {
 
 func (ref *itemRef) close() {}
 
+// refFD is nil off Linux: there is no descriptor behind a held item here, so
+// every caller falls back to addressing the entry by name through os.Root.
+func refFD(ref *itemRef) *os.File { return nil }
+
+// itemRefIn off Linux is statAt of the entry beneath an already-held directory.
+// There is no openat to address it relative to a descriptor, so the name is
+// joined onto the directory's own jail-relative path and os.Root resolves it —
+// the same degradation every other helper here accepts (INV-2).
+func itemRefIn(d *dirRef, name string) (*itemRef, error) {
+	fi, err := statAt(d.j, relJoin(d.rel, name))
+	if err != nil {
+		return nil, err
+	}
+	return &itemRef{fi: fi}, nil
+}
+
+// itemIdentityOf has almost nothing to report off Linux: there is no st_dev
+// behind a Windows FileInfo (devOf) and no mount id to ask a handle for, so
+// every path answers with the zero identity and the move pre-flight predicts
+// "same filesystem" for everything.
+//
+// That is the right degradation rather than a gap. The prediction only ever
+// WARNS — the kernel's own EXDEV is what the engine acts on — and the dev loop
+// has one filesystem, so a prediction of "this will be an instant rename" is
+// also the truth there. INV-2: the kernel that decides is the NAS's, and the CI
+// Linux and ZFS jobs are where this is measured for real.
+func itemIdentityOf(ref *itemRef) mountIdentity {
+	var id mountIdentity
+	if ref != nil && ref.fi != nil {
+		id.dev, id.hasDev = devOf(ref.fi)
+	}
+	return id
+}
+
 // readlinkAt off Linux is os.Root's own readlink.
 func readlinkAt(j fsx.Jail, rel string) (string, error) {
 	return j.Readlink(rel)

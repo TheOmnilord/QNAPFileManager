@@ -112,7 +112,7 @@ func (s *Server) auditAuthDenied(r *http.Request, sess *session, code, detail st
 func isMutationRoute(p string) bool {
 	switch p {
 	case "/api/fs/mkdir", "/api/fs/rename", "/api/fs/delete", "/api/settings",
-		"/api/jobs/delete", "/api/trash/restore", "/api/trash/empty":
+		"/api/jobs/delete", "/api/jobs/copy", "/api/jobs/move", "/api/trash/restore", "/api/trash/empty":
 		return true
 	}
 	return false

@@ -8,6 +8,73 @@ import (
 	"qnapfilemanager/internal/fsx"
 )
 
+func TestContains(t *testing.T) {
+	const install = "/share/CACHEDEV1_DATA/.qpkg/QNAPFileManager"
+	g := New(install, true)
+	g.CanonicalizeRoots(func(p string) (string, bool) {
+		if strings.HasPrefix(p, install) {
+			return strings.Replace(p, install, "/data/app", 1), true
+		}
+		return "", false
+	})
+	for _, tc := range []struct {
+		path, prefix string
+		deny         bool
+	}{
+		{"/", install + "/config", true},
+		{"/etc", "/etc/config", true},
+		{"/share/CACHEDEV1_DATA", install + "/config", true},
+		{install, install + "/config", true},
+		{"/data", "/data/app/config", true},
+		{"/share/Public", "", false},
+		{"/et", "", false},
+		{"/etc/config", "", false},
+		{"/etc/configuration", "", false},
+		{"/bin", "", false},
+	} {
+		t.Run(tc.path, func(t *testing.T) {
+			hit, ok := g.Contains(tc.path)
+			if ok != (tc.prefix != "") || hit.Prefix != tc.prefix || hit.Deny != tc.deny {
+				t.Fatalf("Contains(%q) = %+v, %t", tc.path, hit, ok)
+			}
+			if ok && (hit.Reason == "" || strings.Contains(hit.Reason, "/")) {
+				t.Fatalf("reason is missing or discloses a path: %q", hit.Reason)
+			}
+		})
+	}
+}
+
+func TestContainsSeverityAndExactRules(t *testing.T) {
+	for _, tc := range []struct {
+		name, root, prefix string
+		rules              []Rule
+		deny               bool
+	}{
+		{"warn", "/parent", "/parent/config", []Rule{{Prefix: "/parent/config", Warn: OpWrite, Reason: "warning"}}, false},
+		{"deny beats deeper warn", "/parent", "/parent/a", []Rule{{Prefix: "/parent/longer/config", Warn: OpWrite}, {Prefix: "/parent/a", Deny: OpRead}}, true},
+		{"deepest deny", "/parent", "/parent/a/config", []Rule{{Prefix: "/parent/a", Deny: OpWrite}, {Prefix: "/parent/a/config", Deny: OpRead}}, true},
+		{"exact descendant", "/parent", "/parent/config", []Rule{{Prefix: "/parent/config", Exact: true, Deny: OpDelete}}, true},
+		{"exact equal", "/parent/config", "", []Rule{{Prefix: "/parent/config", Exact: true, Deny: OpDelete}}, false},
+		{"exact child", "/parent/config/child", "", []Rule{{Prefix: "/parent/config", Exact: true, Deny: OpDelete}}, false},
+		{"inactive", "/parent", "", []Rule{{Prefix: "/parent/config"}}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := New("", false)
+			g.rules = tc.rules
+			hit, ok := g.Contains(tc.root)
+			if ok != (tc.prefix != "") || hit.Prefix != tc.prefix || hit.Deny != tc.deny {
+				t.Fatalf("Contains(%q) = %+v, %t", tc.root, hit, ok)
+			}
+		})
+	}
+	// The installation itself remains protected independently of table rows.
+	g := New("/parent/app", false)
+	g.rules = nil
+	if hit, ok := g.Contains("/parent"); !ok || !hit.Deny || hit.Prefix != "/parent/app" {
+		t.Fatalf("installation containment = %+v, %t", hit, ok)
+	}
+}
+
 // TestReasonsArePathFree proves the adv-2 fix: no guard reason (never-write,
 // mount point, or rule table) contains a filesystem path — a "/" — so a reason
 // built from a symlink-resolved path can be surfaced to the client without ever

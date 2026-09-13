@@ -134,6 +134,25 @@ func (s *session) jobWork(ctx context.Context, req wproto.JobReq, e *progEmitter
 		return fsops.DeleteTree(ctx, s.root, s.plat, pathsOf(body.Paths),
 			fsops.DeleteOptions{Recursive: body.Recursive, CrossMounts: body.CrossMounts}, emit)
 
+	case wproto.JobCopy, wproto.JobMove:
+		var body wproto.CopyReq
+		if err := jobBody(req.Body, &body); err != nil {
+			return wproto.JobResult{}, err
+		}
+		// One engine, two kinds (M2-B contract §1.1). The only thing that
+		// differs here is the flag: a move tries renameat2 per source root
+		// first and falls back to copy-verify-delete on the kernel's own EXDEV,
+		// and it deletes a root's source only when that root copied with zero
+		// warnings and zero skips. Everything else — the conflict policy, the
+		// ownership rule, the descriptor discipline — is the same code.
+		//
+		// The request is handed over whole rather than unpacked here, because
+		// every field of it is the engine's: the paths (still []byte, so a
+		// non-UTF-8 Linux filename survives the round trip — fsops converts
+		// them exactly as pathsOf does), the conflict policy, and the owner a
+		// copy applies to what it creates.
+		return fsops.Copy(ctx, s.root, s.plat, body, req.Kind == wproto.JobMove, emit)
+
 	case wproto.JobSize:
 		var body wproto.SizeReq
 		if err := jobBody(req.Body, &body); err != nil {
@@ -164,6 +183,30 @@ func (s *session) trashList(ctx context.Context, f wproto.Frame) {
 		return
 	}
 	s.replyOK(f.ID, wproto.TrashListResp{Items: items})
+}
+
+// fsIdentity answers the move pre-flight (M2-B contract §1.2). Like the trash
+// listing it is a plain request rather than a job: the confirm dialog needs the
+// answer before anything starts, and there is nothing long-running about an
+// openat and a statx.
+//
+// It runs here, as the user, for the reason ResolvePath does: the walk that
+// reaches the path has to enforce the caller's own traversal permissions, not
+// the root front-end's (INV-2). And the answer it gives is only ever a
+// PREDICTION — the engine acts on the kernel's real EXDEV — so a worker that
+// cannot reach the path reports that rather than the front-end guessing.
+func (s *session) fsIdentity(ctx context.Context, f wproto.Frame) {
+	var req wproto.FSIdentityReq
+	if err := f.Unmarshal(&req); err != nil {
+		s.replyErr(f.ID, err, nil)
+		return
+	}
+	id, err := fsops.FSIdentity(ctx, s.root, s.plat, string(req.Path))
+	if err != nil {
+		s.replyErr(f.ID, err, req.Path)
+		return
+	}
+	s.replyOK(f.ID, id)
 }
 
 // uid is the identity whose trash subdirectory this worker owns.

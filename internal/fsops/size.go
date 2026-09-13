@@ -118,10 +118,13 @@ func scanTrees(ctx context.Context, r fsx.Root, plat *platform.Platform, paths [
 			return res, err
 		}
 		v := Visitor{
-			Opened: func(it WalkItem, info os.FileInfo) {
+			Opened: func(it WalkItem, info os.FileInfo) error {
 				if it.Depth == 0 && res.rootInfo == nil {
 					res.rootInfo = info
 				}
+				// A counting pass refuses nothing: the hook exists here only to
+				// take the root's real identity (scanResult.rootInfo).
+				return nil
 			},
 			Pre: func(it WalkItem) error {
 				if it.Mount {

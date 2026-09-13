@@ -2,6 +2,7 @@ package workerpool
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -52,6 +53,12 @@ type jobScript struct {
 	crashAfter int
 	// trash is what OpTrashList answers.
 	trash wproto.TrashListResp
+	// fsid is what OpFSIdentity answers — the move pre-flight's prediction
+	// (M2-B contract §1.2).
+	fsid wproto.FSIdentityResp
+	// jobBodies records the raw body of every OpJob frame, so a test can prove
+	// the request reached the worker unmangled — a non-UTF-8 path included.
+	jobBodies chan json.RawMessage
 }
 
 type fakeWorker struct {
@@ -134,6 +141,8 @@ func (w *fakeWorker) serve() {
 			w.ok(f.ID, nil)
 		case wproto.OpTrashList:
 			w.ok(f.ID, w.script.trash)
+		case wproto.OpFSIdentity:
+			w.ok(f.ID, w.script.fsid)
 		case wproto.OpCancel:
 			var req wproto.CancelReq
 			if err := f.Unmarshal(&req); err == nil {
@@ -151,6 +160,12 @@ func (w *fakeWorker) serve() {
 				continue
 			}
 			w.jobs.Add(1)
+			if w.script.jobBodies != nil {
+				select {
+				case w.script.jobBodies <- req.Body:
+				default:
+				}
+			}
 			go w.runJob(f.ID, req)
 		default:
 			w.errFrame(f.ID, fmt.Errorf("%s: %w", f.Op, fsx.ErrUnsupported))
@@ -942,5 +957,130 @@ func TestJobsSatisfyTheBackendInterface(t *testing.T) {
 	}
 	if _, err := jobs.TrashList(context.Background(), who); err != nil {
 		t.Fatalf("trash list through the interface: %v", err)
+	}
+}
+
+// ---- M2-B: copy, move and the EXDEV pre-flight -------------------------------
+
+// TestFSIdentityIsAPlainCall: the move pre-flight goes through the pool as an
+// ordinary request, not as a job, because the confirm dialog needs its answer
+// before anything is submitted (M2-B contract §1.2).
+func TestFSIdentityIsAPlainCall(t *testing.T) {
+	want := wproto.FSIdentityResp{Mount: 42, HasMount: true, Dev: 2049, Dir: true}
+	p, made, _, _ := jobPool(t, jobScript{fsid: want})
+	who := alice()
+	spawnWorker(t, p, made, who)
+
+	got, err := p.FSIdentity(context.Background(), who, "/share/Public")
+	if err != nil {
+		t.Fatalf("fsid: %v", err)
+	}
+	if got != want {
+		t.Fatalf("identity = %+v, want %+v", got, want)
+	}
+	// The comparison the route makes: two identical identities are one
+	// filesystem, a different mount id is two — which is what a bind-mounted
+	// QTS share layout needs, since those share a st_dev.
+	if !got.Same(want) {
+		t.Error("an identity does not match itself")
+	}
+	other := wproto.FSIdentityResp{Mount: 43, HasMount: true, Dev: 2049}
+	if got.Same(other) {
+		t.Error("two mount ids on one device were reported as one filesystem")
+	}
+}
+
+// TestCopyJobRoundTripsThroughThePool: a JobCopy is an ordinary job to this
+// side — one long-lived RPC, progress and warnings drained to the callbacks,
+// and a terminal JobResult — and its body reaches the worker byte for byte,
+// non-UTF-8 path and all.
+func TestCopyJobRoundTripsThroughThePool(t *testing.T) {
+	want := wproto.JobResult{Files: 4, Dirs: 2, Bytes: 900, Warnings: 1, Detail: "copied 4 items"}
+	bodies := make(chan json.RawMessage, 2)
+	p, made, _, _ := jobPool(t, jobScript{progs: 3, warns: 1, filesTotal: 6, result: want, jobBodies: bodies})
+	who := alice()
+	spawnWorker(t, p, made, who)
+
+	raw := []byte("/share/Public/\xff\xfe")
+	body, err := wproto.NewReq(0, wproto.OpJob, wproto.CopyReq{
+		Src:    [][]byte{raw},
+		DstDir: []byte("/share/Media"),
+		Opts:   wproto.CopyOptions{Conflict: wproto.ConflictRename, As: &wproto.CreateAs{UID: 1000, GID: -1}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var progs []wproto.Prog
+	var warns []wproto.Warn
+	res, err := p.Job(context.Background(), who,
+		wproto.JobReq{JobID: "copy-1", Kind: wproto.JobCopy, Body: body.Body},
+		func(pr wproto.Prog) { progs = append(progs, pr) },
+		func(w wproto.Warn) { warns = append(warns, w) })
+	if err != nil {
+		t.Fatalf("copy job: %v", err)
+	}
+	if !reflect.DeepEqual(res, want) {
+		t.Fatalf("result = %+v, want %+v", res, want)
+	}
+	if len(progs) != 3 || len(warns) != 1 {
+		t.Fatalf("%d progress and %d warning callbacks, want 3 and 1", len(progs), len(warns))
+	}
+
+	select {
+	case got := <-bodies:
+		var req wproto.CopyReq
+		if err := json.Unmarshal(got, &req); err != nil {
+			t.Fatalf("the worker could not decode the body it was sent: %v", err)
+		}
+		if len(req.Src) != 1 || string(req.Src[0]) != string(raw) {
+			t.Fatalf("source = %q, want the non-UTF-8 path unchanged", req.Src)
+		}
+		if string(req.DstDir) != "/share/Media" {
+			t.Fatalf("destination = %q", req.DstDir)
+		}
+		if req.Opts.Conflict != wproto.ConflictRename || req.Opts.As == nil || req.Opts.As.UID != 1000 || req.Opts.As.GID != -1 {
+			t.Fatalf("options = %+v, want the policy and the owner carried across", req.Opts)
+		}
+	case <-time.After(testWait):
+		t.Fatal("the worker never saw the job body")
+	}
+}
+
+// TestCancellingACopyJobKeepsThePartialResult: the same F7 contract as every
+// other job — the pool hands back the worker's own partial counts together
+// with context.Canceled, so a half-finished move is reported and not guessed at.
+func TestCancellingACopyJobKeepsThePartialResult(t *testing.T) {
+	hold := make(chan struct{})
+	defer close(hold)
+	p, made, _, _ := jobPool(t, jobScript{progs: 2, warns: 1, filesTotal: 40, hold: hold, cancelReply: "structured"})
+	who := alice()
+	w := spawnWorker(t, p, made, who)
+
+	first := make(chan struct{})
+	var once sync.Once
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	out := runJobAsync(p, ctx, who,
+		wproto.JobReq{JobID: "move-000000000001", Kind: wproto.JobMove, Body: nil},
+		func(wproto.Prog) { once.Do(func() { close(first) }) }, nil)
+	select {
+	case <-first:
+	case <-time.After(testWait):
+		t.Fatal("the move never reported progress")
+	}
+	cancel()
+	select {
+	case <-w.cancels:
+	case <-time.After(testWait):
+		t.Fatal("the worker was never told to cancel the move")
+	}
+
+	o := awaitJob(t, out)
+	if !errors.Is(o.err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", o.err)
+	}
+	if !o.res.Cancelled || o.res.Files == 0 {
+		t.Fatalf("result = %+v, want the worker's partial counts with Cancelled set", o.res)
 	}
 }

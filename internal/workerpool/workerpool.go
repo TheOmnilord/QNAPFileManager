@@ -662,6 +662,88 @@ func (p *Pool) OpenRead(ctx context.Context, who backend.Principal, path string)
 	return files[0], resp.Entry, nil
 }
 
+// Archive asks the principal's worker to stream the requested trees as one
+// archive into a pipe and returns the pipe's read end (M2-C contract §2). The
+// descriptor arrives the same way OpenRead's does — worker to pool, never the
+// reverse. The worker's walk ends when the archive is complete, when it must
+// give up (it appends ERROR.txt and closes without the trailer), or when this
+// end is closed, which is how a departed client stops it.
+func (p *Pool) Archive(ctx context.Context, who backend.Principal, req wproto.ArchiveReq) (io.ReadCloser, wproto.ArchiveResp, error) {
+	c, err := p.acquire(ctx, who)
+	if err != nil {
+		return nil, wproto.ArchiveResp{}, err
+	}
+	defer p.release(c)
+	if p.opts.Mode == ModeInProcess {
+		return nil, wproto.ArchiveResp{}, fmt.Errorf("archive in the in-process mode: %w", fsx.ErrUnsupported)
+	}
+	f, files, err := p.call(ctx, c, wproto.OpArchive, req)
+	if err != nil {
+		return nil, wproto.ArchiveResp{}, err
+	}
+	if len(files) != 1 {
+		closeAll(files)
+		return nil, wproto.ArchiveResp{}, fmt.Errorf("the worker returned %d descriptors for the archive: %w", len(files), wproto.ErrFDMismatch)
+	}
+	var resp wproto.ArchiveResp
+	if err := f.Unmarshal(&resp); err != nil {
+		closeAll(files)
+		return nil, wproto.ArchiveResp{}, err
+	}
+	return files[0], resp, nil
+}
+
+// OpenWrite asks the principal's worker to create an upload's file as the
+// user and hand back its descriptor with the worker's handle for the inode
+// (M2-C contract §1). The front-end streams the body into the descriptor;
+// Finalize publishes or discards the handle.
+func (p *Pool) OpenWrite(ctx context.Context, who backend.Principal, req wproto.OpenWriteReq) (*os.File, wproto.OpenWriteResp, error) {
+	c, err := p.acquire(ctx, who)
+	if err != nil {
+		return nil, wproto.OpenWriteResp{}, err
+	}
+	defer p.release(c)
+	if p.opts.Mode == ModeInProcess {
+		return nil, wproto.OpenWriteResp{}, fmt.Errorf("upload in the in-process mode: %w", fsx.ErrUnsupported)
+	}
+	f, files, err := p.call(ctx, c, wproto.OpOpenWrite, req)
+	if err != nil {
+		return nil, wproto.OpenWriteResp{}, err
+	}
+	if len(files) != 1 {
+		closeAll(files)
+		return nil, wproto.OpenWriteResp{}, fmt.Errorf("the worker returned %d descriptors for the upload: %w", len(files), wproto.ErrFDMismatch)
+	}
+	var resp wproto.OpenWriteResp
+	if err := f.Unmarshal(&resp); err != nil {
+		closeAll(files)
+		return nil, wproto.OpenWriteResp{}, err
+	}
+	return files[0], resp, nil
+}
+
+// Finalize publishes or discards an upload handle (M2-C contract §1.3).
+func (p *Pool) Finalize(ctx context.Context, who backend.Principal, req wproto.FinalizeReq) (wproto.FinalizeResp, error) {
+	c, err := p.acquire(ctx, who)
+	if err != nil {
+		return wproto.FinalizeResp{}, err
+	}
+	defer p.release(c)
+	if p.opts.Mode == ModeInProcess {
+		return wproto.FinalizeResp{}, fmt.Errorf("upload in the in-process mode: %w", fsx.ErrUnsupported)
+	}
+	f, files, err := p.call(ctx, c, wproto.OpFinalize, req)
+	if err != nil {
+		return wproto.FinalizeResp{}, err
+	}
+	closeAll(files)
+	var resp wproto.FinalizeResp
+	if err := f.Unmarshal(&resp); err != nil {
+		return wproto.FinalizeResp{}, err
+	}
+	return resp, nil
+}
+
 // --- backend.Mutator ---------------------------------------------------
 
 var _ backend.Mutator = (*Pool)(nil)

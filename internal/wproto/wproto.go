@@ -39,8 +39,12 @@ const (
 	// every source with the destination directory to PREDICT an EXDEV and say so
 	// in the confirm dialog; the kernel's actual verdict still decides the move.
 	OpFSIdentity Op = "fsid"
-	OpPing       Op = "ping"
-	OpBye        Op = "bye" // graceful shutdown: finish nothing new, exit
+	// OpArchive streams a zip or tar.gz of the requested trees back through a
+	// pipe whose read end rides on the OK frame (M2-C contract §2): every byte
+	// is read by the worker as the user, and nothing touches the disk.
+	OpArchive Op = "archive"
+	OpPing    Op = "ping"
+	OpBye     Op = "bye" // graceful shutdown: finish nothing new, exit
 )
 
 // Frame kinds. A request gets exactly one terminal frame (KindOK or KindErr)

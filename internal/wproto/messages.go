@@ -159,16 +159,28 @@ type OpenReadResp struct {
 	Entry fsx.Entry `json:"e"`
 }
 
-// OpenWriteReq creates <dir>/.qfm-upload-<hex>.part with
-// O_WRONLY|O_CREAT|O_EXCL and mode 0600, owned by the worker's uid, and
-// returns its fd. The front-end streams the request body into it and never
-// creates a file itself.
+// OpenWriteReq asks the worker to create the upload's file AS THE USER and hand
+// back its descriptor (M2-C contract §1): unnamed (O_TMPFILE) where the kernel
+// allows, so no name can reach it before Finalize publishes it, else a
+// .qfm-upload-<hex>.part created O_EXCL in the destination directory. The
+// front-end streams the request body into that descriptor and never creates
+// a file itself. Size is the declared length for the free-space check (0 =
+// unknown); As is the owner an admin's upload is chowned to, gated by the
+// route exactly as mkdir (chown only, never chmod); Mode is ignored — the file
+// is created 0644 under the umask and the destination's inherited ACL.
 type OpenWriteReq struct {
-	Dir  []byte `json:"d"`
-	Name []byte `json:"n"`
-	Mode uint32 `json:"m"`
+	Dir      []byte    `json:"d"`
+	Name     []byte    `json:"n"`
+	Mode     uint32    `json:"m"`
+	Size     int64     `json:"s,omitempty"`
+	MTime    int64     `json:"mt,omitempty"`
+	Conflict string    `json:"c,omitempty"`
+	As       *CreateAs `json:"as,omitempty"`
 }
 
+// OpenWriteResp.Tmp is an opaque handle the worker keeps for the open inode
+// until Finalize (or its expiry), never a path. The descriptor rides on the
+// frame (NFD = 1).
 type OpenWriteResp struct {
 	Tmp []byte `json:"t"`
 }
@@ -190,6 +202,37 @@ type FinalizeResp struct {
 	// Path is where the file actually landed, which differs from Final when
 	// Conflict was "rename".
 	Path []byte `json:"p"`
+}
+
+// ArchiveReq is the body of OpArchive (M2-C contract §2): the trees to stream
+// as one archive. Format is "zip" or "tgz". The reply carries the pipe's read
+// end; the worker walks the trees on held descriptors and writes into the
+// write end until it is done, the reader goes away, or a fatal error makes it
+// append a final ERROR.txt member and close without the trailer.
+type ArchiveReq struct {
+	Paths       [][]byte `json:"p"`
+	Format      string   `json:"f"`
+	CrossMounts bool     `json:"x,omitempty"`
+}
+
+// ArchiveResp names the archive the front-end should offer for download.
+type ArchiveResp struct {
+	Name []byte `json:"n"`
+}
+
+// SearchReq is the body of a JobSearch (M2-C contract §3). Query is a
+// case-insensitive substring of the entry name, or a path.Match pattern when
+// Glob is set. The caps are sent by the route and clamped by the worker.
+type SearchReq struct {
+	Roots       [][]byte `json:"r"`
+	Query       string   `json:"q"`
+	Glob        bool     `json:"g,omitempty"`
+	Hidden      bool     `json:"h,omitempty"`
+	CrossMounts bool     `json:"x,omitempty"`
+	Kind        string   `json:"k,omitempty"` // "" | "any" | "file" | "dir"
+	MaxHits     int      `json:"mh,omitempty"`
+	MaxVisited  int64    `json:"mv,omitempty"`
+	MaxDuration int64    `json:"md,omitempty"` // seconds
 }
 
 // TextReq reads or writes a small text file whole. Size is bounded by
@@ -367,6 +410,9 @@ type JobResult struct {
 	// created, in path order, so the UI's Undo can restore exactly those
 	// entries instead of guessing from origPath and time (M2-A web review).
 	TrashIDs []string `json:"tids,omitempty"`
+	// Hits are a search job's matches in walk order, capped by SearchReq.MaxHits
+	// (M2-C). Detail says when the cap was hit.
+	Hits []fsx.Entry `json:"hits,omitempty"`
 }
 
 // SizeReq measures trees: files, directories and bytes under each path.

@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 
 	"net/http"
 	"net/http/httptest"
@@ -67,6 +68,21 @@ func (b *fakeBackend) OpenRead(ctx context.Context, p backend.Principal, name st
 	}
 	f, err := os.Open(b.osPath(name))
 	return f, e, err
+}
+
+// The M2-C operations are declared on the interfaces before their routes
+// exist; the fake refuses them until a test teaches it otherwise.
+func (b *fakeBackend) Archive(_ context.Context, p backend.Principal, _ wproto.ArchiveReq) (io.ReadCloser, wproto.ArchiveResp, error) {
+	b.last = p
+	return nil, wproto.ArchiveResp{}, fsx.ErrUnsupported
+}
+func (b *fakeBackend) OpenWrite(_ context.Context, p backend.Principal, _ wproto.OpenWriteReq) (*os.File, wproto.OpenWriteResp, error) {
+	b.last = p
+	return nil, wproto.OpenWriteResp{}, fsx.ErrUnsupported
+}
+func (b *fakeBackend) Finalize(_ context.Context, p backend.Principal, _ wproto.FinalizeReq) (wproto.FinalizeResp, error) {
+	b.last = p
+	return wproto.FinalizeResp{}, fsx.ErrUnsupported
 }
 func (b *fakeBackend) List(ctx context.Context, p backend.Principal, name string, o fsx.ListOptions) (fsx.Listing, error) {
 	b.last = p

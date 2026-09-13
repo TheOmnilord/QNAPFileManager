@@ -11,6 +11,7 @@ package backend
 
 import (
 	"context"
+	"io"
 	"os"
 	"strconv"
 
@@ -53,6 +54,11 @@ type Backend interface {
 	OpenRead(ctx context.Context, who Principal, path string) (*os.File, fsx.Entry, error)
 	// Ping checks that the principal's worker is alive (spawning it if needed).
 	Ping(ctx context.Context, who Principal) error
+	// Archive streams the requested trees as one zip or tar.gz, produced by
+	// the principal's worker into a pipe whose read end is returned (M2-C
+	// contract §2). The caller copies it to the response and must Close it —
+	// closing early is how a departed client stops the worker's walk.
+	Archive(ctx context.Context, who Principal, req wproto.ArchiveReq) (io.ReadCloser, wproto.ArchiveResp, error)
 }
 
 // Mutator executes the M1 filesystem mutations as a principal: create a
@@ -91,6 +97,15 @@ type Mutator interface {
 	// delete). A component the user cannot search surfaces as the kernel's
 	// permission error; a non-existent leaf under !followLeaf is not an error.
 	Resolve(ctx context.Context, who Principal, path string, followLeaf bool) (string, error)
+	// OpenWrite creates an upload's file as the principal and returns the
+	// descriptor to stream into plus the worker's handle for it (M2-C
+	// contract §1). The caller must Close the file and then Finalize (or
+	// Finalize with Discard) the handle.
+	OpenWrite(ctx context.Context, who Principal, req wproto.OpenWriteReq) (*os.File, wproto.OpenWriteResp, error)
+	// Finalize publishes or discards an upload the caller has finished
+	// streaming: the worker verifies, stamps and links the inode into place
+	// under the conflict policy.
+	Finalize(ctx context.Context, who Principal, req wproto.FinalizeReq) (wproto.FinalizeResp, error)
 }
 
 func itoa(i int) string { return strconv.Itoa(i) }

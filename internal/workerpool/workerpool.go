@@ -879,6 +879,64 @@ func (p *Pool) Delete(ctx context.Context, who backend.Principal, path string) e
 	return err
 }
 
+// Chmod applies a mode change to one entry in the user's worker and returns the
+// before, the after and the diff between what was asked and what the kernel did
+// (M3 contract §3). It passes no descriptor, so the ordinary RPC path carries it
+// in both modes.
+func (p *Pool) Chmod(ctx context.Context, who backend.Principal, req wproto.ChmodReq) (wproto.ModeResp, error) {
+	return p.modeCall(ctx, who, wproto.OpChmod, req)
+}
+
+// Chown changes ownership of one entry in the user's worker. It is always an
+// lchown; req.Follow is refused by the worker as unsupported.
+func (p *Pool) Chown(ctx context.Context, who backend.Principal, req wproto.ChownReq) (wproto.ModeResp, error) {
+	return p.modeCall(ctx, who, wproto.OpChown, req)
+}
+
+// modeCall is the shared body of Chmod and Chown: the two differ only in the op
+// and the request body, and a copy of this for each would be a copy to keep in
+// step.
+func (p *Pool) modeCall(ctx context.Context, who backend.Principal, op wproto.Op, body any) (wproto.ModeResp, error) {
+	c, err := p.acquire(ctx, who)
+	if err != nil {
+		return wproto.ModeResp{}, err
+	}
+	defer p.release(c)
+	f, files, err := p.call(ctx, c, op, body)
+	if err != nil {
+		return wproto.ModeResp{}, err
+	}
+	closeAll(files)
+	var resp wproto.ModeResp
+	if err := f.Unmarshal(&resp); err != nil {
+		return wproto.ModeResp{}, err
+	}
+	return resp, nil
+}
+
+// Props describes one entry for the properties dialog, from one canonical walk
+// inside the user's worker. Like TrashList and FSIdentity it is a plain request:
+// the dialog needs the whole answer at once and there is nothing long-running
+// about a walk, an fstat and an fstatfs. The directory SIZE the dialog shows is
+// the existing size job, submitted separately.
+func (p *Pool) Props(ctx context.Context, who backend.Principal, req wproto.PropsReq) (wproto.PropsResp, error) {
+	c, err := p.acquire(ctx, who)
+	if err != nil {
+		return wproto.PropsResp{}, err
+	}
+	defer p.release(c)
+	f, files, err := p.call(ctx, c, wproto.OpProps, req)
+	if err != nil {
+		return wproto.PropsResp{}, err
+	}
+	closeAll(files)
+	var resp wproto.PropsResp
+	if err := f.Unmarshal(&resp); err != nil {
+		return wproto.PropsResp{}, err
+	}
+	return resp, nil
+}
+
 // Resolve canonicalises an API path in the user's worker and returns the
 // canonical spelling. The resolution runs as the user (INV-2), so a component
 // the user cannot traverse is refused by the kernel there rather than resolved

@@ -155,6 +155,50 @@ func Code(err error) string {
 	return "internal"
 }
 
+// WorkerCodes is every error code a WORKER can put on the wire, and it exists
+// because the same gap was found three separate times in the M2-C loop
+// (owner_unset, too_large, changed): a code the worker emits that
+// workerpool.RemoteError.Unwrap cannot turn back into a sentinel becomes
+// "internal" on the front-end, which is a 500 on the real NAS and a pass in
+// every in-process test. A table is cheaper than a fourth round of that.
+//
+// Two contract tests read it, one on each side of the socket:
+//   - internal/workerpool asserts each code round-trips (Unwrap gives a sentinel
+//     that fsx.Code maps back to the same code);
+//   - internal/web asserts each code has a deliberate statusCode, i.e. that none
+//     of them falls through to the 500 default.
+//
+// "internal" is deliberately NOT in the list. It is the default on both sides by
+// construction — Unwrap returns nil for it and fsx.Code calls an unrecognised
+// error "internal" — so requiring an explicit case for it would only add a case
+// that could drift. "ramdisk", "confirm_required" and "unauthorized" are absent
+// for the opposite reason: they are the front-end guard's and the session
+// layer's refusals, made before the RPC, and no worker can emit them (INV-1).
+//
+// This is the ERROR vocabulary. A job's per-item Warn.Code is a different set
+// (it carries "capped", "not_empty", "no_trash" and the like) and never reaches
+// an HTTP status.
+var WorkerCodes = []string{
+	"bad_request",
+	"cancelled",
+	"changed",
+	"conflict",
+	"cross_device",
+	"exists",
+	"invalid_target",
+	"no_space",
+	"not_empty",
+	"not_found",
+	"owner_unset",
+	"permission",
+	"protected",
+	"queue_full",
+	"readonly",
+	"too_large",
+	"unsupported",
+	"worker_gone",
+}
+
 // Errno digs the raw syscall.Errno out of an error so the worker can put the
 // number on the wire and the front-end can be specific about it. It returns 0
 // when there is none.

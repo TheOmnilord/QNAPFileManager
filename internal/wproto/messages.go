@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 
 	"qnapfilemanager/internal/fsx"
+	"qnapfilemanager/internal/perm"
 )
 
 // Limits are the front-end's caps, handed to the worker at hello time so the
@@ -94,12 +95,22 @@ type RenameReq struct {
 	Overwrite bool   `json:"o,omitempty"`
 }
 
+// ChmodReq changes an entry's mode bits. The change travels as a perm.ModeSpec
+// (mask + value), never as an absolute mode: a mixed selection, a recursive
+// apply over modes nobody has seen, and the three special bits are then all one
+// mechanism (m3-contract §1.1).
 type ChmodReq struct {
-	Path []byte `json:"p"`
-	Mode uint32 `json:"m"`
-	// Follow chmods the target of a symlink. A symlink's own mode is
-	// meaningless on Linux, so the default is to refuse rather than to
-	// silently change the target.
+	Path []byte        `json:"p"`
+	Spec perm.ModeSpec `json:"s"`
+	// Follow is INERT in M3 and is never set by the route.
+	//
+	// A symlink's own mode is meaningless on Linux (there is no lchmod), so the
+	// worker refuses a symlink leaf as unsupported and never follows one. A
+	// caller that wants the target changed resolves the path itself and guards
+	// the target as a path of its own (contract §1.4), which is what the web
+	// route does — so what reaches here is already the object to change. The
+	// field is kept so the wire shape does not move under a worker that was
+	// built against it.
 	Follow bool `json:"f,omitempty"`
 }
 
@@ -108,15 +119,105 @@ type ChownReq struct {
 	Path []byte `json:"p"`
 	UID  int    `json:"u"`
 	GID  int    `json:"g"`
-	// Follow chowns through a symlink; the default is lchown.
+	// Follow chowns through a symlink. Chown is ALWAYS lchown in M3 — a
+	// symlink's own ownership is what changes — so a request that sets this is
+	// refused as unsupported, leaving exactly one chown semantics to reason
+	// about (m3-contract §1.4).
 	Follow bool `json:"f,omitempty"`
 }
 
-// ChownReq/ChmodReq reply with the post-call Entry so the front-end can diff
-// what was asked against what the kernel did (INV-2, and the partial-success
-// reporting in PLAN.md decision 12).
+// ChownReq/ChmodReq reply with the pre- and post-call Entry plus the fields the
+// kernel did not do as asked, so the caller can show the DIFF (INV-2, and the
+// partial-success reporting in PLAN.md decision 12). The worker computes the
+// diff because it is the only side holding the pre-call state of the same
+// inode, and INV-1 forbids the front end from looking (m3-contract §3.1).
 type ModeResp struct {
-	Entry fsx.Entry `json:"e"`
+	Before fsx.Entry   `json:"b"`
+	Entry  fsx.Entry   `json:"e"`
+	Diffs  []perm.Diff `json:"d,omitempty"`
+}
+
+// ChmodJobReq is the recursive/multi-item chmod (m3-contract §9). Files and
+// Dirs are separate specs so "apply to files only" is expressed by a zero mask
+// rather than by a mode the server would have to interpret; #pSmartX is a
+// client-side preset over these two and the server has no smart-X of its own.
+type ChmodJobReq struct {
+	Paths       [][]byte      `json:"p"`
+	Files       perm.ModeSpec `json:"fs"`
+	Dirs        perm.ModeSpec `json:"ds"`
+	Recursive   bool          `json:"r,omitempty"`
+	CrossMounts bool          `json:"x,omitempty"`
+}
+
+// ChownJobReq is the recursive/multi-item chown. -1 leaves that half alone.
+type ChownJobReq struct {
+	Paths       [][]byte `json:"p"`
+	UID         int      `json:"u"`
+	GID         int      `json:"g"`
+	Recursive   bool     `json:"r,omitempty"`
+	CrossMounts bool     `json:"x,omitempty"`
+}
+
+// PropsReq asks for everything the properties dialog shows about one entry.
+type PropsReq struct {
+	Path []byte `json:"p"`
+	// Target is the symlink's already-RESOLVED, already-GUARDED spelling, and it
+	// is the only thing that fills PropsResp.Target (M3 round-3 review).
+	//
+	// The worker used to resolve the link itself, with a following StatFollow on
+	// the leaf. That is a second resolution separated from the route's guard by a
+	// gap the client chooses, so a link re-pointed inside it was described from a
+	// path the guard had never seen — the round-14 lesson (canonical.go) applied
+	// to a read. Now the route resolves it as the user, guards THAT spelling, and
+	// sends it here; the worker walks it O_NOFOLLOW per component and refuses a
+	// symlink among them as fsx.ErrChanged.
+	//
+	// Empty means "no target": the link is still fully described, which is what
+	// a dangling one — for which the route has no resolved spelling to send —
+	// needs (§8.1).
+	Target []byte `json:"t,omitempty"`
+	// Follow is INERT. It was what asked the worker to resolve the link, and
+	// resolving in the worker is precisely what Target replaces; it is kept on
+	// the wire so a worker and a front-end of different vintages still speak,
+	// and a request that sets it and sends no Target simply gets no target.
+	Follow bool `json:"f,omitempty"`
+}
+
+// PropsResp is one canonical walk, one fstat, one fstatfs and one xattr probe
+// on the held descriptor. The field names are readable rather than terse
+// because, unlike every other message here, this one is forwarded to the client
+// essentially as it stands (m3-contract §10's properties route).
+type PropsResp struct {
+	Entry    fsx.Entry      `json:"e"`
+	Target   *fsx.Entry     `json:"t,omitempty"`
+	FS       FSInfo         `json:"fs"`
+	ACL      ACLInfo        `json:"acl"`
+	Identity FSIdentityResp `json:"id"`
+}
+
+// FSInfo describes the filesystem holding the entry. Avail/Total come from
+// fstatfs on the held descriptor, so on a per-share hero dataset they are the
+// dataset's numbers; where fstatfs is unavailable they are omitted rather than
+// invented (m3-contract §8.2, §14).
+type FSInfo struct {
+	FSType   string `json:"fsType,omitempty"`
+	Mount    string `json:"mount,omitempty"`
+	Domain   string `json:"domain,omitempty"`
+	Network  bool   `json:"network,omitempty"`
+	ReadOnly bool   `json:"readOnly,omitempty"`
+	Avail    uint64 `json:"avail,omitempty"`
+	Total    uint64 `json:"total,omitempty"`
+}
+
+// ACLInfo is the authoritative display copy of an entry's ACL situation:
+// which backend the mount has, which xattr answered, the per-entry STATE
+// (m3-contract §6.1), and — on ZFS — the dataset and its aclmode.
+type ACLInfo struct {
+	Backend string `json:"backend,omitempty"`
+	Xattr   string `json:"xattr,omitempty"`
+	State   string `json:"state,omitempty"`
+	Aclmode string `json:"aclmode,omitempty"`
+	Dataset string `json:"dataset,omitempty"`
 }
 
 type ReadlinkReq struct {

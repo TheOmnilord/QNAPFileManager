@@ -64,15 +64,66 @@ type Entry struct {
 	// TargetType is the Type of the resolved target, empty when dangling.
 	TargetType string `json:"targetType,omitempty"`
 
-	Hidden     bool `json:"hidden,omitempty"`
-	HasACL     bool `json:"hasAcl,omitempty"`
-	MountPoint bool `json:"mountPoint,omitempty"`
+	Hidden bool `json:"hidden,omitempty"`
+	// HasACL is the boolean kept for compatibility: true for ACLPosix, ACLNFS4
+	// and ACLUnknown, false for everything else including "not probed".
+	HasACL bool `json:"hasAcl,omitempty"`
+	// ACL is the ACL STATE of the entry (M3 contract §6.1): "" when it was not
+	// probed at all, else ACLNone, ACLPosix, ACLNFS4, ACLNFS4Trivial or
+	// ACLUnknown.
+	//
+	// A state and not a boolean, because on ZFS presence is the wrong question:
+	// every object on a dataset carries system.nfs4_acl, so "the attribute
+	// exists" would badge the whole NAS. What the badge reports is whether the
+	// ACL says anything the mode does not.
+	ACL        string `json:"acl,omitempty"`
+	MountPoint bool   `json:"mountPoint,omitempty"`
 
 	// Class is the guard classification: "normal", "warn" or "protected".
 	Class string `json:"class,omitempty"`
 	// ShareLink and VolumeRoot tag the two kinds of entry found at /share.
 	ShareLink  bool `json:"shareLink,omitempty"`
 	VolumeRoot bool `json:"volumeRoot,omitempty"`
+}
+
+// The Entry.ACL vocabulary (M3 contract §6.1). The empty string is a sixth
+// value with a meaning of its own — "not probed" — and is deliberately not a
+// constant here: it is the zero value, and naming it would invite a caller to
+// treat "we did not look" as a fact about the file.
+const (
+	// ACLNone: the filesystem has an ACL backend and this object carries no
+	// ACL beyond the mode.
+	ACLNone = "none"
+	// ACLPosix: system.posix_acl_access is present and non-empty — exactly the
+	// "+" in ls -l.
+	ACLPosix = "posix"
+	// ACLNFS4: an NFSv4 ACL that names somebody other than
+	// OWNER@/GROUP@/EVERYONE@, or carries an inheritance flag.
+	ACLNFS4 = "nfs4"
+	// ACLNFS4Trivial: an NFSv4 ACL that is only what the mode already describes.
+	// ZFS gives every object one of these, so this is the ordinary state on a
+	// hero dataset and is NOT badged.
+	ACLNFS4Trivial = "nfs4-trivial"
+	// ACLUnknown: the attribute could not be read or could not be parsed. It is
+	// never reported as ACLNone — a failure fails towards the pessimistic side,
+	// which is the half that matters.
+	ACLUnknown = "unknown"
+)
+
+// ACLPresent reports whether an ACL state means "there is an ACL here worth
+// telling the user about". It is what fills Entry.HasACL.
+func ACLPresent(state string) bool {
+	switch state {
+	case ACLPosix, ACLNFS4, ACLUnknown:
+		return true
+	}
+	return false
+}
+
+// SetACL records a probed ACL state and keeps HasACL consistent with it.
+func (e *Entry) SetACL(state string) {
+	e.ACL = state
+	e.HasACL = ACLPresent(state)
 }
 
 // SetName fills Name and, only when the raw bytes are not valid UTF-8,
@@ -164,7 +215,26 @@ type ListOptions struct {
 	Offset    int  `json:"offset,omitempty"`
 	// Limit defaults to DefaultListLimit and is capped at MaxListLimit.
 	Limit int `json:"limit,omitempty"`
+	// ACLProbe asks the listing to fill Entry.ACL (M3 contract §6.2). It costs
+	// one lgetxattr per entry, so it is off unless the route asks, it is only
+	// honoured where the mount has an ACL backend at all, and it is bounded per
+	// page by ACLProbeMaxEntries and ACLProbeMaxBytes — beyond either, the rest
+	// of the page is left unprobed and the listing says so.
+	ACLProbe bool `json:"aclProbe,omitempty"`
 }
+
+// The ACL probe's per-page bounds (M3 contract §6.2 and §13). They are per PAGE
+// rather than per directory because the probe runs over the entries actually
+// being returned: paging through a huge folder therefore badges each page it
+// shows instead of badging nothing at all.
+const (
+	ACLProbeMaxEntries = 2000
+	ACLProbeMaxBytes   = 64 << 10
+)
+
+// ACLProbeCappedNote is the listing note the probe adds when it stopped at one
+// of its bounds. It is a sentence and not a code because it is shown verbatim.
+const ACLProbeCappedNote = "ACL badges are not shown for very large folders."
 
 // Listing is one page of a directory.
 type Listing struct {

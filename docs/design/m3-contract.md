@@ -52,8 +52,10 @@ kernel refuses (INV-2).
    **after** re-proving `(dev, ino, btime)` against the held leaf, and refuses `changed` if they differ. chmod is
    `chmod("/proc/self/fd/N", mode)` on the held `O_PATH` descriptor — the established idiom in this tree
    (`unnamed_linux.go`) — which acts on that inode and refuses a symlink with `EOPNOTSUPP` exactly where `lchmod`
-   would; where `/proc` is not mounted it falls back to `fchmod` on a readable re-open, and where that fails (a 0200
-   file) it reports `unsupported` rather than reaching for a pathname.
+   would; where `/proc` is not mounted it falls back to `fchmod` on a readable re-open; where that open fails the
+   kernel's own verdict is returned (a 0200 file is `permission`, INV-2 — amended round 2), and only an object
+   with no readable route for anybody (ELOOP, ENXIO, ENODEV, EOPNOTSUPP) is `unsupported`; a pathname is never
+   reached for.
 4. **The post-call stat is on the same descriptor.** `fstat(leaffd)` before and after. Re-`lstat`ing by name would
    describe whatever answers to that name now, which is the whole class of bug the descriptor discipline exists to
    close — and it is the *diff* that the user is being shown, so a wrong object there is a lie, not a nuisance.
@@ -160,7 +162,8 @@ read the same data-driven table, so they agree by construction (the trash-root a
 | `ACL == "nfs4-trivial"` with `aclmode=discard` | normal rules | there is nothing to destroy, so no promotion |
 
 `ZFSAclmode == ""` is treated as `discard`, never as `passthrough`: the pessimistic reading is the only honest one
-when `zfs get` is unavailable (identity plan §4.4 is explicit — never guess). Token parts, ordered: `op=chmod|chown`,
+when `zfs get` is unavailable (identity plan §4.4 is explicit — never guess). Token parts, ordered (amended round 3: a leading `kind=sync|job` part keeps a sync token from redeeming at the job
+route and vice versa): `kind=sync|job`, `op=chmod|chown`,
 `mask=<octal>`, `value=<octal>`, `dirs=<octal>/<octal>`, `uid=<n>`, `gid=<n>`, `recursive=<bool>`, `cross=<bool>`,
 then the sorted resolved roots — so a token issued for 0755 cannot be redeemed for 4755, and one issued
 non-recursively cannot be redeemed recursively.
@@ -302,6 +305,11 @@ special-bit *set* refused; job concurrency is the existing `ClassMetadata` semap
 chmod/chown routes are ordinary JSON routes under the 15 s handler context and the 1 MiB body cap — nothing in M3
 streams, so nothing in M3 needs an admission slot.
 
+*Amended, round 2:* the recursive pre-scan is bounded by the request context (the 15 s handler budget, with a margin
+for the dispatch), not by a separate 30 s constant; a scan that runs out of budget reports `-1` and the ladder treats
+that as large (L2). The measured count travels in the confirmation's summary and is reused when the token is
+redeemed, so the tree is scanned once per confirmed job.
+
 ## 14. Degradation off Linux (the dev loop)
 
 `chmod_other.go` applies `os.Chmod` best effort (Windows mode bits are a fiction and the dev loop only needs the
@@ -369,6 +377,11 @@ in-app drag-and-drop and the trash janitor stay deferred.
    covers the far more likely failure (the `zfs` binary not being callable at all).
 4. **"Trivial" is our heuristic.** A mis-classified trivial NFSv4 ACL under-warns. Parse failures fail towards the
    pessimistic side, which is the half that matters.
+4a. **With crossing, a job's ACL rung is the worst of every dataset the mount table places below the roots at the
+   moment the token is issued** (round-4 review): a hero pool is one dataset per share and often per sub-folder, so
+   grading the selected root alone let a `passthrough` parent promise "other entries are kept" and then destroy a
+   `discard` child's ACLs one directory down. A dataset mounted *after* the token was issued is not seen — the same
+   window as residual 3, and accepted on the same grounds.
 5. **A recursive permissions job has no undo,** and a cancelled one leaves a half-changed tree. Stated in the dialog
    and in the result.
 6. **chown clears setuid/setgid,** and POSIX chmod rewrites the ACL mask. Both are reported after the fact, never
@@ -382,6 +395,15 @@ in-app drag-and-drop and the trash janitor stay deferred.
    expects pool free space.
 10. **No kernel semantics are exercised on the dev box** (INV-2), so local green means less for M3 than for any
     milestone so far. CI's root and ZFS jobs are the real gate.
+11. **Hardlinks (round 2).** A recursive chmod applies to the inode an entry names, wherever else it is linked. When
+    the worker is root (an administrator), non-directory entries with `nlink > 1` are skipped with a warning and
+    must be changed by naming them directly — which also skips legitimate hardlink farms (rsync `--link-dest`
+    backup trees) under an admin's recursive change. Non-root workers are left to the kernel, which refuses a
+    chmod of an inode the user does not own. Recursive jobs also resolve a symlink root to its target and change
+    that; a mount-point root is changed and descended (child mounts follow `CrossMounts`).
+12. **Link target spelling (round 4).** `properties` without `follow` still reports `LinkResolved` from the worker's
+    own resolution, as the listing has since M1; the `follow` refusal protects the target's attributes, not its
+    spelling. Accepted as M1 behaviour.
 
 **To confirm on hardware first (both units):** that `zfs get -Hp -o value aclmode` is callable at all as root on
 hero and what it returns for an ordinary share — the entire L2 promotion hangs on it, and an empty answer means every

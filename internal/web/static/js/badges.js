@@ -1,4 +1,5 @@
 import {$,el,route} from './dom.js';
+import {aclBadge} from './perm.js';
 export const isSymlink = e => e.isSymlink || e.type === 'symlink';
 export const hasTarget = e => !!(e.linkResolvedB64 || e.linkResolved);
 export const isDirectory = e => isSymlink(e) ? hasTarget(e) && e.targetType === 'dir' : e.type === 'dir';
@@ -12,6 +13,13 @@ export function nameCell(entry) {
  const broken = isSymlink(entry) && !hasTarget(entry);
  cell.append(el('span',{class:`nameText${broken ? ' broken' : ''}`},entry.name));
  if (entry.class === 'protected') cell.append(el('span',{class:'badge',title:'Protected system path','aria-label':'Protected system path'},'🛡'));
+ // The ACL badge (M3 contract §6). It reports a STATE, not a boolean: every
+ // object on a ZFS dataset carries system.nfs4_acl, so "the attribute exists"
+ // would badge the entire NAS. A trivial NFSv4 ACL says exactly what the mode
+ // says and gets no badge; an unreadable one gets the badge with the
+ // pessimistic text, because a parse failure is never reported as "none".
+ const acl = aclBadge(entry);
+ if (acl) cell.append(el('span',{class:`badge acl acl-${acl.state}`,title:acl.title,'aria-label':acl.label},acl.glyph));
  if (entry.mountPoint) cell.append(el('span',{class:'badge',title:'Mount point','aria-label':'Mount point'},'⏏'));
  if (entry.isSymlink) cell.append(el('span',{class:'target'},`→ ${entry.linkTarget || '?'}${broken ? ' (broken)' : ''}`));
  return cell;

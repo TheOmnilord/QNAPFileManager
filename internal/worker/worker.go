@@ -618,6 +618,12 @@ func (s *session) dispatch(ctx context.Context, f wproto.Frame) {
 		s.rename(ctx, f)
 	case wproto.OpDelete:
 		s.delete(ctx, f)
+	case wproto.OpChmod:
+		s.chmod(ctx, f)
+	case wproto.OpChown:
+		s.chown(ctx, f)
+	case wproto.OpProps:
+		s.props(ctx, f)
 	case wproto.OpOpenRead:
 		s.openRead(ctx, f)
 	case wproto.OpOpenWrite:

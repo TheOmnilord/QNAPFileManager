@@ -199,7 +199,12 @@ type confirmEnvelope struct {
 		Code, Message, Path string
 	} `json:"error"`
 	Confirm struct {
-		Token   string        `json:"token"`
+		Token string `json:"token"`
+		// Grade is M3's explicit confirmation grade (ui-ux §4.2): absent (0)
+		// on every pre-M3 route, 1 for an acknowledgement, 2 for the typed
+		// phrase. It travels beside the token because the guard's token
+		// machinery is grade-blind.
+		Grade   int           `json:"grade"`
 		Summary guard.Summary `json:"summary"`
 	} `json:"confirm"`
 }

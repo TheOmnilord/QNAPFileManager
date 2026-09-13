@@ -105,10 +105,11 @@ type Guard struct {
 	mu      sync.RWMutex
 	mountFn func(apiPath string) bool
 
-	// Confirmation-token state (confirm.go).
+	// Confirmation-token state (confirm.go). seenMu guards both maps.
 	serverKey []byte
 	seenMu    sync.Mutex
-	seen      map[string]int64 // spent token -> expiry unix, swept lazily
+	seen      map[string]int64      // spent token -> expiry unix, swept lazily
+	issued    map[string]issuedCost // live token -> what its summary measured
 }
 
 // New builds a Guard for a daemon whose own installation lives at installDir
@@ -124,6 +125,7 @@ func New(installDir string, shareIsRAM bool) *Guard {
 		shareIsRAM: shareIsRAM,
 		serverKey:  newServerKey(),
 		seen:       make(map[string]int64),
+		issued:     make(map[string]issuedCost),
 	}
 	g.rules = defaultRules(installDir, shareIsRAM)
 	return g

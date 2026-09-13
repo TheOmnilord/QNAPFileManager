@@ -175,6 +175,12 @@ var routes = map[string][]string{
 	"/api/fs/upload": {"POST"}, "/api/fs/archive": {"GET"}, "/api/jobs/search": {"POST"},
 	"/api/fs/archive/select": {"POST"},
 	"/api/trash":             {"GET"}, "/api/trash/restore": {"POST"}, "/api/trash/empty": {"POST"},
+	// M3 (contract §10): the permission mutations, sync and as jobs, plus the
+	// properties read. "chmod"/"chown" cannot collide with a job id — jobPath
+	// insists on 16 hex characters — and literal routes win regardless.
+	"/api/fs/chmod": {"POST"}, "/api/fs/chown": {"POST"},
+	"/api/jobs/chmod": {"POST"}, "/api/jobs/chown": {"POST"},
+	"/api/fs/properties": {"GET"},
 }
 
 // routeFor resolves a request path to the methods it answers. Literal routes
@@ -399,7 +405,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	case "/api/fs/text":
 		s.text(w, r, sess)
 	case "/api/ids":
-		s.identities(w, r)
+		s.identities(w, r, sess)
 	case "/api/diag":
 		s.diag(w, r, sess)
 	case "/api/fs/mkdir":
@@ -408,6 +414,16 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		s.rename(w, r, sess)
 	case "/api/fs/delete":
 		s.delete(w, r, sess)
+	case "/api/fs/chmod":
+		s.chmod(w, r, sess)
+	case "/api/fs/chown":
+		s.chown(w, r, sess)
+	case "/api/fs/properties":
+		s.properties(w, r, sess)
+	case "/api/jobs/chmod":
+		s.jobChmod(w, r, sess)
+	case "/api/jobs/chown":
+		s.jobChown(w, r, sess)
 	case "/api/settings":
 		// GET and HEAD are reads; only POST mutates. A HEAD must never reach
 		// postSettings — Go's decoder would apply a HEAD body without CSRF or an

@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -176,5 +177,88 @@ func TestNeedsConfirm(t *testing.T) {
 		if got := NeedsConfirm(c.op, "/some/path", c.count, c.bytes); got != c.want {
 			t.Errorf("NeedsConfirm(%v, count=%d, bytes=%d) = %v, want %v", c.op, c.count, c.bytes, got, c.want)
 		}
+	}
+}
+
+// TestPeekReturnsTheMeasuredCostWithoutSpending covers the ledger M3 needs: a
+// recursive permissions change pre-scans the tree to say how many items it will
+// touch, and the re-post that redeems the token must not walk it again. The
+// count is remembered against the token — unforgeable, so a client cannot
+// influence it — and Peek reads it back without spending anything.
+func TestPeekReturnsTheMeasuredCostWithoutSpending(t *testing.T) {
+	g := New("", false)
+	parts := []string{"op=chmod", "/data/tree"}
+	token, _ := g.Issue("chmod", Summary{Files: 8003, Bytes: 12, Warnings: []string{"a sentence"}}, parts, true)
+
+	cost, ok := g.Peek(token, "chmod", parts, true)
+	if !ok || cost.Files != 8003 || cost.Bytes != 12 {
+		t.Fatalf("Peek = %+v, %v; want the measured totals", cost, ok)
+	}
+	// The warning sentences are deliberately not kept: they are the caller's own
+	// wording and one operation can carry a sentence per selected root.
+	if cost.Warnings != nil {
+		t.Fatalf("Peek must not retain warnings: %v", cost.Warnings)
+	}
+	// Peeking does not spend: the token still redeems, exactly once.
+	if _, ok := g.Peek(token, "chmod", parts, true); !ok {
+		t.Fatal("Peek spent the token")
+	}
+	if err := g.Redeem(token, "chmod", parts, true); err != nil {
+		t.Fatalf("Redeem after Peek: %v", err)
+	}
+	if err := g.Redeem(token, "chmod", parts, true); err == nil {
+		t.Fatal("a spent token redeemed twice")
+	}
+	// A spent token's record is dropped rather than held until its expiry, and
+	// Peek reports it as unusable.
+	if _, ok := g.Peek(token, "chmod", parts, true); ok {
+		t.Fatal("a spent token must not peek")
+	}
+	g.seenMu.Lock()
+	held := len(g.issued)
+	g.seenMu.Unlock()
+	if held != 0 {
+		t.Fatalf("the ledger still holds %d record(s) for a spent token", held)
+	}
+}
+
+// TestPeekFailsClosed: every way a token can be wrong reports false, so a caller
+// that cannot read a count measures one rather than proceeding on a guess.
+func TestPeekFailsClosed(t *testing.T) {
+	g := New("", false)
+	parts := []string{"op=chmod", "/data/tree"}
+	token, _ := g.Issue("chmod", Summary{Files: 8003}, parts, true)
+	for name, peek := range map[string]func() (Summary, bool){
+		"no token":    func() (Summary, bool) { return g.Peek("", "chmod", parts, true) },
+		"malformed":   func() (Summary, bool) { return g.Peek("not-a-token", "chmod", parts, true) },
+		"wrong op":    func() (Summary, bool) { return g.Peek(token, "chown", parts, true) },
+		"wrong parts": func() (Summary, bool) { return g.Peek(token, "chmod", []string{"op=chmod", "/data/other"}, true) },
+		"wrong order": func() (Summary, bool) { return g.Peek(token, "chmod", []string{"/data/tree", "op=chmod"}, true) },
+	} {
+		if _, ok := peek(); ok {
+			t.Errorf("%s: Peek reported a usable record", name)
+		}
+	}
+	// An authentic token whose summary measured nothing is not recorded at all,
+	// which the caller must read as "measure it yourself", never as a zero.
+	empty, _ := g.Issue("chmod", Summary{}, parts, true)
+	if _, ok := g.Peek(empty, "chmod", parts, true); ok {
+		t.Fatal("an unmeasured summary must not be recorded")
+	}
+}
+
+// TestIssuedLedgerIsBounded: minting a token is cheap, so the ledger must not be
+// a way to grow the daemon's memory. Beyond its cap it records nothing and the
+// caller measures again — which is what it did before the ledger existed.
+func TestIssuedLedgerIsBounded(t *testing.T) {
+	g := New("", false)
+	for i := 0; i < maxIssuedCosts+50; i++ {
+		g.Issue("chmod", Summary{Files: int64(i + 1)}, []string{"op=chmod", strconv.Itoa(i)}, true)
+	}
+	g.seenMu.Lock()
+	held := len(g.issued)
+	g.seenMu.Unlock()
+	if held > maxIssuedCosts {
+		t.Fatalf("the ledger holds %d records, cap is %d", held, maxIssuedCosts)
 	}
 }

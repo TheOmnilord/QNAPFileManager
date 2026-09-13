@@ -666,13 +666,23 @@ func List(ctx context.Context, r fsx.Root, plat *platform.Platform, dir string, 
 		out = append(out, entries[off:min(off+limit, total)]...)
 	}
 
+	notes := dirNotes(plat, clean, osDir, mountPointAt(r, plat, tg, dirInfo, osDir), capped)
+	// The ACL badge, for the page that is actually being returned (M3 contract
+	// §6.2). It runs over `out` rather than over every entry read, because the
+	// bound is per page: paging through a huge folder then badges each page it
+	// shows instead of badging nothing at all. A probe that hit its bound says
+	// so, so that a missing badge is never read as "no ACL".
+	if probeListing(plat, osDir, out, o.ACLProbe) {
+		notes = append(notes, fsx.ACLProbeCappedNote)
+	}
+
 	l := fsx.Listing{
 		Path:      clean,
 		Parent:    fsx.Parent(clean),
 		Entries:   out,
 		Total:     total,
 		Truncated: capped || off+len(out) < total,
-		Notes:     dirNotes(plat, clean, osDir, mountPointAt(r, plat, tg, dirInfo, osDir), capped),
+		Notes:     notes,
 	}
 	return l, nil
 }

@@ -59,6 +59,11 @@ type Backend interface {
 	// contract §2). The caller copies it to the response and must Close it —
 	// closing early is how a departed client stops the worker's walk.
 	Archive(ctx context.Context, who Principal, req wproto.ArchiveReq) (ArchiveStream, wproto.ArchiveResp, error)
+	// Props reports everything the properties dialog shows about one entry:
+	// the entry, a followed symlink's target, the filesystem, the ACL state and
+	// the mount identity — all from ONE canonical walk on a held descriptor
+	// inside the worker (M3 contract §8.1). It is a plain read, not a job.
+	Props(ctx context.Context, who Principal, req wproto.PropsReq) (wproto.PropsResp, error)
 }
 
 // ArchiveStream is an archive being produced: the bytes, and the one question a
@@ -127,6 +132,16 @@ type Mutator interface {
 	// streaming: the worker verifies, stamps and links the inode into place
 	// under the conflict policy.
 	Finalize(ctx context.Context, who Principal, req wproto.FinalizeReq) (wproto.FinalizeResp, error)
+	// Chmod applies a mode CHANGE (mask + value) to one entry and reports the
+	// pre-call entry, the post-call entry and the fields the kernel did not do
+	// as asked. A symlink leaf is refused as unsupported unless Follow is set
+	// (M3 contract §1.4); the diff, not an error, is how a silently-dropped
+	// setgid or an aclmode=groupmask rewrite is surfaced (§3).
+	Chmod(ctx context.Context, who Principal, req wproto.ChmodReq) (wproto.ModeResp, error)
+	// Chown changes owner and/or group of one entry; -1 leaves that half
+	// alone. It is always an lchown — a symlink's own ownership is what
+	// changes — so req.Follow is refused as unsupported in M3.
+	Chown(ctx context.Context, who Principal, req wproto.ChownReq) (wproto.ModeResp, error)
 }
 
 func itoa(i int) string { return strconv.Itoa(i) }

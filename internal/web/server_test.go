@@ -22,6 +22,7 @@ import (
 	"qnapfilemanager/internal/fsx"
 	"qnapfilemanager/internal/guard"
 	"qnapfilemanager/internal/idmap"
+	"qnapfilemanager/internal/perm"
 	"qnapfilemanager/internal/platform"
 	"qnapfilemanager/internal/qtsauth"
 	"qnapfilemanager/internal/wproto"
@@ -34,6 +35,20 @@ type fakeBackend struct {
 	last   backend.Principal
 	lastAs *wproto.CreateAs // the owner the most recent Mkdir was asked to apply
 	opts   fsx.ListOptions
+
+	// M3 seams. Set them before the server serves anything; they are read on
+	// the request goroutine alone (no job goroutine calls Backend).
+	chmodReqs  []wproto.ChmodReq
+	chownReqs  []wproto.ChownReq
+	propsReqs  []wproto.PropsReq
+	chmodErr   error
+	chownErr   error
+	propsErr   error
+	chmodLands *uint32           // the mode the "kernel" actually left behind
+	chownKeeps bool              // the "kernel" silently kept the old ownership
+	propsFS    wproto.FSInfo     // what Props reports about the filesystem
+	propsACL   wproto.ACLInfo    // what Props reports about the ACL
+	aclState   map[string]string // per-path ACL state override
 }
 
 func (b *fakeBackend) osPath(p string) string {
@@ -165,6 +180,97 @@ func (b *fakeBackend) Rename(_ context.Context, p backend.Principal, from, to st
 func (b *fakeBackend) Delete(_ context.Context, p backend.Principal, name string) error {
 	b.last = p
 	return os.Remove(b.osPath(name))
+}
+
+// --- the M3 permission/properties half of the fake ----------------------------
+//
+// These three do NOT touch the host's permission bits, deliberately: Windows
+// mode bits are a fiction and INV-2 forbids simulating the kernel, so the fake
+// applies the requested change ARITHMETICALLY (perm.ModeSpec.Apply) and reports
+// it. That makes every route test — guard, ladder, token, audit — deterministic
+// on every OS, and leaves the real kernel semantics to the Linux and root CI
+// jobs, which is where the contract says they belong.
+//
+// Every knob is set before the server serves anything (the fixture convention),
+// and every call is recorded so a test can pin WHICH spelling was dispatched.
+
+func (b *fakeBackend) Chmod(ctx context.Context, p backend.Principal, req wproto.ChmodReq) (wproto.ModeResp, error) {
+	b.last = p
+	b.chmodReqs = append(b.chmodReqs, req)
+	if b.chmodErr != nil {
+		return wproto.ModeResp{}, b.chmodErr
+	}
+	name := string(req.Path)
+	before, err := b.Stat(ctx, p, name)
+	if err != nil {
+		return wproto.ModeResp{}, err
+	}
+	// The contract's symlink rule (§1.4): chmod never touches a symlink, so a
+	// link leaf without follow is unsupported.
+	if before.Type == "symlink" && !req.Follow {
+		return wproto.ModeResp{}, fsx.ErrUnsupported
+	}
+	after := before
+	landed := req.Spec.Apply(perm.EntryMode(before))
+	if b.chmodLands != nil {
+		landed = *b.chmodLands // a kernel that did something else (INV-2, made visible)
+	}
+	after.Mode = perm.Octal(landed)
+	after.ModeStr = perm.Symbolic(landed, before.Type == "dir")
+	return wproto.ModeResp{Before: before, Entry: after, Diffs: perm.DiffOf(req.Spec, -1, -1, before, after)}, nil
+}
+
+func (b *fakeBackend) Chown(ctx context.Context, p backend.Principal, req wproto.ChownReq) (wproto.ModeResp, error) {
+	b.last = p
+	b.chownReqs = append(b.chownReqs, req)
+	if b.chownErr != nil {
+		return wproto.ModeResp{}, b.chownErr
+	}
+	if req.Follow {
+		return wproto.ModeResp{}, fsx.ErrUnsupported // M3 refuses it (§1.4)
+	}
+	before, err := b.Stat(ctx, p, string(req.Path))
+	if err != nil {
+		return wproto.ModeResp{}, err
+	}
+	after := before
+	if req.UID >= 0 {
+		after.UID = req.UID
+	}
+	if req.GID >= 0 {
+		after.GID = req.GID
+	}
+	if b.chownKeeps {
+		after = before // a kernel that refused half of it, silently
+	}
+	return wproto.ModeResp{Before: before, Entry: after, Diffs: perm.DiffOf(perm.ModeSpec{}, req.UID, req.GID, before, after)}, nil
+}
+
+func (b *fakeBackend) Props(ctx context.Context, p backend.Principal, req wproto.PropsReq) (wproto.PropsResp, error) {
+	b.last = p
+	b.propsReqs = append(b.propsReqs, req)
+	if b.propsErr != nil {
+		return wproto.PropsResp{}, b.propsErr
+	}
+	name := string(req.Path)
+	e, err := b.Stat(ctx, p, name)
+	if err != nil {
+		return wproto.PropsResp{}, err
+	}
+	resp := wproto.PropsResp{Entry: e, FS: b.propsFS, ACL: b.propsACL}
+	if acl, ok := b.aclState[name]; ok {
+		resp.ACL.State = acl
+		resp.Entry.ACL = acl
+	}
+	// The target is described only when the caller SENT one: it is an
+	// already-resolved, already-guarded spelling, and the worker resolves
+	// nothing of its own (M3 contract §8.1 after round 3). Follow is inert.
+	if len(req.Target) > 0 {
+		if target, terr := b.Stat(ctx, p, string(req.Target)); terr == nil {
+			resp.Target = &target
+		}
+	}
+	return resp, nil
 }
 
 // Resolve mirrors the worker-side resolver over the fake's temp dir, resolving

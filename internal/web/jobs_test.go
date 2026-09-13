@@ -39,6 +39,8 @@ type fakeJobs struct {
 	started   chan struct{} // closed by the first Job call
 	trash     wproto.TrashListResp
 	trashErr  error
+	fsid      map[string]wproto.FSIdentityResp // per-path identity for the move pre-flight
+	fsidErr   error
 }
 
 func (f *fakeJobs) Job(ctx context.Context, who backend.Principal, req wproto.JobReq, onProg func(wproto.Prog), onWarn func(wproto.Warn)) (wproto.JobResult, error) {
@@ -87,6 +89,21 @@ func (f *fakeJobs) TrashList(_ context.Context, _ backend.Principal) (wproto.Tra
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.trash, f.trashErr
+}
+
+// FSIdentity answers from the fsid map when the test configured one, else says
+// every path is on one filesystem (Dev 1) — the same-device case, so the move
+// pre-flight predicts nothing unless a test asks it to.
+func (f *fakeJobs) FSIdentity(_ context.Context, _ backend.Principal, path string) (wproto.FSIdentityResp, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.fsidErr != nil {
+		return wproto.FSIdentityResp{}, f.fsidErr
+	}
+	if id, ok := f.fsid[path]; ok {
+		return id, nil
+	}
+	return wproto.FSIdentityResp{Dev: 1, Dir: true}, nil
 }
 
 func (f *fakeJobs) requests() []wproto.JobReq {

@@ -34,8 +34,13 @@ const (
 	OpJob       Op = "job" // copy|move|delete|size|search|archive|chmod|chown|trash
 	OpCancel    Op = "cancel"
 	OpTrashList Op = "trashlist" // list the caller's own trash: a plain read, not a job (M2)
-	OpPing      Op = "ping"
-	OpBye       Op = "bye" // graceful shutdown: finish nothing new, exit
+	// OpFSIdentity answers which filesystem holds a path, from a descriptor the
+	// worker opens as the user (M2-B contract §1.2). The move pre-flight compares
+	// every source with the destination directory to PREDICT an EXDEV and say so
+	// in the confirm dialog; the kernel's actual verdict still decides the move.
+	OpFSIdentity Op = "fsid"
+	OpPing       Op = "ping"
+	OpBye        Op = "bye" // graceful shutdown: finish nothing new, exit
 )
 
 // Frame kinds. A request gets exactly one terminal frame (KindOK or KindErr)

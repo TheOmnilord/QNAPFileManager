@@ -113,4 +113,9 @@ type Jobs interface {
 	// TrashList lists the principal's own trashed items: a plain read, not a
 	// job, so the trash panel opens without a job round-trip.
 	TrashList(ctx context.Context, who Principal) (wproto.TrashListResp, error)
+	// FSIdentity reports which filesystem holds path, computed in the
+	// principal's worker from a descriptor it opened as the user — never by a
+	// root-side pathname lookup (INV-2). The move pre-flight uses it to predict
+	// an EXDEV and say so up front (M2-B contract §1.2).
+	FSIdentity(ctx context.Context, who Principal, path string) (wproto.FSIdentityResp, error)
 }

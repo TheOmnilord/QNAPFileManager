@@ -446,3 +446,24 @@ func (p *Pool) TrashList(ctx context.Context, who backend.Principal) (wproto.Tra
 	}
 	return resp, nil
 }
+
+// FSIdentity asks the principal's worker which filesystem holds path. Like
+// TrashList it is a plain request: the answer is a prediction for a dialog,
+// not a step of the job.
+func (p *Pool) FSIdentity(ctx context.Context, who backend.Principal, path string) (wproto.FSIdentityResp, error) {
+	c, err := p.acquire(ctx, who)
+	if err != nil {
+		return wproto.FSIdentityResp{}, err
+	}
+	defer p.release(c)
+	f, files, err := p.call(ctx, c, wproto.OpFSIdentity, wproto.FSIdentityReq{Path: []byte(path)})
+	if err != nil {
+		return wproto.FSIdentityResp{}, err
+	}
+	closeAll(files)
+	var resp wproto.FSIdentityResp
+	if err := f.Unmarshal(&resp); err != nil {
+		return wproto.FSIdentityResp{}, err
+	}
+	return resp, nil
+}

@@ -240,12 +240,57 @@ type CopyOptions struct {
 	// domain — "include mounted sub-folders" in the UI. It never permits
 	// /proc, /sys, /dev, tmpfs, USB disks, other pools or network mounts.
 	CrossMounts bool `json:"crossMounts,omitempty"`
+	// As is the owner for every entry a COPY creates — the same chown-only rule
+	// as MkdirReq.As (never chmod; GID -1 = inherit), gated by the front-end the
+	// same way: only for an admin operating as root, only when both spellings of
+	// the destination directory classify "normal". Ignored for a move, which
+	// preserves the source owner when the worker's euid is 0 — what the rename
+	// would have done (M2-B contract §1.4).
+	As *CreateAs `json:"as,omitempty"`
 }
 
+// CopyReq is the body of a JobCopy and of a JobMove: one engine, two kinds
+// (M2-B contract §1.1). A move tries renameat2 per source first and falls back
+// to copy, verify, then delete the source — and deletes a root's source only
+// when that root copied with zero warnings and zero skips.
+//
+// Conflict is ConflictSkip (the default when empty), ConflictOverwrite or
+// ConflictRename ("keep both": "name (2).ext"). It applies to non-directory
+// entries; directories always merge. PreserveTimes: the route always sends it;
+// the engine treats an omitted value as true. PreserveMode is accepted and
+// ignored — the creation mode is srcMode&0777 under the umask and the
+// destination's inherited ACL, and no chmod is ever issued (§1.5).
 type CopyReq struct {
 	Src    [][]byte    `json:"s"`
 	DstDir []byte      `json:"d"`
 	Opts   CopyOptions `json:"o"`
+}
+
+// FSIdentityReq asks OpFSIdentity about one path — the entry itself, never
+// followed, so a symlink answers for the link.
+type FSIdentityReq struct {
+	Path []byte `json:"p"`
+}
+
+// FSIdentityResp is the mount identity of the opened descriptor: the statx
+// mount id when the kernel gives one (bind mounts share a st_dev, so the mount
+// id is what tells datasets and shares apart — astra-per-user-review §46), and
+// st_dev always. Two paths with equal identities rename between each other;
+// two with different identities are predicted EXDEV.
+type FSIdentityResp struct {
+	Mount    uint64 `json:"m,omitempty"`
+	HasMount bool   `json:"hm,omitempty"`
+	Dev      uint64 `json:"d"`
+	Dir      bool   `json:"dir"`
+}
+
+// Same reports whether two identities name one filesystem: by mount id when
+// both sides have one, else by device.
+func (a FSIdentityResp) Same(b FSIdentityResp) bool {
+	if a.HasMount && b.HasMount {
+		return a.Mount == b.Mount
+	}
+	return a.Dev == b.Dev
 }
 
 type DeleteReq struct {

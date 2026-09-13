@@ -730,11 +730,23 @@ func TestHeadSettingsDoesNotMutate(t *testing.T) {
 	c, _ := sessionCookie(t, s)
 	s.sessions[c.Value].admin = true
 	// HEAD is a safe method, so no CSRF is required to reach the router; the body
-	// asks to disable read-only. It must be ignored.
+	// asks to disable read-only. It must be ignored — and since round-13 it does
+	// not even get as far as being ignored: a read that claims a body is refused
+	// before routing, because net/http's drain of an unread body is a lever for
+	// blocking a handler that holds a slot (bodiedRead in server.go).
 	r := httptest.NewRequest("HEAD", "/api/settings", strings.NewReader(`{"readOnly":false}`))
 	r.AddCookie(c)
 	r.Header.Set("Origin", "http://example.com")
 	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusBadRequest || w.Header().Get("Connection") != "close" {
+		t.Fatalf("HEAD settings with a body: %d %v", w.Code, w.Header())
+	}
+	// The same HEAD without a body is the ordinary read it always was.
+	r = httptest.NewRequest("HEAD", "/api/settings", nil)
+	r.AddCookie(c)
+	r.Header.Set("Origin", "http://example.com")
+	w = httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, r)
 	if w.Code != 200 {
 		t.Fatalf("HEAD settings status %d, want 200", w.Code)

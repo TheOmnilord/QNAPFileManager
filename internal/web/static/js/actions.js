@@ -1,6 +1,6 @@
 import {api} from './api.js';
 import {$,el,error,announce,openDialog,pathArgs,toast} from './dom.js';
-import {state,sessionGuard} from './state.js';
+import {state,sessionGuard,listingActions,sessionTransition,subscribe} from './state.js';
 import {loadList,focused,selectedOne,selectionEntries,extraActions} from './list.js';
 import {loadTree} from './tree.js';
 import {trackJob,awaitJob,jobLive} from './jobs.js';
@@ -29,26 +29,160 @@ export async function runMutation(endpoint,body,ask) {
  }
 }
 
+// oneDialog runs exactly ONE dialog lifecycle and resolves only from the
+// element's own `close` event.
+//
+// The distinction matters because `close` is ASYNCHRONOUS. `dlg.close()` clears
+// .open synchronously and queues the event; a dialog that resolved its promise
+// from the OK handler therefore released its caller — and, behind it, the
+// confirmation queue — while its own close event was still in flight. The next
+// question then set itself up, attached its listeners, and opened; and only
+// then did the PREVIOUS close arrive, was delivered to the listeners that
+// happened to be attached by then, and cancelled the new question. What was
+// left on screen was an open, unresponsive modal (round 7, finding 1).
+//
+// So: `setup` paints and wires the dialog and is handed a `finish(answer)` that
+// only records the answer and closes; the promise settles when the element has
+// really shut and its event has been delivered. Anything waiting for the
+// promise — the queue included — therefore starts from a quiet dialog.
+//
+// `dlg` needs only addEventListener/removeEventListener/.open/.close(), so the
+// whole lifecycle is unit-testable against a fake whose close is async.
+// It is also where an answer is bound to the PERSON WHO GAVE IT.
+//
+// The close event's asynchrony is a window, and a session switch fits inside
+// it: OK recorded the answer and closed the dialog, the switch landed, and the
+// close event then handed the departed user's answer to a caller that had not
+// yet captured a session guard — newFolder, renameEntry and deleteEntries all
+// capture theirs only after awaiting the dialog. Alice's folder name was
+// created in Bob's directory, with Bob's CSRF token (round 9). The confirmation
+// queue's ticket did not help: prompt and delete dialogs never go through it.
+//
+// Binding the check here covers all four dialogs at once, because this is the
+// one place any of them can produce an answer.
+export function oneDialog(dlg,setup,fallback=null) {
+ return new Promise(resolve => {
+  // Already open means someone else owns this element; refusing is the only
+  // safe answer (the queue makes it unreachable for the dialogs it serialises).
+  if (dlg.open) { resolve(fallback); return; }
+  const ticket=confirmTicket(state.session,state.sessionGeneration);
+  let answer=fallback,teardown=null;
+  const onClose=() => {
+   dlg.removeEventListener('close',onClose);
+   teardown?.();
+   // A refresh keeps the answer; a sign-out or a change of user discards it.
+   resolve(confirmTicketValid(ticket,state.session) ? answer : fallback);
+  };
+  dlg.addEventListener('close',onClose);
+  teardown=setup(value => { answer=value; dlg.close(); });
+ });
+}
+
 // promptDialog resolves to the entered string, or null if cancelled.
 function promptDialog({title,label,value=''}) {
- return new Promise(resolve => {
-  const dlg=$('#dlgPrompt'),input=$('#promptInput'),ok=$('#promptOK');
+ const dlg=$('#dlgPrompt'),input=$('#promptInput'),ok=$('#promptOK');
+ return oneDialog(dlg,finish => {
   $('#promptTitle').textContent=title; $('#promptLabel').textContent=label; input.value=value;
-  const cleanup=() => { ok.removeEventListener('click',onOK); dlg.removeEventListener('close',onClose); };
-  const onOK=() => { cleanup(); resolve(input.value); dlg.close(); };
-  const onClose=() => { cleanup(); resolve(null); };
-  ok.addEventListener('click',onOK); dlg.addEventListener('close',onClose);
+  const onOK=() => finish(input.value);
+  ok.addEventListener('click',onOK);
   openDialog('#dlgPrompt'); input.focus?.(); input.select?.();
- });
+  return () => ok.removeEventListener('click',onOK);
+ },null);
+}
+
+// confirmQueue serialises everything that asks the user a modal question.
+//
+// There is ONE #dlgConfirm element and every caller re-dresses it. That is safe
+// exactly as long as two callers never own it at once — and they did. Emptying
+// the Trash is the canonical grade-2 action: it opens the dialog and waits for
+// the word "empty" to be typed. A background upload hitting an overwrite then
+// called confirmDialog too: it rewrote the title and the body, cleared the
+// phrase requirement (its own question had none, so `ok.disabled` became
+// false), and attached a SECOND click handler beside the one Trash was still
+// waiting on. One click on OK resolved both promises — the Trash was emptied,
+// permanently, without the phrase ever being typed, under a heading about an
+// upload (round 6, finding 1).
+//
+// So questions are asked one at a time, in the order they were raised. A caller
+// that arrives while another question is open waits for its turn rather than
+// stealing the dialog.
+//
+// The rule for callers: never call confirmQueue from inside a queued function.
+// Nothing does, and nothing may — it would wait for itself.
+// A queued question also belongs to the SESSION that raised it, and that is not
+// a detail — it is the difference between asking the right person and asking
+// whoever happens to be sitting there.
+//
+// signInNotice() closes the dialog that is on screen. Its close event advanced
+// the queue, which opened the NEXT question — one raised by the user who has
+// just gone — under the new user's session. Approving it took the operation
+// through runMutation, which reposted it with the NEW user's CSRF token; the
+// session checks in newFolder and renameEntry run only after the request has
+// already been sent. So a question nobody currently at the keyboard had asked
+// for could be answered by them, as them (round 8).
+//
+// Every entry therefore carries a ticket taken at ENQUEUE, and the ticket is
+// checked twice: when its turn comes, so a stale question never reaches the
+// screen at all, and again when it is answered, so an approval cannot outlive
+// the user who gave it. A switch or a sign-out also flushes the queue outright.
+const confirmPending=new Set();
+
+// confirmTicket is who is asking, captured before the question is raised.
+export function confirmTicket(session,generation) {
+ return {user:session?.user ?? null,uid:session?.uid ?? null,generation};
+}
+
+// confirmTicketValid says whether the person the question was raised for is
+// still the person at the keyboard. A REFRESH keeps the ticket — the same user
+// with a rotated token or a toggled setting is still the same user; only a
+// sign-out or a change of user invalidates it.
+export function confirmTicketValid(ticket,session) {
+ return !!ticket && !!session && ticket.user===session.user && ticket.uid===session.uid;
+}
+
+// flushConfirmQueue disowns every question that has not yet been answered. It
+// runs from the session subscriber BEFORE signInNotice() closes the dialogs, so
+// no entry can be revived by the close event that follows.
+export function flushConfirmQueue() { for (const entry of confirmPending) entry.flushed=true; }
+
+let confirmChain=Promise.resolve();
+export function confirmQueue(run,refused=false) {
+ const entry={ticket:confirmTicket(state.session,state.sessionGeneration),flushed:false};
+ confirmPending.add(entry);
+ const owned = async () => {
+  confirmPending.delete(entry);
+  // Its turn has come: is the question still worth asking?
+  if (entry.flushed || !confirmTicketValid(entry.ticket,state.session)) return refused;
+  const answer=await run();
+  // It was on screen while the world could change under it. An answer is only
+  // an answer from the person who was asked.
+  if (entry.flushed || !confirmTicketValid(entry.ticket,state.session)) return refused;
+  return answer;
+ };
+ // `owned` on both settlements: the queue is about ORDER, not about whether the
+ // previous question succeeded.
+ const mine=confirmChain.then(owned,owned);
+ // A rejection must not poison the queue for every question after it.
+ confirmChain=mine.then(() => {},() => {});
+ return mine;
 }
 
 // confirmDialog resolves to true only when confirmed. When phrase is set, the
 // OK button stays disabled until the typed text matches it exactly. okLabel
 // names the button for callers whose dangerous action is not a delete — an
 // overwriting copy is danger-styled but says "Copy", not "Delete".
-export function confirmDialog({title,body,why='',danger=false,phrase='',okLabel=''}) {
- return new Promise(resolve => {
-  const dlg=$('#dlgConfirm'),ok=$('#confirmOK'),input=$('#confirmPhrase'),phraseLabel=$('#confirmPhraseLabel');
+//
+// It takes its turn in the queue above, so it always opens a dialog nobody else
+// is answering.
+export function confirmDialog(options) { return confirmQueue(() => askConfirm(options)); }
+
+// askConfirm is one lifecycle of #dlgConfirm. The "already open" refusal that
+// oneDialog performs is the same guarantee this used to make for itself: the
+// queue makes it unreachable, and the failure it prevents — approving an
+// operation the user never saw — is worth refusing over.
+function askConfirm({title,body,why='',danger=false,phrase='',okLabel=''}) {
+ const dlg=$('#dlgConfirm'),ok=$('#confirmOK'),input=$('#confirmPhrase'),phraseLabel=$('#confirmPhraseLabel');
+ return oneDialog(dlg,finish => {
   $('#confirmTitle').textContent=title; $('#confirmBody').textContent=body;
   $('#confirmWhy').textContent=why; $('#confirmWhy').hidden=!why;
   const needPhrase=!!phrase; phraseLabel.hidden=!needPhrase; input.value='';
@@ -59,12 +193,11 @@ export function confirmDialog({title,body,why='',danger=false,phrase='',okLabel=
   dlg.classList.toggle('danger',!!danger);
   const validate=() => { ok.disabled=needPhrase && input.value!==phrase; };
   validate();
-  const cleanup=() => { ok.removeEventListener('click',onOK); input.removeEventListener('input',validate); dlg.removeEventListener('close',onClose); };
-  const onOK=() => { cleanup(); resolve(true); dlg.close(); };
-  const onClose=() => { cleanup(); resolve(false); };
-  ok.addEventListener('click',onOK); input.addEventListener('input',validate); dlg.addEventListener('close',onClose);
+  const onOK=() => finish(true);
+  ok.addEventListener('click',onOK); input.addEventListener('input',validate);
   openDialog('#dlgConfirm'); (needPhrase?input:ok).focus?.();
- });
+  return () => { ok.removeEventListener('click',onOK); input.removeEventListener('input',validate); };
+ },false);
 }
 
 // askWarn is the confirmation prompt for a warn-class path (server 409 on an
@@ -91,6 +224,12 @@ export function actionMessage(err) {
   invalid_target:'The destination is inside the folder being copied.',
   no_trash:'There is no Trash on this volume, so deleting here is permanent.',
   queue_full:'Too many operations are already queued. Wait for some to finish, then try again.',
+  // M2-C. `conflict` is an upload finding something that is NOT a plain file
+  // under the name it wanted (contract §1.3) — a distinct answer from `exists`,
+  // which only an overwrite or a keep-both can resolve; nothing the conflict
+  // dialog offers would help here, so it says what is actually in the way.
+  conflict:'Something else — a folder or a link — already has that name here.',
+  no_space:'There is not enough free space on the volume for this upload.',
  };
  if (err.code==='not_empty' && Array.isArray(err.blockers) && err.blockers.length){
   const names = err.blockers.map(b=>b.name).join(', ') + (err.truncated ? ', …' : '');
@@ -124,10 +263,15 @@ export function onNewFolderError(err,{refresh=()=>{ loadList(); loadTree(); },re
 }
 
 export async function newFolder() {
- if (!state.session?.canWrite) return;
- const name=await promptDialog({title:'New folder',label:'Folder name',value:''});
- if (name==null || name.trim()==='') return;
+ if (!state.session?.canWrite || !listingActions().mutate) return;
+ // Captured BEFORE the dialog opens, not after it answers: the session can
+ // change while the user is typing, and a guard taken afterwards belongs to
+ // whoever is signed in by then (round 9). oneDialog refuses the answer
+ // outright in that case; this is the second lock on the same door.
  const valid=sessionGuard();
+ const name=await promptDialog({title:'New folder',label:'Folder name',value:''});
+ if (!valid()) return;
+ if (name==null || name.trim()==='') return;
  try {
   const res=await runMutation('api/fs/mkdir',{...currentDirArg(),name},askWarn);
   if (!valid()) return;
@@ -139,9 +283,10 @@ export async function newFolder() {
 export async function renameEntry(entry) {
  const e=entry||focused();
  if (!e || !state.session?.canWrite) return;
+ const valid=sessionGuard();   // before the dialog, as in newFolder
  const name=await promptDialog({title:'Rename',label:'New name',value:e.name});
+ if (!valid()) return;
  if (name==null || name==='' || name===e.name) return;
- const valid=sessionGuard();
  try {
   const res=await runMutation('api/fs/rename',{...pathArgs(e),to:name},askWarn);
   if (!valid()) return;
@@ -173,9 +318,14 @@ export function deleteGrade({mode,summary}) {
 // deleteDialog is the one delete prompt: it chooses the mode, carries the
 // crossing checkbox on QuTS hero, and is itself the grade-1 or grade-2
 // confirmation. It resolves to {mode,crossMounts} or null.
+// It runs through oneDialog for the same reason askConfirm does, and with more
+// cause: deleteEntries RE-OPENS it in a loop when the server's summary raises
+// the grade, so the next lifecycle begins microseconds after the last one
+// closed — precisely the window in which a stray close event cancels the dialog
+// that has just opened (round 7, finding 1).
 function deleteDialog({entries,mode,summary,note}) {
- return new Promise(resolve => {
-  const dlg=$('#dlgDelete'),ok=$('#delOK'),perm=$('#delPermanent'),cross=$('#delCross'),phrase=$('#delPhrase');
+ const dlg=$('#dlgDelete'),ok=$('#delOK'),perm=$('#delPermanent'),cross=$('#delCross'),phrase=$('#delPhrase');
+ return oneDialog(dlg,finish => {
   const label=entries.length===1 ? `“${entries[0].name}”` : `${entries.length} items`;
   const hero=state.session?.family==='quts_hero';
   $('#delCrossRow').hidden=!hero;
@@ -199,14 +349,13 @@ function deleteDialog({entries,mode,summary,note}) {
    ok.disabled=needPhrase && phrase.value!==entries[0].name;
   };
   phrase.value='';
-  const cleanup=() => { ok.removeEventListener('click',onOK); perm.removeEventListener('change',paint); phrase.removeEventListener('input',paint); dlg.removeEventListener('close',onClose); };
-  const onOK=() => { cleanup(); const answer={mode:perm.checked ? 'permanent' : 'trash',crossMounts:!!cross.checked}; dlg.close(); resolve(answer); };
-  const onClose=() => { cleanup(); resolve(null); };
-  ok.addEventListener('click',onOK); perm.addEventListener('change',paint); phrase.addEventListener('input',paint); dlg.addEventListener('close',onClose);
+  const onOK=() => finish({mode:perm.checked ? 'permanent' : 'trash',crossMounts:!!cross.checked});
+  ok.addEventListener('click',onOK); perm.addEventListener('change',paint); phrase.addEventListener('input',paint);
   paint();
   openDialog('#dlgDelete');
   (deleteGrade({mode:perm.checked ? 'permanent' : 'trash',summary})===2 ? phrase : ok).focus?.();
- });
+  return () => { ok.removeEventListener('click',onOK); perm.removeEventListener('change',paint); phrase.removeEventListener('input',paint); };
+ },null);
 }
 
 // deleteEntries deletes ANY selection — folders included, which is what the job
@@ -218,8 +367,13 @@ export async function deleteEntries(entries) {
  if (!state.session?.canWrite || !entries || !entries.length) return;
  let mode='trash',note='',summary=null;
  const shown=new Set();
+ // One guard for the WHOLE operation, captured before the first dialog opens.
+ // The loop re-opens the dialog when the server's summary raises the grade, and
+ // every one of those openings belongs to the session that started the delete.
+ const valid=sessionGuard();
  for (;;) {
   const choice=await deleteDialog({entries,mode,summary,note});
+  if (!valid()) return;
   if (!choice) return;
   mode=choice.mode;
   // What the dialog just displayed, so a challenge that adds nothing new is not
@@ -227,7 +381,6 @@ export async function deleteEntries(entries) {
   const shownGrade=deleteGrade({mode,summary});
   for (const warning of summary?.warnings||[]) shown.add(warning);
   const body={paths:entries.map(pathArgs),mode,crossMounts:choice.crossMounts};
-  const valid=sessionGuard();
   try {
    // The dialog just shown IS the confirmation, so a challenge whose summary
    // holds nothing the dialog did not already cover is approved directly; a
@@ -338,6 +491,10 @@ async function undoWhenDone(job,requested) {
 // deleted in full or not at all — never a silently truncated subset reported as
 // success (standard P2).
 export async function deleteSelection() {
+ // The gate, enforced where the action IS and not only where its button is: a
+ // Delete key must not reach a selection the search results are covering
+ // (round 1, finding 1).
+ if (!listingActions().mutate) return;
  let entries;
  try {
   entries=await selectionEntries();
@@ -347,6 +504,16 @@ export async function deleteSelection() {
 }
 
 export function initActions() {
+ // The queue is disowned the moment the session stops being the same user's.
+ // This subscriber fires from inside update(), which is the FIRST thing
+ // signInNotice() does — before it closes the open dialogs — so every pending
+ // question is already flushed by the time the close event advances the queue.
+ let lastSession=state.session;
+ subscribe(() => {
+  const before=lastSession;
+  lastSession=state.session;
+  if (sessionTransition(before,state.session)!=='refresh') flushConfirmQueue();
+ });
  $('#btnMkdir').addEventListener('click',() => newFolder());
  $('#btnRename').addEventListener('click',() => { const e=selectedOne(); if (e) renameEntry(e); });
  $('#btnDelete').addEventListener('click',() => deleteSelection());

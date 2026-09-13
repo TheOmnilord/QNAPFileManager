@@ -622,6 +622,15 @@ func (e *RemoteError) Unwrap() error {
 		// "internal", so the front-end's partial-create warning would surface as a
 		// 500 on the real NAS while the in-process fake passed (high-effort review).
 		return fsx.ErrOwnerUnset
+	case "too_large":
+		// A job whose terminal frame would not fit (M2-C review round 6). Same
+		// lesson again: a code the pool cannot reassemble is a 500 on the NAS
+		// and a pass in the in-process fake.
+		return fsx.ErrTooLarge
+	case "changed":
+		// The upload's "what arrived is not what was declared" (M2-C). Same
+		// lesson again: without this case the route would answer 500.
+		return fsx.ErrChanged
 	case "invalid_target":
 		// The engine's own "destination is inside the source" refusal (M2-B).
 		// Same lesson as owner_unset: a code the pool cannot reassemble is a

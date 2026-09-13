@@ -28,6 +28,7 @@ package fsops
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"syscall"
 	"time"
@@ -121,6 +122,13 @@ func utimesEntry(dir *dirRef, name string, f *os.File, link bool, atime, mtime t
 	_ = f
 	if link {
 		return nil
+	}
+	if name == "" {
+		// There is no unnamed file off Linux, so nothing should ask for this —
+		// and relJoin of an empty name is the DIRECTORY, which would be stamped
+		// with the entry's time. Refusing is the honest answer; the callers
+		// treat a timestamp they could not set as a warning (upload.go, copy.go).
+		return fmt.Errorf("there is no name to set the times of in %q: %w", dir.rel, fsx.ErrUnsupported)
 	}
 	return dir.j.Chtimes(relJoin(dir.rel, name), atime, mtime)
 }

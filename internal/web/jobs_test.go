@@ -40,6 +40,7 @@ type fakeJobs struct {
 	trash     wproto.TrashListResp
 	trashErr  error
 	fsid      map[string]wproto.FSIdentityResp // per-path identity for the move pre-flight
+	fsidPaths []string                         // every path FSIdentity was asked about, in order
 	fsidErr   error
 }
 
@@ -97,6 +98,9 @@ func (f *fakeJobs) TrashList(_ context.Context, _ backend.Principal) (wproto.Tra
 func (f *fakeJobs) FSIdentity(_ context.Context, _ backend.Principal, path string) (wproto.FSIdentityResp, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// Recorded so a test can pin WHICH spelling the worker was asked about: the
+	// guard clears a resolved path, and every request must carry that one.
+	f.fsidPaths = append(f.fsidPaths, path)
 	if f.fsidErr != nil {
 		return wproto.FSIdentityResp{}, f.fsidErr
 	}

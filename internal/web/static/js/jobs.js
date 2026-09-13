@@ -4,6 +4,7 @@ import {state,sessionGuard} from './state.js';
 import {loadList} from './list.js';
 import {loadTree} from './tree.js';
 import {propsTarget} from './viewer.js';
+import {mergeJobs} from './upload.js';
 
 // The jobs panel (ui-ux §3.4): a right-side drawer listing every operation this
 // session can see, polled while anything is live and silent when nothing is.
@@ -47,6 +48,10 @@ export function formatETA(seconds) {
 // meaningful denominator, so it is shown as indeterminate instead of guessed.
 export function jobPercent(job) {
  if (!job) return null;
+ // A LOCAL entry knows its own percentage — an upload is measured by the
+ // transport, not by a count the server reports — so it is believed rather than
+ // re-derived. A server job never carries this field.
+ if (Number.isFinite(job.percent)) return Math.max(0,Math.min(100,job.percent));
  if (job.bytesTotal > 0) return Math.max(0,Math.min(100,Math.round(job.bytes/job.bytesTotal*100)));
  if (job.filesTotal > 0) return Math.max(0,Math.min(100,Math.round(job.files/job.filesTotal*100)));
  return null;
@@ -137,13 +142,55 @@ let refreshAfterJob = false;
 let primed = false;
 
 // REFRESH_KINDS are the kinds whose completion changes what the list and the
-// tree show, so finishing one reloads both.
-const REFRESH_KINDS = new Set(['delete','trash-restore','trash-empty','copy','move']);
+// tree show, so finishing one reloads both. `upload` is here for the same
+// reason, though no SERVER job ever carries that kind: an upload is a local
+// entry (below) and upload.js reloads the listing once when its queue drains —
+// the rule is the same rule, applied on the side that owns the work. `search`
+// is deliberately absent: it changes nothing (contract §3.4).
+const REFRESH_KINDS = new Set(['delete','trash-restore','trash-empty','copy','move','upload']);
+
+// localJobs are operations this TAB is performing that the server has no job
+// for — uploads, which are a stream of bytes into one route rather than a job
+// on the manager. They are shaped exactly like a server job so every formatter
+// here treats them alike; the two differences are that they never poll (nothing
+// to poll) and that `cancel` is their own, because there is no id to POST to.
+export const localJobs = [];
+// serverJobs is the last listing seen, kept so a local entry's progress can
+// repaint the panel without inventing a server state or waiting for the poll.
+let serverJobs = [];
+
+// Insertion and update are DELIBERATELY separate operations. A single
+// create-or-update setter looks tidier and hid a real bug: a session ending
+// aborted an upload and removed its entry, the abort's rejection arrived a
+// moment later, and the "finish" that followed re-inserted the entry that had
+// just been torn down — leaving the previous user's file name on screen for the
+// next one (round 7, finding 2). Only makeJob may insert; every continuation
+// updates, and an update to an entry that is gone is a no-op.
+export function addLocalJob(job) {
+ if (!job?.id || hasLocalJob(job.id)) return false;
+ localJobs.push(job);
+ return true;
+}
+export function updateLocalJob(job) {
+ const at = localJobs.findIndex(j => j.id === job?.id);
+ if (at < 0) return false;      // removed: nothing to update, and nothing to resurrect
+ localJobs[at] = job;
+ return true;
+}
+export const hasLocalJob = id => localJobs.some(j => j.id === id);
+export function dropLocalJob(id) {
+ const at = localJobs.findIndex(j => j.id === id);
+ if (at >= 0) localJobs.splice(at,1);
+}
 
 function panelOpen(open) {
  $('#jobsPanel').hidden = !open;
  $('#btnJobs').setAttribute('aria-expanded',String(open));
 }
+
+// showJobsPanel opens the drawer for work that was just started somewhere else
+// (an upload queue), without the poll trackJob would trigger for a server job.
+export function showJobsPanel() { panelOpen(true); }
 
 function jobRow(job) {
  const row = el('div',{id:`job-${job.id}`,class:`job job-${job.state}`,role:'group','aria-label':jobTitle(job)});
@@ -153,7 +200,9 @@ function jobRow(job) {
  head.append(el('span',{class:'jobPct'},jobLive(job) ? (percent === null ? '…' : `${percent}%`) : job.state));
  if (jobLive(job)) {
   const cancel = el('button',{id:`jobCancel-${job.id}`,class:'jobCancel'},'Cancel');
-  cancel.addEventListener('click',() => cancelJob(job.id));
+  // A local entry cancels itself (it aborts its own transport); a server job is
+  // cancelled by asking the manager.
+  cancel.addEventListener('click',() => job.local ? job.cancel?.() : cancelJob(job.id));
   head.append(cancel);
  }
  row.append(head);
@@ -222,13 +271,20 @@ function announceTransitions(list) {
  if (refresh) refreshAfterJob = true;
 }
 
+// renderJobs paints the panel from the server's listing MERGED with this tab's
+// local entries. Passing null repaints from the last listing seen, which is how
+// an upload's progress reaches the panel between polls.
 export function renderJobs(list) {
- const visible = list.filter(j => !dismissed.has(j.id));
+ if (Array.isArray(list)) serverJobs = list;
+ const visible = mergeJobs(serverJobs,localJobs).filter(j => !dismissed.has(j.id));
  $('#jobsList').replaceChildren(...visible.map(jobRow));
  $('#jobsEmpty').hidden = visible.length > 0;
  const live = visible.filter(jobLive).length;
  $('#btnJobs').textContent = live ? `Operations (${live})` : 'Operations';
 }
+
+// repaintJobs is renderJobs with no new listing: local progress only.
+export function repaintJobs() { renderJobs(null); }
 
 // refreshJobs polls once and reports whether anything is still live. A failure
 // is shown but does not stop the loop from being restarted by the next submit.
@@ -277,6 +333,12 @@ export function trackJob(job) {
 
 // awaitJob resolves with the finished job, polling until it leaves the live
 // states. Used by "Calculate size", which has a result to show.
+//
+// It polls the SINGLE-job endpoint deliberately. Waiting on the panel's listing
+// instead would look like a saving and is not one: GET /api/jobs omits the bulk
+// parts of a result (a search's hits), so a caller that has a result to show
+// must ask about its own job by id. search.js makes that request itself rather
+// than inheriting this one — see searchJobView there.
 export async function awaitJob(id,{tries=1200,delay=500} = {}) {
  for (let i = 0; i < tries; i++) {
   const valid = sessionGuard();
@@ -320,8 +382,11 @@ export function initJobs() {
   // The manager reaps finished jobs on its own schedule, so "clear" is local:
   // it hides what this session has already seen rather than pretending to
   // delete a record somebody else may still need.
+  // A finished LOCAL entry has no server record to retain, so it is simply
+  // forgotten rather than added to the dismissed set.
+  for (const job of [...localJobs]) if (!jobLive(job)) dropLocalJob(job.id);
   try { const data = await api('api/jobs'); for (const job of data.jobs || []) if (!jobLive(job)) dismissed.add(job.id); }
-  catch(err) { error(err); return; }
+  catch(err) { repaintJobs(); error(err); return; }
   pollJobs();
  });
  document.addEventListener('visibilitychange',() => { if (document.hidden) poller.stop(); else pollJobs(); });

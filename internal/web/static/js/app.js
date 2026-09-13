@@ -1,11 +1,13 @@
-import {$,el,error,openDialog,route,parseRoute,rawPath,bytePath} from './dom.js';
+import {$,announce,el,error,openDialog,route,parseRoute,rawPath,bytePath} from './dom.js';
 import {api,signInNotice,connectionNotice} from './api.js';
-import {state,update,sessionGuard} from './state.js';
+import {state,update,sessionGuard,listingActions,sessionTransition} from './state.js';
 import {initList,loadList} from './list.js';
 import {loadTree} from './tree.js';
 import {initViewer} from './viewer.js';
 import {initActions,deleteSelection} from './actions.js';
 import {initTransfer,markClipboard,pasteHere} from './transfer.js';
+import {initUpload} from './upload.js';
+import {initSearch,openSearch,closeResults,escapeReturnsToListing} from './search.js';
 import {initJobs,pollJobs} from './jobs.js';
 import {initTrash} from './trash.js';
 import {initSettings,loadAudit} from './settings.js';
@@ -33,6 +35,11 @@ function navigate() {
  const crumbs=$('#crumbs'); crumbs.replaceChildren(el('a',{href:'#/'},'/'));
  const parts=rawPath(state).split('/').filter(Boolean);
  parts.forEach((part,i) => { const entry=bytePath('/'+parts.slice(0,i+1).join('/')); crumbs.append(el('span',{'aria-hidden':'true'},'›'),el('a',{href:route(entry)},bytePath(part).path)); });
+ // Navigating shows a FOLDER, so the results view stops being what the pane is
+ // for. The hits themselves survive in state.searchResults — following one into
+ // its folder must not throw the search away — and the Results button brings
+ // them back.
+ closeResults();
  if (state.session) loadList();
 }
 
@@ -52,8 +59,17 @@ async function connect() {
   }
  } finally { connecting=false; }
 }
-function showSession(session) {
-  if (state.session) signInNotice();
+// showSession installs a session. It is exported so the session-change path can
+// be exercised directly; nothing imports app.js, which is the entry module.
+export function showSession(session) {
+  // A REFRESH is not a sign-in. The minute poll republishes the session
+  // whenever anything in it differs — a read-only toggle made in another tab,
+  // for instance — and routing that through signInNotice() published a
+  // transient `session:null` first. Subscribers are notified synchronously, so
+  // the upload teardown aborted the transfer and emptied the queue before the
+  // refreshed session was installed a line later (round 7). Only a genuine
+  // sign-out or a change of USER tears anything down.
+  if (sessionTransition(state.session,session)==='switch') signInNotice();
   update({session}); $('#signin').hidden=true;
   $('#identity').textContent=`${session.user} · ${session.admin ? 'Administrator' : 'User'}`;
   $('#sessionDetails').textContent=`${session.user} · uid ${session.uid}, gid ${session.gid} · ${session.viaQTS ? 'QTS session' : 'Pinned development identity'} · ${session.rootMode ? 'root mode' : 'normal user'} · ${session.canWrite ? 'changes enabled' : 'read-only'}${session.groupsIncomplete ? ' · Warning: groups incomplete' : ''}`;
@@ -62,7 +78,7 @@ function showSession(session) {
   if (session.groupsIncomplete) $('#announce').textContent='Warning: supplementary groups are incomplete.';
   navigate(); loadTree(); pollJobs();
 }
-initList(); initViewer(); initActions(); initTransfer(); initJobs(); initTrash(); initSettings();
+initList(); initViewer(); initActions(); initTransfer(); initUpload(); initSearch(); initJobs(); initTrash(); initSettings();
 $('.skip').addEventListener('click',ev => { ev.preventDefault(); $('#list').focus(); });
 window.addEventListener('hashchange',navigate);
 $('#btnRetry').addEventListener('click',connect);
@@ -89,7 +105,18 @@ document.addEventListener('keydown',ev => {
  const editing=ev.target.matches('input,textarea,select') || ev.target.isContentEditable,ctrl=ev.ctrlKey || ev.metaKey;
  if (document.querySelector('dialog[open]')) return;
  if (ctrl && ev.key.toLowerCase()==='l') { ev.preventDefault(); $('#pathEdit').focus(); $('#pathEdit').select(); return; }
+ // Ctrl+F is the SEARCH (ui-ux §4), not the browser's find-in-page: what the
+ // user wants on a virtualised listing of a million files is a server-side
+ // walk, and find-in-page could only ever search the rows currently painted.
+ // Like Ctrl+L it works from inside the filter box too.
+ if (ctrl && !ev.altKey && ev.key.toLowerCase()==='f') { ev.preventDefault(); openSearch(); return; }
  if (editing) return;
+ // Every shortcut that acts on the LISTING's selection is gated on the listing
+ // being what is on screen. While the search results cover it, Ctrl+C, Ctrl+X,
+ // Ctrl+V and Delete would be operating on rows nobody can see (round 1,
+ // finding 1) — so they do nothing at all, and say so once.
+ if ((ev.key==='Delete' || ctrl && !ev.altKey && !ev.shiftKey && ev.key.length===1 && 'cxv'.includes(ev.key.toLowerCase()))
+  && !listingActions().mutate) { ev.preventDefault(); announce('Close the search results (Esc) to act on this folder.'); return; }
  if (ctrl && !ev.altKey && !ev.shiftKey && ev.key.length===1 && 'cxv'.includes(ev.key.toLowerCase())) {
   // A text selection means the user is copying TEXT; the browser's own
   // clipboard keeps the keys in that case.
@@ -106,9 +133,19 @@ document.addEventListener('keydown',ev => {
  else if (ev.altKey && ev.key==='ArrowRight') { ev.preventDefault(); history.forward(); }
  else if (ev.key==='/') { ev.preventDefault(); $('#searchBox').focus(); }
  else if (ev.key==='?') { ev.preventDefault(); openDialog('#dlgShortcuts'); }
- else if (ev.key==='Escape') { $('#ctxMenu').hidden=true; $('#tree').classList.remove('open'); $('#btnTree').setAttribute('aria-expanded','false'); }
+ else if (ev.key==='Escape') {
+  // A results view is the outermost thing Escape closes: it has REPLACED the
+  // listing, so dismissing it is what "go back" means here.
+  if (escapeReturnsToListing(state)) { ev.preventDefault(); closeResults(); return; }
+  $('#ctxMenu').hidden=true; $('#tree').classList.remove('open'); $('#btnTree').setAttribute('aria-expanded','false');
+ }
  // Ctrl+R deliberately retains the browser's normal refresh behavior.
 });
+// The document-level suppressor: a file dropped anywhere OUTSIDE the list pane
+// must do nothing at all, because the browser's default is to navigate to it —
+// which inside the QTS desktop means losing the app. The list pane is the one
+// drop target (upload.js), and it stops propagation so its drops never reach
+// here.
 for (const event of ['dragover','drop']) document.addEventListener(event,ev => { ev.preventDefault(); ev.stopPropagation(); });
 // Polling couples visible state to QTS expiry even while the user is idle.
 setInterval(async () => {

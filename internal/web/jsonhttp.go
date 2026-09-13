@@ -23,6 +23,12 @@ func statusCode(code string) int {
 		return 404
 	case "exists", "not_empty", "cross_device", "conflict":
 		return 409
+	case "invalid_target", "changed":
+		// invalid_target: the destination lies inside the source (M2-B);
+		// changed: an upload's body did not match what it declared (M2-C).
+		// Both are the request's own state contradicting itself, not a
+		// malformed request and not our failure — 409, and the client re-asks.
+		return 409
 	case "owner_unset":
 		// The folder was created but its owner could not be set (finding E): the
 		// request partially completed and the folder exists, root-owned, so this is

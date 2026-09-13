@@ -71,3 +71,31 @@ dialog { border:1px solid var(--line); border-radius:10px; padding:1.4rem; max-w
 #trashTable th,#trashTable td { text-align:left; padding:.25rem .5rem; border-bottom:1px solid var(--line); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:18rem; }
 #trashTable th { position:sticky; top:0; background:var(--panel); }
 @media(max-width:60rem) { #jobsPanel { position:absolute; inset:0 0 0 auto; z-index:4; box-shadow:-4px 0 16px #0003; } }
+/* Download split — the ▾ menu is positioned by CSS under its own button, so no
+   code anywhere sets an inline style. */
+.split { display:inline-flex; position:relative; }
+.split #btnDownload { border-top-right-radius:0; border-bottom-right-radius:0; }
+#btnDownloadAs { border-top-left-radius:0; border-bottom-left-radius:0; margin-left:-1px; padding:.25rem .4rem; }
+#dlMenu { position:absolute; top:100%; left:0; z-index:5; min-width:max-content; margin-top:.2rem; padding:.3rem; background:var(--surface); border:1px solid var(--line); border-radius:6px; box-shadow:0 6px 24px #0004; }
+#dlMenu button { display:block; width:100%; text-align:left; border:0; }
+/* Upload — the list pane is the one drop target; everything else suppresses. */
+#list.dropTarget { outline:2px dashed var(--focus); outline-offset:-4px; background:var(--sel-bg); }
+#dlgUpConflict .bar { flex-wrap:wrap; margin-top:.8rem; }
+/* Search results replace the listing in the same pane, and keep its geometry so
+   switching back and forth does not move anything under the pointer. */
+#searchQuery,#searchRoot { width:100%; margin:.4rem 0; }
+#searchKindSet { display:flex; flex-wrap:wrap; gap:.4rem 1.1rem; align-items:center; margin:.6rem 0; padding:.3rem .7rem .6rem; border:1px solid var(--line); border-radius:6px; }
+#searchKindSet legend { padding:0 .3rem; font-size:.85rem; opacity:.8; }
+#searchKindSet label { white-space:nowrap; }
+#searchError { margin:.4rem 0; border-color:var(--fail); color:var(--fail); background:#cf222e22; }
+#results { flex:1; min-width:0; display:flex; flex-direction:column; overflow:auto; }
+.resultsBar { display:flex; align-items:center; gap:.6rem; padding:.4rem .75rem; border-bottom:1px solid var(--line); }
+.resultsBar h2 { flex:1; margin:.2rem 0; font-size:.95rem; overflow-wrap:anywhere; }
+.resultRow { display:grid; grid-template-columns:minmax(180px,1.2fr) minmax(160px,1fr) 90px 150px; height:36px; align-items:center; border-bottom:1px solid var(--line); }
+.resultRow > span { padding:0 .6rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#resultsHead { background:var(--panel); font-weight:600; position:sticky; top:0; }
+#resultsRows .resultRow { cursor:pointer; } #resultsRows .resultRow:hover { background:var(--sel-bg); }
+#resultsRows .resultRow[aria-selected=true] { background:var(--sel-bg); }
+.resultParent { opacity:.8; }
+#resultsEmpty { padding:1rem; }
+@media(max-width:60rem) { .resultRow { grid-template-columns:minmax(140px,1.2fr) minmax(120px,1fr) 90px; } .resultRow > span:nth-child(4),#resultsHead span:nth-child(4) { display:none; } }

@@ -408,6 +408,12 @@ func runServe(args []string, stderr io.Writer) error {
 				return
 			case <-ticker.C:
 				jobMgr.Reap()
+				// Abandoned archive selection tickets expire on their own clock; the
+				// sweep on select/consume covers a busy daemon, this one an idle one.
+				frontend.ReapArchiveSelections()
+				// Search hits live in the front-end ledger, not in the job manager, so
+				// a reaped job's hits need this to go on an idle daemon.
+				frontend.PruneSearchResults()
 			}
 		}
 	}()

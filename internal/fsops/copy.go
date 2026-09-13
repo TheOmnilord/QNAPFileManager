@@ -164,6 +164,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"qnapfilemanager/internal/fsx"
 	"qnapfilemanager/internal/platform"
@@ -3850,7 +3851,16 @@ func (c *copier) place(dstDir *dirRef, name string, k kind) placed {
 // answers to, bounded at maxKeepBothTries.
 func (c *copier) freeName(dstDir *dirRef, name string, k kind) placed {
 	for n := 2; n < 2+maxKeepBothTries; n++ {
-		cand := keepBothName(name, k == kindDir, n)
+		// Bounded by NAME_MAX, like every other generated component (round 7
+		// adversarial). Without it the candidate was simply 259 bytes long and
+		// the create failed with ENAMETOOLONG — reported, but as the kernel's
+		// complaint about a name this engine had built rather than as the
+		// refusal it is.
+		cand, ok := keepBothWithin(name, k == kindDir, n)
+		if !ok {
+			return placed{name: name, act: actSkip, code: warnConflict, msg: fmt.Sprintf(
+				"%q is too long for a \"keep both\" name to be made from it", name)}
+		}
 		_, err := dstDir.lstat(cand)
 		if errors.Is(err, fs.ErrNotExist) {
 			return placed{name: cand, act: actCreate}
@@ -3871,13 +3881,78 @@ func (c *copier) freeName(dstDir *dirRef, name string, k kind) placed {
 // (".bashrc (2)", never ". (2)bashrc"). A name with an interior dot is treated
 // as having an extension however it starts, so ".tar.gz" becomes ".tar (2).gz".
 func keepBothName(name string, isDir bool, n int) string {
-	stem, ext := name, ""
+	stem, ext := splitKeepBoth(name, isDir)
+	return stem + " (" + strconv.Itoa(n) + ")" + ext
+}
+
+// splitKeepBoth is keepBothName's stem/extension split, on its own so that the
+// bounded form below can rebuild the name at a different length.
+func splitKeepBoth(name string, isDir bool) (stem, ext string) {
 	if !isDir {
 		if i := strings.LastIndexByte(name, '.'); i > 0 {
-			stem, ext = name[:i], name[i:]
+			return name[:i], name[i:]
 		}
 	}
-	return stem + " (" + strconv.Itoa(n) + ")" + ext
+	return name, ""
+}
+
+// maxNameBytes is NAME_MAX: the kernel's own limit on ONE path component, in
+// BYTES rather than characters. Every Linux filesystem this app runs on
+// enforces it, and a name that exceeds it is not a long name — it is ENAMETOOLONG.
+const maxNameBytes = 255
+
+// keepBothWithin is keepBothName bounded by what the kernel will accept (M2-C
+// review round 7 adversarial).
+//
+// " (2)" is four bytes, and a name may already be all 255 of them. Appending
+// regardless produced a 259-byte component, and what happened next depended on
+// who was creating it: the upload's linkat failed with ENAMETOOLONG after the
+// whole body had been transferred, and an ARCHIVE — which creates nothing and
+// so is told nothing — wrote the member happily and left the failure for the
+// user's unzip, on a file they had already waited for. Neither is a thing to
+// discover at the end.
+//
+// So the stem is shortened to make room, on a rune boundary, and the EXTENSION
+// is never touched: it is what tells the user (and their desktop) what the file
+// is, and four bytes of stem are worth less than that. The suffix carries n, so
+// two different attempts can never shorten to the same string — and every
+// caller re-checks the candidate against what is already taken in any case.
+//
+// false means there is no room at all: an extension so long that the suffix
+// alone does not fit beside it. The caller reports that rather than inventing a
+// name, because a name it invented would be one the user did not ask for.
+func keepBothWithin(name string, isDir bool, n int) (string, bool) {
+	if cand := keepBothName(name, isDir, n); len(cand) <= maxNameBytes {
+		return cand, true
+	}
+	stem, ext := splitKeepBoth(name, isDir)
+	suffix := " (" + strconv.Itoa(n) + ")"
+	room := maxNameBytes - len(suffix) - len(ext)
+	if room < 1 {
+		return "", false
+	}
+	if stem = truncateAtRune(stem, room); stem == "" {
+		return "", false
+	}
+	return stem + suffix + ext, true
+}
+
+// truncateAtRune cuts a string to at most max BYTES without splitting a rune.
+//
+// A Linux filename is an arbitrary byte string, so this cannot assume valid
+// UTF-8: what it guarantees is that a multi-byte sequence which IS there is not
+// cut in half — a half rune renders as U+FFFD and turns a shortened name into
+// an unreadable one. Bytes that are not part of any sequence are cut wherever
+// the limit falls, which is the only thing that can be done with them.
+func truncateAtRune(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	cut := max
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
 }
 
 // kindName is the word a warning uses for a kind.

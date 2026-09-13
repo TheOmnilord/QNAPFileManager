@@ -14,9 +14,12 @@
   <button id="btnTree" aria-controls="tree" aria-expanded="false">Folders</button>
   <button id="btnBack" title="Back (Alt+Left)">←</button><button id="btnFwd" title="Forward (Alt+Right)">→</button><button id="btnUp" title="Parent folder (Backspace)">↑</button><button id="btnRefresh" title="Refresh (F5)">↻</button>
   <button id="btnMkdir" disabled>New folder</button>
-  <button id="btnUpload" disabled aria-disabled="true" title="Uploads are not available in this version.">Upload</button>
-  <button id="btnDownload" disabled>Download</button><button id="btnView" disabled>View text</button><button id="btnProps" disabled>Properties</button>
+  <button id="btnUpload" disabled>Upload</button><input id="upFile" type="file" multiple hidden>
+  <span class="split"><button id="btnDownload" disabled>Download</button><button id="btnDownloadAs" disabled aria-haspopup="menu" aria-expanded="false" aria-label="Download as…" title="Download as…">▾</button>
+   <div id="dlMenu" role="menu" aria-label="Download as" hidden><button id="dlZip" role="menuitem">Download as ZIP</button><button id="dlTgz" role="menuitem">Download as tar.gz</button></div></span>
+  <button id="btnView" disabled>View text</button><button id="btnProps" disabled>Properties</button>
   <button id="btnRename" disabled>Rename</button><button id="btnCopy" disabled>Copy to…</button><button id="btnMove" disabled>Move to…</button><button id="btnDelete" disabled>Delete</button>
+  <button id="btnSearch" disabled title="Search this folder and below (Ctrl+F)">Search…</button><button id="btnResults" hidden>Results</button>
   <button id="btnTrash">Trash</button><button id="btnJobs" aria-controls="jobsPanel" aria-expanded="false">Operations</button>
   <label class="filter"><span class="visually-hidden">Filter loaded names</span><input id="searchBox" type="text" placeholder="Filter loaded names (/)"></label>
   <label><input id="chkHidden" type="checkbox"> Hidden</label><button id="btnShortcuts" title="Keyboard shortcuts (?)">?</button>
@@ -29,6 +32,12 @@
    <div id="listHead" class="fileRow" role="row" aria-rowindex="1"><span role="columnheader" aria-sort="ascending"><button data-sort="name">Name ↑</button></span><span role="columnheader"><button data-sort="size">Size</button></span><span role="columnheader" class="extra"><button data-sort="type">Kind</button></span><span role="columnheader"><button data-sort="mtime">Modified</button></span><span role="columnheader" class="extra">Mode</span><span role="columnheader" class="extra">Owner</span></div>
    <div id="listViewport"><div id="listSpacer" aria-hidden="true"></div><div id="listRows" role="rowgroup"></div><div id="listTail" aria-hidden="true"></div><p id="listEmpty" hidden>This folder is empty.</p></div>
    <details id="mountGroup" hidden><summary>⏏ Volume mounts</summary><div id="mountLinks"></div></details>
+  </section>
+  <section id="results" role="grid" aria-label="Search results" hidden>
+   <div class="resultsBar"><h2 id="resultsTitle">Search results</h2><button id="btnResultsBack">Back to folder</button></div>
+   <div id="resultsHead" class="resultRow" role="row"><span role="columnheader">Name</span><span role="columnheader">In folder</span><span role="columnheader">Size</span><span role="columnheader">Modified</span></div>
+   <div id="resultsRows" role="rowgroup"></div>
+   <p id="resultsEmpty" hidden>Nothing matched.</p>
   </section>
   <aside id="jobsPanel" aria-label="Operations" hidden>
    <div class="jobsBar"><h2>Operations</h2><button id="btnJobsClear">Clear finished</button><button id="btnJobsClose">Close</button></div>
@@ -61,6 +70,25 @@
  <p id="xferSummary" role="status"></p>
  <p id="xferError" class="banner" role="alert" hidden></p>
  <div class="bar"><button id="xferOK">Copy</button><button data-close>Cancel</button></div></dialog>
+<dialog id="dlgSearch" aria-labelledby="searchTitle"><h2 id="searchTitle">Search</h2>
+ <label for="searchQuery">Find</label><input id="searchQuery" type="text" placeholder="part of a name" autocomplete="off" spellcheck="false">
+ <label for="searchRoot">Search in</label><input id="searchRoot" type="text" placeholder="/share" autocomplete="off" spellcheck="false">
+ <fieldset id="searchKindSet"><legend>What to find</legend>
+  <label><input type="radio" name="searchKind" value="any" checked> Anything</label>
+  <label><input type="radio" name="searchKind" value="file"> Files only</label>
+  <label><input type="radio" name="searchKind" value="dir"> Folders only</label>
+ </fieldset>
+ <p><label><input type="checkbox" id="searchGlob"> Match pattern (glob, e.g. <code>*.log</code>)</label></p>
+ <p><label><input type="checkbox" id="searchHidden"> Include hidden items</label></p>
+ <p id="searchCrossRow" hidden><label><input type="checkbox" id="searchCross" checked> Include mounted sub-folders</label></p>
+ <p id="searchWhy" class="hint">Names are matched without regard to case. Long searches run in Operations and can be cancelled there.</p>
+ <p id="searchError" class="banner" role="alert" hidden></p>
+ <div class="bar"><button id="searchOK">Search</button><button data-close>Cancel</button></div></dialog>
+<dialog id="dlgUpConflict" aria-labelledby="upConflictTitle"><h2 id="upConflictTitle">A file with that name is already there</h2>
+ <p id="upConflictBody"></p>
+ <p id="upConflictMore" class="hint" hidden></p>
+ <p id="upAllRow" hidden><label><input type="checkbox" id="upAll"> Apply to all remaining files in this batch</label></p>
+ <div class="bar"><button id="upSkip">Skip</button><button id="upOverwrite">Overwrite</button><button id="upRename">Keep both</button><button data-close>Cancel</button></div></dialog>
 <dialog id="dlgTrash" aria-labelledby="trashTitle"><h2 id="trashTitle">Trash</h2>
  <p id="trashWhere" class="hint">Trash lives in .@qfm_trash on each volume.</p>
  <div id="trashWrap"><table id="trashTable"><thead><tr><th><input type="checkbox" id="trashAll" aria-label="Select all"></th><th>Name</th><th>Original location</th><th>Deleted</th><th>Size</th></tr></thead><tbody id="trashRows"></tbody></table></div>
@@ -80,5 +108,5 @@
 <dialog id="dlgPrompt" aria-labelledby="promptTitle"><h2 id="promptTitle">Name</h2><label id="promptLabel" for="promptInput">Name</label><input id="promptInput" type="text"><div class="bar"><button id="promptOK">OK</button><button data-close>Cancel</button></div></dialog>
 <dialog id="dlgConfirm" aria-labelledby="confirmTitle"><h2 id="confirmTitle">Confirm</h2><p id="confirmBody"></p><p id="confirmWhy" class="hint" hidden></p><label id="confirmPhraseLabel" for="confirmPhrase" hidden>Type <b id="confirmPhraseName"></b> to confirm <input id="confirmPhrase" type="text"></label><div class="bar"><button id="confirmOK">Confirm</button><button data-close>Cancel</button></div></dialog>
 <dialog id="dlgSession" aria-labelledby="sessionTitle"><h2 id="sessionTitle">Session</h2><p id="sessionDetails"></p><button id="btnLogout">Sign out of this app</button><button data-close>Close</button></dialog>
-<dialog id="dlgShortcuts" aria-labelledby="shortcutsTitle"><h2 id="shortcutsTitle">Browse with the keyboard</h2><p>↑ ↓ / Home / End / Page Up / Page Down: move<br>Shift + movement: extend selection<br>Ctrl + movement: keep selection<br>Space: toggle · Ctrl+A: select all<br>Enter: open · F4: view text · Alt+Enter: properties<br>Delete: move the selection to Trash<br>Ctrl+C / Ctrl+X: mark to copy / move · Ctrl+V: paste here<br>Backspace: parent · Alt+←/→: back/forward<br>Ctrl+L: edit path · /: filter loaded names<br>Ctrl+H: hidden files · F5: refresh<br>Shift+F10 / Menu: actions · Esc: clear or close<br>?: shortcuts</p><button data-close>Close</button></dialog>
+<dialog id="dlgShortcuts" aria-labelledby="shortcutsTitle"><h2 id="shortcutsTitle">Browse with the keyboard</h2><p>↑ ↓ / Home / End / Page Up / Page Down: move<br>Shift + movement: extend selection<br>Ctrl + movement: keep selection<br>Space: toggle · Ctrl+A: select all<br>Enter: open · F4: view text · Alt+Enter: properties<br>Delete: move the selection to Trash<br>Ctrl+C / Ctrl+X: mark to copy / move · Ctrl+V: paste here<br>Backspace: parent · Alt+←/→: back/forward<br>Ctrl+L: edit path · /: filter loaded names<br>Ctrl+F: search this folder and below<br>Ctrl+H: hidden files · F5: refresh<br>Shift+F10 / Menu: actions · Esc: clear or close<br>?: shortcuts</p><button data-close>Close</button></dialog>
 </body></html>

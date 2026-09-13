@@ -30,6 +30,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"qnapfilemanager/internal/fsops"
 	"qnapfilemanager/internal/fsx"
@@ -72,6 +73,13 @@ type Options struct {
 	// the one thing no real filesystem call can be relied on to do: run until
 	// its request context is cancelled and not a moment before.
 	dispatch func(ctx context.Context, f wproto.Frame) (any, error)
+
+	// now replaces the clock the upload-handle expiry is measured against. It
+	// is unexported for the same reason dispatch is, and it exists for the one
+	// thing a test cannot do: wait ten real minutes. A package variable would
+	// have been a data race — the test writes it while a worker goroutine reads
+	// it — so the clock belongs to the session (upload.go).
+	now func() time.Time
 }
 
 func (o Options) normalise() Options {
@@ -100,9 +108,17 @@ func Run(ctx context.Context, rw io.ReadWriter, o Options) error {
 		sem:      make(chan struct{}, o.MaxConcurrent),
 		inflight: map[uint64]context.CancelFunc{},
 		jobs:     map[string]*jobEntry{},
+		uploads:  map[string]*uploadEntry{},
+
+		archiveSem: make(chan struct{}, maxArchiveStreams),
+		archives:   map[string]*archiveRecord{},
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	// The context everything that outlives a single request runs under: today
+	// the archive goroutine, which must not be bounded by the request whose
+	// only job was to hand the pipe over (archive.go).
+	s.sessCtx = ctx
 
 	if err := s.hello(); err != nil {
 		return err
@@ -110,6 +126,21 @@ func Run(ctx context.Context, rw io.ReadWriter, o Options) error {
 	// The jail's descriptor is this worker's; nothing outlives the loop that
 	// could still resolve a path through it.
 	defer func() { _ = s.root.Close() }()
+	// Every upload that was never finalised goes with the session (contract
+	// §1.3): the descriptor is closed and the named fallback's `.part` file is
+	// unlinked, by identity. This runs before the jail handle is released,
+	// because the cleanup addresses the destination through descriptors this
+	// session holds.
+	defer s.closeUploads()
+	// The expiry of an abandoned upload must not depend on somebody starting
+	// ANOTHER upload (M2-C review round 1 adversarial, finding 3): the sweep
+	// used to run only inside OpenWrite and Finalize, so a handle whose browser
+	// had gone survived for as long as the user kept browsing — which is
+	// exactly the session that keeps the worker alive. A tick of its own is
+	// what makes ten minutes mean ten minutes.
+	stopSweep := make(chan struct{})
+	defer close(stopSweep)
+	go s.sweeper(stopSweep)
 	return s.serve(ctx)
 }
 
@@ -120,6 +151,11 @@ type session struct {
 	root fsx.Root
 	plat *platform.Platform
 	lim  wproto.Limits
+
+	// sessCtx is the serve loop's own context: the one thing that outlives a
+	// request and still ends with the session. Only work that is deliberately
+	// not bounded by one frame uses it (the archive goroutine).
+	sessCtx context.Context
 
 	sem chan struct{}
 	wg  sync.WaitGroup
@@ -139,6 +175,26 @@ type session struct {
 	// never held across a handler or a write.
 	jobsMu sync.Mutex
 	jobs   map[string]*jobEntry
+
+	// uploads holds one open inode per unfinished upload, keyed by the opaque
+	// handle the OpenWrite reply carried (M2-C contract §1.3). It is guarded by
+	// uploadsMu, which is never held across a syscall or a write — a handle is
+	// always taken out of the table before anything is done to it, which is
+	// also what stops two Finalize frames acting on one inode (upload.go).
+	uploadsMu sync.Mutex
+	uploads   map[string]*uploadEntry
+
+	// archiveSem bounds the archive producers this session runs at once. They
+	// are the one kind of work that outlives its own request frame, so the
+	// request semaphore above bounds none of them (archive.go).
+	archiveSem chan struct{}
+
+	// archives holds one record per archive this session produced, so the
+	// front-end can ask what became of one after the pipe has closed — a clean
+	// EOF being what a truncated archive and a complete one both look like
+	// (archive.go). Bounded by count and by age.
+	archivesMu sync.Mutex
+	archives   map[string]*archiveRecord
 
 	// fatalOnce/fatalErr record the first unrecoverable transport failure.
 	fatalOnce sync.Once
@@ -483,10 +539,39 @@ func (s *session) cancel(f wproto.Frame) {
 	s.replyOK(f.ID, nil)
 }
 
+// reply writes one frame, and ends the connection if it cannot — with ONE
+// exception, which is the difference between a stream that is broken and an
+// answer that is too big (M2-C review round 6).
+//
+// A frame above wproto.MaxFrame is refused by marshalFrame BEFORE a single byte
+// reaches the socket, so the stream is exactly as it was: nothing is half
+// written, nothing is out of step, and the next frame will be read correctly.
+// That is not the failure fatal() exists for. Tearing the worker down there
+// meant one oversized search result disconnected a user's session and every
+// other operation running in it — a listing, an upload in flight, an archive
+// being produced — for a fault that belongs to one request.
+//
+// So an oversized OK becomes an error frame for that request: a terminal
+// either way, and the caller is told the result was too large instead of
+// watching its worker vanish. A prog or warn frame that will not fit is dropped
+// and logged; both are advisory and the terminal still comes, while sending an
+// err in their place would retire a request id that is still running. An err
+// frame that will not fit cannot be made smaller and is dropped too, which
+// leaves the caller waiting on its own deadline rather than on a corrupted
+// stream.
 func (s *session) reply(f wproto.Frame) {
-	if err := s.tr.Write(f, nil); err != nil {
-		s.fatal(fmt.Errorf("writing the reply to request %d: %w", f.ID, err))
+	err := s.tr.Write(f, nil)
+	if err == nil {
+		return
 	}
+	if errors.Is(err, wproto.ErrFrameTooLarge) {
+		s.opts.Log.Printf("worker: the %s frame for request %d is too large to send: %v", f.Kind, f.ID, err)
+		if f.Kind == wproto.KindOK {
+			s.replyErr(f.ID, fmt.Errorf("the result of this request is too large to send: %w", fsx.ErrTooLarge), nil)
+		}
+		return
+	}
+	s.fatal(fmt.Errorf("writing the reply to request %d: %w", f.ID, err))
 }
 
 // replyErr answers a request with a classified failure. path is echoed so the
@@ -535,6 +620,14 @@ func (s *session) dispatch(ctx context.Context, f wproto.Frame) {
 		s.delete(ctx, f)
 	case wproto.OpOpenRead:
 		s.openRead(ctx, f)
+	case wproto.OpOpenWrite:
+		s.openWrite(ctx, f)
+	case wproto.OpFinalize:
+		s.finalize(ctx, f)
+	case wproto.OpArchive:
+		s.archive(ctx, f)
+	case wproto.OpArchiveStatus:
+		s.archiveStatus(ctx, f)
 	case wproto.OpTrashList:
 		s.trashList(ctx, f)
 	case wproto.OpFSIdentity:

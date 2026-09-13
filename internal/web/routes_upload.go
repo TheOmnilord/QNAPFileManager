@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"qnapfilemanager/internal/audit"
 	"qnapfilemanager/internal/fsx"
 	"qnapfilemanager/internal/guard"
 	"qnapfilemanager/internal/wproto"
@@ -442,7 +443,9 @@ func (s *Server) upload(w http.ResponseWriter, r *http.Request, sess *session) {
 	}
 
 	var as *wproto.CreateAs
-	if sess.who.Root && s.guard.Classify(dir) == "normal" && s.guard.Classify(rdir) == "normal" {
+	// No real user behind a break-glass session, so nothing to create as: the
+	// upload lands root-owned (contract §2.4).
+	if sess.who.Root && sess.door != audit.DoorLocal && s.guard.Classify(dir) == "normal" && s.guard.Classify(rdir) == "normal" {
 		as = &wproto.CreateAs{UID: sess.who.UID, GID: -1}
 	}
 

@@ -1,5 +1,6 @@
 import {api} from './api.js';
-import {$,el,error,announce,openDialog,pathArgs,toast} from './dom.js';
+import {$,el,error,announce,openDialog,pathArgs,toast,applyWhy} from './dom.js';
+import {whyDisabled} from './why.js';
 import {state,sessionGuard,listingActions,sessionTransition,subscribe} from './state.js';
 import {loadList,focused,selectedOne,selectionEntries,extraActions} from './list.js';
 import {loadTree} from './tree.js';
@@ -353,7 +354,14 @@ function deleteDialog({entries,mode,summary,note}) {
    $('#delPhraseName').textContent=entries[0].name;
    dlg.classList.toggle('danger',needPhrase);
    ok.textContent=current==='permanent' ? 'Delete permanently' : 'Move to Trash';
-   ok.disabled=needPhrase && phrase.value!==entries[0].name;
+   // The dialog's primary button consults the same table the toolbar does (M4
+   // contract §7.1). The typed phrase is the dialog's OWN reason to keep it
+   // disabled, and it says so in its own words — a button grey for the phrase
+   // must not describe itself as ready to delete (round 1, finding 2).
+   const pending=needPhrase && phrase.value!==entries[0].name
+    ? `Type “${entries[0].name}” in the box to confirm.`
+    : '';
+   applyWhy('#delOK',whyDisabled('delete',{readOnly:!state.session?.canWrite,count:entries.length}),pending);
   };
   phrase.value='';
   const onOK=() => finish({mode:perm.checked ? 'permanent' : 'trash',crossMounts:!!cross.checked});
@@ -524,7 +532,11 @@ export function initActions() {
  $('#btnMkdir').addEventListener('click',() => newFolder());
  $('#btnRename').addEventListener('click',() => { const e=selectedOne(); if (e) renameEntry(e); });
  $('#btnDelete').addEventListener('click',() => deleteSelection());
- // Context-menu entries, added without list.js importing this module.
- extraActions.push({label:'Rename…',show:() => !!state.session?.canWrite,run:e => renameEntry(e)});
- extraActions.push({label:'Delete',show:() => !!state.session?.canWrite,run:e => deleteEntries([e])});
+ // Context-menu entries, added without list.js importing this module. They name
+ // their ACTION rather than deciding their own enablement: the menu asks
+ // why.js, so a read-only session sees a disabled Rename with the reason on it
+ // instead of a menu that has quietly lost two items (M4 contract §7.1 —
+ // "never hidden for a state reason").
+ extraActions.push({label:'Rename…',action:'rename',run:e => renameEntry(e)});
+ extraActions.push({label:'Delete',action:'delete',run:e => deleteEntries([e])});
 }

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strconv"
@@ -93,6 +94,19 @@ func (s *Server) decodeBody(w http.ResponseWriter, r *http.Request, v any) bool 
 		s.fail(w, r, "bad_request", "The request body could not be read.", "", err.Error())
 		return false
 	}
+	// Drain whatever the decoder did not read (round-4 P3).
+	//
+	// json.Decoder stops at the closing brace and buffers ahead; it never reads
+	// to EOF. On the break-glass listener the response wrapper decides whether
+	// to close the connection by asking whether the declared body was consumed,
+	// so every SUCCESSFUL mutation would otherwise be answered with
+	// Connection: close — one TCP handshake per request through the emergency
+	// door, which is the opposite of what that door is for. The read is bounded
+	// by the MaxBytesReader the caller already wrapped this body in (1 MiB on
+	// the shared routes), so draining cannot itself become a lever, and a
+	// failure here is not worth failing a request that has already been parsed:
+	// the worst case is the connection closing, which is what happened before.
+	_, _ = io.Copy(io.Discard, r.Body)
 	return true
 }
 
@@ -119,7 +133,7 @@ func (s *Server) auditAuthDenied(r *http.Request, sess *session, code, detail st
 	// unlocked here is a data race (adv session.go). The caller reaches this
 	// before it takes the session lock, so acquiring it now cannot self-deadlock.
 	sess.mu.Lock()
-	who, admin := sess.who, sess.admin
+	who, admin, door := sess.who, sess.admin, sess.door
 	sess.mu.Unlock()
 	// A rejected unsafe request is a denial milestone; write it durably (adv 10).
 	s.auditor.WriteSync(r.Context(), audit.Event{
@@ -128,6 +142,7 @@ func (s *Server) auditAuthDenied(r *http.Request, sess *session, code, detail st
 		Admin:          admin,
 		Root:           who.Root,
 		IP:             ClientIP(r),
+		Door:           door,
 		Op:             "auth",
 		Path:           r.URL.Path,
 		Phase:          "result",
@@ -163,7 +178,12 @@ func (s *Server) auditUnauthenticated(r *http.Request, code, detail string) {
 		return
 	}
 	s.auditor.WriteSync(r.Context(), audit.Event{
-		IP:             ClientIP(r),
+		IP: ClientIP(r),
+		// No session, so no session door: the LISTENER's door is what is known,
+		// and it is exactly what an operator needs to see on a sessionless
+		// denial — a forged mutation arriving on the LAN-facing port is not the
+		// same event as one arriving through the proxy.
+		Door:           doorOf(r),
 		Op:             "auth",
 		Path:           r.URL.Path,
 		Phase:          "result",
@@ -241,6 +261,7 @@ func (s *Server) writeAudit(sess *session, r *http.Request, m mutation, phase, r
 		Admin:          sess.admin,
 		Root:           sess.who.Root,
 		IP:             ClientIP(r),
+		Door:           sess.door,
 		Op:             m.op,
 		Path:           m.path,
 		Dst:            m.dst,
@@ -568,7 +589,11 @@ func (s *Server) mkdir(w http.ResponseWriter, r *http.Request, sess *session) {
 	// and As stays nil (a non-root worker chowning to another uid is EPERM
 	// anyway). The front-end only ever names the session's OWN uid.
 	var as *wproto.CreateAs
-	if sess.who.Root && s.guard.Classify(dir) == "normal" && s.guard.Classify(resolvedDir) == "normal" {
+	// A break-glass session has no real user behind it (contract §2.4), so
+	// there is nobody to create content AS: CreateAs stays nil and the folder is
+	// root-owned. It is the one place the admin-as-real-user rule cannot apply,
+	// and the UI and docs say so rather than letting it surprise anyone.
+	if sess.who.Root && sess.door != audit.DoorLocal && s.guard.Classify(dir) == "normal" && s.guard.Classify(resolvedDir) == "normal" {
 		as = &wproto.CreateAs{UID: sess.who.UID, GID: -1} // Mode 0: chown only, never chmod
 	}
 	// Dispatch against the resolved parent, binding the operation as tightly as

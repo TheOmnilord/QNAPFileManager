@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -69,15 +70,23 @@ type Web struct {
 // BreakGlass is the second listener. It exists because this is the tool an
 // operator would use to fix a NAS whose Apache or App Center is broken, and it
 // must not depend on the thing it may have to repair. It serves only the local
-// bcrypt auth mode.
+// bcrypt auth mode (M4 contract §2.1).
 type BreakGlass struct {
 	Enabled bool   `json:"enabled"`
 	Addr    string `json:"addr"`
+	// CertFile and KeyFile hold the self-signed certificate the listener
+	// terminates TLS with. Empty means "beside the config file", as
+	// BreakGlassFiles derives it; both are generated on first start and
+	// regenerated within 30 days of expiry (M4 contract §3).
+	CertFile string `json:"certFile,omitempty"`
+	KeyFile  string `json:"keyFile,omitempty"`
 }
 
 type Auth struct {
 	// Mode is "qts" (the QTS session), "local" (the break-glass account) or
-	// "both".
+	// "both". Outside -dev only "qts" is accepted: M4 moved the local account
+	// to its own listener, so it is no longer a mode of the main one
+	// (contract §2.2).
 	Mode string `json:"mode"`
 	// AdminRequiresBoth makes an administrator prove both identities before
 	// root mode can be armed: the QTS session says isAdmin, and the local
@@ -87,6 +96,43 @@ type Auth struct {
 	// QTSPort is the loopback port of authLogin.cgi. 0 means read it from
 	// /etc/config/uLinux.conf, falling back to 8080.
 	QTSPort int `json:"qtsPort"`
+	// Local is the break-glass administrator account. It is written only by
+	// `qnapfilemanager break-glass` on the NAS shell; there is no HTTP route
+	// that sets, changes, resets or reveals it (M4 contract §4.1).
+	Local Local `json:"local"`
+}
+
+// Local is the break-glass credential as it sits in the config file. The daemon
+// re-reads it rather than caching it (guarded by an mtime+size check), so a
+// password change from the shell takes effect on the next attempt without a
+// restart (M4 contract §4.3).
+type Local struct {
+	// Hash is the bcrypt hash of the password. Empty means the break-glass
+	// listener does not bind at all (contract §2.5).
+	Hash string `json:"hash,omitempty"`
+	// Cost is the bcrypt cost the hash was written with; 0 means DefaultCost.
+	Cost int `json:"cost,omitempty"`
+	// Updated is an RFC3339 stamp. Every live break-glass session carries the
+	// value it was issued under, so bumping it evicts them all (contract §4.4).
+	Updated string `json:"updated,omitempty"`
+}
+
+// bcrypt cost bounds (M4 contract §4.2). Cost 12 on the ARM cores these units
+// ship is seconds rather than milliseconds, and verification is a CPU cost an
+// unauthenticated caller controls; the ceiling keeps an operator from
+// configuring a self-inflicted denial of service.
+const (
+	DefaultLocalCost = 11
+	MinLocalCost     = 10
+	MaxLocalCost     = 15
+)
+
+// LocalCost is Local.Cost with the zero value resolved to the default.
+func (l Local) LocalCost() int {
+	if l.Cost == 0 {
+		return DefaultLocalCost
+	}
+	return l.Cost
 }
 
 type Trash struct {
@@ -147,6 +193,7 @@ func Default() Config {
 			Mode:              AuthQTS,
 			AdminRequiresBoth: true,
 			QTSPort:           0,
+			Local:             Local{Cost: DefaultLocalCost},
 		},
 		ReadOnly: true,
 		Trash:    Trash{Enabled: true, Days: 30},
@@ -163,7 +210,13 @@ func Default() Config {
 // error, malformed JSON — is an error, because starting with defaults on top
 // of a config that exists but could not be read would silently discard the
 // operator's settings, read-only mode included.
-func Load(path string) (Config, error) {
+func Load(path string) (Config, error) { return LoadDev(path, false) }
+
+// LoadDev is Load with the development relaxations of Validate: auth.mode
+// "local" and "both" are accepted so the Windows dev loop can exercise the
+// local door without a QTS to talk to. Everything else is validated identically.
+// Production callers use Load.
+func LoadDev(path string, dev bool) (Config, error) {
 	c := Default()
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -185,29 +238,82 @@ func Load(path string) (Config, error) {
 		return Config{}, fmt.Errorf("parsing %s: %w", path, err)
 	}
 	c.Normalize()
-	if err := c.Validate(); err != nil {
+	if err := c.ValidateDev(dev); err != nil {
 		return Config{}, fmt.Errorf("%s: %w", path, err)
 	}
 	return c, nil
+}
+
+// BreakGlassFiles resolves where the break-glass certificate and key live.
+// Explicit config values win; otherwise they sit beside the config file (the
+// QPKG's config/ directory, which package_routines already tightens to 0700),
+// falling back to the working directory when the daemon runs without a config
+// file at all. M4 contract §3.1.
+func (c Config) BreakGlassFiles(configPath string) (certFile, keyFile string) {
+	dir := "."
+	if configPath != "" {
+		dir = filepath.Dir(configPath)
+	}
+	certFile, keyFile = c.Web.BreakGlass.CertFile, c.Web.BreakGlass.KeyFile
+	if certFile == "" {
+		certFile = filepath.Join(dir, "breakglass-cert.pem")
+	}
+	if keyFile == "" {
+		keyFile = filepath.Join(dir, "breakglass-key.pem")
+	}
+	return certFile, keyFile
 }
 
 // Save writes the config atomically — through jsonfile, which publishes by
 // rename after flushing, so a crash cannot leave a half-written file where the
 // last good one was — and then tightens the mode: this file holds the
 // break-glass password hash.
-func Save(path string, c Config) error {
+func Save(path string, c Config) error { return SaveDev(path, c, false) }
+
+// SaveDev is Save with LoadDev's validation relaxations, so a daemon or a CLI
+// run that loaded a -dev configuration can write it back (round-2 P3-6).
+func SaveDev(path string, c Config, dev bool) error {
 	c.Normalize()
-	if err := c.Validate(); err != nil {
+	if err := c.ValidateDev(dev); err != nil {
 		return err
 	}
-	if err := jsonfile.Write(path, c); err != nil {
+	// 0600 on the SCRATCH file, so the published document is never briefly
+	// world-readable under its own name: this file holds the break-glass
+	// password hash (round-2 P3-5).
+	if err := jsonfile.WriteMode(path, c, 0o600); err != nil {
 		return err
 	}
-	// jsonfile publishes archive data at 0644; a credential store is not that.
+	// Belt and braces for a pre-existing file whose mode was already wrong.
 	if err := os.Chmod(path, 0o600); err != nil {
 		return fmt.Errorf("tightening the mode of %s: %w", path, err)
 	}
 	return nil
+}
+
+// Update is the read-modify-write every writer of this file must use: it takes
+// the cross-process lock, loads, applies change, and saves — so the daemon's
+// read-only toggle and the CLI's `break-glass set-password` cannot interleave
+// and publish each other's stale copy (round-2 P3-5).
+//
+// dev selects the validation relaxations of LoadDev, because a daemon started
+// with -dev must still be able to save the file it started from (round-2 P3-6).
+func Update(path string, dev bool, change func(*Config) error) error {
+	release, err := Lock(path)
+	if err != nil {
+		if hint := lockHint(path); hint != "" {
+			return fmt.Errorf("%w (%s)", err, hint)
+		}
+		return err
+	}
+	defer release()
+	c, err := LoadDev(path, dev)
+	if err != nil {
+		return err
+	}
+	if err := change(&c); err != nil {
+		return err
+	}
+	return SaveDev(path, c, dev)
 }
 
 // Normalize fixes up the shapes that have one obviously intended form, so

@@ -10,7 +10,10 @@
   "auth": {
     "mode": "qts",
     "adminRequiresBoth": true,
-    "qtsPort": 0
+    "qtsPort": 0,
+    "local": {
+      "cost": 11
+    }
   },
   "readOnly": true,
   "trash": {

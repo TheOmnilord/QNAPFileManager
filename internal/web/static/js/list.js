@@ -1,7 +1,10 @@
 import {api} from './api.js';
-import {$,el,error,pathArgs,route,heightRule,announce} from './dom.js';
+import {$,el,error,pathArgs,route,heightRule,announce,applyWhy} from './dom.js';
 import {state,update,selected,countSelected,subscribe,sessionGuard,listingActions} from './state.js';
 import {nameCell,isDirectory,isReadable,isSymlink,hasTarget,fileTarget,actionHint,directoryNotice} from './badges.js';
+import {whyDisabled,entryKind} from './why.js';
+import {emptyState} from './empty.js';
+import {syncOverflow} from './narrow.js';
 import {view,download,downloadMode,downloadArchive} from './viewer.js';
 import {properties} from './props.js';
 // pathBytes is the byte spelling of a path reference. It lives in transfer.js
@@ -71,7 +74,9 @@ async function page(number,generation) {
   if (number === 0) pageSize = data.limit;
   else if (data.limit !== pageSize) throw new Error('Listing page size changed. Refresh to continue.');
   const pages = new Map(state.pages); pages.set(number,data.entries);
-  update({pages,total:data.total,loading:false});
+  // The guard's classification of the folder travels with its first page, and
+  // it is kept: it is the `guard` cause every mutating control consults (§7.1).
+  update(number === 0 ? {pages,total:data.total,loading:false,dirClass:data.class || ''} : {pages,total:data.total,loading:false});
   if (number === 0) directoryNotice(data);
   render();
  })();
@@ -84,7 +89,7 @@ export async function loadList() {
  const valid=sessionGuard();
  const generation = state.generation+1;
  pageSize = DEFAULT_PAGE;
- update({generation,pages:new Map(),total:0,selection:new Set(),exclude:false,focus:0,anchor:0,loading:true});
+ update({generation,pages:new Map(),total:0,selection:new Set(),exclude:false,focus:0,anchor:0,loading:true,listError:null,dirClass:''});
  $('#listViewport').scrollTop = 0; $('#status').textContent = 'Loading…'; render();
  try {
   await page(0,generation);
@@ -104,7 +109,33 @@ export async function loadList() {
     announce(`Opened this folder — “${want.name}” is not on the pages loaded so far.`);
    }
   }
- } catch(err) { if (valid() && generation === state.generation) { update({loading:false,pendingReveal:null}); error(err); } }
+ } catch(err) {
+  if (valid() && generation === state.generation) {
+   // The failure is KEPT, not just reported: an empty list and a list the
+   // kernel refused must not look the same (§8.1). The status bar still says
+   // what happened; the list region now says it too, where the rows would be.
+   update({loading:false,pendingReveal:null,listError:{code:err.code || '',message:err.message || ''}});
+   render();
+   error(err);
+   describeRefusal(err,generation,valid);
+  }
+ }
+}
+
+// describeRefusal asks the kernel for the folder's own owner and mode so the
+// refused-listing sentence can NAME them (§8.1: the kernel's verdict, reported
+// — INV-2). Reading a directory and traversing to it are different permissions,
+// so a stat usually survives a listing that did not; when it does not, the
+// sentence falls back to the server's own message and says nothing it does not
+// know.
+async function describeRefusal(err,generation,valid) {
+ if (!['permission','protected','readonly','read_only'].includes(String(err.code || ''))) return;
+ try {
+  const entry = await api('api/fs/stat',pathArgs(state));
+  if (!valid() || generation !== state.generation || !state.listError) return;
+  update({listError:{...state.listError,owner:entry.user || (entry.uid != null ? `uid ${entry.uid}` : ''),mode:entry.modeStr || entry.mode || ''}});
+  render();
+ } catch { /* The stat was refused too; the sentence stays as it is. */ }
 }
 
 function select(index,event={}) {
@@ -154,13 +185,6 @@ function status() {
 // results have replaced it, it is the focused RESULT and nothing else — the
 // listing's selection is invisible then, and acting on invisible rows is the
 // bug the gate exists to prevent (round 1, finding 1).
-// resultHint is actionHint for a row in the RESULTS view, where a symlink's
-// target was never inspected. Kept here rather than imported from search.js so
-// the two modules do not close a cycle over a one-line sentence.
-const resultHint = e => isSymlink(e) && !hasTarget(e)
- ? 'Search does not follow symlinks, so this one’s target was not inspected. Open its folder to see where it points.'
- : actionHint(e);
-
 export function activeSelection() {
  const gate = listingActions();
  if (!gate.listing) {
@@ -171,58 +195,132 @@ export function activeSelection() {
  return {gate,count:gate.count,entry:e,one:gate.count === 1 && !!e && selected(state.focus)};
 }
 
+// whyContext is the state every control's verdict is read from, assembled once.
+//
+// It is exported because the context menu, the dialogs and the tests all have
+// to ask the SAME question the toolbar asks: one table (why.js), one context,
+// and no third place quietly deciding that a button should be grey.
+// kindOf is the one word why.js needs for "is this the right sort of thing".
+//
+// An unresolved symlink is reported differently in the two views, and only the
+// context knows which it is. The listing follows symlinks, so an unresolved one
+// there really is broken; a search hit was never followed, so calling it broken
+// states something nobody checked (round 10).
+export function kindOf(entry,listing = true) {
+ if (!entry) return '';
+ const broken = isSymlink(entry) && !hasTarget(entry);
+ if (broken && !listing) return 'unfollowed';
+ return entryKind({dir:isDirectory(entry),readable:isReadable(entry),broken});
+}
+
+export function whyContext(extra = {}) {
+ const {gate,count,entry,one} = activeSelection();
+ // The kind only means anything for a single selection: it answers "is this the
+ // right sort of thing", which is not a question about twelve items.
+ const kind = one && entry ? kindOf(entry,gate.listing) : '';
+ return {
+  readOnly:!state.session?.canWrite,
+  // The listing is not on screen: a selection-class reason with its own
+  // sentence, never reported as read-only mode (round 1, finding 1).
+  paused:!gate.listing,
+  count,one,kind,
+  entry:one ? entry : null,
+  session:state.session,
+  // The guard's own verdict on the folder, so every mutating control — and the
+  // empty state's single offer — knows that nothing may be created or changed
+  // inside a protected region. 'warn' is NOT a denial: the guard refuses
+  // specific operations there (a new folder directly under the /share RAM disk)
+  // and permits the rest, so the server stays the one that says no.
+  guard:{denied:state.dirClass==='protected'},
+  ...extra,
+ };
+}
+
 // refreshToolbar reflects the current selection and the session's write
-// capability onto every action button. Mutating buttons are disabled (never
-// hidden) with a title saying why, per the safety plan §3.2/§4.1 — and while
-// the search results are up, "why" is that the listing is not on screen.
+// capability onto every action button, through the ONE reason table (M4
+// contract §7). Mutating buttons are disabled (never hidden) and carry the
+// verdict's sentence as a title, as aria-disabled and as an aria-describedby
+// node, per the safety plan §3.2/§4.1.
 export function refreshToolbar() {
- const {gate,count:n,entry:e,one} = activeSelection();
- const canWrite = !!state.session?.canWrite && gate.mutate;
+ const {count:n,entry:e,one} = activeSelection();
+ const ctx = whyContext();
  // The Download button is a SPLIT (contract §2.4): one readable file leaves as
  // itself, anything else — a folder, or several items — leaves as a ZIP, and
  // the ▾ menu offers tar.gz instead. The button says which it will do, so the
  // click is never a surprise.
  const mode = downloadMode({count:n,entry:one ? e : null});
- $('#btnDownload').disabled = mode === 'none';
+ const download = whyDisabled('download',ctx);
+ applyWhy('#btnDownload',mode === 'archive' ? {...download,sentence:'Download the selection as a ZIP archive'} : download);
  $('#btnDownload').textContent = mode === 'archive' ? 'Download as ZIP' : 'Download';
- $('#btnDownloadAs').disabled = mode === 'none';
- $('#btnView').disabled = !one || !isReadable(e);
- // View stays disabled for an unresolved link either way — the kind is not
- // known to be readable — but the REASON differs, and only the context knows
- // which it is. The listing follows symlinks, so an unresolved one there really
- // is broken; a search hit was never followed, so calling it broken states
- // something nobody checked (round 10).
- const hint = one && !isReadable(e)
-  ? (gate.listing ? actionHint(e) : resultHint(e))
-  : '';
- $('#btnDownload').title = mode === 'archive' ? 'Download the selection as a ZIP archive' : hint;
- $('#btnView').title = hint;
- $('#btnProps').disabled = !one;
- // Two different reasons a change is refused, said apart: read-only mode, and
- // "the listing is not what you are looking at". Saying "read-only mode is on"
- // for the second would be a lie the user would go and check in Settings.
- const paused = 'Close the search results to change files in this folder.';
- const ro = !gate.mutate ? paused : 'Read-only mode is on. Turn it off in Settings to make changes.';
- $('#btnMkdir').disabled = !canWrite;
- $('#btnMkdir').title = canWrite ? 'New folder' : ro;
- $('#btnUpload').disabled = !canWrite;
- $('#btnUpload').title = canWrite ? 'Upload files into this folder (or drop them on the list)' : ro;
+ applyWhy('#btnDownloadAs',download);
+ applyWhy('#btnView',whyDisabled('viewText',ctx));
+ applyWhy('#btnProps',whyDisabled('properties',ctx));
+ applyWhy('#btnMkdir',whyDisabled('newFolder',ctx));
+ applyWhy('#btnUpload',whyDisabled('upload',ctx));
  // Searching is reading: it needs a session, never write permission.
- $('#btnSearch').disabled = false;
+ applyWhy('#btnSearch',whyDisabled('search',ctx));
  // Permissions acts on the WHOLE selection — a recursive chmod over several
  // roots is one job — so it needs a selection and write permission, and never
- // the owner arithmetic: that is a hint the dialog shows, not a lock (PLAN
- // decision 12, M3 contract §5.2).
- $('#btnPerms').disabled = !canWrite || n < 1;
- $('#btnPerms').title = !canWrite ? ro : (n < 1 ? 'Select items to change permissions.' : 'Permissions (F9)');
- $('#btnRename').disabled = !canWrite || !one;
- $('#btnRename').title = !canWrite ? ro : (!one ? 'Select one item to rename.' : 'Rename');
- $('#btnDelete').disabled = !canWrite || n < 1;
- $('#btnDelete').title = !canWrite ? ro : (n < 1 ? 'Select items to delete.' : 'Delete');
- for (const [id,verb] of [['#btnCopy','copy'],['#btnMove','move']]) {
-  $(id).disabled = !canWrite || n < 1;
-  $(id).title = !canWrite ? ro : (n < 1 ? `Select items to ${verb}.` : `${verb==='copy' ? 'Copy' : 'Move'} to another folder (Ctrl+${verb==='copy' ? 'C' : 'X'}, then Ctrl+V)`);
- }
+ // the owner arithmetic: that is a hint the table returns as `capability`,
+ // which explains without locking (PLAN decision 12, M3 contract §5.2).
+ applyWhy('#btnPerms',whyDisabled('permissions',ctx));
+ applyWhy('#btnRename',whyDisabled('rename',ctx));
+ applyWhy('#btnDelete',whyDisabled('delete',ctx));
+ applyWhy('#btnCopy',whyDisabled('copy',ctx));
+ applyWhy('#btnMove',whyDisabled('move',ctx));
+ // The ⋯ menu mirrors whatever the buttons have just been told, so the narrow
+ // layout can never disagree with the wide one (§9.5).
+ syncOverflow();
+ paintEmpty();
+}
+
+// --- the empty states (§8) ---------------------------------------------------
+
+// loadedCount and loadedMatches are counted rather than estimated, because
+// "4,182 entries are loaded" is the sentence's whole point: a number is what
+// distinguishes "nothing is there" from "we stopped looking". Both walk only
+// the pages actually held, and the matcher runs only when a filter is set.
+function loadedCount() { let n = 0; for (const entries of state.pages.values()) n += entries.length; return n; }
+function loadedMatches() {
+ let n = 0;
+ for (const entries of state.pages.values()) for (const entry of entries) if (matchesFilter(state.filter,entry.name)) n++;
+ return n;
+}
+
+let emptyAction = '';
+// paintEmpty renders the list region's empty state. An empty folder and a
+// folder you cannot read must never look the same (§8.1).
+export function paintEmpty() {
+ const box = $('#listEmpty');
+ if (!box) return null;
+ const info = emptyState('list',{
+  loading:state.loading,
+  total:state.total,
+  loaded:loadedCount(),
+  filter:state.filter,
+  matches:state.filter ? loadedMatches() : 0,
+  error:state.listError,
+  owner:state.listError?.owner || '',
+  mode:state.listError?.mode || '',
+  // The offer goes through the SAME table as the button it presses (§8.1's
+  // "one action", §7.1's one reason table): read-only, a paused listing and a
+  // guard-denied folder each withdraw it, rather than offering a control that
+  // forwards to a disabled button or to a 403 (round 2, finding 2).
+  canCreate:whyDisabled('newFolder',whyContext()).allowed,
+ });
+ box.hidden = !info;
+ emptyAction = info?.action?.id || '';
+ if (!info) return null;
+ $('#listEmptyText').textContent = info.sentence;
+ $('#listEmptyDetail').textContent = info.detail;
+ $('#listEmptyDetail').hidden = !info.detail;
+ const action = $('#listEmptyAction');
+ action.hidden = !info.action;
+ if (info.action) action.textContent = info.action.label;
+ // The refused state is marked in WORDS by the sentence itself; the class only
+ // carries the border, so nothing here is signalled by colour alone (§4.1).
+ box.classList?.toggle('refused',info.state === 'listing-refused' || info.state === 'listing-failed');
+ return info;
 }
 
 export function render() {
@@ -255,7 +353,7 @@ export function render() {
  }
  $('#listRows').replaceChildren(...rows);
  syncSelection();
- $('#listEmpty').hidden = state.loading || state.total !== 0;
+ paintEmpty();
  if (hadFocus) focusRow();
  const valid=sessionGuard(),generation=state.generation;
  for (const n of needed) page(n,generation).catch(err => { if (valid() && generation===state.generation) error(err); });
@@ -409,20 +507,58 @@ export async function downloadSelection(format) {
  announce(`Preparing ${entries.length.toLocaleString()} item(s) as ${format === 'tgz' ? 'a tar.gz' : 'a ZIP'} archive…`);
 }
 
+// contextMenu is the third place that used to decide enablement for itself. It
+// now asks the same table the toolbar asks (M4 contract §7.1), over a context
+// built from the ONE entry it acts on — which is not always the selection, so
+// it is built explicitly rather than read from activeSelection.
+//
+// A mutating item is DISABLED with its reason, never removed: "never hidden for
+// a state reason" (§7.1) applies here too, and a Rename that silently vanishes
+// in read-only mode teaches the user that the app is broken.
 export function contextMenu(e) {
  if (!e) return;
  const menu = $('#ctxMenu'); menu.replaceChildren();
- const actions = [['Open',() => open(e),!isDirectory(e) && !isReadable(e)],['Properties',() => properties(e)],['Copy full path',async () => { try { await navigator.clipboard.writeText(e.path); announce('Path copied.'); } catch { error(new Error('Could not copy the path. Use the path field to copy it.')); } }]];
+ const ctx = whyContext({count:1,one:true,entry:e,kind:kindOf(e,listingActions().listing)});
+ const free = label => ({allowed:true,cause:'',sentence:label,causes:[]});
+ // Each row is {label, run, why}: `why` is a verdict from the shared table, or
+ // a free one for an item nothing can refuse.
+ const actions = [
+  {label:'Open',run:() => open(e),why:isDirectory(e) ? free('Open this folder') : whyDisabled('viewText',ctx)},
+  {label:'Properties',run:() => properties(e),why:whyDisabled('properties',ctx)},
+  {label:'Copy full path',run:async () => { try { await navigator.clipboard.writeText(e.path); announce('Path copied.'); } catch { error(new Error('Could not copy the path. Use the path field to copy it.')); } },why:free('Copy this item’s full path')},
+ ];
  // The download group, kept together: the plain download where it applies, then
  // the two archive forms — the only way a FOLDER can be downloaded at all, and
  // a legitimate way to take a file with its name intact (contract §2.4).
- const downloads = [['Download as ZIP',() => downloadArchive([e],'zip',archiveOptions())],['Download as tar.gz',() => downloadArchive([e],'tgz',archiveOptions())]];
- if (isReadable(e) || isSymlink(e) && !hasTarget(e)) downloads.unshift(['View text',() => view(e),!isReadable(e)],['Download',() => download(e),!isReadable(e)]);
+ const downloads = [
+  {label:'Download as ZIP',run:() => downloadArchive([e],'zip',archiveOptions()),why:free('Download this item as a ZIP archive')},
+  {label:'Download as tar.gz',run:() => downloadArchive([e],'tgz',archiveOptions()),why:free('Download this item as a tar.gz archive')},
+ ];
+ if (isReadable(e) || isSymlink(e) && !hasTarget(e)) downloads.unshift(
+  {label:'View text',run:() => view(e),why:whyDisabled('viewText',ctx)},
+  {label:'Download',run:() => download(e),why:whyDisabled('download',{...ctx,count:isReadable(e) ? 1 : 0})},
+ );
  actions.splice(1,0,...downloads);
- if (isSymlink(e) && (e.targetType === 'dir' || !hasTarget(e))) actions.push(['Go to target',() => { location.hash = route(fileTarget(e)); },!hasTarget(e)]);
- for (const a of extraActions) if (!a.show || a.show(e)) actions.push([a.label,() => a.run(e),a.disabled?.(e)]);
- for (const [label,action,disabled] of actions) { const b = el('button',{role:'menuitem',tabindex:'-1'},label); b.disabled=!!disabled; if (disabled) b.title=actionHint(e); b.addEventListener('click',() => { menu.hidden=true; action(); }); menu.append(b); }
- menu.hidden=false; const first=menu.querySelector('button:not(:disabled)'); first.tabIndex=0; first.focus();
+ if (isSymlink(e) && (e.targetType === 'dir' || !hasTarget(e))) {
+  actions.push({label:'Go to target',run:() => { location.hash = route(fileTarget(e)); },
+   why:hasTarget(e) ? free('Go to the folder this link points at') : {allowed:false,cause:'selection',sentence:actionHint(e),causes:['selection']}});
+ }
+ for (const extra of extraActions) {
+  if (extra.show && !extra.show(e)) continue;
+  actions.push({label:extra.label,run:() => extra.run(e),
+   why:extra.action ? whyDisabled(extra.action,ctx) : extra.disabled?.(e) ? {allowed:false,cause:'selection',sentence:actionHint(e),causes:['selection']} : free(extra.label)});
+ }
+ actions.forEach((entry,index) => {
+  const button = el('button',{role:'menuitem',tabindex:'-1',id:`ctxItem-${index}`},entry.label);
+  button.addEventListener('click',() => { menu.hidden=true; entry.run(); });
+  menu.append(button);
+ });
+ // applyWhy after the append: the describedby node it points at only helps once
+ // the button is in the document.
+ actions.forEach((entry,index) => applyWhy(`#ctxItem-${index}`,entry.why));
+ menu.hidden=false;
+ const first=menu.querySelector('button:not(:disabled)');
+ if (first) { first.tabIndex=0; first.focus?.(); }
 }
 
 export function initList() {
@@ -431,6 +567,10 @@ export function initList() {
   else refreshToolbar();
  });
  topHeight = heightRule('#listSpacer'); bottomHeight = heightRule('#listTail');
+ // The empty state's single offer (§8.1: one sentence plus at most one action)
+ // presses the real toolbar button, so the action it offers is the action the
+ // reason table has already judged — never a second path into the same work.
+ $('#listEmptyAction').addEventListener('click',() => { if (emptyAction) $(`#${emptyAction}`)?.click?.(); });
  $('#listViewport').addEventListener('scroll',render); window.addEventListener('resize',render);
  $('#searchBox').addEventListener('input',ev => { update({filter:ev.target.value}); render(); });
  $('#listHead').addEventListener('click',ev => {

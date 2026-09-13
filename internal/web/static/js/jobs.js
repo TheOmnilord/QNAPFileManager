@@ -4,6 +4,7 @@ import {state,sessionGuard} from './state.js';
 import {loadList} from './list.js';
 import {loadTree} from './tree.js';
 import {mergeJobs} from './upload.js';
+import {emptyState} from './empty.js';
 
 // The jobs panel (ui-ux §3.4): a right-side drawer listing every operation this
 // session can see, polled while anything is live and silent when nothing is.
@@ -325,7 +326,11 @@ export function renderJobs(list) {
  if (Array.isArray(list)) serverJobs = list;
  const visible = mergeJobs(serverJobs,localJobs).filter(j => !dismissed.has(j.id));
  $('#jobsList').replaceChildren(...visible.map(jobRow));
- $('#jobsEmpty').hidden = visible.length > 0;
+ // An idle panel says what it is FOR, and counts what it has cleared, rather
+ // than leaving the user to wonder whether the operation ran at all (§8.1).
+ const nothing = emptyState('jobs',{visible:visible.length,finished:dismissed.size});
+ $('#jobsEmpty').hidden = !nothing;
+ if (nothing) $('#jobsEmpty').textContent = [nothing.sentence,nothing.detail].filter(Boolean).join(' ');
  const live = visible.filter(jobLive).length;
  $('#btnJobs').textContent = live ? `Operations (${live})` : 'Operations';
 }

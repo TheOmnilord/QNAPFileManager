@@ -72,7 +72,10 @@ func TestLoadUnreadableFileIsAnError(t *testing.T) {
 
 func TestLoadPartialOverlaysDefaults(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "c.json")
-	body := `{"readOnly":false,"web":{"listen":"0.0.0.0:9000","proxyPrefix":"/qnapfilemanager/"},"worker":{"max":2}}`
+	// A non-default loopback address: M4 §13.1 refuses anything that is not
+	// loopback on web.listen, so the overlay is exercised with 127.0.0.5 rather
+	// than the 0.0.0.0 this test used before the rule existed.
+	body := `{"readOnly":false,"web":{"listen":"127.0.0.5:9000","proxyPrefix":"/qnapfilemanager/"},"worker":{"max":2}}`
 	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +86,7 @@ func TestLoadPartialOverlaysDefaults(t *testing.T) {
 	if c.ReadOnly {
 		t.Error("an explicit false must turn readOnly off")
 	}
-	if c.Web.Listen != "0.0.0.0:9000" {
+	if c.Web.Listen != "127.0.0.5:9000" {
 		t.Errorf("listen = %q", c.Web.Listen)
 	}
 	// Normalize strips the trailing slash: the mux mounts at the prefix and

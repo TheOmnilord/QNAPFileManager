@@ -1,5 +1,6 @@
 import {api} from './api.js';
-import {$,el,error,announce,openDialog,pathArgs,toast} from './dom.js';
+import {$,el,error,announce,applyWhy,openDialog,pathArgs,toast} from './dom.js';
+import {whyDisabled} from './why.js';
 import {state,sessionGuard,listingActions,subscribe} from './state.js';
 import {isDirectory,isSymlink,hasTarget,fileTarget} from './badges.js';
 import {runMutation,confirmDialog,actionMessage} from './actions.js';
@@ -248,7 +249,26 @@ function refreshApply() {
   applying,canWrite:state.session ? !!state.session.canWrite : true,
   recursive:recursive(),specs:currentSpecs(),
  });
- $('#pApply').disabled = !!blocked;
+ // The dialog's primary button goes through the shared reason table (M4
+ // contract §7.1) so read-only mode says here exactly what it says on the
+ // toolbar; `blocked` carries the dialog's own reasons (a request in flight, a
+ // recursive change that would SET a special bit), which the table does not
+ // know about and must not be asked to.
+ const verdict = whyDisabled('permissions',{
+  readOnly:state.session ? !state.session.canWrite : false,
+  count:targets.length,
+  // The capability hint is shown by #pCaps; the button stays ENABLED for it,
+  // because the kernel decides and the arithmetic only predicts (INV-2).
+  entry:null,session:state.session,
+ });
+ // Each of the dialog's own reasons in its own words: a button grey because a
+ // request is in flight must not describe itself as ready (round 1, finding 2).
+ const pending={
+  applying:'The change is being sent.',
+  readOnly:'',   // the verdict says this one, and says it better
+  special:RECURSIVE_SPECIAL_REFUSAL,
+ }[blocked] ?? '';
+ applyWhy('#pApply',verdict,blocked ? pending || true : '');
 }
 
 function repaint() { paintGrid(); paintRecursive(); paintWarnings(); }
@@ -502,7 +522,7 @@ export function initPerms() {
  $('#dlgPerms').addEventListener('close',() => { impactRunner.stop(); targets = []; });
  $('#btnPerms').addEventListener('click',openPermsForSelection);
  $('#propPerms').addEventListener('click',() => { const entry = propsTarget(); if (entry) { $('#dlgProps').close(); openPerms([entry]); } });
- extraActions.push({label:'Permissions…',show:() => !!state.session,run:entry => openPerms([entry])});
+ extraActions.push({label:'Permissions…',action:'permissions',run:entry => openPerms([entry])});
 }
 
 // setsSpecial and applySpec are re-exported for the dialog's own tests: the

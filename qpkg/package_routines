@@ -3,14 +3,23 @@
 
 pkg_post_install(){
     mkdir -p "$SYS_QPKG_DIR/config" "$SYS_QPKG_DIR/logs"
-    # Deliberately no seeded config: an absent config is what opens the
-    # first-run claim window, and seeding one would have to invent a password.
-    # The daemon starts on its defaults — read-only, loopback only.
+    # Deliberately no seeded config: the daemon starts on its defaults —
+    # read-only, loopback only — and the break-glass listener binds NOTHING
+    # until an operator runs, as root on the NAS shell:
     #
-    # The config holds the break-glass password hash and the audit log holds
-    # every path this app has touched. Admin-only, both of them.
+    #   qnapfilemanager break-glass set-password
+    #
+    # There is no HTTP route that sets the password and no unauthenticated
+    # bootstrap window of any kind (M4 contract §2.5, §4.1). Seeding a config
+    # here would have to invent a credential.
+    #
+    # The config holds the break-glass password hash and the self-signed
+    # certificate's private key; the audit log holds every path this app has
+    # touched. Admin-only, all of them.
     chmod 700 "$SYS_QPKG_DIR/config" "$SYS_QPKG_DIR/logs"
     [ -f "$SYS_QPKG_DIR/config/config.json" ] && chmod 600 "$SYS_QPKG_DIR/config/config.json"
+    [ -f "$SYS_QPKG_DIR/config/breakglass-key.pem" ] && chmod 600 "$SYS_QPKG_DIR/config/breakglass-key.pem"
+    [ -f "$SYS_QPKG_DIR/config/breakglass-cert.pem" ] && chmod 600 "$SYS_QPKG_DIR/config/breakglass-cert.pem"
     :
 }
 

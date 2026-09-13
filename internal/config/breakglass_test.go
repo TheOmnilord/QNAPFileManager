@@ -1,0 +1,379 @@
+package config
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+// TestListenMustBeLoopback is M4 contract §13.1 as a table of spellings. The
+// main listener carries the QTS cookie door and is reached through the QTS
+// proxy; the break-glass listener is the one sanctioned non-loopback surface,
+// and there is deliberately NO override key — so this table is the whole rule.
+func TestListenMustBeLoopback(t *testing.T) {
+	cases := []struct {
+		addr string
+		ok   bool
+	}{
+		{"127.0.0.1:8770", true},
+		{"127.0.0.1:1", true},
+		{"127.0.0.5:8770", true}, // the whole 127.0.0.0/8 block is loopback
+		{"127.255.255.254:1", true},
+		{"[::1]:8770", true},
+		{"0.0.0.0:8770", false},
+		{":8770", false},     // the empty host binds every interface
+		{"[::]:8770", false}, // and so does the v6 wildcard
+		{"192.168.1.10:8770", false},
+		{"10.0.0.1:8770", false},
+		{"[2001:db8::1]:8770", false},
+		{"nas.local:8770", false}, // a hostname is refused before the loopback test
+		{"localhost:8770", false}, // including the one that happens to resolve to loopback
+		{"127.0.0.1", false},      // no port
+		{"8770", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		t.Run(c.addr, func(t *testing.T) {
+			cfg := Default()
+			cfg.Web.Listen = c.addr
+			err := cfg.Validate()
+			if c.ok && err != nil {
+				t.Fatalf("Validate(%q) = %v, want it accepted", c.addr, err)
+			}
+			if !c.ok {
+				if err == nil {
+					t.Fatalf("Validate(%q) = nil, want it refused", c.addr)
+				}
+				if !strings.Contains(err.Error(), "web.listen") {
+					t.Fatalf("the error must name the key it is about: %v", err)
+				}
+			}
+			// -dev relaxes auth.mode and nothing else: there is no development
+			// escape hatch for exposing the main listener.
+			if got := cfg.ValidateDev(true); (got == nil) != c.ok {
+				t.Fatalf("ValidateDev(%q) = %v, want the same verdict as Validate", c.addr, got)
+			}
+		})
+	}
+}
+
+// The break-glass listener is the exception, and it is meant to be: 0.0.0.0 is
+// its default, because a door you can only reach from the machine you cannot
+// log in to is not a door.
+func TestBreakGlassAddrMayBeNonLoopback(t *testing.T) {
+	cfg := Default()
+	if cfg.Web.BreakGlass.Addr != "0.0.0.0:8771" {
+		t.Fatalf("breakGlass.addr default = %q, want 0.0.0.0:8771", cfg.Web.BreakGlass.Addr)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("the default must validate: %v", err)
+	}
+	for _, addr := range []string{"0.0.0.0:8771", "127.0.0.1:8771", "[::]:8771", "192.168.1.10:8771"} {
+		cfg.Web.BreakGlass.Addr = addr
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("breakGlass.addr %q = %v, want it accepted", addr, err)
+		}
+	}
+	// It still has to be an address, and it still cannot collide with the main
+	// listener.
+	cfg.Web.BreakGlass.Addr = "not-an-address"
+	if err := cfg.Validate(); err == nil {
+		t.Error("a malformed break-glass address must be refused")
+	}
+	cfg.Web.BreakGlass.Addr = cfg.Web.Listen
+	if err := cfg.Validate(); err == nil {
+		t.Error("the two listeners must not share an address")
+	}
+	// Disabled means inert: the address is not even looked at.
+	cfg.Web.BreakGlass.Enabled = false
+	cfg.Web.BreakGlass.Addr = "nonsense"
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("a disabled break-glass listener must not be validated: %v", err)
+	}
+}
+
+// M4 §2.2: the local account moved entirely to its own listener, so "local" and
+// "both" are no longer modes of the main one — except under -dev, where the
+// Windows loop has no QTS to talk to.
+func TestAuthModeIsNarrowedToQTS(t *testing.T) {
+	for _, c := range []struct {
+		mode          string
+		prodOK, devOK bool
+	}{
+		{AuthQTS, true, true},
+		{AuthLocal, false, true},
+		{AuthBoth, false, true},
+		{"", false, false},
+		{"ldap", false, false},
+	} {
+		t.Run("mode="+c.mode, func(t *testing.T) {
+			cfg := Default()
+			cfg.Auth.Mode = c.mode
+			if err := cfg.Validate(); (err == nil) != c.prodOK {
+				t.Errorf("Validate(mode=%q) = %v, want accepted %v", c.mode, err, c.prodOK)
+			}
+			if err := cfg.ValidateDev(true); (err == nil) != c.devOK {
+				t.Errorf("ValidateDev(mode=%q) = %v, want accepted %v", c.mode, err, c.devOK)
+			}
+			if !c.prodOK && c.devOK {
+				// The refusal has to say where the local account actually lives,
+				// or the operator just picks another wrong value.
+				err := cfg.Validate()
+				if !strings.Contains(err.Error(), "breakGlass") {
+					t.Errorf("the refusal must point at the break-glass listener: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestLocalCredentialValidation(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		local Local
+		ok    bool
+	}{
+		{"empty is the first-run state", Local{}, true},
+		{"default cost", Local{Cost: DefaultLocalCost}, true},
+		{"floor", Local{Cost: MinLocalCost}, true},
+		{"ceiling", Local{Cost: MaxLocalCost}, true},
+		{"below the floor", Local{Cost: MinLocalCost - 1}, false},
+		{"above the ceiling", Local{Cost: MaxLocalCost + 1}, false},
+		{"a stamp", Local{Updated: "2026-09-13T12:00:00Z"}, true},
+		{"a bad stamp", Local{Updated: "yesterday"}, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := Default()
+			cfg.Auth.Local = c.local
+			if err := cfg.Validate(); (err == nil) != c.ok {
+				t.Fatalf("Validate(%+v) = %v, want accepted %v", c.local, err, c.ok)
+			}
+		})
+	}
+	if got := (Local{}).LocalCost(); got != DefaultLocalCost {
+		t.Fatalf("LocalCost() on a zero value = %d, want %d", got, DefaultLocalCost)
+	}
+	if got := (Local{Cost: 13}).LocalCost(); got != 13 {
+		t.Fatalf("LocalCost() = %d, want 13", got)
+	}
+}
+
+func TestLocalCredentialRoundTrips(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "config.json")
+	c := Default()
+	c.Auth.Local = Local{Hash: "$2a$10$notarealhashbutlongenoughtolooklikeone", Cost: 12, Updated: time.Now().UTC().Format(time.RFC3339)}
+	if err := Save(p, c); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Auth.Local != c.Auth.Local {
+		t.Fatalf("auth.local round trip = %+v, want %+v", got.Auth.Local, c.Auth.Local)
+	}
+}
+
+func TestBreakGlassFilesDefaultBesideTheConfig(t *testing.T) {
+	c := Default()
+	cert, key := c.BreakGlassFiles(filepath.Join("install", "config", "config.json"))
+	if cert != filepath.Join("install", "config", "breakglass-cert.pem") {
+		t.Errorf("certFile = %q", cert)
+	}
+	if key != filepath.Join("install", "config", "breakglass-key.pem") {
+		t.Errorf("keyFile = %q", key)
+	}
+	// An explicit setting wins.
+	c.Web.BreakGlass.CertFile = "/somewhere/else/c.pem"
+	c.Web.BreakGlass.KeyFile = "/somewhere/else/k.pem"
+	cert, key = c.BreakGlassFiles("install/config/config.json")
+	if cert != "/somewhere/else/c.pem" || key != "/somewhere/else/k.pem" {
+		t.Errorf("explicit paths lost: %q %q", cert, key)
+	}
+	// No config file at all still yields usable paths.
+	cert, key = Default().BreakGlassFiles("")
+	if cert == "" || key == "" {
+		t.Error("BreakGlassFiles must always name a path")
+	}
+}
+
+func TestLoadDevRelaxesOnlyTheAuthMode(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "c.json")
+	if err := writeFile(p, `{"auth":{"mode":"local"}}`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(p); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("Load = %v, want the production refusal", err)
+	}
+	if _, err := LoadDev(p, true); err != nil {
+		t.Fatalf("LoadDev = %v, want it accepted for the dev loop", err)
+	}
+	// But not the loopback rule.
+	q := filepath.Join(dir, "d.json")
+	if err := writeFile(q, `{"web":{"listen":"0.0.0.0:8770"}}`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadDev(q, true); err == nil {
+		t.Fatal("-dev must not be a way to expose the main listener")
+	}
+}
+
+// writeFile is a local helper so the table above reads as a table.
+func writeFile(path, body string) error { return os.WriteFile(path, []byte(body), 0o600) }
+
+// --- round-2 P3-5: the cross-process lock ------------------------------------
+
+// The daemon's read-only toggle and `break-glass set-password` are two
+// processes doing a read-modify-write on one file. Without the lock, whichever
+// saved second published its own stale copy of everything it had not changed —
+// silently reverting a password that had just been set, or restoring one that
+// had just been disabled.
+func TestUpdateSerialisesConcurrentWriters(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "config.json")
+	if err := Save(p, Default()); err != nil {
+		t.Fatal(err)
+	}
+	// One writer owns readOnly, the other owns the credential — exactly the
+	// split the daemon and the CLI have. Interleaved without the lock, one of
+	// the two changes disappears.
+	var wg sync.WaitGroup
+	const rounds = 25
+	for i := 0; i < rounds; i++ {
+		wg.Add(2)
+		go func(n int) {
+			defer wg.Done()
+			_ = Update(p, false, func(c *Config) error {
+				c.ReadOnly = n%2 == 0
+				return nil
+			})
+		}(i)
+		go func(n int) {
+			defer wg.Done()
+			_ = Update(p, false, func(c *Config) error {
+				c.Auth.Local.Hash = fmt.Sprintf("$2a$10$hash.number.%02d.aaaaaaaaaaaaaaaaaaaaaaaaaaaa", n)
+				c.Auth.Local.Updated = "2026-09-14T09:00:00Z"
+				return nil
+			})
+		}(i)
+	}
+	wg.Wait()
+	got, err := Load(p)
+	if err != nil {
+		t.Fatalf("the config did not survive concurrent writers: %v", err)
+	}
+	// Whatever the interleaving, BOTH fields are written: neither writer's
+	// section was rolled back to a value nobody asked for.
+	if got.Auth.Local.Hash == "" {
+		t.Fatal("the credential was lost to a concurrent read-only toggle")
+	}
+	if got.Auth.Local.Updated != "2026-09-14T09:00:00Z" {
+		t.Fatalf("the eviction stamp was lost: %+v", got.Auth.Local)
+	}
+	// Nothing is left behind that a later writer would have to reason about.
+	// On Linux the empty lock FILE is expected to persist — flock lives on the
+	// inode, and unlinking the name would let a third writer create a fresh one
+	// and lock that instead — but no broken-lock debris ever is.
+	entries, err := os.ReadDir(filepath.Dir(p))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.Contains(e.Name(), ".dead-") {
+			t.Errorf("%s was left behind", e.Name())
+		}
+	}
+	if runtime.GOOS != "linux" {
+		if _, err := os.Stat(p + ".lock"); err == nil {
+			t.Error("the O_EXCL lock file was left behind")
+		}
+	}
+}
+
+func TestLockIsExclusiveAndBounded(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "config.json")
+	release, err := Lock(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	if _, err := Lock(p); !errors.Is(err, ErrLocked) {
+		t.Fatalf("a second Lock = %v, want ErrLocked", err)
+	}
+	if waited := time.Since(start); waited < LockWait/2 {
+		t.Fatalf("the second Lock gave up after %v; it must wait for the holder", waited)
+	}
+	release()
+	release() // releasing twice is harmless
+	if got, err := Lock(p); err != nil {
+		t.Fatalf("the lock was not released: %v", err)
+	} else {
+		got()
+	}
+}
+
+// The published file is at its final mode the instant the rename makes it
+// visible: chmodding afterwards left a window in which the break-glass password
+// hash was world-readable under the name every reader knows.
+func TestSavedConfigIsNeverBrieflyWorldReadable(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix modes are approximate on Windows")
+	}
+	dir := t.TempDir()
+	p := filepath.Join(dir, "config.json")
+	c := Default()
+	c.Auth.Local = Local{Hash: "$2a$10$secret.hash.value.aaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Cost: 10}
+	if err := Save(p, c); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Fatalf("mode = %04o, want 0600", fi.Mode().Perm())
+	}
+	// No scratch file survives at a wider mode either.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.Name() == filepath.Base(p) {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm()&0o077 != 0 {
+			t.Errorf("%s is mode %04o", e.Name(), info.Mode().Perm())
+		}
+	}
+}
+
+// SaveDev is what lets a -dev daemon write back the configuration it started
+// from; Save must still refuse it.
+func TestSaveDevAcceptsWhatSaveRefuses(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "config.json")
+	c := Default()
+	c.Auth.Mode = AuthLocal
+	if err := Save(p, c); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("Save(mode=local) = %v, want ErrInvalid", err)
+	}
+	if err := SaveDev(p, c, true); err != nil {
+		t.Fatalf("SaveDev(mode=local) = %v, want it accepted", err)
+	}
+	if err := Update(p, true, func(c *Config) error { c.ReadOnly = false; return nil }); err != nil {
+		t.Fatalf("Update on a dev config = %v", err)
+	}
+	if err := Update(p, false, func(c *Config) error { c.ReadOnly = true; return nil }); err == nil {
+		t.Fatal("a strict Update must refuse a development configuration")
+	}
+}

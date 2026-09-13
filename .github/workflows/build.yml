@@ -35,6 +35,28 @@ jobs:
       # genuinely missing or unused requirement would go unnoticed too, until a
       # build broke somewhere unrelated.
       - run: go mod tidy -diff
+      # "Only one dependency" (PLAN decision 1, M4 contract §4.5) is a property
+      # that decays the moment nobody is checking. golang.org/x/crypto, for
+      # break-glass bcrypt, is the first and only require line; a second one
+      # fails the build rather than arriving unnoticed in a diff.
+      - name: Assert the single-dependency invariant
+        run: |
+          # Two halves: go.mod may name only x/crypto, and the packages we build
+          # may come from only x/crypto. `go list -m all` is the wrong oracle: it
+          # prints x/crypto's own transitive graph (x/net, x/sys, x/term, x/text)
+          # even though none of it is linked.
+          requires=$(go mod edit -json | grep -o '"Path": "[^"]*"' | sed 's/"Path": "//; s/"//' | grep -v '^qnapfilemanager$' || true)
+          echo "go.mod requires: $requires"
+          [ "$requires" = "golang.org/x/crypto" ] || {
+            echo "go.mod must require exactly golang.org/x/crypto; got: $requires"
+            exit 1
+          }
+          linked=$(go list -deps -f '{{if .Module}}{{.Module.Path}}{{end}}' ./... | sort -u | grep -v '^qnapfilemanager$' || true)
+          echo "modules linked: $linked"
+          [ "$linked" = "golang.org/x/crypto" ] || {
+            echo "the build must link only golang.org/x/crypto; got: $linked"
+            exit 1
+          }
       # -race needs cgo, which is why it cannot run on the Windows dev box and
       # runs here instead — on linux/amd64, the platform half the NAS ships.
       # Do not set CGO_ENABLED: the runner's default of 1 is what it needs, and
@@ -142,6 +164,20 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
 
+      # Before anything is built, signed or uploaded: a tag that is not
+      # vMAJOR.MINOR.PATCH fails the build (M4 contract §12.1). The QDK
+      # installer and the checksums file both take the version at its word, so
+      # a malformed one would ship a package nobody can reason about.
+      - name: Check the tag shape
+        if: github.ref_type == 'tag'
+        run: |
+          case "$GITHUB_REF_NAME" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "tag $GITHUB_REF_NAME is not vMAJOR.MINOR.PATCH"; exit 1 ;;
+          esac
+          echo "$GITHUB_REF_NAME" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || {
+            echo "tag $GITHUB_REF_NAME is not vMAJOR.MINOR.PATCH"; exit 1; }
+
       - name: Build the binaries
         run: |
           if [ "$GITHUB_REF_TYPE" = tag ]; then
@@ -196,6 +232,23 @@ jobs:
             # Unknown API routes answer 401 before routing when nobody is signed in,
             # so the route table cannot be enumerated anonymously.
             [ "$(curl -s -o /dev/null -w '%{http_code}' localhost:18770/api/nope)" = 401 ]
+            # M4 contract §2.5 / §16.8: the break-glass listener does NOT bind
+            # while no password hash is configured, and this smoke runs with no
+            # config file at all. An open port that can never authenticate is
+            # pure surface, and this is the property most likely to regress
+            # silently — nothing in the UI would look different.
+            # `ss` must exist, or the check below would silently pass — the
+            # failure mode this test exists to prevent.
+            command -v ss >/dev/null || { echo "ss is missing; the 8771 check cannot run"; kill $pid; exit 1; }
+            if ss -ltnH | grep -q ':8771 '; then
+              echo "$arch: 8771 is bound with no break-glass password configured"
+              ss -ltnp | grep ':8771 ' || true
+              kill $pid; exit 1
+            fi
+            # The CLI subcommand runs on the packaged binary, on both trees.
+            # `status` reads only: no bcrypt, so qemu emulation stays cheap.
+            "$tree/bin/qnapfilemanager" break-glass status -config /tmp/fakeroot/bg.json \
+              | grep -q 'password:    not set'
             kill $pid
             wait $pid 2>/dev/null || true
             echo "$arch ok: qnapfilemanager $VERSION"
@@ -221,10 +274,22 @@ jobs:
           PATH="$PATH:/usr/share/QDK/bin" qbuild
           ls -l build/
 
+      # The checksums are produced ONCE, here, and the same file is what the
+      # artifact carries and what the release attaches: a pre-release build a
+      # tester downloads must be verifiable the same way a released one is
+      # (M4 contract §12.3).
+      - name: Checksum the package
+        run: |
+          cd qpkg/build
+          sha256sum *.qpkg > SHA256SUMS
+          cat SHA256SUMS
+
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: qpkg
-          path: qpkg/build/*.qpkg
+          path: |
+            qpkg/build/*.qpkg
+            qpkg/build/SHA256SUMS
           # Not the 90-day default: the sibling project's account-wide artifact
           # quota has blocked releases twice. Releases hold the durable copies.
           retention-days: 7
@@ -234,7 +299,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # A checksum file beside the artifacts, so a download can be verified
-          # on the NAS before installing an unsigned package.
-          (cd qpkg/build && sha256sum *.qpkg) > SHA256SUMS
-          gh release create "$GITHUB_REF_NAME" qpkg/build/*.qpkg SHA256SUMS --generate-notes
+          # The checksum file was written by the step above, so what the release
+          # attaches is byte-identical to what the artifact carried.
+          gh release create "$GITHUB_REF_NAME" qpkg/build/*.qpkg qpkg/build/SHA256SUMS --generate-notes

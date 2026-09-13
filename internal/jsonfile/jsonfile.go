@@ -24,7 +24,17 @@ import (
 // write over each other, publishing a file whose first half is one dump and
 // whose tail is the other. That file is valid to neither, and it would then
 // be copied into every snapshot taken afterwards.
-func Write(path string, v any) error {
+func Write(path string, v any) error { return WriteMode(path, v, 0o644) }
+
+// WriteMode is Write with the published mode fixed by the caller.
+//
+// The mode is applied to the SCRATCH file, before the rename, so the document
+// never exists under its final name at a wider mode than it should be. Write's
+// 0644 default is right for archive data; a file holding a credential passes
+// 0600 here, because chmodding after the rename leaves a window — however
+// short — in which the break-glass password hash is world-readable under the
+// name every reader knows (round-2 P3-5).
+func WriteMode(path string, v any, mode os.FileMode) error {
 	data, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
 		return err
@@ -51,9 +61,10 @@ func Write(path string, v any) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	// CreateTemp makes the file 0600; these are archive data, not secrets,
-	// and the rest of the archive is world-readable.
-	if err := os.Chmod(tmp, 0o644); err != nil {
+	// CreateTemp makes the file 0600. Widen (or keep) it HERE, on the scratch
+	// name, so the published file is already at its final mode the instant the
+	// rename makes it visible.
+	if err := os.Chmod(tmp, mode); err != nil {
 		return err
 	}
 	if err := os.Rename(tmp, path); err != nil {

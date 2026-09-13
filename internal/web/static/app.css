@@ -29,7 +29,17 @@ dialog { border:1px solid var(--line); border-radius:10px; padding:1.4rem; max-w
 @media(max-width:80rem) { .fileRow { grid-template-columns:minmax(160px,1fr) 75px 65px 135px 95px 100px; } }
 @media(max-width:60rem) { #tree { display:none; position:absolute; inset:0 auto 0 0; z-index:3; width:min(280px,85vw); box-shadow:4px 0 16px #0003; } #tree.open { display:block; } .extra { display:none; } .fileRow { grid-template-columns:minmax(160px,1fr) 80px 140px; } }
 @media(min-width:60rem) { #btnTree { display:none; } }
-@media(max-width:46rem) { #hdr { padding:.4rem .6rem; gap:.35rem; } #identity { display:none; } #crumbs { display:none; } #pathEdit { width:100%; } .filter { margin-left:0; flex:1; } #searchBox { width:100%; } #btnMkdir,#btnUpload { display:none; } }
+/* The 48rem (768 px) rung is the M4 contract's own (§9.5): at and below it the
+   secondary toolbar actions move into the ⋯ menu. They are RELOCATED, never
+   removed — narrow.js adds .inOverflow to the button and puts a menu item with
+   the same enablement and the same reason in its place. Before M4 #btnMkdir and
+   #btnUpload were simply display:none here, which took the function away and
+   said nothing. */
+.inOverflow { display:none; }
+#moreMenu { position:absolute; top:100%; right:0; z-index:5; min-width:max-content; margin-top:.2rem; padding:.3rem; background:var(--surface); border:1px solid var(--line); border-radius:6px; box-shadow:0 6px 24px #0004; }
+#moreMenu button { display:block; width:100%; text-align:left; border:0; }
+@media(max-width:48rem) { #toolbar { gap:.3rem; padding:.4rem .5rem; } }
+@media(max-width:46rem) { #hdr { padding:.4rem .6rem; gap:.35rem; } #identity { display:none; } #crumbs { display:none; } #pathEdit { width:100%; } .filter { margin-left:0; flex:1; } #searchBox { width:100%; } }
 @media(max-width:30rem) { .fileRow { height:44px; grid-template-columns:minmax(100px,1fr) 64px 95px; font-size:12px; } button { min-height:32px; } #chipReadonly { font-size:.7rem; } }
 @media(prefers-reduced-motion:reduce) { * { scroll-behavior:auto!important; animation-duration:.01ms!important; transition-duration:.01ms!important; } }
 .hint { opacity:.75; font-size:.85rem; margin:.3rem 0; }
@@ -135,3 +145,42 @@ dialog { border:1px solid var(--line); border-radius:10px; padding:1.4rem; max-w
    can report, an ordinary mode landing elsewhere is not. The words differ too —
    the tone never carries the meaning on its own (§4.1). */
 #pDiff.diff-special { border-color:var(--fail); }
+/* The emergency door's sign-in (§2). It is the whole page on that listener, so
+   it is centred and bounded rather than tucked into a corner. */
+#bgSignin { padding:1rem; border-bottom:2px solid var(--warn); max-width:34rem; }
+#bgSignin h2 { margin:.2rem 0; }
+#bgIntro { margin:.3rem 0 .8rem; }
+#bgForm { display:flex; flex-wrap:wrap; gap:.5rem; align-items:center; }
+#bgForm label { min-width:100%; }
+#bgPassword { flex:1; min-width:12rem; padding:.25rem .5rem; border:1px solid var(--line); border-radius:5px; background:Field; color:FieldText; }
+#bgError { margin:.6rem 0 0; border-color:var(--fail); color:var(--fail); background:#cf222e22; }
+/* --- M4: banners, empty states, narrow dialogs ---------------------------- */
+/* The two persistent bars (§8.3, §8.4). Each carries a glyph AND its words: the
+   colour is never the message (§4.1, "no colour-only signals"). */
+.bannerBar { display:flex; align-items:center; gap:.5rem; flex-wrap:wrap; }
+.bannerBar .bannerMark { flex-shrink:0; }
+.bannerTail { opacity:.85; }
+.bannerWarn { border-color:var(--fail); }
+/* An empty state is one sentence, at most one action, and it is TEXT: an empty
+   folder and a folder you cannot read differ in what they say, never in colour
+   alone (§8.1). */
+.emptyState { padding:1rem; max-width:44rem; }
+.emptyState p { margin:.2rem 0; }
+.emptyState.refused { border-left:3px solid var(--protected); background:#b58a0011; }
+#listEmptyAction,#resultsEmpty { margin-top:.4rem; }
+/* Dialogs fit the viewport at every acceptance size (§9.5): the body scrolls
+   inside the dialog and the action row stays pinned where the thumb is. */
+dialog { overflow:auto; overscroll-behavior:contain; }
+dialog .bar { position:sticky; bottom:-1.4rem; padding:.6rem 0 0; margin-top:.6rem; background:Canvas; }
+.tableWrap { max-height:50dvh; overflow:auto; border:1px solid var(--line); border-radius:6px; margin:.4rem 0; }
+#shortcutsTable { width:100%; border-collapse:collapse; font-size:.85rem; }
+#shortcutsTable th,#shortcutsTable td { text-align:left; padding:.25rem .5rem; border-bottom:1px solid var(--line); vertical-align:top; }
+#shortcutsTable thead th { position:sticky; top:0; background:var(--panel); }
+#shortcutsTable th[scope=row] { white-space:nowrap; font-family:ui-monospace,monospace; }
+@media(max-width:48rem) {
+ dialog { width:calc(100% - 1rem); max-width:none; max-height:92dvh; padding:1rem; border-radius:8px; }
+ dialog .bar { bottom:-1rem; flex-wrap:wrap; }
+ .tableWrap { max-height:60dvh; }
+ /* The folder drawer is available at every narrow size, not only under 60rem. */
+ #tree { width:min(280px,85vw); }
+}

@@ -17,6 +17,17 @@ func statusCode(code string) int {
 		return 400
 	case "unauthorized":
 		return 401
+	case "auth_failed":
+		// M4 §10. The break-glass login's ONE failure answer: wrong password, no
+		// password configured, malformed body, an unreadable credential — all of
+		// them, with the same body and the same minimum latency. It is issued by
+		// the web layer and never crosses the RPC, which is why M3's worker
+		// code-coverage table deliberately excludes it.
+		return 401
+	case "locked_out":
+		// M4 §5.1. The account lockout, always with a Retry-After. Also web-only
+		// and also excluded from the worker table, for the same reason.
+		return 429
 	case "permission", "protected", "readonly", "read_only":
 		return 403
 	case "not_found":

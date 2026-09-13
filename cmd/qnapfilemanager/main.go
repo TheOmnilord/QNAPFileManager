@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
@@ -18,11 +19,13 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"qnapfilemanager/internal/audit"
 	"qnapfilemanager/internal/backend"
+	"qnapfilemanager/internal/breakglass"
 	"qnapfilemanager/internal/config"
 	"qnapfilemanager/internal/fsx"
 	"qnapfilemanager/internal/guard"
@@ -63,6 +66,8 @@ func main() {
 			fmt.Fprintf(os.Stderr, "qnapfilemanager: %v\n", err)
 			os.Exit(1)
 		}
+	case "break-glass":
+		os.Exit(runBreakGlass(args[1:], os.Stdin, os.Stdout, os.Stderr))
 	case "version", "-version", "--version":
 		fmt.Println(version)
 	case "help", "-h", "-help", "--help":
@@ -78,9 +83,12 @@ func usage(w io.Writer) {
 	fmt.Fprintf(w, `qnapfilemanager %s
 
 Usage:
-  qnapfilemanager serve [flags]   run the daemon
-  qnapfilemanager version         print the version
-  qnapfilemanager -worker -uid N  internal: the per-user worker process
+  qnapfilemanager serve [flags]        run the daemon
+  qnapfilemanager break-glass <sub>    manage the emergency-access password and
+                                       certificate (set-password, disable,
+                                       status, cert) — root, on the NAS shell
+  qnapfilemanager version              print the version
+  qnapfilemanager -worker -uid N       internal: the per-user worker process
 
 serve flags:
   -config <path>        JSON config file (a missing file means defaults)
@@ -259,13 +267,20 @@ func runServe(args []string, stderr io.Writer) error {
 		// A missing file is the first-run state and Load returns the defaults
 		// for it; anything else — unreadable, malformed, invalid — must stop
 		// the daemon rather than silently start with different settings.
-		cfg, err = config.Load(o.configPath)
+		cfg, err = config.LoadDev(o.configPath, o.dev)
 		if err != nil {
 			return err
 		}
 	}
 	cfg = o.apply(cfg)
-	if err := cfg.Validate(); err != nil {
+	// Forced BEFORE validation, so the forced address is itself validated — a
+	// dev run whose forcing would collide the two listeners on one port is a
+	// startup error, not a bind failure later.
+	cfg = forceLoopbackBreakGlass(cfg, o.dev)
+	// -addr goes through the same validation as the config key, never around it
+	// (contract §13.1): the loopback rule on the main listener has no override,
+	// by flag or by key.
+	if err := cfg.ValidateDev(o.dev); err != nil {
 		return err
 	}
 	// The jail is validated here so a typo fails at startup rather than on
@@ -376,6 +391,9 @@ func runServe(args []string, stderr io.Writer) error {
 	frontend := web.New(cfg, poolBackend{b}, verifier, ids, plat, pinned, version, logger, g, auditor, nil)
 	frontend.ConfigPath = o.configPath
 	frontend.AuditPath = auditPath
+	// The settings route re-reads this file to change readOnly alone; a -dev run
+	// must be able to save the configuration it started from (round-2 P3-6).
+	frontend.Dev = o.dev
 	// The guard resolves parent symlinks through this same jail mapping before a
 	// mutation (resolveForGuard). It is also how a delete-to-trash maps an API
 	// path to the OS path trashroot.Ensure needs. The zero Root production uses
@@ -419,7 +437,149 @@ func runServe(args []string, stderr io.Writer) error {
 	}()
 	frontend.SetJobs(poolBackend{b}, jobMgr)
 	srv.frontend = frontend.Handler()
+	srv.bgFrontend, srv.bgConfigPath = frontend, o.configPath
+	if err := armBreakGlass(srv, frontend, cfg, o.configPath, logger); err != nil {
+		return err
+	}
 	return srv.run(context.Background())
+}
+
+// forceLoopbackBreakGlass pins the break-glass address to loopback under -dev,
+// so a development run never opens a LAN port (contract §15).
+//
+// Forced rather than validated, deliberately: the dev loop is allowed to load
+// the production config, ask for its 0.0.0.0 default, and simply not get it —
+// refusing to start would push a developer into editing the very file whose
+// production shape they are trying to reproduce.
+func forceLoopbackBreakGlass(cfg config.Config, dev bool) config.Config {
+	if !dev || !cfg.Web.BreakGlass.Enabled || cfg.Web.BreakGlass.Addr == "" {
+		return cfg
+	}
+	host, port, err := net.SplitHostPort(cfg.Web.BreakGlass.Addr)
+	if err != nil {
+		return cfg
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return cfg
+	}
+	cfg.Web.BreakGlass.Addr = net.JoinHostPort("127.0.0.1", port)
+	return cfg
+}
+
+// armBreakGlass decides whether the second listener exists at all, and prepares
+// its certificate if it does.
+//
+// The listener does NOT bind until a password exists (contract §2.5): an open
+// port that can never authenticate is pure surface, and this is also what
+// replaces the backend plan's claim window — there is no unauthenticated
+// bootstrap path over HTTP at all, in any window, ever.
+func armBreakGlass(srv *server, frontend *web.Server, cfg config.Config, configPath string, logger *log.Logger) error {
+	if !cfg.Web.BreakGlass.Enabled {
+		logger.Printf("break-glass is disabled (web.breakGlass.enabled=false); the daemon is loopback-only")
+		return nil
+	}
+	if cfg.Auth.Local.Hash == "" {
+		logger.Printf("break-glass is enabled but no password is set; run `qnapfilemanager break-glass set-password` on the NAS shell. Nothing is bound on %s; the listener binds within a minute of a password being set, without a restart.", cfg.Web.BreakGlass.Addr)
+		srv.bgPending = true
+		return nil
+	}
+	certFile, keyFile := cfg.BreakGlassFiles(configPath)
+	// Under the credential-store lock: the pair is two files and therefore two
+	// publications, so a CLI `cert -regenerate` running at the same moment as
+	// this could otherwise leave one generator's certificate beside the other's
+	// key (round-5).
+	var cert breakglass.Cert
+	if err := withCertLock(configPath, func() error {
+		var gerr error
+		cert, gerr = breakglass.Ensure(certFile, keyFile, time.Now())
+		return gerr
+	}); err != nil {
+		return fmt.Errorf("break-glass certificate: %w", err)
+	}
+	// The fingerprint is logged at EVERY start, not only when it changes: an
+	// operator comparing it against a browser warning needs to find it in the
+	// log they already have open (contract §3.4).
+	logger.Printf("break-glass certificate %s sha256:%s expires %s", certFile, cert.Fingerprint, cert.NotAfter.UTC().Format(time.RFC3339))
+	if cert.Generated {
+		logger.Printf("break-glass certificate was generated (%s); its fingerprint has changed", cert.Reason)
+		frontend.AuditBreakGlass("breakglass-cert", "ok", fmt.Sprintf("door=local cert generated (%s), sha256=%s", cert.Reason, cert.Fingerprint))
+	}
+	frontend.EnableBreakGlass(configPath)
+	srv.bgHandler = frontend.BreakGlassHandler()
+	srv.bgCert = cert.TLS
+	srv.bgAddr = cfg.Web.BreakGlass.Addr
+	srv.auditBG = frontend.AuditBreakGlass
+	srv.bgPending = false
+	return nil
+}
+
+// armBreakGlassFn is armBreakGlass, in a variable so a test can count how often
+// the watcher actually re-arms — arming loads or generates a certificate and
+// measures a bcrypt, and doing that once a minute behind a failing bind would
+// be a self-inflicted load on a NAS that is already in trouble (round-3 P3).
+var armBreakGlassFn = armBreakGlass
+
+// breakGlassWatchInterval is how often a daemon that started with no password
+// looks for one. A minute is the difference between "run this command" and "run
+// this command, then restart the app you are trying to repair".
+var breakGlassWatchInterval = time.Minute
+
+// watchForCredential binds the break-glass listener when a password appears
+// under a running daemon (round-2 P2-3).
+//
+// The documented first run is: install, run `break-glass set-password`, compare
+// the fingerprint, open https://<nas>:8771/. Until this existed the last step
+// failed — the listener had decided at start-up that there was no password and
+// nothing ever revisited it — so the procedure silently required a restart of
+// the very app an operator may be using to repair the NAS. The credential
+// itself is already re-read per attempt (localCred); this is the one decision
+// that was frozen.
+//
+// It stops at the first success: from then on the listener is bound and the
+// password is read live.
+func (s *server) watchForCredential(ctx context.Context, frontend *web.Server, configPath string, serve func(*http.Server, net.Listener)) {
+	if !s.bgPending || configPath == "" {
+		return
+	}
+	ticker := time.NewTicker(breakGlassWatchInterval)
+	defer ticker.Stop()
+	// The hash the door is already prepared for. Arming is expensive — it loads
+	// or generates a certificate and measures one bcrypt at the configured cost,
+	// which on a slow ARM core at cost 15 is seconds — so a bind that failed and
+	// is being retried must not redo it every minute (round-3 P3). Only a hash
+	// that actually CHANGED re-arms.
+	armedFor := ""
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		cfg, err := config.LoadDev(configPath, s.dev)
+		if err != nil || !cfg.Web.BreakGlass.Enabled || cfg.Auth.Local.Hash == "" {
+			continue
+		}
+		if cfg.Auth.Local.Hash != armedFor {
+			if err := armBreakGlassFn(s, frontend, cfg, configPath, s.logger); err != nil {
+				s.logger.Printf("break-glass could not be armed after a password appeared: %v", err)
+				continue
+			}
+			armedFor = cfg.Auth.Local.Hash
+		}
+		if s.bgHandler == nil {
+			continue
+		}
+		httpSrv, ln, err := s.listenBreakGlass()
+		if err != nil {
+			// Log and keep watching: the port may be momentarily taken, and an
+			// operator who has just set a password should not have to set it
+			// again to get another attempt.
+			s.logger.Printf("break-glass listener could not bind after a password appeared: %v", err)
+			continue
+		}
+		serve(httpSrv, ln)
+		return
+	}
 }
 
 // guardInstallDir is the API path of the daemon's own installation tree, used
@@ -457,6 +617,20 @@ type server struct {
 	dev      bool
 	logger   *log.Logger
 	frontend http.Handler
+
+	// The break-glass listener. All four are set together by armBreakGlass, or
+	// none of them are: a nil bgHandler is what "the listener does not bind"
+	// looks like from here.
+	bgHandler http.Handler
+	bgCert    *tls.Certificate
+	bgAddr    string
+	auditBG   func(op, result, detail string)
+	// bgPending is "enabled, but no password yet": the listener binds nothing
+	// and a watcher looks for a credential appearing under the running daemon
+	// (round-2 P2-3). bgFrontend and bgConfigPath are what that watcher needs.
+	bgPending    bool
+	bgFrontend   *web.Server
+	bgConfigPath string
 }
 
 // Adapt the pool's concrete diagnostic slice to web's optional Stats contract.
@@ -501,7 +675,30 @@ func (s *server) run(ctx context.Context) error {
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	errc := make(chan error, 1)
+	// errc is sized for the two listeners plus a late-bound break-glass one.
+	errc := make(chan error, 3)
+	// live is the set of servers shutdown must drain. The credential watcher can
+	// add to it from its own goroutine long after start-up, so it has a mutex:
+	// a slice appended to by one goroutine and ranged over by another during
+	// shutdown is the kind of race that only ever shows up on a NAS.
+	listeners := &listenerSet{servers: []*http.Server{httpSrv}, started: 1}
+	serveOne := func(srv *http.Server, l net.Listener, tls bool) {
+		if !listeners.add(srv, l) {
+			return
+		}
+		go func() {
+			var err error
+			if tls {
+				err = srv.ServeTLS(l, "", "")
+			} else {
+				err = srv.Serve(l)
+			}
+			if errors.Is(err, http.ErrServerClosed) {
+				err = nil
+			}
+			errc <- err
+		}()
+	}
 	go func() {
 		err := httpSrv.Serve(ln)
 		if errors.Is(err, http.ErrServerClosed) {
@@ -510,18 +707,125 @@ func (s *server) run(ctx context.Context) error {
 		errc <- err
 	}()
 
+	if s.bgHandler != nil {
+		bgSrv, bgLn, err := s.listenBreakGlass()
+		if err != nil {
+			// Refusing to start is right: an operator who configured an
+			// emergency door and got a daemon that silently has none would
+			// discover it at the worst possible moment.
+			_ = httpSrv.Close()
+			return err
+		}
+		serveOne(bgSrv, bgLn, true)
+	} else if s.bgPending {
+		// Enabled, but no password yet. Watch for one rather than requiring a
+		// restart of the app the operator may be repairing with (round-2 P2-3).
+		watchCtx, stopWatch := context.WithCancel(ctx)
+		defer stopWatch()
+		go s.watchForCredential(watchCtx, s.bgFrontend, s.bgConfigPath, func(srv *http.Server, l net.Listener) {
+			serveOne(srv, l, true)
+		})
+	}
+
 	select {
 	case err := <-errc:
 		return err
 	case <-ctx.Done():
 		s.logger.Printf("shutting down")
 		// QPKG_TIMEOUT is "30,60", so there is room to drain before App
-		// Center loses patience.
+		// Center loses patience. EVERY listener drains inside the one budget.
 		shutCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
-		if err := httpSrv.Shutdown(shutCtx); err != nil {
-			return err
+		draining, count := listeners.beginShutdown()
+		var firstErr error
+		for _, srv := range draining {
+			if err := srv.Shutdown(shutCtx); err != nil && firstErr == nil {
+				firstErr = err
+			}
 		}
-		return <-errc
+		if firstErr != nil {
+			return firstErr
+		}
+		for range count {
+			if err := <-errc; err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+		return firstErr
 	}
+}
+
+// listenerSet is every HTTP server this daemon has running, and the one place
+// that decides whether a NEW one may still start.
+//
+// The credential watcher can bind the break-glass listener at any moment,
+// including while the daemon is already draining (round-3 P3). A listener that
+// arrived after shutdown took its snapshot would serve on past Shutdown with
+// nothing left to stop it — a root daemon's LAN port outliving the daemon's own
+// shutdown. Registration and the snapshot take the same lock, so there is no
+// window between them at all.
+type listenerSet struct {
+	mu       sync.Mutex
+	servers  []*http.Server
+	started  int
+	draining bool
+}
+
+// add registers srv as live and reports whether it may serve. When the daemon
+// is already shutting down it closes l and answers false: the caller must not
+// start serving, and nothing is added to the count shutdown waits for.
+func (s *listenerSet) add(srv *http.Server, l net.Listener) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.draining {
+		_ = l.Close()
+		return false
+	}
+	s.servers = append(s.servers, srv)
+	s.started++
+	return true
+}
+
+// beginShutdown closes the set to new listeners and returns what to drain,
+// with the number of Serve goroutines that will report back.
+func (s *listenerSet) beginShutdown() ([]*http.Server, int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.draining = true
+	return append([]*http.Server(nil), s.servers...), s.started
+}
+
+// listenBreakGlass binds and configures the second listener. HTTP/2 is declined
+// on purpose (contract §13.5): every streaming, admission and deadline argument
+// in M2-C was reasoned over HTTP/1.1 semantics, and a release is not the place
+// to re-derive them.
+func (s *server) listenBreakGlass() (*http.Server, net.Listener, error) {
+	ln, err := net.Listen("tcp", s.bgAddr)
+	if err != nil {
+		return nil, nil, fmt.Errorf("listening on the break-glass address %s: %w", s.bgAddr, err)
+	}
+	// Deliberately NO ReadTimeout, on this listener as on the main one. It would
+	// bound the whole request body, and this listener serves the same API —
+	// uploads included — so a ten-second one would cut every large upload made
+	// through the emergency door at ten seconds, which is the one situation
+	// where an operator has no other route. The slow-body lever it would have
+	// closed is closed where it actually lives instead: the login handler reads
+	// its bounded body under its own read deadline BEFORE taking an admission
+	// slot, and the door routes arm a 15 s request context (web/breakglass.go).
+	srv := &http.Server{
+		Handler:           s.bgHandler,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    64 << 10,
+		TLSConfig: &tls.Config{
+			MinVersion:   tls.VersionTLS12,
+			NextProtos:   []string{"http/1.1"},
+			Certificates: []tls.Certificate{*s.bgCert},
+		},
+	}
+	s.logger.Printf("break-glass listening on %s (TLS, local administrator account only)", ln.Addr())
+	if s.auditBG != nil {
+		s.auditBG("breakglass-listen", "ok", fmt.Sprintf("door=local listener bound %s", ln.Addr()))
+	}
+	return srv, ln, nil
 }

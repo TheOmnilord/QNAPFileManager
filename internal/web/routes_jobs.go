@@ -110,12 +110,15 @@ type jobActor struct {
 	admin bool
 	root  bool
 	ip    string
+	// door is the session's door, carried into every line the job writes:
+	// the job outlives the request, and "which door" must outlive it too.
+	door string
 }
 
 func jobActorOf(sess *session, r *http.Request) jobActor {
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
-	return jobActor{actor: sess.who.User, uid: sess.who.UID, admin: sess.admin, root: sess.who.Root, ip: ClientIP(r)}
+	return jobActor{actor: sess.who.User, uid: sess.who.UID, admin: sess.admin, root: sess.who.Root, ip: ClientIP(r), door: sess.door}
 }
 
 // jobAudit writes one audit line on behalf of a running job. The context is
@@ -128,7 +131,7 @@ func (s *Server) jobAudit(ctx context.Context, who jobActor, ev audit.Event, mil
 	if s.auditor == nil {
 		return
 	}
-	ev.Actor, ev.UID, ev.Admin, ev.Root, ev.IP = who.actor, who.uid, who.admin, who.root, who.ip
+	ev.Actor, ev.UID, ev.Admin, ev.Root, ev.IP, ev.Door = who.actor, who.uid, who.admin, who.root, who.ip, who.door
 	ev.ForceMilestone = milestone
 	if milestone || ev.Phase == "intent" {
 		if err := s.auditor.WriteSync(context.WithoutCancel(ctx), ev); err != nil {

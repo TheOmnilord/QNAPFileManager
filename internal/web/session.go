@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"qnapfilemanager/internal/audit"
 	"qnapfilemanager/internal/backend"
 	"qnapfilemanager/internal/idmap"
 	"qnapfilemanager/internal/qtsauth"
@@ -38,8 +39,15 @@ type session struct {
 	id, csrf, binding, kind string
 	who                     backend.Principal
 	admin, partial          bool
-	dead                    atomic.Bool
-	authRequests            atomic.Int32
+	// door is audit.DoorQTS, DoorCredential or DoorLocal: which door this
+	// session came through. It is set once at creation, never changes, and is
+	// stamped on every audit event the session produces (contract §6.1) — the
+	// one question an operator will actually ask after an incident. It is also
+	// what suppresses CreateAs: a break-glass session is not a QTS user, so
+	// there is no real user to create content as (§2.4).
+	door         string
+	dead         atomic.Bool
+	authRequests atomic.Int32
 	// Index metadata is immutable after insertion; list links require Server.mu.
 	user             string
 	order, userOrder *list.Element
@@ -218,7 +226,13 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (*session,
 
 func (s *Server) createSession(r *http.Request, cred qtsauth.Cred) (*session, error) {
 	now := s.now()
-	sess := &session{id: rand.Text(), csrf: rand.Text(), expires: now.Add(sessionTTL), checked: now}
+	// Every session issued by the MAIN listener came through the QTS door: the
+	// cookie pair, the sid form, or (in the dev loop) -impersonate, which stands
+	// in for one. audit.DoorCredential is reserved for the credential-proxy form
+	// (authLogin.cgi?user=&pwd=), which has no HTTP route yet; nothing issues it
+	// today, and the constant exists so the vocabulary is complete rather than
+	// invented later.
+	sess := &session{id: rand.Text(), csrf: rand.Text(), expires: now.Add(sessionTTL), checked: now, door: audit.DoorQTS}
 	if s.pinned != nil {
 		sess.who = *s.pinned
 		sess.admin = idmap.IsLocalAdmin(idmap.Ident{Name: s.pinned.User, UID: s.pinned.UID, GID: s.pinned.GID, Groups: s.pinned.Groups}, s.ids)
@@ -369,7 +383,7 @@ func (s *Server) authenticateSession(w http.ResponseWriter, r *http.Request, old
 }
 
 func snapshot(s *session) *session {
-	return &session{id: s.id, csrf: s.csrf, who: s.who, admin: s.admin, kind: s.kind, partial: s.partial, note: s.note}
+	return &session{id: s.id, csrf: s.csrf, who: s.who, admin: s.admin, kind: s.kind, partial: s.partial, note: s.note, door: s.door}
 }
 
 func principal(id idmap.Ident) backend.Principal {
@@ -378,8 +392,41 @@ func principal(id idmap.Ident) backend.Principal {
 
 func (s *Server) sessionInfo(w http.ResponseWriter, r *http.Request, sess *session) {
 	readOnly := s.readOnly()
-	v := map[string]any{"authenticated": sess != nil, "user": "", "admin": false, "rootMode": false, "uid": -1, "gid": -1, "groups": []int{}, "readOnly": readOnly, "canWrite": false, "version": s.version, "isQTS": s.isQTS(), "family": s.platform.Family, "csrf": "", "viaQTS": false}
+	// door tells the UI which listener it is on even before anyone signs in, so
+	// the break-glass page can say what it is; createsAs is the consequence the
+	// UI has to state persistently (contract §8.4): everything a break-glass
+	// session creates is owned by root, because there is no real user behind it.
+	v := map[string]any{"authenticated": sess != nil, "user": "", "admin": false, "rootMode": false, "uid": -1, "gid": -1, "groups": []int{}, "readOnly": readOnly, "canWrite": false, "version": s.version, "isQTS": s.isQTS(), "family": s.platform.Family, "csrf": "", "viaQTS": false, "door": doorOf(r), "createsAs": ""}
+	if breakGlassRequest(r) {
+		// Present only on the break-glass listener, so the main listener's shape
+		// is untouched. It is what tells an unauthenticated page to render the
+		// emergency password form instead of the QTS sign-in notice — and it
+		// says NOTHING about whether a password is configured: that would tell a
+		// scanner whether this door is worth attacking, and the login route's
+		// uniform failure exists precisely so it cannot be learned.
+		v["listener"] = audit.DoorLocal
+		if sess == nil {
+			// Before anyone signs in, this listener answers with the two facts
+			// the page needs and nothing else (round-2 P3-4). The main listener
+			// is behind the QTS proxy and its anonymous answer reaches only
+			// someone already on the QTS origin; this one answers any host on
+			// the LAN, so the version string, the firmware family, whether this
+			// is QTS at all and whether the app is in read-only mode are all
+			// free reconnaissance — enough to match a unit against a
+			// vulnerability list without touching the password.
+			writeJSON(w, map[string]any{"authenticated": false, "listener": audit.DoorLocal})
+			return
+		}
+	}
 	if sess != nil {
+		v["door"] = sess.door
+		if sess.door == audit.DoorLocal {
+			// Explicitly empty, not absent: the UI must be able to tell "no
+			// CreateAs" from "this build does not report it".
+			v["createsAs"] = ""
+		} else {
+			v["createsAs"] = sess.who.User
+		}
 		v["rootMode"] = sess.who.Root
 		// The UI enables mutating controls on canWrite alone: a live session and
 		// read-only mode off.

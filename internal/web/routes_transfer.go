@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"time"
 
+	"qnapfilemanager/internal/audit"
 	"qnapfilemanager/internal/backend"
 	"qnapfilemanager/internal/fsx"
 	"qnapfilemanager/internal/guard"
@@ -261,7 +262,9 @@ func (s *Server) jobTransfer(w http.ResponseWriter, r *http.Request, sess *sessi
 		return
 	}
 	opts := wproto.CopyOptions{Conflict: body.Conflict, PreserveTimes: true, CrossMounts: body.CrossMounts}
-	if mode == "copy" && who.Root && s.guard.Classify(dest) == "normal" && s.guard.Classify(rdest) == "normal" {
+	// Same rule as mkdir and upload: a break-glass session has no real user, so
+	// a copy it makes is root-owned (contract §2.4).
+	if mode == "copy" && who.Root && sess.door != audit.DoorLocal && s.guard.Classify(dest) == "normal" && s.guard.Classify(rdest) == "normal" {
 		opts.As = &wproto.CreateAs{UID: who.UID, GID: -1} // chown only, never chmod
 	}
 	wire := make([][]byte, len(resolved))

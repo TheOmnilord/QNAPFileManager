@@ -40,6 +40,58 @@ export function sizeReport(job) {
  };
 }
 
+// --- one measurement per folder, shared ---------------------------------------
+//
+// A size job is submitted by a DIALOG, not by the user, and two dialogs ask the
+// same question about the same folder: Properties measures it, and Permissions'
+// impact line measures it again. Opening Properties, closing it and opening it
+// again asked a third time. Each of those was a separate job, so the Operations
+// panel filled with identical "Calculating size: _IMAGES" rows (owner, hardware
+// 0.0.133).
+//
+// So the measurement is keyed by the request it would send, and a dialog either
+// attaches to the one already running or reuses one that finished a moment ago.
+// `holders` is why sharing is safe: the walk is cancelled when the LAST dialog
+// holding it goes away, not when the first one closes.
+export const SIZE_REUSE_MS = 10000;
+const sizeJobs = new Map();
+
+// sizeJobKey is the identity of a measurement: the exact body it would post.
+// Crossing is part of it — a share measured with and without crossing into its
+// sub-datasets are two different answers (decision 9).
+export function sizeJobKey(entries,{crossMounts = false} = {}) {
+ return JSON.stringify(sizeRequest(entries,{crossMounts}));
+}
+
+// sizeJobUsable says whether an existing measurement may be attached to. Pure
+// over the entry and the clock, so "fresh enough" is a unit test.
+//
+// Still running → yes, attach: a second dialog waits for the same walk. Done
+// and recent → yes, reuse the answer. Anything else — failed, cancelled,
+// abandoned, or simply old — is not an answer this dialog may present as its
+// own, and it measures again.
+export function sizeJobUsable(entry,now = Date.now(),window = SIZE_REUSE_MS) {
+ if (!entry || entry.abandoned || entry.failed) return false;
+ if (!entry.finishedAt) return true;
+ if (entry.job?.state !== 'done') return false;
+ return now - entry.finishedAt <= window;
+}
+
+// resetSizeJobs drops every shared measurement. Tests use it; nothing else
+// needs to, because an entry ages out on its own.
+export function resetSizeJobs() { sizeJobs.clear(); }
+
+// pruneSizeJobs collects measurements nobody holds and nobody may reuse. A
+// session that walks a thousand folders would otherwise keep a thousand stale
+// answers alive for the sake of a ten-second window.
+export const SIZE_JOB_CAP = 32;
+export function pruneSizeJobs(now = Date.now()) {
+ if (sizeJobs.size <= SIZE_JOB_CAP) return;
+ for (const [key,entry] of sizeJobs) {
+  if (entry.holders <= 0 && !sizeJobUsable(entry,now)) sizeJobs.delete(key);
+ }
+}
+
 // createSizeRunner owns at most ONE size job on behalf of one dialog.
 //
 // Every DOM-touching collaborator is injected, so the wiring itself — submit on
@@ -52,34 +104,77 @@ export function sizeReport(job) {
 // awaiting its job reports nothing when it finally answers, and a second start
 // cannot be overtaken by the first.
 export function createSizeRunner({report = () => {},track = trackJob,cancel = cancelJob,poll = awaitJob} = {}) {
- let id = null,run = 0;
+ let held = null,run = 0;
+ // release is this runner letting go of a shared measurement. The walk is
+ // cancelled only when nobody is left holding it: a du over a multi-terabyte
+ // share must not outlive the last dialog that asked — and must not be killed
+ // out from under a dialog that is still waiting for it either.
+ function release(entry) {
+  if (!entry) return undefined;
+  entry.holders--;
+  if (entry.holders > 0) return undefined;
+  // A FINISHED measurement is kept for the reuse window: closing Properties and
+  // opening it again on the same folder a second later must not walk it twice.
+  // sizeJobUsable ages it out, and pruneSizeJobs collects it.
+  if (entry.finishedAt) return undefined;
+  if (sizeJobs.get(entry.key) === entry) sizeJobs.delete(entry.key);
+  entry.abandoned = true;
+  // The 202 may still be in flight; the submitting closure cancels it then.
+  return entry.id ? cancel(entry.id) : undefined;
+ }
  const runner = {
-  get jobId() { return id; },
+  // jobId is the measurement this runner could still cancel, and only that: a
+  // finished one has nothing to stop.
+  get jobId() { return held && !held.finishedAt ? held.id : null; },
   stop() {
-   const had = id;
-   run++; id = null;
-   return had ? cancel(had) : undefined;
+   const had = held;
+   run++; held = null;
+   return release(had);
   },
   async start(entries,{crossMounts = false} = {}) {
    runner.stop();
    const ticket = run,valid = sessionGuard();
+   const key = sizeJobKey(entries,{crossMounts});
    report({state:'running',text:'Measuring…',result:null});
+   pruneSizeJobs();
+   let entry = sizeJobs.get(key);
+   if (!sizeJobUsable(entry)) {
+    if (entry && sizeJobs.get(key) === entry) sizeJobs.delete(key);
+    entry = null;
+   }
+   if (!entry) {
+    entry = {key,id:null,holders:0,job:null,finishedAt:0,abandoned:false,failed:false};
+    entry.promise = (async () => {
+     const res = await api('api/jobs/size',{},{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(sizeRequest(entries,{crossMounts}))});
+     entry.id = res.job?.id ?? null;
+     // Abandoned while the 202 was in flight: the job exists on the server and
+     // nobody is waiting for it, so it is cancelled rather than left to walk.
+     if (entry.abandoned) { if (entry.id) cancel(entry.id); return null; }
+     // quiet: a measurement the user did not ask for as an operation must not
+     // throw the Operations drawer over the dialog they are reading.
+     track(res.job,{quiet:true});
+     const job = await poll(entry.id);
+     entry.job = job; entry.finishedAt = Date.now();
+     return job;
+    })();
+    entry.promise.catch(() => {
+     // A measurement that could not even be submitted is not an answer to
+     // attach to; the next dialog asks again.
+     entry.failed = true;
+     if (sizeJobs.get(key) === entry) sizeJobs.delete(key);
+    });
+    sizeJobs.set(key,entry);
+   }
+   entry.holders++;
+   held = entry;
    try {
-    const res = await api('api/jobs/size',{},{method:'POST',headers:{'Content-Type':'application/json'},
-     body:JSON.stringify(sizeRequest(entries,{crossMounts}))});
-    // Superseded or abandoned while the 202 was in flight: the job exists on
-    // the server and nobody is waiting for it, so it is cancelled rather than
-    // left to walk.
-    if (ticket !== run || !valid()) { if (res?.job?.id) cancel(res.job.id); return null; }
-    id = res.job?.id ?? null;
-    track(res.job);
-    const job = await poll(id);
+    const job = await entry.promise;
     if (ticket !== run || !valid()) return null;
-    id = null;
     report(sizeReport(job));
     return job;
    } catch(err) {
-    if (ticket === run && valid()) { id = null; report({state:'failed',text:err.message,result:null}); }
+    if (ticket === run && valid()) { held = null; entry.holders--; report({state:'failed',text:err.message,result:null}); }
     return null;
    }
   },

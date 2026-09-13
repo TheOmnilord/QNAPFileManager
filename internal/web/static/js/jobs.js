@@ -372,11 +372,18 @@ export async function cancelJob(id) {
 // trackJob shows the panel for a job that was just submitted and starts polling.
 // It records the submitted state first (finding W8), so however fast the job
 // finishes its completion is still seen as a transition.
-export function trackJob(job) {
+//
+// `quiet` registers and polls the job WITHOUT opening the panel. It is for work
+// the user did not ask for as an operation: opening Properties measures the
+// folder, and that measurement is a real job — it belongs in the panel if the
+// panel is open — but it is not a reason to throw a drawer over the dialog the
+// user is reading (owner, hardware 0.0.133). Only a job the user started as an
+// operation (delete, copy, move, trash, search, chmod/chown) opens the panel.
+export function trackJob(job,{quiet = false} = {}) {
  if (!job) return;
  seedJob(job);
  dismissed.delete(job.id);
- panelOpen(true);
+ if (!quiet) panelOpen(true);
  // pollJobs refreshes immediately and then every 500 ms while anything is
  // live, so the new job appears from the same listing as everything else
  // rather than being painted alone and then replaced.

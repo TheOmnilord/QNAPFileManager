@@ -439,7 +439,14 @@ func runServe(args []string, stderr io.Writer) error {
 	srv.frontend = frontend.Handler()
 	srv.bgFrontend, srv.bgConfigPath = frontend, o.configPath
 	if err := armBreakGlass(srv, frontend, cfg, o.configPath, logger); err != nil {
-		return err
+		if !errors.Is(err, errArmRefused) {
+			return err
+		}
+		// Said once here, and the watcher takes it from there: it repeats the
+		// line only when the reason changes and arms the door as soon as the
+		// reason is gone, without a restart (Astra r2 #2).
+		logger.Printf("%v", err)
+		srv.bgPending = true
 	}
 	return srv.run(context.Background())
 }
@@ -466,6 +473,20 @@ func forceLoopbackBreakGlass(cfg config.Config, dev bool) config.Config {
 	return cfg
 }
 
+// errArmRefused is a refusal to arm the emergency door that a LATER attempt can
+// still resolve: a key directory anyone but root can write, a pair whose
+// resolved ancestry the loader refuses.
+//
+// It is an ERROR rather than a logged nil (Astra r2 #2). Returning nil told the
+// watcher the door had been dealt with for that credential, so it recorded the
+// hash as armed and never called this again — and fixing the directory then did
+// nothing until the app was restarted, which is precisely the restart this
+// whole path exists to avoid. It is distinguishable from a fatal error because
+// the daemon must NOT refuse to start over it: the main listener and the QTS
+// door are unaffected, and a daemon that will not start at all is a worse
+// outcome than one whose emergency door is off and says why.
+var errArmRefused = errors.New("break-glass is enabled but the listener will not bind")
+
 // armBreakGlass decides whether the second listener exists at all, and prepares
 // its certificate if it does.
 //
@@ -473,6 +494,10 @@ func forceLoopbackBreakGlass(cfg config.Config, dev bool) config.Config {
 // port that can never authenticate is pure surface, and this is also what
 // replaces the backend plan's claim window — there is no unauthenticated
 // bootstrap path over HTTP at all, in any window, ever.
+//
+// A refusal that a later tick could resolve is returned as errArmRefused and is
+// NOT logged here: the caller decides how often that line is worth repeating
+// (start-up says it once; the watcher says it once per distinct reason).
 func armBreakGlass(srv *server, frontend *web.Server, cfg config.Config, configPath string, logger *log.Logger) error {
 	if !cfg.Web.BreakGlass.Enabled {
 		logger.Printf("break-glass is disabled (web.breakGlass.enabled=false); the daemon is loopback-only")
@@ -486,34 +511,60 @@ func armBreakGlass(srv *server, frontend *web.Server, cfg config.Config, configP
 	// An explicitly configured key location is checked before anything is
 	// generated into it (Astra r1 #9): a group- or other-writable parent, or one
 	// not owned by root, lets someone other than root replace the key this
-	// listener terminates TLS with. Logged and NOT bound, rather than refusing
-	// to start: the main listener and the QTS door are unaffected, and a daemon
-	// that will not start at all is a worse outcome than one whose emergency
-	// door is off and says so.
+	// listener terminates TLS with. Refused rather than fatal — the caller logs
+	// it and keeps the daemon running, because the main listener and the QTS
+	// door are unaffected and a daemon that will not start at all is a worse
+	// outcome than one whose emergency door is off and says so.
+	//
+	// This is the PRE-FLIGHT and not the authority: the loader below resolves
+	// the path, walks the resolved ancestry and fstats what it opened, which is
+	// what a directory of symlinks into somebody else's share fails
+	// (Astra r2 #1). Both failures come back as errArmRefused.
 	if err := cfg.CheckBreakGlassKeyDir(configPath); err != nil {
-		logger.Printf("break-glass is enabled but the listener will not bind: %v. Fix the directory (root-owned, mode 0700) or remove web.breakGlass.certFile/keyFile to use the QPKG's own config directory.", err)
-		return nil
+		return fmt.Errorf("%w: %v. Fix the directory (root-owned, mode 0700) or remove web.breakGlass.certFile/keyFile to use the QPKG's own config directory", errArmRefused, err)
 	}
-	certFile, keyFile := cfg.BreakGlassFiles(configPath)
+	loc := certLocation(cfg, configPath)
 	// Under the credential-store lock: the pair is two files and therefore two
 	// publications, so a CLI `cert -regenerate` running at the same moment as
 	// this could otherwise leave one generator's certificate beside the other's
 	// key (round-5).
+	//
+	// EnsureUsable, not a renewing Ensure (Astra r2 #3): the daemon generates a
+	// pair that is absent, unreadable, torn or EXPIRED, and never rotates a
+	// usable one. An operator is told to compare this fingerprint against the
+	// browser's warning, so a restart that silently changed it would teach them
+	// that a changed fingerprint is normal — the one lesson this door must not
+	// teach. Inside the renewal window the daemon says so, once, and serves what
+	// it has.
 	var cert breakglass.Cert
 	if err := withCertLock(configPath, func() error {
 		var gerr error
-		cert, gerr = breakglass.Ensure(certFile, keyFile, time.Now())
+		cert, gerr = loc.EnsureUsable(time.Now())
 		return gerr
 	}); err != nil {
+		if errors.Is(err, breakglass.ErrUnsafeLocation) {
+			// A refusal, not a fatal error: the main listener and the QTS door
+			// are unaffected, the daemon keeps running, and fixing the directory
+			// re-arms the door within a minute (Astra r2 #1, #2).
+			return fmt.Errorf("%w: %v", errArmRefused, err)
+		}
 		return fmt.Errorf("break-glass certificate: %w", err)
 	}
 	// The fingerprint is logged at EVERY start, not only when it changes: an
 	// operator comparing it against a browser warning needs to find it in the
 	// log they already have open (contract §3.4).
-	logger.Printf("break-glass certificate %s sha256:%s expires %s", certFile, cert.Fingerprint, cert.NotAfter.UTC().Format(time.RFC3339))
+	logger.Printf("break-glass certificate %s sha256:%s expires %s", loc.CertFile, cert.Fingerprint, cert.NotAfter.UTC().Format(time.RFC3339))
 	if cert.Generated {
 		logger.Printf("break-glass certificate was generated (%s); its fingerprint has changed", cert.Reason)
 		frontend.AuditBreakGlass("breakglass-cert", "ok", fmt.Sprintf("door=local cert generated (%s), sha256=%s", cert.Reason, cert.Fingerprint))
+	} else if now := time.Now(); !now.Add(breakglass.RenewWithin).Before(cert.NotAfter) {
+		// Once per arm — once at start-up, once per late bind — because nothing
+		// else will ever say it: the pair is not rotated by this process
+		// (Astra r2 #3). Audited as well as logged, because the day this door
+		// stops opening is the day nobody can read the log through the app.
+		days := daysUntil(cert.NotAfter, now)
+		logger.Printf("break-glass certificate expires in %d days; run `qnapfilemanager break-glass cert -regenerate` and restart the app when you are ready to compare a new fingerprint", days)
+		frontend.AuditBreakGlass("breakglass-cert", "warn", fmt.Sprintf("door=local cert expires in %d days (sha256=%s); run `break-glass cert -regenerate`", days, cert.Fingerprint))
 	}
 	frontend.EnableBreakGlass(configPath)
 	srv.bgHandler = frontend.BreakGlassHandler()
@@ -560,6 +611,12 @@ func (s *server) watchForCredential(ctx context.Context, frontend *web.Server, c
 	// is being retried must not redo it every minute (round-3 P3). Only a hash
 	// that actually CHANGED re-arms.
 	armedFor := ""
+	// The last refusal already reported. A key directory anyone can write is a
+	// standing condition, not an event: repeating the same line every minute
+	// would bury the log of a NAS that is already in trouble, and saying it
+	// once and then never again would hide a reason that CHANGED. One line per
+	// distinct reason is both (Astra r2 #2).
+	lastRefusal := ""
 	for {
 		select {
 		case <-ctx.Done():
@@ -584,9 +641,21 @@ func (s *server) watchForCredential(ctx context.Context, frontend *web.Server, c
 		}
 		if cfg.Auth.Local.Hash != armedFor {
 			if err := armBreakGlassFn(s, frontend, cfg, configPath, s.logger); err != nil {
-				s.logger.Printf("break-glass could not be armed after a password appeared: %v", err)
+				// armedFor is deliberately NOT recorded: the hash has not been
+				// armed for, so the next tick tries again and an operator who
+				// fixes the directory gets their door back without a restart
+				// (Astra r2 #2).
+				if reason := err.Error(); reason != lastRefusal {
+					lastRefusal = reason
+					if errors.Is(err, errArmRefused) {
+						s.logger.Printf("%v", err)
+					} else {
+						s.logger.Printf("break-glass could not be armed after a password appeared: %v", err)
+					}
+				}
 				continue
 			}
+			lastRefusal = ""
 			armedFor = cfg.Auth.Local.Hash
 		}
 		if s.bgHandler == nil {

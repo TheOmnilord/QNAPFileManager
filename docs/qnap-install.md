@@ -138,6 +138,14 @@ you want it shut now, restart the app from App Center.
    for — a broken NAS, an operator in a hurry — is precisely when nobody checks. Check anyway.
 4. A *different* warning ("the name on the certificate does not match") means something else: the certificate's IP
    subject-alternative names were generated when the NAS had different addresses. Run `break-glass cert -regenerate`.
+
+**The fingerprint changes only when you change it.** The certificate is valid for 397 days, and nothing rotates it for
+you: not a restart, not setting a password. Inside the last 30 days the app log and `break-glass status` say how many
+days are left and name `break-glass cert -regenerate`; run it, restart the app, and compare the new fingerprint once,
+deliberately. That is the point — a fingerprint that changed by itself would be indistinguishable from somebody
+answering in the NAS's place, and an operator who has learned to shrug at a changed fingerprint has lost the only check
+this door gives them. The one exception is a certificate that has already **expired**: no browser would open that door
+at all, so the app replaces it at the next start and logs the new fingerprint as a generated one.
 5. Enter the local administrator password in the form. There is no username — the break-glass account is the only
    identity this listener has. The session you get is an administrator session, and a persistent orange banner says that
    everything you create through it will be owned by root.
@@ -193,6 +201,14 @@ silently ignored, because a silently ignored safety switch is exactly the failur
 Useful keys: `readOnly` (the global switch, also in Settings), `trash.enabled`, `web.breakGlass.enabled`,
 `web.breakGlass.addr`, `auth.local.cost`, `logging.quLog`, `worker.max`, `jobs.*`. The break-glass **password** is never
 edited here by hand — use `break-glass set-password`, which writes the hash and the `updated` stamp together.
+
+`web.breakGlass.certFile` and `web.breakGlass.keyFile` move the key pair somewhere else, and they come with a rule: the
+key, and **every directory above it up to `/`**, must be owned by root and writable by nobody else. The key is what the
+emergency door terminates TLS with, so anybody who can replace it — or replace a directory on the way to it, symlinks
+included — can answer in the NAS's place on that port. A location that does not meet the rule is refused: the door does
+not bind, the app log says which path and why, and `break-glass status` prints `fingerprint: refused`. Fix the directory
+and the door comes up within a minute, without a restart. Leaving both keys out puts the pair in the QPKG's own
+`config/`, which the installer already tightens, and is the recommended answer.
 
 ## 8. The audit log
 

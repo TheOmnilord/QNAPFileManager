@@ -217,6 +217,20 @@ func withCertLock(configPath string, fn func() error) error {
 	return fn()
 }
 
+// certLocation is where the break-glass pair lives, and whether the OPERATOR
+// named that location — which is what decides how far the loader checks it
+// (Astra r2 #1). A location config owns is checked by the credential-store
+// guard; one web.breakGlass.certFile/keyFile named has its whole resolved
+// ancestry walked, because nothing else is checking it.
+func certLocation(cfg config.Config, configPath string) breakglass.Location {
+	certFile, keyFile := cfg.BreakGlassFiles(configPath)
+	return breakglass.Location{
+		CertFile: certFile,
+		KeyFile:  keyFile,
+		Explicit: cfg.BreakGlassExplicit(),
+	}
+}
+
 // lockHintFor reports who holds a stuck lock, for an error message. It reads
 // the lock file directly because config keeps its own hint unexported.
 func lockHintFor(configPath string) string {
@@ -341,7 +355,11 @@ func breakGlassSetPassword(args []string, stdin io.Reader, stdout, stderr io.Wri
 	// toggle writes the same file, and a save that lost this credential — or
 	// restored one that was just disabled — would be silent (round-2 P3-5).
 	var cfg config.Config
-	if err := config.Update(p, *dev, func(c *config.Config) error {
+	// UpdateCredential, not Update (Astra r2 #5): a hash the daemon refuses is
+	// exactly the state this command exists to leave, so it must not be what
+	// stops it from running. The result is validated strictly before it is
+	// written.
+	if err := config.UpdateCredential(p, *dev, func(c *config.Config) error {
 		// The hash, the cost and the stamp: nothing else. Bumping Updated is
 		// what evicts every live break-glass session on the daemon's next
 		// request (§4.4), so it is written even when the password happens to be
@@ -363,17 +381,19 @@ func breakGlassSetPassword(args []string, stdin io.Reader, stdout, stderr io.Wri
 	// fingerprint to compare, because nothing had generated one. This is also
 	// the only moment the CLI is guaranteed to be root in the config directory.
 	if cfg.Web.BreakGlass.Enabled {
-		certFile, keyFile := cfg.BreakGlassFiles(p)
+		loc := certLocation(cfg, p)
+		certFile := loc.CertFile
 		var cert breakglass.Cert
-		// EnsureUsable, not Ensure (Astra r1 #16): setting a password must never
-		// be the thing that RENEWS a certificate. A usable pair is left alone;
-		// only a missing or torn one is generated, which is what makes the
-		// documented first run — set the password, compare the fingerprint, open
-		// the page — work without a restart. Renewal is `cert -regenerate`'s job
-		// and says so.
+		// EnsureUsable (Astra r1 #16): setting a password must never be the thing
+		// that RENEWS a certificate. A usable pair is left alone; only a missing,
+		// torn or expired one is generated, which is what makes the documented
+		// first run — set the password, compare the fingerprint, open the page —
+		// work without a restart. Rotation is `cert -regenerate`'s job and says
+		// so. Since Astra r2 #3 the daemon does not renew either: nothing changes
+		// this fingerprint without an operator asking for it.
 		cerr := withCertLock(p, func() error {
 			var err error
-			cert, err = breakglass.EnsureUsable(certFile, keyFile, time.Now())
+			cert, err = loc.EnsureUsable(time.Now())
 			return err
 		})
 		if cerr != nil {
@@ -405,8 +425,15 @@ func breakGlassDisable(args []string, stdout, stderr io.Writer) error {
 	if err := guardCredentialStore(p, stderr); err != nil {
 		return err
 	}
-	if err := config.Update(p, *dev, func(c *config.Config) error {
+	// UpdateCredential, not Update (Astra r2 #5): revoking a credential the
+	// daemon refuses to load is the case that matters most, and until this it
+	// was the case that failed.
+	if err := config.UpdateCredential(p, *dev, func(c *config.Config) error {
 		c.Auth.Local.Hash = ""
+		// The cost key goes with it: it describes a credential that no longer
+		// exists, and leaving an out-of-range one behind would leave the file
+		// invalid for the daemon that has to load it next.
+		c.Auth.Local.Cost = 0
 		// The stamp still moves: that is what evicts the sessions the cleared
 		// hash is meant to lock out. An eviction that waited for a restart
 		// would not be an eviction.
@@ -457,16 +484,42 @@ func breakGlassStatus(args []string, stdout, stderr io.Writer) error {
 		fmt.Fprintf(stdout, "password:    set (%s)\n", when)
 		fmt.Fprintf(stdout, "cost:        %d\n", cost)
 	}
-	certFile, keyFile := cfg.BreakGlassFiles(p)
-	fmt.Fprintf(stdout, "certificate: %s\n", certFile)
-	cert, err := breakglass.Load(certFile, keyFile)
+	loc := certLocation(cfg, p)
+	fmt.Fprintf(stdout, "certificate: %s\n", loc.CertFile)
+	cert, err := loc.Load()
 	if err != nil {
+		// A location the loader REFUSES is not the same news as one that has not
+		// been generated yet, and an operator reading this while locked out has
+		// to be able to tell them apart: the second is the first run, the first
+		// is a listener that will not bind until a directory is fixed
+		// (Astra r2 #1).
+		if errors.Is(err, breakglass.ErrUnsafeLocation) {
+			fmt.Fprintf(stdout, "fingerprint: refused — %v\n", err)
+			return nil
+		}
 		fmt.Fprintf(stdout, "fingerprint: not generated yet (%v)\n", err)
 		return nil
 	}
 	fmt.Fprintf(stdout, "fingerprint: sha256:%s\n", cert.Fingerprint)
 	fmt.Fprintf(stdout, "expires:     %s\n", cert.NotAfter.UTC().Format(time.RFC3339))
+	// Inside the renewal window, `status` says so in the same place the
+	// fingerprint is read (Astra r2 #3): nothing rotates this pair on its own,
+	// so the only way an operator learns it is running out is by being told.
+	if !time.Now().Add(breakglass.RenewWithin).Before(cert.NotAfter) {
+		fmt.Fprintf(stdout, "warning:     this certificate expires in %d days; run `qnapfilemanager break-glass cert -regenerate` and restart the app when you are ready to compare a new fingerprint.\n", daysUntil(cert.NotAfter, time.Now()))
+	}
 	return nil
+}
+
+// daysUntil is whole days, rounded down, and never negative: "expires in 0
+// days" is today, and an expired pair is reported as expired rather than as a
+// negative number of days.
+func daysUntil(when, now time.Time) int {
+	d := when.Sub(now)
+	if d < 0 {
+		return 0
+	}
+	return int(d / (24 * time.Hour))
 }
 
 func breakGlassCert(args []string, stdout, stderr io.Writer) error {
@@ -483,18 +536,27 @@ func breakGlassCert(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	certFile, keyFile := cfg.BreakGlassFiles(p)
+	loc := certLocation(cfg, p)
+	certFile := loc.CertFile
 	var cert breakglass.Cert
 	if !*regen {
 		// Plain `cert` READS and nothing else (round-1 P3-10). It used to call
-		// Ensure, which regenerates inside the 30-day renewal window — so an
+		// Ensure, which regenerated inside the 30-day renewal window — so an
 		// operator running it to read the fingerprint could be the one who
 		// changed it, without root, without a warning, and while the running
 		// daemon went on serving the old one. Reporting a fingerprint must never
-		// be the thing that changes it.
-		cert, err = breakglass.Load(certFile, keyFile)
+		// be the thing that changes it. Since Astra r2 #3 nothing renews inside
+		// that window at all: this command is the only thing that rotates the
+		// pair, and only with -regenerate.
+		cert, err = loc.Load()
 		if err != nil {
 			fmt.Fprintf(stdout, "certificate: %s\n", certFile)
+			if errors.Is(err, breakglass.ErrUnsafeLocation) {
+				fmt.Fprintf(stdout, "fingerprint: refused — %v\n", err)
+				fmt.Fprintln(stdout, "             The listener will not bind until that path is root-owned and")
+				fmt.Fprintln(stdout, "             writable by nobody else, every directory above it included.")
+				return nil
+			}
 			fmt.Fprintln(stdout, "fingerprint: no certificate yet — the daemon generates one the first time the")
 			fmt.Fprintln(stdout, "             break-glass listener binds, or run `break-glass cert -regenerate`.")
 			return nil
@@ -507,7 +569,7 @@ func breakGlassCert(args []string, stdout, stderr io.Writer) error {
 		}
 		if err := withCertLock(p, func() error {
 			var gerr error
-			cert, gerr = breakglass.Regenerate(certFile, keyFile, time.Now())
+			cert, gerr = loc.Regenerate(time.Now())
 			return gerr
 		}); err != nil {
 			return err
@@ -526,6 +588,13 @@ func breakGlassCert(args []string, stdout, stderr io.Writer) error {
 	fmt.Fprintf(stdout, "certificate: %s\n", certFile)
 	fmt.Fprintf(stdout, "fingerprint: sha256:%s\n", cert.Fingerprint)
 	fmt.Fprintf(stdout, "expires:     %s\n", cert.NotAfter.UTC().Format(time.RFC3339))
+	// The renewal window is a REMINDER, not a countdown to something automatic
+	// (Astra r2 #3): no daemon start and no password change rotates this pair,
+	// so the operator is the only one who can, and they should do it when they
+	// are ready to compare the new fingerprint rather than be surprised by it.
+	if !cert.Generated && !time.Now().Add(breakglass.RenewWithin).Before(cert.NotAfter) {
+		fmt.Fprintf(stdout, "This certificate expires in %d days. Nothing rotates it for you: run `break-glass cert -regenerate`\nand restart the app when you are ready to compare a new fingerprint.\n", daysUntil(cert.NotAfter, time.Now()))
+	}
 	fmt.Fprintln(stdout, "Compare this fingerprint in the browser before typing a password into a page it has warned about.")
 	return nil
 }

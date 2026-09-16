@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -780,5 +781,103 @@ func TestArmBreakGlassHoldsTheCredentialLock(t *testing.T) {
 	certFile, keyFile := cfg.BreakGlassFiles(p)
 	if _, err := breakglass.Load(certFile, keyFile); err != nil {
 		t.Fatalf("the daemon left an unusable pair: %v", err)
+	}
+}
+
+// --- Astra r2 #5: the way out of a rejected credential -----------------------
+
+// rejectedCredentialConfig writes a config the daemon REFUSES to load, by hand:
+// config.Save would not write one. That is the state an operator can be in —
+// a hand edit, a half-written file, a hash from an older cost policy — and it
+// is exactly when they need `set-password` and `disable` to work.
+func rejectedCredentialConfig(t *testing.T, hash string, cost int) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "config.json")
+	body := fmt.Sprintf(`{"auth":{"mode":"qts","local":{"hash":%q,"cost":%d,"updated":"2026-09-17T09:00:00Z"}}}`, hash, cost)
+	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The premise: the daemon will not load this file at all.
+	if _, err := config.Load(p); err == nil {
+		t.Fatalf("config.Load accepted hash=%q cost=%d; this fixture proves nothing", hash, cost)
+	}
+	return p
+}
+
+// Both commands load leniently and validate the RESULT. Until this, both failed
+// on the validation of the value they were about to replace — so the documented
+// way to fix a broken credential was to hand-edit the credential store of a NAS
+// the operator may already be locked out of.
+func TestTheCredentialCommandsRecoverARejectedHash(t *testing.T) {
+	real10, err := breakglass.Hash("a long enough password", breakglass.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		name string
+		hash string
+		cost int
+	}{
+		{"whitespace", " ", 0},
+		{"an embedded cost of 31", "$2a$31$" + real10[7:], 0},
+		{"a malformed tail", "$2a$10$" + strings.Repeat("!", 53), 0},
+		{"a cost key outside the range", real10, 31},
+	} {
+		t.Run(c.name+"/set-password", func(t *testing.T) {
+			p := rejectedCredentialConfig(t, c.hash, c.cost)
+			unprivileged(t)
+			code, stdout, stderr := run(t, "a different long password\n", "set-password", "-config", p, "-cost", "10", "-stdin")
+			if code != 0 {
+				t.Fatalf("set-password over a rejected hash = %d\n%s\n%s", code, stdout, stderr)
+			}
+			cfg, err := config.Load(p)
+			if err != nil {
+				t.Fatalf("what set-password wrote is still refused by the daemon: %v", err)
+			}
+			if cfg.Auth.Local.Hash == c.hash || cfg.Auth.Local.Cost != 10 {
+				t.Fatalf("the credential was not replaced: %+v", cfg.Auth.Local)
+			}
+			if err := breakglass.Verify(cfg.Auth.Local.Hash, "a different long password"); err != nil {
+				t.Fatalf("the new password does not verify: %v", err)
+			}
+		})
+		t.Run(c.name+"/disable", func(t *testing.T) {
+			p := rejectedCredentialConfig(t, c.hash, c.cost)
+			unprivileged(t)
+			code, stdout, stderr := run(t, "", "disable", "-config", p)
+			if code != 0 {
+				t.Fatalf("disable over a rejected hash = %d\n%s\n%s", code, stdout, stderr)
+			}
+			cfg, err := config.Load(p)
+			if err != nil {
+				t.Fatalf("what disable wrote is still refused by the daemon: %v", err)
+			}
+			// The hash is gone and the cost key with it — what comes back is the
+			// default, because an omitted cost IS the default.
+			if cfg.Auth.Local.Hash != "" || cfg.Auth.Local.Cost != config.DefaultLocalCost {
+				t.Fatalf("the credential was not cleared: %+v", cfg.Auth.Local)
+			}
+			// The stamp still moves: that is what evicts live sessions.
+			if cfg.Auth.Local.Updated == "2026-09-17T09:00:00Z" || cfg.Auth.Local.Updated == "" {
+				t.Fatalf("the eviction stamp did not move: %q", cfg.Auth.Local.Updated)
+			}
+		})
+	}
+}
+
+// The leniency is narrow: it covers auth.local and nothing else, so a config
+// that is broken somewhere ELSE is still refused rather than quietly rewritten
+// by a credential command.
+func TestTheCredentialCommandsStillRefuseAnUnrelatedlyBrokenConfig(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(p, []byte(`{"web":{"listen":"0.0.0.0:8770"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	unprivileged(t)
+	if code, stdout, stderr := run(t, "a long enough password\n", "set-password", "-config", p, "-cost", "10", "-stdin"); code == 0 {
+		t.Fatalf("set-password ran against a non-loopback web.listen:\n%s\n%s", stdout, stderr)
+	}
+	if code, stdout, stderr := run(t, "", "disable", "-config", p); code == 0 {
+		t.Fatalf("disable ran against a non-loopback web.listen:\n%s\n%s", stdout, stderr)
 	}
 }

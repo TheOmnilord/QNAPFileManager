@@ -25,12 +25,12 @@ func TestEnsureGeneratesPersistsAndReloads(t *testing.T) {
 	certFile, keyFile := certPaths(t)
 	now := time.Date(2026, 9, 13, 12, 0, 0, 0, time.UTC)
 
-	first, err := Ensure(certFile, keyFile, now)
+	first, err := EnsureUsable(certFile, keyFile, now)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !first.Generated || first.Reason != "absent" {
-		t.Fatalf("first Ensure = %+v, want a generation because the file was absent", first)
+		t.Fatalf("first EnsureUsable = %+v, want a generation because the file was absent", first)
 	}
 	if first.Fingerprint == "" || len(first.Fingerprint) != 64 {
 		t.Fatalf("fingerprint = %q, want 64 hex characters", first.Fingerprint)
@@ -48,7 +48,7 @@ func TestEnsureGeneratesPersistsAndReloads(t *testing.T) {
 	// A restart must serve the SAME certificate: a fingerprint that changed on
 	// every start would train the operator to ignore the one comparison that
 	// protects them.
-	second, err := Ensure(certFile, keyFile, now.Add(24*time.Hour))
+	second, err := EnsureUsable(certFile, keyFile, now.Add(24*time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,39 +60,48 @@ func TestEnsureGeneratesPersistsAndReloads(t *testing.T) {
 	}
 }
 
-func TestEnsureRegeneratesInsideTheRenewalWindow(t *testing.T) {
+// Astra r2 #3: the daemon never renews silently. A pair inside its renewal
+// window is served exactly as it is — the caller warns — and only an EXPIRED
+// one, which no browser would accept anyway, is replaced.
+func TestExpiringIsServedAndExpiredIsReplaced(t *testing.T) {
 	certFile, keyFile := certPaths(t)
 	now := time.Date(2026, 9, 13, 12, 0, 0, 0, time.UTC)
-	first, err := Ensure(certFile, keyFile, now)
+	first, err := EnsureUsable(certFile, keyFile, now)
 	if err != nil {
 		t.Fatal(err)
 	}
 	expiry := first.NotAfter
 
-	// One second before the window opens: still reloaded.
-	justOutside := expiry.Add(-RenewWithin).Add(-time.Second)
-	got, err := Ensure(certFile, keyFile, justOutside)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.Generated || got.Fingerprint != first.Fingerprint {
-		t.Fatalf("regenerated %v before the window opened", justOutside)
+	// Deep inside the 30-day window, and one second before expiry: the same
+	// pair, both times. A fingerprint an operator was told to compare does not
+	// change because a daemon restarted.
+	for _, at := range []time.Time{
+		expiry.Add(-RenewWithin).Add(time.Second),
+		expiry.Add(-time.Second),
+	} {
+		got, err := EnsureUsable(certFile, keyFile, at)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Generated || got.Fingerprint != first.Fingerprint {
+			t.Fatalf("EnsureUsable at %v = %+v, want the pair on disk served unchanged", at, got)
+		}
 	}
 
-	// Inside the 30-day window: regenerated, in the process that is already
-	// running, so it costs the operator nothing.
-	inside := expiry.Add(-RenewWithin).Add(time.Second)
-	got, err = Ensure(certFile, keyFile, inside)
+	// Expired: worth nothing to any browser, so it is replaced and the new
+	// fingerprint is the caller's to log and audit.
+	after := expiry.Add(time.Second)
+	got, err := EnsureUsable(certFile, keyFile, after)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !got.Generated || got.Reason != "expiring" {
-		t.Fatalf("Ensure at %v = %+v, want a regeneration", inside, got)
+	if !got.Generated || got.Reason != "expired" {
+		t.Fatalf("EnsureUsable at %v = %+v, want a regeneration with reason \"expired\"", after, got)
 	}
 	if got.Fingerprint == first.Fingerprint {
 		t.Fatal("a regenerated certificate must have a new fingerprint")
 	}
-	if want := inside.Add(Validity); !got.NotAfter.Equal(want) {
+	if want := after.Add(Validity); !got.NotAfter.Equal(want) {
 		t.Fatalf("NotAfter = %s, want %s", got.NotAfter, want)
 	}
 }
@@ -100,26 +109,26 @@ func TestEnsureRegeneratesInsideTheRenewalWindow(t *testing.T) {
 func TestEnsureReplacesAnUnreadablePair(t *testing.T) {
 	certFile, keyFile := certPaths(t)
 	now := time.Now()
-	if _, err := Ensure(certFile, keyFile, now); err != nil {
+	if _, err := EnsureUsable(certFile, keyFile, now); err != nil {
 		t.Fatal(err)
 	}
 	// A half-written or corrupted pair must not leave the door unopenable.
 	if err := os.WriteFile(certFile, []byte("-----BEGIN CERTIFICATE-----\ngarbage\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	got, err := Ensure(certFile, keyFile, now)
+	got, err := EnsureUsable(certFile, keyFile, now)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !got.Generated || got.Reason != "unreadable" {
-		t.Fatalf("Ensure over a corrupt pair = %+v, want a regeneration", got)
+		t.Fatalf("EnsureUsable over a corrupt pair = %+v, want a regeneration", got)
 	}
 }
 
 func TestRegenerateAlwaysChangesTheFingerprint(t *testing.T) {
 	certFile, keyFile := certPaths(t)
 	now := time.Now()
-	first, err := Ensure(certFile, keyFile, now)
+	first, err := EnsureUsable(certFile, keyFile, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,7 +164,7 @@ func TestGeneratedCertificateCarriesTheExpectedSANs(t *testing.T) {
 	HostnameFile = hostFile
 	t.Cleanup(func() { HostnameFile = old })
 
-	got, err := Ensure(certFile, keyFile, time.Now())
+	got, err := EnsureUsable(certFile, keyFile, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,7 +203,7 @@ func TestCertificateFilesAreOwnerOnly(t *testing.T) {
 		t.Skip("Unix modes are approximate on Windows")
 	}
 	certFile, keyFile := certPaths(t)
-	if _, err := Ensure(certFile, keyFile, time.Now()); err != nil {
+	if _, err := EnsureUsable(certFile, keyFile, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	for _, p := range []string{certFile, keyFile} {
@@ -222,7 +231,7 @@ func TestCertificateFilesAreOwnerOnly(t *testing.T) {
 }
 
 func TestEnsureRefusesEmptyPaths(t *testing.T) {
-	if _, err := Ensure("", "", time.Now()); err == nil {
+	if _, err := EnsureUsable("", "", time.Now()); err == nil {
 		t.Fatal("empty certificate paths must be an error, never a silent skip")
 	}
 }
@@ -234,7 +243,7 @@ func TestEnsureRefusesEmptyPaths(t *testing.T) {
 // machine they administer the NAS from.
 func TestGeneratedCertificateIsNotACertificateAuthority(t *testing.T) {
 	certFile, keyFile := certPaths(t)
-	got, err := Ensure(certFile, keyFile, time.Now())
+	got, err := EnsureUsable(certFile, keyFile, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -340,17 +349,17 @@ func TestConcurrentGenerationUnderTheLockLeavesOneUsablePair(t *testing.T) {
 
 // A crash between the two renames leaves a certificate from one generation
 // beside a key from another. The lock cannot prevent that — nothing can, with
-// two files — so Ensure heals it at the next start instead of refusing to
+// two files — so EnsureUsable heals it at the next start instead of refusing to
 // serve.
 func TestEnsureHealsATornPair(t *testing.T) {
 	certFile, keyFile := certPaths(t)
-	first, err := Ensure(certFile, keyFile, time.Now())
+	first, err := EnsureUsable(certFile, keyFile, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
 	// A second generation, kept aside, standing in for the half that landed.
 	otherCert, otherKey := certPaths(t)
-	second, err := Ensure(otherCert, otherKey, time.Now())
+	second, err := EnsureUsable(otherCert, otherKey, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -380,14 +389,14 @@ func TestEnsureHealsATornPair(t *testing.T) {
 			if _, err := Load(certFile, keyFile); !errors.Is(err, ErrPairMismatch) {
 				t.Fatalf("Load over a torn pair = %v, want ErrPairMismatch", err)
 			}
-			// Ensure heals it rather than failing: this is what makes a crash
+			// EnsureUsable heals it rather than failing: this is what makes a crash
 			// between the two renames survivable without an operator.
-			healed, err := Ensure(certFile, keyFile, time.Now())
+			healed, err := EnsureUsable(certFile, keyFile, time.Now())
 			if err != nil {
-				t.Fatalf("Ensure over a torn pair = %v, want a regeneration", err)
+				t.Fatalf("EnsureUsable over a torn pair = %v, want a regeneration", err)
 			}
 			if !healed.Generated || healed.Reason != "mismatched" {
-				t.Fatalf("Ensure = %+v, want a regeneration with reason \"mismatched\"", healed)
+				t.Fatalf("EnsureUsable = %+v, want a regeneration with reason \"mismatched\"", healed)
 			}
 			if healed.Fingerprint == fresh.Fingerprint {
 				t.Fatal("the torn pair was reported healed without changing")
@@ -412,5 +421,152 @@ func copyFile(t *testing.T, from, to string) {
 	}
 	if err := os.WriteFile(to, data, 0o600); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// bindTreeTop points the ancestor walk at a test's own temporary root. /tmp is
+// mode 1777 on every Linux box, so without it no pair a test can create could
+// pass a rule whose whole point is that nobody but root may write any ancestor.
+func bindTreeTop(t *testing.T, dir string) {
+	t.Helper()
+	old := treeTop
+	treeTop = dir
+	t.Cleanup(func() { treeTop = old })
+}
+
+// Astra r2 #1: the old check looked at the LEXICAL parent of the configured
+// path. A root-owned 0700 directory holding root-owned SYMLINKS into a share
+// anybody can write passed it, and the loader then followed them — so the key
+// the emergency door terminates TLS with was one that user could replace. The
+// check is now bound to what is actually opened: the path is resolved, the
+// RESOLVED ancestry is walked, and the open is O_NOFOLLOW on the resolved name.
+func TestExplicitPairRefusesASymlinkChainIntoAWritableDirectory(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("ownership and POSIX modes are a Linux question (contract §15)")
+	}
+	root := t.TempDir()
+	bindTreeTop(t, root)
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// The real pair lives in a directory anybody can write.
+	writable := filepath.Join(root, "share")
+	if err := os.Mkdir(writable, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(writable, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	realCert := filepath.Join(writable, "cert.pem")
+	realKey := filepath.Join(writable, "key.pem")
+	if _, err := EnsureUsable(realCert, realKey, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	// The configured location is a 0700 directory of links into it — exactly
+	// what the lexical parent check accepted.
+	tight := filepath.Join(root, "tight")
+	if err := os.Mkdir(tight, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	certFile := filepath.Join(tight, "breakglass-cert.pem")
+	keyFile := filepath.Join(tight, "breakglass-key.pem")
+	if err := os.Symlink(realCert, certFile); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realKey, keyFile); err != nil {
+		t.Fatal(err)
+	}
+
+	loc := Location{CertFile: certFile, KeyFile: keyFile, Explicit: true}
+	if _, err := loc.Load(); !errors.Is(err, ErrUnsafeLocation) {
+		t.Fatalf("Load through a symlink into a world-writable directory = %v, want ErrUnsafeLocation", err)
+	}
+	// And it is a REFUSAL, not a reason to generate: writing a fresh private key
+	// into that directory would hand it to whoever can write there.
+	got, err := loc.EnsureUsable(time.Now())
+	if !errors.Is(err, ErrUnsafeLocation) {
+		t.Fatalf("EnsureUsable = (%+v, %v), want ErrUnsafeLocation", got, err)
+	}
+	if got.Generated {
+		t.Fatal("a pair was generated into a location the check refused")
+	}
+	// The same refusal before anything exists: the directory a key is about to
+	// be written into is checked too.
+	fresh := Location{
+		CertFile: filepath.Join(writable, "new-cert.pem"),
+		KeyFile:  filepath.Join(writable, "new-key.pem"),
+		Explicit: true,
+	}
+	if _, err := fresh.EnsureUsable(time.Now()); !errors.Is(err, ErrUnsafeLocation) {
+		t.Fatalf("EnsureUsable into a world-writable directory = %v, want ErrUnsafeLocation", err)
+	}
+	if _, err := os.Stat(fresh.KeyFile); !os.IsNotExist(err) {
+		t.Fatalf("a key was published into the refused directory (%v)", err)
+	}
+}
+
+// The other half of the rule: a plain pair in a tight, owner-only ancestry is
+// served. Run as root — the CI root job — this is the production rule exactly,
+// every ancestor owned by uid 0.
+func TestExplicitPairAcceptsATightLocation(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("ownership and POSIX modes are a Linux question (contract §15)")
+	}
+	root := t.TempDir()
+	bindTreeTop(t, root)
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(root, "keys")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	loc := Location{
+		CertFile: filepath.Join(dir, "breakglass-cert.pem"),
+		KeyFile:  filepath.Join(dir, "breakglass-key.pem"),
+		Explicit: true,
+	}
+	made, err := loc.EnsureUsable(time.Now())
+	if err != nil {
+		t.Fatalf("a tight, owner-only location was refused: %v", err)
+	}
+	loaded, err := loc.Load()
+	if err != nil {
+		t.Fatalf("the pair it had just written was refused: %v", err)
+	}
+	if loaded.Fingerprint != made.Fingerprint {
+		t.Fatalf("Load = %s, want %s", loaded.Fingerprint, made.Fingerprint)
+	}
+
+	// A key group or other can read is refused wherever it lives: that half is a
+	// property of the FILE, so the default location is covered by it too.
+	if err := os.Chmod(loc.KeyFile, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(loc.CertFile, loc.KeyFile); !errors.Is(err, ErrUnsafeLocation) {
+		t.Fatalf("Load of a 0644 key = %v, want ErrUnsafeLocation", err)
+	}
+}
+
+// The ownership half needs a uid this process does not own, so it needs root.
+func TestKeyOwnedByAnotherUidIsRefused(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("ownership is a Linux question (contract §15)")
+	}
+	if os.Geteuid() != 0 {
+		t.Skip("only root can give a file away (INV-2: never simulate the kernel)")
+	}
+	certFile, keyFile := certPaths(t)
+	if _, err := EnsureUsable(certFile, keyFile, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	// uid 1 (bin): a uid that is neither root nor this process.
+	if err := os.Chown(keyFile, 1, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(certFile, keyFile); !errors.Is(err, ErrUnsafeLocation) {
+		t.Fatalf("Load of a key owned by uid 1 = %v, want ErrUnsafeLocation", err)
 	}
 }

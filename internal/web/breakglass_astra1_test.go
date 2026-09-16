@@ -2,9 +2,7 @@ package web
 
 import (
 	"crypto/tls"
-	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -351,91 +349,14 @@ func TestTheCredentialReloadsWithTheDaemonsValidationMode(t *testing.T) {
 }
 
 // --- Astra r1 #8: a declared-but-unsent body does not park the connection ----
-
-// decodeBody's drain had no read deadline: a valid JSON prefix under a larger
-// Content-Length, then silence, parked the handler goroutine — the 15 s handler
-// context does not interrupt a socket read, and neither listener sets
-// ReadTimeout. The deadline is what bounds it on a real connection; what a
-// handler-level test can assert is the other half, that a drain which did not
-// finish is not treated as a consumed body.
-func TestAnUnfinishedDrainClosesTheConnection(t *testing.T) {
-	s, _, _ := bgFixture(t)
-	cookie, csrf := bgSignIn(t, s)
-
-	body := `{"dir":"/","name":"support"}`
-	r := httptest.NewRequest("POST", "/api/fs/mkdir", &haltingBody{data: []byte(body), err: os.ErrDeadlineExceeded})
-	// Declared far larger than what is actually sent: the lever.
-	r.ContentLength = int64(len(body) * 100)
-	r.TLS = bgTLS()
-	r.Header.Set("Origin", "https://"+r.Host)
-	r.Header.Set("Content-Type", "application/json")
-	r.Header.Set("X-QFM-CSRF", csrf)
-	r.AddCookie(cookie)
-	w := httptest.NewRecorder()
-	s.BreakGlassHandler().ServeHTTP(w, r)
-
-	// The request itself is answered — it parsed — but the connection must not
-	// be reused, because net/http would drain the remainder behind the response
-	// with no deadline at all.
-	if w.Header().Get("Connection") != "close" {
-		t.Fatalf("a body that was never consumed left the connection open: %d %v", w.Code, w.Header())
-	}
-
-	// A body that WAS consumed keeps keep-alive: closing every successful
-	// mutation would be one TCP handshake per request through the emergency
-	// door, which is the opposite of what that door is for.
-	ok := bgRequest(s, "POST", "/api/fs/mkdir", []*http.Cookie{cookie},
-		map[string]string{"X-QFM-CSRF": csrf, "Content-Type": "application/json"}, `{"dir":"/","name":"support2"}`)
-	if ok.Code != http.StatusOK {
-		t.Fatalf("mkdir = %d %s", ok.Code, ok.Body)
-	}
-	if got := ok.Header().Get("Connection"); got == "close" {
-		t.Fatal("a fully consumed body closed the connection")
-	}
-}
-
-// haltingBody yields its data and then fails, the way a socket read does when
-// the read deadline expires under a Content-Length that will never arrive.
-type haltingBody struct {
-	data []byte
-	err  error
-	n    int
-}
-
-func (b *haltingBody) Read(p []byte) (int, error) {
-	if b.n < len(b.data) {
-		n := copy(p, b.data[b.n:])
-		b.n += n
-		return n, nil
-	}
-	return 0, b.err
-}
-
-func (b *haltingBody) Close() error { return nil }
-
-// A drain that fails must not be mistaken for a decode that failed: the caller
-// still gets its answer.
-func TestAnUnfinishedDrainStillAnswersTheRequest(t *testing.T) {
-	s, _, _ := bgFixture(t)
-	cookie, csrf := bgSignIn(t, s)
-	body := `{"dir":"/","name":"answered"}`
-	r := httptest.NewRequest("POST", "/api/fs/mkdir", &haltingBody{data: []byte(body), err: io.ErrUnexpectedEOF})
-	r.ContentLength = int64(len(body) * 10)
-	r.TLS = bgTLS()
-	r.Header.Set("Origin", "https://"+r.Host)
-	r.Header.Set("Content-Type", "application/json")
-	r.Header.Set("X-QFM-CSRF", csrf)
-	r.AddCookie(cookie)
-	w := httptest.NewRecorder()
-	s.BreakGlassHandler().ServeHTTP(w, r)
-	if w.Code != http.StatusOK {
-		t.Fatalf("mkdir = %d %s", w.Code, w.Body)
-	}
-	var payload map[string]any
-	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
-		t.Fatalf("the answer is not JSON: %v (%s)", err, w.Body)
-	}
-}
+//
+// The two tests that used to live here drove the handler with a fake body that
+// returned os.ErrDeadlineExceeded of its own accord, through an
+// httptest.ResponseRecorder — which carries no read deadline at all, so nothing
+// the fix added was ever exercised and both passed against the code before it
+// (Astra r2 #7). They are replaced by a socket-level test, because a read
+// deadline is only real on a socket: see TestAWithheldBodyIsAnsweredAndClosed
+// and TestAConsumedBodyKeepsTheConnection in breakglass_astra2_test.go.
 
 // bgTLS is the marker net/http sets on a request that arrived over TLS. The
 // break-glass listener is TLS-only, and validOrigin checks the scheme.

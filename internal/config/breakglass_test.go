@@ -203,6 +203,17 @@ func TestTheStoredHashMustBeABcryptHash(t *testing.T) {
 		{"the right shape, the wrong content", "$2a$10$notarealhashbutlongenoughtolook", false},
 		{"cost 31", cost31, false},
 		{"cost 4", cost04, false},
+		// Astra r2 #4: bcrypt.Cost reads the HEADER and stops, so everything
+		// below parsed as a cost-10 hash and was accepted — then failed every
+		// comparison the operator ever made. The shape is checked structurally,
+		// without running one.
+		{"a valid header and 53 characters of nothing", "$2a$10$" + strings.Repeat("!", 53), false},
+		{"a valid header and a truncated tail", real10[:50], false},
+		{"a valid header and a long tail", real10 + "AAAA", false},
+		{"$2b$ is written by some implementations", "$2b$" + real10[4:], true},
+		{"$2y$ likewise", "$2y$" + real10[4:], true},
+		{"$2x$ is the broken variant", "$2x$" + real10[4:], false},
+		{"a standard-base64 character bcrypt never writes", real10[:59] + "+", false},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			cfg := Default()

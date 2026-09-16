@@ -26,7 +26,7 @@ import (
 // serves uploads, and a server-wide read timeout would cut them.
 func bgTLSServer(t *testing.T, s *Server) *httptest.Server {
 	t.Helper()
-	cert, err := breakglass.Ensure(tmpPath(t, "breakglass-cert.pem"), tmpPath(t, "breakglass-key.pem"), time.Now())
+	cert, err := breakglass.EnsureUsable(tmpPath(t, "breakglass-cert.pem"), tmpPath(t, "breakglass-key.pem"), time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}

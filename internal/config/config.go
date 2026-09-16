@@ -216,7 +216,13 @@ func Load(path string) (Config, error) { return LoadDev(path, false) }
 // "local" and "both" are accepted so the Windows dev loop can exercise the
 // local door without a QTS to talk to. Everything else is validated identically.
 // Production callers use Load.
-func LoadDev(path string, dev bool) (Config, error) {
+func LoadDev(path string, dev bool) (Config, error) { return loadFile(path, dev, false) }
+
+// loadFile is LoadDev with one extra knob, lenientHash, which skips the
+// validation of the credential keys and nothing else (Astra r2 #5). Only
+// UpdateCredential sets it; every other reader, the daemon included, loads
+// strictly.
+func loadFile(path string, dev, lenientHash bool) (Config, error) {
 	c := Default()
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -238,7 +244,7 @@ func LoadDev(path string, dev bool) (Config, error) {
 		return Config{}, fmt.Errorf("parsing %s: %w", path, err)
 	}
 	c.Normalize()
-	if err := c.ValidateDev(dev); err != nil {
+	if err := c.validate(dev, lenientHash); err != nil {
 		return Config{}, fmt.Errorf("%s: %w", path, err)
 	}
 	return c, nil
@@ -264,8 +270,26 @@ func (c Config) BreakGlassFiles(configPath string) (certFile, keyFile string) {
 	return certFile, keyFile
 }
 
+// BreakGlassExplicit reports whether the OPERATOR named the pair's location in
+// web.breakGlass.certFile/keyFile rather than letting it sit beside the config
+// file. It is what decides how far the loader checks what it opens: a location
+// this package's own installer owns is checked once, by the credential-store
+// guard; one the operator chose has its whole resolved ancestry walked
+// (Astra r2 #1, breakglass.Location).
+func (c Config) BreakGlassExplicit() bool {
+	return c.Web.BreakGlass.CertFile != "" || c.Web.BreakGlass.KeyFile != ""
+}
+
 // CheckBreakGlassKeyDir refuses an EXPLICIT key location whose parent directory
 // anyone but root can write (Astra r1 #9, narrowed).
+//
+// This is the PRE-FLIGHT, not the authority. It runs before anything is
+// generated, so the start-up log can name the directory and the fix in one
+// line; the check that actually governs the key the door serves is in the
+// loader, which resolves the path, walks the resolved ancestry and fstats the
+// descriptor it opened (Astra r2 #1). A lexical parent is not enough on its own:
+// a root-owned 0700 directory of root-owned symlinks into a user-writable share
+// passes this and is refused there.
 //
 // An explicit web.breakGlass.keyFile is accepted — an operator may have reasons
 // to put the pair somewhere else — but the directory it lives in decides who
@@ -335,6 +359,27 @@ func SaveDev(path string, c Config, dev bool) error {
 // dev selects the validation relaxations of LoadDev, because a daemon started
 // with -dev must still be able to save the file it started from (round-2 P3-6).
 func Update(path string, dev bool, change func(*Config) error) error {
+	return update(path, dev, false, change)
+}
+
+// UpdateCredential is Update for the two commands that exist to REPLACE the
+// break-glass credential — `break-glass set-password` and `break-glass disable`
+// (Astra r2 #5).
+//
+// It differs from Update in one way: the load is lenient about auth.local, so a
+// hash the daemon refuses (" ", a cost outside 10-15, a truncated tail) is not
+// what stops the command that would overwrite it. Everything else is identical,
+// the cross-process lock included, and SaveDev validates the RESULT strictly —
+// so nothing invalid is ever written, and the only thing leniency buys is a way
+// back out of a broken credential store without hand-editing the credential
+// store.
+func UpdateCredential(path string, dev bool, change func(*Config) error) error {
+	return update(path, dev, true, change)
+}
+
+// Update and UpdateCredential differ only in lenientHash; the lock, the load,
+// the change and the strict save are one sequence and must stay one.
+func update(path string, dev, lenientHash bool, change func(*Config) error) error {
 	release, err := Lock(path)
 	if err != nil {
 		if hint := lockHint(path); hint != "" {
@@ -343,7 +388,7 @@ func Update(path string, dev bool, change func(*Config) error) error {
 		return err
 	}
 	defer release()
-	c, err := LoadDev(path, dev)
+	c, err := loadFile(path, dev, lenientHash)
 	if err != nil {
 		return err
 	}

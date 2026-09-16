@@ -548,10 +548,20 @@ certificate and a running daemon binds the listener when a credential appears, s
     time, cost 11 — a few per second on NAS silicon) and each source's 10/min bucket. Against a 12-byte-minimum
     password that is hopeless; against a weak one the operator chose anyway, it is the residual. Every attempt is
     still a milestone, and a spray across sources is counted and reported (§5, the dropped-source summary).
-13. **Explicit certificate and key paths are the operator's** (Astra round 1 #9). The daemon refuses to arm when
-    the key's parent directory is group- or other-writable or not root-owned, and logs why; it does not otherwise
-    guard those locations, and an administrator who points the key at a share and then downloads it through the app
-    has only exercised the root they already had.
+13. **Explicit certificate and key paths are the operator's** (Astra round 1 #9, round 2 #1). The daemon refuses
+    to arm unless the pair it actually **loads** is root-owned with no group/other bits on the key and every
+    ancestor of the *resolved* path is root-owned and not group/other-writable — checked on the opened
+    descriptors, with `O_NOFOLLOW` on the final component, so a root-owned symlink into a share does not pass on
+    the strength of its own directory. It does not otherwise guard those locations, and an administrator who
+    points the key at a share and then downloads it through the app has only exercised the root they already had.
+    A refused arm is retried by the credential watcher on every tick (round 2 #2), so fixing the directory
+    recovers the listener without a restart.
+15. **The daemon never renews a certificate silently** (round 2 #3, superseding §3's "regenerated within 30
+    days"). Start-up and late-bind both serve the existing pair while it is valid and log an audited warning
+    inside the 30-day window — *run `break-glass cert -regenerate`* — so the fingerprint an operator was told to
+    compare changes only by their own act or by expiry. An expired or torn pair is unusable and is regenerated,
+    with the new fingerprint logged. A stored hash must be a complete bcrypt encoding — 60 bytes, `$2a$`/`$2b$`/
+    `$2y$`, cost in range, 53 base64 characters — not merely a parsable header (round 2 #4).
 14. **Sessionless denials on 8771 are throttled like refusals** (#3), so a flood of forged mutations shows as one
     line per source per window plus a summary, not as one line per packet — the operator sees that it happened and
     how often, not each packet.

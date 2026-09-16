@@ -678,7 +678,7 @@ func TestBreakGlassOverRealTLS(t *testing.T) {
 	dir := t.TempDir()
 	certFile := filepath.Join(dir, "breakglass-cert.pem")
 	keyFile := filepath.Join(dir, "breakglass-key.pem")
-	cert, err := breakglass.Ensure(certFile, keyFile, time.Now())
+	cert, err := breakglass.EnsureUsable(certFile, keyFile, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}

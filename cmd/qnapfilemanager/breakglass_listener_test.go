@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"errors"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -11,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -612,4 +615,296 @@ func mustListen(t *testing.T) net.Listener {
 	}
 	t.Cleanup(func() { _ = l.Close() })
 	return l
+}
+
+// --- Astra r2 #2: a refused arm is retried -----------------------------------
+
+// A strict-mode refusal used to be logged and returned as nil, so the watcher
+// recorded the hash as armed and never called arm again: fixing the directory
+// did nothing until the app was restarted, which is exactly the restart this
+// path exists to avoid. The refusal is now an error the watcher can tell from a
+// success, so the SAME hash is retried on the next tick.
+func TestARefusedArmIsRetriedAndArmsOnceTheReasonIsFixed(t *testing.T) {
+	srv, _, configPath, _ := armFixture(t, nil) // no password yet: pending
+	old := breakGlassWatchInterval
+	breakGlassWatchInterval = 5 * time.Millisecond
+	t.Cleanup(func() { breakGlassWatchInterval = old })
+
+	var mu sync.Mutex
+	refusing, arms := true, 0
+	realArm := armBreakGlassFn
+	t.Cleanup(func() { armBreakGlassFn = realArm })
+	armBreakGlassFn = func(s *server, f *web.Server, cfg config.Config, path string, lg *log.Logger) error {
+		mu.Lock()
+		arms++
+		refuse := refusing
+		mu.Unlock()
+		if refuse {
+			return fmt.Errorf("%w: %v", errArmRefused, errors.New("the break-glass key directory is group-writable"))
+		}
+		// Armed, but never on a LAN port: the address is the test's own.
+		s.bgHandler, s.bgCert, s.bgAddr = http.NotFoundHandler(), &tls.Certificate{}, "127.0.0.1:0"
+		return nil
+	}
+
+	hash, err := breakglass.Hash("a long enough password", breakglass.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := config.Update(configPath, false, func(c *config.Config) error {
+		c.Auth.Local.Hash = hash
+		c.Auth.Local.Cost = breakglass.MinCost
+		c.Auth.Local.Updated = "2026-09-17T09:00:00Z"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	frontend := web.New(srv.cfg, nil, nil, nil, nil, nil, "test", srv.logger, nil, nil, nil)
+	bound := make(chan struct{}, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		srv.watchForCredential(ctx, frontend, configPath, func(h *http.Server, l net.Listener) {
+			_ = l.Close()
+			bound <- struct{}{}
+		})
+	}()
+
+	// The hash never changes, so a second attempt can only come from the
+	// refusal not being recorded as an arm.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		mu.Lock()
+		n := arms
+		mu.Unlock()
+		if n >= 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the watcher stopped retrying after %d attempts; a refused arm was recorded as armed", n)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// The directory is fixed: the very next tick arms and binds, with no
+	// restart and no password change.
+	mu.Lock()
+	refusing = false
+	mu.Unlock()
+	select {
+	case <-bound:
+	case <-ctx.Done():
+		t.Fatal("the listener never bound after the reason was fixed")
+	}
+	cancel()
+	<-done
+}
+
+// The line is worth saying once, not once a minute: a key directory anyone can
+// write is a standing condition, and a daemon that repeats it every tick buries
+// the log of a NAS that is already in trouble. A reason that CHANGES is said
+// again.
+func TestARepeatedRefusalIsLoggedOncePerReason(t *testing.T) {
+	srv, _, configPath, logged := armFixture(t, nil)
+	old := breakGlassWatchInterval
+	breakGlassWatchInterval = 5 * time.Millisecond
+	t.Cleanup(func() { breakGlassWatchInterval = old })
+
+	var mu sync.Mutex
+	reason, arms := "the break-glass key directory is group-writable", 0
+	realArm := armBreakGlassFn
+	t.Cleanup(func() { armBreakGlassFn = realArm })
+	armBreakGlassFn = func(s *server, f *web.Server, cfg config.Config, path string, lg *log.Logger) error {
+		mu.Lock()
+		arms++
+		r := reason
+		mu.Unlock()
+		return fmt.Errorf("%w: %s", errArmRefused, r)
+	}
+	hash, err := breakglass.Hash("a long enough password", breakglass.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := config.Update(configPath, false, func(c *config.Config) error {
+		c.Auth.Local.Hash = hash
+		c.Auth.Local.Cost = breakglass.MinCost
+		c.Auth.Local.Updated = "2026-09-17T09:00:00Z"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	frontend := web.New(srv.cfg, nil, nil, nil, nil, nil, "test", srv.logger, nil, nil, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		srv.watchForCredential(ctx, frontend, configPath, func(*http.Server, net.Listener) {
+			t.Error("nothing should bind: every arm was refused")
+		})
+	}()
+	time.Sleep(150 * time.Millisecond)
+	mu.Lock()
+	reason = "the break-glass key directory is owned by uid 1000, not root"
+	mu.Unlock()
+	time.Sleep(150 * time.Millisecond)
+	cancel()
+	<-done
+
+	mu.Lock()
+	tries := arms
+	mu.Unlock()
+	if tries < 4 {
+		t.Fatalf("only %d arm attempts in 300ms; the retry is not running", tries)
+	}
+	out := logged.String()
+	if got := strings.Count(out, "group-writable"); got != 1 {
+		t.Fatalf("the first reason was logged %d times, want once:\n%s", got, out)
+	}
+	if got := strings.Count(out, "owned by uid 1000"); got != 1 {
+		t.Fatalf("the second reason was logged %d times, want once:\n%s", got, out)
+	}
+}
+
+// The other half of #2: armBreakGlass itself reports a strict-mode refusal as
+// errArmRefused. It is a REFUSAL, not a fatal error — the daemon starts, the
+// main listener and the QTS door are unaffected — and not a nil either, which
+// is what let the watcher record the hash as armed and stop trying.
+func TestAnUnsafeExplicitKeyLocationRefusesTheArm(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("directory ownership and POSIX modes are a Linux question (contract §15)")
+	}
+	dir := t.TempDir()
+	loose := filepath.Join(dir, "loose")
+	if err := os.Mkdir(loose, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(loose, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	hash, err := breakglass.Hash("a long enough password", breakglass.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(dir, "config.json")
+	cfg := config.Default()
+	cfg.Auth.Local = config.Local{Hash: hash, Cost: breakglass.MinCost, Updated: "2026-09-17T09:00:00Z"}
+	cfg.Web.BreakGlass.CertFile = filepath.Join(loose, "breakglass-cert.pem")
+	cfg.Web.BreakGlass.KeyFile = filepath.Join(loose, "breakglass-key.pem")
+	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+	var logged bytes.Buffer
+	logger := log.New(&logged, "", 0)
+	srv := &server{cfg: cfg, logger: logger}
+	frontend := web.New(cfg, nil, nil, nil, nil, nil, "test", logger, nil, nil, nil)
+	err = armBreakGlass(srv, frontend, cfg, configPath, logger)
+	if !errors.Is(err, errArmRefused) {
+		t.Fatalf("armBreakGlass = %v, want errArmRefused", err)
+	}
+	if srv.bgHandler != nil || srv.bgCert != nil {
+		t.Fatalf("the door was armed over a refused location: %+v", srv)
+	}
+	// And nothing was published into it: generating a key there would hand it
+	// to whoever can write there.
+	if _, err := os.Stat(cfg.Web.BreakGlass.KeyFile); !os.IsNotExist(err) {
+		t.Fatalf("a key was generated into the refused directory (%v)", err)
+	}
+}
+
+// --- Astra r2 #3: the daemon never renews silently ---------------------------
+
+// A pair inside its 30-day window is SERVED, not replaced, and the daemon says
+// how many days are left. An operator is told to compare this fingerprint
+// against the browser's warning; a restart that changed it under them would
+// teach them that a changed fingerprint is normal.
+func TestAnExpiringCertificateIsServedWithAWarning(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.json")
+	hash, err := breakglass.Hash("a long enough password", breakglass.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.Auth.Local = config.Local{Hash: hash, Cost: breakglass.MinCost, Updated: "2026-09-17T09:00:00Z"}
+	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+	certFile, keyFile := cfg.BreakGlassFiles(configPath)
+	// Ten days left: deep inside the renewal window.
+	expiring, err := breakglass.Regenerate(certFile, keyFile, time.Now().Add(-breakglass.Validity+10*24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var logged bytes.Buffer
+	logger := log.New(&logged, "", 0)
+	srv := &server{cfg: cfg, logger: logger}
+	frontend := web.New(cfg, nil, nil, nil, nil, nil, "test", logger, nil, nil, nil)
+	if err := armBreakGlass(srv, frontend, cfg, configPath, logger); err != nil {
+		t.Fatalf("armBreakGlass: %v", err)
+	}
+	served, err := breakglass.Load(certFile, keyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if served.Fingerprint != expiring.Fingerprint {
+		t.Fatalf("the daemon renewed an expiring certificate: %s -> %s", expiring.Fingerprint, served.Fingerprint)
+	}
+	out := logged.String()
+	if !strings.Contains(out, "expires in 9 days") && !strings.Contains(out, "expires in 10 days") {
+		t.Fatalf("the warning must say how long is left:\n%s", out)
+	}
+	if !strings.Contains(out, "cert -regenerate") {
+		t.Fatalf("the warning must name the command that rotates it:\n%s", out)
+	}
+	if strings.Contains(out, "was generated") {
+		t.Fatalf("an expiring certificate was reported as generated:\n%s", out)
+	}
+}
+
+// An EXPIRED pair is a different thing: no browser will open that door at all,
+// so it is replaced and the new fingerprint is logged like every other
+// generation.
+func TestAnExpiredCertificateIsRegenerated(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.json")
+	hash, err := breakglass.Hash("a long enough password", breakglass.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.Auth.Local = config.Local{Hash: hash, Cost: breakglass.MinCost, Updated: "2026-09-17T09:00:00Z"}
+	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+	certFile, keyFile := cfg.BreakGlassFiles(configPath)
+	dead, err := breakglass.Regenerate(certFile, keyFile, time.Now().Add(-breakglass.Validity-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var logged bytes.Buffer
+	logger := log.New(&logged, "", 0)
+	srv := &server{cfg: cfg, logger: logger}
+	frontend := web.New(cfg, nil, nil, nil, nil, nil, "test", logger, nil, nil, nil)
+	if err := armBreakGlass(srv, frontend, cfg, configPath, logger); err != nil {
+		t.Fatalf("armBreakGlass: %v", err)
+	}
+	fresh, err := breakglass.Load(certFile, keyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh.Fingerprint == dead.Fingerprint {
+		t.Fatal("an expired certificate was served unchanged")
+	}
+	out := logged.String()
+	if !strings.Contains(out, "was generated (expired)") {
+		t.Fatalf("the log must say the pair was replaced and why:\n%s", out)
+	}
+	if !strings.Contains(out, fresh.Fingerprint) {
+		t.Fatalf("the new fingerprint is not in the log:\n%s", out)
+	}
 }

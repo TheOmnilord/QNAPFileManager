@@ -174,13 +174,21 @@ func TestBreakGlassSignInFlow(t *testing.T) {
 // just disabled. The toggle now reads the file, changes ReadOnly, and writes
 // that back.
 func TestReadOnlyToggleDoesNotClobberTheCredential(t *testing.T) {
+	// A REAL hash, not a hand-written lookalike: since Astra r2 #4 the config is
+	// validated for the whole bcrypt shape, and a fixture that could never have
+	// been written by `break-glass set-password` is not the state this test is
+	// about.
+	written, err := breakglass.Hash("a long enough password", breakglass.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, c := range []struct {
 		name  string
 		edit  func(*config.Config)
 		check func(*testing.T, config.Local)
 	}{
 		{"a password set after the daemon started", func(cfg *config.Config) {
-			cfg.Auth.Local = config.Local{Hash: "$2a$10$externally.written.hash.value.aaaaaaaaaaaaaaaaaaaaaaaa", Cost: 10, Updated: "2026-09-14T09:00:00Z"}
+			cfg.Auth.Local = config.Local{Hash: written, Cost: breakglass.MinCost, Updated: "2026-09-14T09:00:00Z"}
 		}, func(t *testing.T, got config.Local) {
 			if got.Hash == "" || got.Updated != "2026-09-14T09:00:00Z" {
 				t.Fatalf("the externally written credential was lost: %+v", got)
@@ -242,7 +250,7 @@ func TestSlowLoginBodiesDoNotHoldAdmissionSlots(t *testing.T) {
 	// test that waited ten real seconds four times over would not be run.
 	s.BreakGlassGate().Floor = -1
 
-	cert, err := breakglass.Ensure(
+	cert, err := breakglass.EnsureUsable(
 		tmpPath(t, "breakglass-cert.pem"), tmpPath(t, "breakglass-key.pem"), time.Now())
 	if err != nil {
 		t.Fatal(err)

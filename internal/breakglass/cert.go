@@ -12,6 +12,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"os"
@@ -20,17 +21,39 @@ import (
 	"time"
 )
 
-// Certificate lifetime (M4 contract §3.2).
+// Certificate lifetime (M4 contract §3.2, amended by Astra r2 #3).
 //
 // 397 days, not ten years: Apple's 398-day ceiling makes a long-lived
 // certificate one that Safari may simply refuse, and an emergency door one
-// family of browsers cannot open is not an emergency door. The daemon
-// regenerates inside RenewWithin of expiry at start-up, in the process that is
-// already running, so it costs the operator nothing.
+// family of browsers cannot open is not an emergency door.
+//
+// RenewWithin is a WARNING window, not a renewal one: the daemon never rotates
+// this pair by itself. An operator is told to compare a fingerprint against the
+// browser's warning before typing the emergency password, and a daemon that
+// changes that fingerprint on a restart nobody connected to the change teaches
+// them that a changed fingerprint is normal — which is the one lesson this door
+// must never teach. Inside the window the daemon says how many days are left
+// and names `break-glass cert -regenerate`; the operator rotates when they are
+// ready to compare the new one. An EXPIRED pair is different: no browser will
+// open that door at all, so it is worth nothing and is replaced, loudly.
 const (
 	Validity    = 397 * 24 * time.Hour
 	RenewWithin = 30 * 24 * time.Hour
 )
+
+// maxPEMBytes bounds what the loader reads from either half of the pair. A key
+// pair is a couple of kilobytes; this is what stops a file that has become
+// something else — a log, a device, a mistake — from being read into the memory
+// of a root daemon at start-up.
+const maxPEMBytes = 1 << 20
+
+// treeTop bounds the ancestor walk of an explicit location. It is empty in
+// production, which means the walk runs to the filesystem root. A test sets it
+// to its own temporary root: /tmp is mode 1777 on every Linux box, so nothing
+// under it can ever pass a rule whose whole point is that nobody but root may
+// write any ancestor, and a rule that can only be tested by its refusals is a
+// rule that is half tested. Nothing reads it from a goroutine.
+var treeTop = ""
 
 // HostnameFile is where the certificate's primary DNS SAN comes from. It is a
 // variable so a test can point it at a fixture instead of the host's own name.
@@ -63,9 +86,42 @@ type Cert struct {
 // that torn state self-heal at the next start (round-5).
 var ErrPairMismatch = errors.New("breakglass: the certificate and key on disk are not a pair")
 
-// Ensure loads the certificate at certFile/keyFile, generating a new one when
-// it is absent, unreadable, mismatched, or within RenewWithin of expiry. now is
-// the clock seam: production passes time.Now().
+// ErrUnsafeLocation is a pair the kernel says somebody other than root can
+// replace: a key owned by another uid, a key group or other can read, a
+// non-regular file where a key should be, or — for a location the operator
+// named — an ancestor directory that is not root-owned or that group or other
+// can write (Astra r2 #1).
+//
+// It is never healed by generating a new pair. Writing a fresh private key into
+// a directory somebody else can write would hand them that key; the door stays
+// shut, and the log says which path and why.
+var ErrUnsafeLocation = errors.New("breakglass: the key pair location is not root-only")
+
+// Location is where the pair lives, and how far the loader checks what it
+// opens.
+//
+// Explicit marks a location the OPERATOR named in web.breakGlass.certFile /
+// keyFile rather than the QPKG's own config directory. That is the case whose
+// whole resolved ancestry is walked. The default location is created and
+// tightened by package_routines and checked by the CLI's own credential-store
+// guard whenever it writes a credential; checking it twice, with two sets of
+// rules, is how the two come to disagree (Astra r1 #9, kept). A location the
+// operator chose has no such owner — and its lexical parent says almost
+// nothing, because a root-owned 0700 directory of root-owned SYMLINKS into a
+// share anybody can write passes a parent check and still hands over the key
+// (Astra r2 #1).
+type Location struct {
+	CertFile string
+	KeyFile  string
+	Explicit bool
+}
+
+// EnsureUsable generates a pair only when there is not a usable one already:
+// absent, unreadable, torn between the two renames, or expired. A certificate
+// inside its renewal window is left exactly where it is and the caller warns
+// about it — nothing here rotates a fingerprint an operator has been told to
+// compare (Astra r1 #16, Astra r2 #3). now is the clock seam: production passes
+// time.Now().
 //
 // Both files are written at 0600 and their directory is created at 0700. The
 // mode is approximate on Windows, which is why the mode assertion is a
@@ -78,33 +134,22 @@ var ErrPairMismatch = errors.New("breakglass: the certificate and key on disk ar
 // NAS) around the call. The self-heal below is what covers a crash between the
 // two renames; the lock is what stops two live writers producing that state in
 // the first place.
-func Ensure(certFile, keyFile string, now time.Time) (Cert, error) {
-	return ensure(certFile, keyFile, now, true)
-}
-
-// EnsureUsable generates a pair only when there is not a usable one already:
-// absent, unreadable, or torn between the two renames. A certificate inside its
-// renewal window is left exactly where it is.
-//
-// It exists for `break-glass set-password` (Astra r1 #16). That command called
-// Ensure, which renews — so an operator setting a password on a unit whose
-// certificate happened to be 20 days from expiry got a NEW fingerprint printed
-// with the instruction to compare it in the browser, while the running daemon
-// went on serving the old pair. The operator then compares two different
-// fingerprints and concludes, correctly by every rule the documentation gave
-// them, that they are being intercepted. Renewal belongs to the daemon's own
-// start-up and to `cert -regenerate`, both of which say a restart is involved.
 func EnsureUsable(certFile, keyFile string, now time.Time) (Cert, error) {
-	return ensure(certFile, keyFile, now, false)
+	return Location{CertFile: certFile, KeyFile: keyFile}.EnsureUsable(now)
 }
 
-func ensure(certFile, keyFile string, now time.Time, renew bool) (Cert, error) {
-	if certFile == "" || keyFile == "" {
+// EnsureUsable is EnsureUsable for a location the operator may have named. The
+// strict checks of an explicit location are refusals, never reasons to
+// generate: see ErrUnsafeLocation.
+func (l Location) EnsureUsable(now time.Time) (Cert, error) {
+	if l.CertFile == "" || l.KeyFile == "" {
 		return Cert{}, fmt.Errorf("breakglass: certificate paths are empty")
 	}
 	reason := ""
-	loaded, err := load(certFile, keyFile)
+	loaded, err := l.Load()
 	switch {
+	case errors.Is(err, ErrUnsafeLocation):
+		return Cert{}, err
 	case err != nil && os.IsNotExist(err):
 		reason = "absent"
 	case errors.Is(err, ErrPairMismatch):
@@ -115,12 +160,15 @@ func ensure(certFile, keyFile string, now time.Time, renew bool) (Cert, error) {
 		reason = "mismatched"
 	case err != nil:
 		reason = "unreadable"
-	case renew && !now.Add(RenewWithin).Before(loaded.NotAfter):
-		reason = "expiring"
+	case !now.Before(loaded.NotAfter):
+		// EXPIRED, not expiring. A certificate no browser will accept opens
+		// nothing, so replacing it costs the operator nothing either — and the
+		// new fingerprint is logged and audited like every other generation.
+		reason = "expired"
 	default:
 		return loaded, nil
 	}
-	generated, err := generate(certFile, keyFile, now)
+	generated, err := l.generate(now)
 	if err != nil {
 		return Cert{}, err
 	}
@@ -132,7 +180,12 @@ func ensure(certFile, keyFile string, now time.Time, renew bool) (Cert, error) {
 // `break-glass cert -regenerate` calls after an IP change or a suspected key
 // compromise.
 func Regenerate(certFile, keyFile string, now time.Time) (Cert, error) {
-	c, err := generate(certFile, keyFile, now)
+	return Location{CertFile: certFile, KeyFile: keyFile}.Regenerate(now)
+}
+
+// Regenerate is Regenerate for a location the operator may have named.
+func (l Location) Regenerate(now time.Time) (Cert, error) {
+	c, err := l.generate(now)
 	if err != nil {
 		return Cert{}, err
 	}
@@ -143,14 +196,17 @@ func Regenerate(certFile, keyFile string, now time.Time) (Cert, error) {
 // Load reads an existing certificate without generating anything. It is what
 // `break-glass status` uses: reporting a fingerprint must never be the thing
 // that changes it.
-func Load(certFile, keyFile string) (Cert, error) { return load(certFile, keyFile) }
+func Load(certFile, keyFile string) (Cert, error) {
+	return Location{CertFile: certFile, KeyFile: keyFile}.Load()
+}
 
-func load(certFile, keyFile string) (Cert, error) {
-	certPEM, err := os.ReadFile(certFile)
+// Load is Load for a location the operator may have named.
+func (l Location) Load() (Cert, error) {
+	certPEM, err := l.read(l.CertFile, false)
 	if err != nil {
 		return Cert{}, err
 	}
-	keyPEM, err := os.ReadFile(keyFile)
+	keyPEM, err := l.read(l.KeyFile, true)
 	if err != nil {
 		return Cert{}, err
 	}
@@ -158,26 +214,74 @@ func load(certFile, keyFile string) (Cert, error) {
 	// unreadable rather than as a mismatch: the two are different events and the
 	// start-up log should not conflate them. A malformed KEY still surfaces as a
 	// mismatch below, because a pair that cannot be verified is not a pair — and
-	// either way Ensure regenerates.
+	// either way EnsureUsable regenerates.
 	block, _ := pem.Decode(certPEM)
 	if block == nil || block.Type != "CERTIFICATE" {
-		return Cert{}, fmt.Errorf("breakglass: %s is not a PEM certificate", certFile)
+		return Cert{}, fmt.Errorf("breakglass: %s is not a PEM certificate", l.CertFile)
 	}
 	leaf, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
-		return Cert{}, fmt.Errorf("breakglass: parsing %s: %w", certFile, err)
+		return Cert{}, fmt.Errorf("breakglass: parsing %s: %w", l.CertFile, err)
 	}
 	// X509KeyPair is what verifies that the private key really belongs to the
 	// certificate's public key — the check a torn publication fails.
 	pair, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
-		return Cert{}, fmt.Errorf("%w (%s): %v", ErrPairMismatch, certFile, err)
+		return Cert{}, fmt.Errorf("%w (%s): %v", ErrPairMismatch, l.CertFile, err)
 	}
 	if len(pair.Certificate) == 0 {
-		return Cert{}, fmt.Errorf("breakglass: %s holds no certificate", certFile)
+		return Cert{}, fmt.Errorf("breakglass: %s holds no certificate", l.CertFile)
 	}
 	pair.Leaf = leaf
 	return Cert{TLS: &pair, Fingerprint: Fingerprint(pair.Certificate[0]), NotAfter: leaf.NotAfter}, nil
+}
+
+// read opens one half of the pair and asks the KERNEL about the file it
+// actually opened (Astra r2 #1).
+//
+// The path is resolved first, so the ancestry that is checked is the ancestry
+// the bytes really come from and not the one the config file spells — a
+// root-owned 0700 directory of symlinks into a share anybody can write is
+// exactly what the old lexical parent check could not see. The final open is
+// O_NOFOLLOW on the RESOLVED path, so a link swapped in between resolving and
+// opening is refused rather than followed, and the mode and owner come from
+// fstat(2) on the descriptor that was opened rather than from a second lookup
+// of a name that may by then mean something else.
+func (l Location) read(path string, isKey bool) ([]byte, error) {
+	if path == "" {
+		return nil, fmt.Errorf("breakglass: certificate paths are empty")
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		// An absent file stays an absent file: EnsureUsable reads ENOENT as
+		// "absent" and generates.
+		return nil, err
+	}
+	if l.Explicit {
+		if err := treeStrict(resolved); err != nil {
+			return nil, err
+		}
+	}
+	f, err := openNoFollow(resolved)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if err := fileStrict(fi, resolved, isKey); err != nil {
+		return nil, err
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxPEMBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxPEMBytes {
+		return nil, fmt.Errorf("breakglass: %s is larger than %d bytes, so it is not a key pair", path, maxPEMBytes)
+	}
+	return data, nil
 }
 
 // Fingerprint is the SHA-256 of a DER certificate as lowercase hex.
@@ -186,7 +290,20 @@ func Fingerprint(der []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func generate(certFile, keyFile string, now time.Time) (Cert, error) {
+func (l Location) generate(now time.Time) (Cert, error) {
+	if l.Explicit {
+		// Checked before the pair exists, too. An absent file resolves to
+		// nothing, so the ancestry the loader walks has nothing to walk yet —
+		// and the moment that matters most is this one: publishing a fresh
+		// private key into a directory somebody else can write hands them the
+		// key (Astra r2 #1).
+		if err := treeStrict(l.KeyFile); err != nil {
+			return Cert{}, err
+		}
+		if err := treeStrict(l.CertFile); err != nil {
+			return Cert{}, err
+		}
+	}
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return Cert{}, fmt.Errorf("breakglass: generating a key: %w", err)
@@ -230,12 +347,12 @@ func generate(certFile, keyFile string, now time.Time) (Cert, error) {
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
 
 	// The key is written before the certificate and both at 0600: a reader that
-	// catches the pair half-written sees an unusable pair (Ensure regenerates),
-	// never a certificate with a world-readable key beside it.
-	if err := writePrivate(keyFile, keyPEM); err != nil {
+	// catches the pair half-written sees an unusable pair (EnsureUsable
+	// regenerates), never a certificate with a world-readable key beside it.
+	if err := writePrivate(l.KeyFile, keyPEM); err != nil {
 		return Cert{}, err
 	}
-	if err := writePrivate(certFile, certPEM); err != nil {
+	if err := writePrivate(l.CertFile, certPEM); err != nil {
 		return Cert{}, err
 	}
 	pair, err := tls.X509KeyPair(certPEM, keyPEM)

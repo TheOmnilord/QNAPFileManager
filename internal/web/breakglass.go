@@ -128,10 +128,15 @@ type breakGlassDoor struct {
 	// Guarded by mu; bounded by breakglass.MaxSources, exactly as the bucket is.
 	refusals map[string]*refusalState
 	// dropped counts refusals that could not even be tracked because the table
-	// was full, and droppedAt rate-bounds the line that reports them. Guarded
-	// by mu.
-	dropped   int
-	droppedAt time.Time
+	// was full, and droppedAt rate-bounds the line that reports them. Both are
+	// keyed BY EVENT SHAPE (Astra r2 #6): a refused login and a sessionless
+	// mutation denial are different events, and one shared counter would have to
+	// pick a single shape for a mixed flood — which for the sessionless half
+	// means reporting it as an authenticated root administrator. Two counters is
+	// the smaller change of the two on offer and it cannot misreport at all.
+	// Guarded by mu.
+	dropped   [refusalShapes]int
+	droppedAt [refusalShapes]time.Time
 
 	// bcryptTime is one verification's measured cost on this machine, taken
 	// once in EnableBreakGlass and never written again — so doorTimeout reads
@@ -245,6 +250,21 @@ func (s *Server) BreakGlassHandler() http.Handler {
 // written without reading it.
 const bgDrainDeadline = 5 * time.Second
 
+// bgReadDeadlineCap clamps every body-read deadline armed through the refusal
+// wrapper, and is ZERO in production, which means no clamp at all: the handler's
+// own bound — jsonBodyRead on the JSON routes, bgLoginRead at the door — is what
+// applies, unchanged.
+//
+// It exists for one test (Astra r2 #7). The unfinished-drain behaviour is only
+// real on a socket: httptest's recorder carries no read deadline, so a test
+// driving the handler directly asserts nothing about it and passes against code
+// that never armed one. A socket-level test has to hold a real connection open
+// until the deadline fires, and the production bound for that is fifteen
+// seconds — long enough that the test would be one nobody runs. The seam is a
+// package-level var rather than a parameter because the deadline is armed in
+// decodeBody, which this door does not own.
+var bgReadDeadlineCap time.Duration
+
 // bodyState says whether a declared request body is still unread. It is touched
 // only from the request's own goroutine — the reader and the ResponseWriter are
 // both used by the handler, never by anything else — so it needs no lock.
@@ -306,8 +326,10 @@ func (w *bgRefusal) WriteHeader(code int) {
 		w.Header().Set("Connection", "close")
 		// Armed BEFORE the status is written: once WriteHeader returns, the
 		// drain may already be in progress, and a deadline set afterwards would
-		// be a deadline on a read that is already blocked.
-		_ = http.NewResponseController(w.ResponseWriter).SetReadDeadline(time.Now().Add(bgDrainDeadline))
+		// be a deadline on a read that is already blocked. Through this wrapper's
+		// own method, so the one clamp below covers every deadline this listener
+		// arms rather than most of them.
+		_ = w.SetReadDeadline(time.Now().Add(bgDrainDeadline))
 	}
 	w.ResponseWriter.WriteHeader(code)
 }
@@ -363,6 +385,20 @@ func markBodyUnconsumed(w http.ResponseWriter) {
 // listener — the login body read included — answers ErrNotSupported and does
 // nothing at all.
 func (w *bgRefusal) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+// SetReadDeadline is what http.ResponseController finds on this wrapper before
+// it unwraps any further, so EVERY read deadline armed on this listener — the
+// door's own body read, decodeBody's decode and drain, the drain bound above —
+// passes through here. It forwards unchanged unless bgReadDeadlineCap has been
+// shortened, which only a test does; see the note on that variable.
+func (w *bgRefusal) SetReadDeadline(t time.Time) error {
+	if limit := bgReadDeadlineCap; limit > 0 && !t.IsZero() {
+		if capped := time.Now().Add(limit); capped.Before(t) {
+			t = capped
+		}
+	}
+	return http.NewResponseController(w.ResponseWriter).SetReadDeadline(t)
+}
 
 // --- the credential ----------------------------------------------------------
 
@@ -1028,17 +1064,86 @@ func (d *breakGlassDoor) reject(ctx context.Context, w http.ResponseWriter, r *h
 // operator sees lines up with the budget that produced it.
 const refusalWindow = breakglass.BucketWindow
 
+// refusalShape is WHAT a throttled refusal is, and therefore what shape every
+// line about it has to be written in (Astra r2 #6).
+//
+// The throttle counts two quite different events. A refused LOGIN is an event of
+// the door itself, and d.audit stamps it with the door's actor: break-glass, UID
+// 0, admin, root. A SESSIONLESS mutation denial is the opposite — nobody
+// authenticated, there is no actor at all, and auditUnauthenticated records the
+// listener's door and the path instead. The per-source line already told them
+// apart; the AGGREGATE lines did not, and wrote both through d.audit. So a spray
+// of cookie-less POSTs from more sources than the table can hold was reported as
+// a root administrator being refused, which is the one thing that had not
+// happened.
+type refusalShape uint8
+
+const (
+	// refusalLogin: an attempt at the door itself was refused.
+	refusalLogin refusalShape = iota
+	// refusalSessionless: an unsafe request to a mutation route arrived with no
+	// session at all.
+	refusalSessionless
+	// refusalShapes is how many there are, so the overflow counters above can be
+	// keyed by shape.
+	refusalShapes
+)
+
+// refusalEvent is the line one refusal would write: its shape, and the audit
+// vocabulary that goes with it. It is carried into the counters so every summary
+// is written in the shape of what it counts.
+type refusalEvent struct {
+	shape refusalShape
+	op    string // the audit Op — refusalLogin only; the other shape has its own
+	code  string
+}
+
+// summary is the event an AGGREGATE line for this shape is written as. Both
+// aggregates — the untracked-source count and the flush summary — are rate
+// reports about a burst rather than a report of one particular refusal, so
+// neither carries the individual refusal's code.
+func (s refusalShape) summary() refusalEvent {
+	if s == refusalSessionless {
+		return refusalEvent{shape: refusalSessionless, code: "unauthorized"}
+	}
+	return refusalEvent{shape: refusalLogin, op: "breakglass-login", code: "rate_limited"}
+}
+
+// writeRefusal writes one line in its event's own shape — the single place that
+// knows how each shape is recorded, so a new caller cannot reach for d.audit and
+// silently give a sessionless event the door's root-administrator actor.
+func (d *breakGlassDoor) writeRefusal(r *http.Request, ev refusalEvent, detail string) {
+	if ev.shape == refusalSessionless {
+		// auditUnauthenticated reads the request for the peer and the path, so a
+		// sessionless line with no request to read is dropped rather than written
+		// in the other shape. Nothing reaches it that way today: both callers of
+		// this shape are on a request goroutine.
+		if d.srv == nil || r == nil {
+			return
+		}
+		d.srv.auditUnauthenticated(r, ev.code, detail)
+		return
+	}
+	d.audit(r, ev.op, "denied", ev.code, detail)
+}
+
 type refusalState struct {
 	opened     time.Time
 	suppressed int
+	// shape is what the SUMMARY for this window will be written as (Astra r2 #6).
+	// It starts as the shape that opened the window and only ever moves towards
+	// refusalSessionless: a window that counted even one sessionless denial must
+	// not be summarised as an authenticated root administrator being refused,
+	// whereas the reverse — a login refusal summarised in the actor-less shape —
+	// is merely less specific, and true either way, because nobody has
+	// authenticated at this door on either path.
+	shape refusalShape
 }
 
 // noteRefusal writes at most one audit line per source per refusalWindow and
 // counts the rest, in the door's own event shape.
 func (d *breakGlassDoor) noteRefusal(r *http.Request, ip, op, code, detail string) {
-	d.noteRefusalEvent(r, ip, detail, func(detail string) {
-		d.audit(r, op, "denied", code, detail)
-	})
+	d.noteRefusalEvent(r, ip, detail, refusalEvent{shape: refusalLogin, op: op, code: code})
 }
 
 // noteUnauthenticated is the same throttle over a SESSIONLESS denial (Astra r1
@@ -1051,18 +1156,17 @@ func (d *breakGlassDoor) noteUnauthenticated(r *http.Request) {
 		return
 	}
 	ip := peerHost(r)
-	d.noteRefusalEvent(r, ip, "no valid session on a mutation route", func(detail string) {
-		d.srv.auditUnauthenticated(r, "unauthorized", detail)
-	})
+	d.noteRefusalEvent(r, ip, "no valid session on a mutation route", refusalEvent{shape: refusalSessionless, code: "unauthorized"})
 }
 
 // noteRefusalEvent is the throttle itself: at most one line per source per
 // refusalWindow, the rest counted and carried into the next one. The tracking
 // table is bounded exactly as the source bucket is, so a spray from many
-// sources can neither grow memory nor buy extra lines. write builds the line —
-// a login refusal and a sessionless mutation denial are different events and
-// must not be made to look alike.
-func (d *breakGlassDoor) noteRefusalEvent(r *http.Request, ip, detail string, write func(detail string)) {
+// sources can neither grow memory nor buy extra lines. ev carries the event's
+// SHAPE as well as its vocabulary — a login refusal and a sessionless mutation
+// denial are different events and must not be made to look alike, on the
+// per-source line or on either of the aggregates (Astra r2 #6).
+func (d *breakGlassDoor) noteRefusalEvent(r *http.Request, ip, detail string, ev refusalEvent) {
 	now := d.now()
 	d.mu.Lock()
 	if d.refusals == nil {
@@ -1071,6 +1175,13 @@ func (d *breakGlassDoor) noteRefusalEvent(r *http.Request, ip, detail string, wr
 	state := d.refusals[ip]
 	if state != nil && now.Sub(state.opened) < refusalWindow {
 		state.suppressed++
+		// One sessionless denial anywhere in the window fixes the summary's
+		// shape, as refusalState.shape explains: the summary is written once for
+		// everything the window counted, and it must not describe a sessionless
+		// flood as the door refusing an authenticated root administrator.
+		if ev.shape == refusalSessionless {
+			state.shape = refusalSessionless
+		}
 		d.mu.Unlock()
 		return
 	}
@@ -1097,32 +1208,48 @@ func (d *breakGlassDoor) noteRefusalEvent(r *http.Request, ip, detail string, wr
 		// unbounded, so they are COUNTED and reported periodically instead
 		// (round-2 P3-11). Dropping them silently would make the loudest
 		// possible event the one the log says least about.
-		d.dropped++
-		dropped := d.dropped
-		report := d.droppedAt.IsZero() || now.Sub(d.droppedAt) >= refusalWindow
+		//
+		// Counted PER SHAPE, and reported in that shape (Astra r2 #6). This is
+		// the branch a distributed flood actually lands in — 257 sources is all
+		// it takes — so it is the branch where getting the shape wrong matters
+		// most: a spray of cookie-less POSTs is exactly the sessionless case, and
+		// one shared counter reported the whole of it as a break-glass login
+		// refusal by the root administrator account.
+		d.dropped[ev.shape]++
+		dropped := d.dropped[ev.shape]
+		report := d.droppedAt[ev.shape].IsZero() || now.Sub(d.droppedAt[ev.shape]) >= refusalWindow
 		if report {
-			d.droppedAt, d.dropped = now, 0
+			d.droppedAt[ev.shape], d.dropped[ev.shape] = now, 0
 		}
 		d.mu.Unlock()
 		if report {
-			d.audit(r, "breakglass-login", "denied", "rate_limited",
+			d.writeRefusal(r, ev.shape.summary(),
 				fmt.Sprintf("door=local %d refusals from untracked sources; the %d-source table is full", dropped, breakglass.MaxSources))
 		}
 		return
 	}
-	carried := 0
+	carried, previous := 0, ev.shape
 	if state == nil {
 		state = &refusalState{}
 		d.refusals[ip] = state
 	} else {
-		carried = state.suppressed
+		carried, previous = state.suppressed, state.shape
 	}
-	state.opened, state.suppressed = now, 0
+	state.opened, state.suppressed, state.shape = now, 0, ev.shape
 	d.mu.Unlock()
+	line := ev
 	if carried > 0 {
 		detail = fmt.Sprintf("%s (%d further refusals suppressed in the previous window)", detail, carried)
+		// The carried count belongs to the window that just closed, not to this
+		// refusal, so the line that reports it obeys the same rule as every other
+		// summary (Astra r2 #6): a count of sessionless denials is never written
+		// in the door's authenticated shape. When the two agree — which is the
+		// ordinary case, a source doing one thing repeatedly — nothing changes.
+		if previous == refusalSessionless && ev.shape != refusalSessionless {
+			line = refusalSessionless.summary()
+		}
 	}
-	write(detail)
+	d.writeRefusal(r, line, detail)
 }
 
 // flushRefusals writes the one summary line a source earns when it comes back
@@ -1141,11 +1268,17 @@ func (d *breakGlassDoor) flushRefusals(r *http.Request, ip string) {
 		d.mu.Unlock()
 		return
 	}
-	suppressed := state.suppressed
+	suppressed, shape := state.suppressed, state.shape
 	delete(d.refusals, ip)
 	d.mu.Unlock()
 	if suppressed > 0 {
-		d.audit(r, "breakglass-login", "denied", "rate_limited",
+		// In the shape of what the window COUNTED, not of the login that happens
+		// to be collecting it (Astra r2 #6). Only a login reaches this function,
+		// so writing the summary through d.audit gave every flush the door's
+		// root-administrator actor — including the flush of a window that held
+		// nothing but sessionless mutation denials from a host that had not
+		// authenticated and was not trying to.
+		d.writeRefusal(r, shape.summary(),
 			fmt.Sprintf("door=local ip=%s %d further refusals suppressed; the source is inside its budget again", ip, suppressed))
 	}
 }

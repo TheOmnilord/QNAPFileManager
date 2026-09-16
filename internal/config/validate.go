@@ -25,7 +25,19 @@ func (c Config) Validate() error { return c.ValidateDev(false) }
 // contract: auth.mode may be "local" or "both" (§2.2), which exist only for the
 // Windows dev loop. The loopback rule on web.listen is NOT relaxed — there is
 // no override key for it anywhere, in any mode (§13.1).
-func (c Config) ValidateDev(dev bool) error {
+func (c Config) ValidateDev(dev bool) error { return c.validate(dev, false) }
+
+// validate's lenientHash skips the checks on auth.local.hash, and nothing else.
+// It exists for the two commands whose whole purpose is to REPLACE that key
+// (Astra r2 #5): with a rejected hash on disk — " ", a cost of 31, a truncated
+// tail — `break-glass set-password` and `break-glass disable` failed on the
+// load, before they could write the value that would have fixed it, so the one
+// documented way out of a broken credential was to hand-edit the credential
+// store of a NAS the operator may already be locked out of. They load
+// leniently and the RESULT is validated strictly on the way out, which is where
+// it matters: nothing invalid is ever written, and the daemon's own load is
+// unchanged.
+func (c Config) validate(dev, lenientHash bool) error {
 	var problems []string
 	add := func(format string, args ...any) {
 		problems = append(problems, fmt.Sprintf(format, args...))
@@ -82,7 +94,11 @@ func (c Config) ValidateDev(dev bool) error {
 	if c.Auth.QTSPort < 0 || c.Auth.QTSPort > 65535 {
 		add("auth.qtsPort %d is not a port (0 means read it from uLinux.conf)", c.Auth.QTSPort)
 	}
-	if c.Auth.Local.Cost != 0 && (c.Auth.Local.Cost < MinLocalCost || c.Auth.Local.Cost > MaxLocalCost) {
+	if !lenientHash && c.Auth.Local.Cost != 0 && (c.Auth.Local.Cost < MinLocalCost || c.Auth.Local.Cost > MaxLocalCost) {
+		// The cost key travels with the hash, so it is skipped with it: an
+		// out-of-range cost beside the credential must not be what stops the
+		// command that replaces the credential (Astra r2 #5). set-password
+		// writes the cost it used; disable clears it with the hash.
 		add("auth.local.cost %d is outside %d-%d (0 means %d)", c.Auth.Local.Cost, MinLocalCost, MaxLocalCost, DefaultLocalCost)
 	}
 	// The HASH itself, not only the cost key beside it (Astra r1 #10). The cost
@@ -92,7 +108,10 @@ func (c Config) ValidateDev(dev bool) error {
 	// and an embedded cost of 31 would run for minutes per attempt on a NAS
 	// core, from an unauthenticated caller, which is the denial of service
 	// §4.2's ceiling exists to prevent.
-	if strings.TrimSpace(c.Auth.Local.Hash) != "" {
+	if lenientHash {
+		// Nothing about the hash is checked, including the whitespace rule
+		// below: `disable` clears it and `set-password` overwrites it.
+	} else if strings.TrimSpace(c.Auth.Local.Hash) != "" {
 		cost, err := bcrypt.Cost([]byte(c.Auth.Local.Hash))
 		switch {
 		case err != nil:
@@ -100,6 +119,17 @@ func (c Config) ValidateDev(dev bool) error {
 			add("auth.local.hash is not a bcrypt hash (%v); it is written only by `qnapfilemanager break-glass set-password`", err)
 		case cost < MinLocalCost || cost > MaxLocalCost:
 			add("auth.local.hash carries bcrypt cost %d, outside %d-%d", cost, MinLocalCost, MaxLocalCost)
+		default:
+			// The whole shape, not only the header bcrypt.Cost reads (Astra r2
+			// #4). Cost parses "$2a$11$" and stops, so a hash with a truncated
+			// or corrupted tail passed validation and then failed every single
+			// comparison — a listener that binds, accepts the password the
+			// operator set, and refuses it, with no way to tell from the config
+			// that anything is wrong. Checked structurally rather than by
+			// running a comparison, because validation must not cost a bcrypt.
+			if err := checkBcryptShape(c.Auth.Local.Hash); err != nil {
+				add("auth.local.hash %v; it is written only by `qnapfilemanager break-glass set-password`", err)
+			}
 		}
 	} else if c.Auth.Local.Hash != "" {
 		add("auth.local.hash is whitespace; use `qnapfilemanager break-glass disable` to clear it")
@@ -148,6 +178,46 @@ func (c Config) ValidateDev(dev bool) error {
 
 	if len(problems) > 0 {
 		return fmt.Errorf("%w: %s", ErrInvalid, strings.Join(problems, "; "))
+	}
+	return nil
+}
+
+// bcryptSalt64 is bcrypt's own base64 alphabet — NOT the standard one: it
+// starts at "." and "/" and has no padding. The 22-character salt and the
+// 31-character digest are both written in it.
+const bcryptSalt64 = "./ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+
+// checkBcryptShape is the structural half of the hash check (Astra r2 #4):
+// exactly 60 bytes, a recognised prefix, a two-digit cost, and 53 characters of
+// bcrypt's own base64 after the third "$". It never runs a comparison — a
+// config validation that cost a bcrypt would be a lever on a root daemon — and
+// it never echoes the value, because the value is the credential. The error
+// says what is wrong with the SHAPE; only `break-glass set-password` writes
+// this key, so a wrong shape is corruption or a hand edit, not a typo worth
+// helping along.
+//
+// $2a$, $2b$ and $2y$ only. $2$ and $2x$ are the broken-implementation
+// variants, and this file is written by exactly one program.
+func checkBcryptShape(hash string) error {
+	if len(hash) != 60 {
+		return fmt.Errorf("is %d bytes long, not the 60 a bcrypt hash always is", len(hash))
+	}
+	switch hash[:4] {
+	case "$2a$", "$2b$", "$2y$":
+	default:
+		return fmt.Errorf("does not start with $2a$, $2b$ or $2y$")
+	}
+	if hash[4] < '0' || hash[4] > '9' || hash[5] < '0' || hash[5] > '9' {
+		return fmt.Errorf("does not carry a two-digit bcrypt cost")
+	}
+	if hash[6] != '$' {
+		return fmt.Errorf("is not $2<v>$<cost>$<salt><digest>")
+	}
+	for i := 7; i < len(hash); i++ {
+		if !strings.ContainsRune(bcryptSalt64, rune(hash[i])) {
+			// The position, never the character: this is the credential.
+			return fmt.Errorf("carries a character at offset %d that is not in bcrypt's base64 alphabet", i)
+		}
 	}
 	return nil
 }

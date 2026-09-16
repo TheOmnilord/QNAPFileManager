@@ -31,6 +31,10 @@ type fakeJobs struct {
 	reqs      []wproto.JobReq
 	cancelled []string
 	result    wproto.JobResult
+	// resultFor, when set, answers PER REQUEST instead of from result: a walker
+	// that honours the entry budget it was handed, which is what a bounded
+	// pre-scan needs in order to be tested at all (Astra M3 round-2 finding 8).
+	resultFor func(wproto.JobReq) (wproto.JobResult, error)
 	partial   wproto.JobResult // returned alongside ctx.Err() when cancelled
 	err       error
 	prog      []wproto.Prog
@@ -49,7 +53,11 @@ func (f *fakeJobs) Job(ctx context.Context, who backend.Principal, req wproto.Jo
 	f.reqs = append(f.reqs, req)
 	prog, warns, block, started := f.prog, f.warns, f.block, f.started
 	result, partial, err := f.result, f.partial, f.err
+	resultFor := f.resultFor
 	f.mu.Unlock()
+	if resultFor != nil {
+		result, err = resultFor(req)
+	}
 	if started != nil {
 		select {
 		case <-started:

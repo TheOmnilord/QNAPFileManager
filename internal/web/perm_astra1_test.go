@@ -221,13 +221,18 @@ func TestWorkerBackendNeverDowngrades(t *testing.T) {
 		worker       wproto.ACLInfo
 		wantBackend  string
 		wantState    string
+		wantExpect   string
 		wantDiscards bool
 	}{
 		{
-			name:         "a worker none is ignored and the state stays unknown",
-			worker:       wproto.ACLInfo{Backend: platform.ACLNone, State: fsx.ACLNone},
-			wantBackend:  platform.ACLNFS4,
-			wantState:    fsx.ACLUnknown,
+			name:        "a worker none is ignored and the state stays unknown",
+			worker:      wproto.ACLInfo{Backend: platform.ACLNone, State: fsx.ACLNone},
+			wantBackend: platform.ACLNFS4,
+			wantState:   fsx.ACLUnknown,
+			// Discarded for GRADING, still what the worker will see when it
+			// re-probes (Astra r2 #1): expecting the pessimistic grade here made
+			// the worker refuse `changed` on an object that never moved.
+			wantExpect:   fsx.ACLNone,
 			wantDiscards: true,
 		},
 		{
@@ -235,12 +240,14 @@ func TestWorkerBackendNeverDowngrades(t *testing.T) {
 			worker:      wproto.ACLInfo{State: fsx.ACLNFS4Trivial},
 			wantBackend: platform.ACLNFS4,
 			wantState:   fsx.ACLNFS4Trivial,
+			wantExpect:  fsx.ACLNFS4Trivial,
 		},
 		{
 			name:         "a worker that agrees is believed",
 			worker:       wproto.ACLInfo{Backend: platform.ACLNFS4, State: fsx.ACLNFS4},
 			wantBackend:  platform.ACLNFS4,
 			wantState:    fsx.ACLNFS4,
+			wantExpect:   fsx.ACLNFS4,
 			wantDiscards: true,
 		},
 	} {
@@ -256,8 +263,8 @@ func TestWorkerBackendNeverDowngrades(t *testing.T) {
 			if facts.state != tc.wantState {
 				t.Fatalf("state %q, want %q", facts.state, tc.wantState)
 			}
-			if expect == nil || expect.State != tc.wantState {
-				t.Fatalf("the precondition must carry the state that was graded: %+v", expect)
+			if expect == nil || expect.State != tc.wantExpect {
+				t.Fatalf("the precondition must carry the state the worker OBSERVED (%q): %+v", tc.wantExpect, expect)
 			}
 			if _, _, discards := chmodACLNotice(facts); discards != tc.wantDiscards {
 				t.Fatalf("discards %v, want %v", discards, tc.wantDiscards)

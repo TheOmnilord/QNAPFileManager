@@ -222,7 +222,17 @@ function paintGrid(writeOctal = true) {
   box.checked = value === true;
  }
  const dir = targets.length === 1 ? isDirectory(targets[0]) : targets.some(isDirectory);
- if (writeOctal) $('#pOctal').value = octalField(model);
+ // Whoever writes the field owns its verdict. Typing 0788 set octalInvalid, and
+ // only onOctal ever cleared it — so ticking a grid box, which rewrites the
+ // field with a perfectly good mode, left Apply grey under an error line about a
+ // 0788 that was no longer on screen (Astra r2 #10). The validity is recomputed
+ // from the text actually written, not assumed from where the write came from.
+ if (writeOctal) {
+  const shown = octalField(model);
+  $('#pOctal').value = shown;
+  octalInvalid = octalState(shown).state === 'invalid';
+  paintErrors();
+ }
  $('#pSymbolic').textContent = symbolicField(model,dir) || 'mixed';
 }
 

@@ -68,6 +68,10 @@ type Platform struct {
 	order  []string          // mount points, longest first
 	read   time.Time         // when the table was last parsed
 	live   bool              // true when /proc/self/mountinfo is readable
+	// probeDone is the in-flight background probe pass, or nil when none is
+	// running. It is the single-flight latch AND the way a test waits for the
+	// pass it started: the channel is closed after the results are published.
+	probeDone chan struct{}
 
 	getxattr XattrProbe
 	run      CommandRunner
@@ -135,14 +139,23 @@ func (p *Platform) setMounts(mounts []Mount) {
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	// Carry probed fields across a refresh so we do not re-probe every 5 s.
+	// Carry probed fields across a refresh so we do not re-probe every 5 s — but
+	// only for a mount point where the VISIBLE row is still the same mount (Astra
+	// r2 #13). Matching on the filesystem type alone carried one dataset's
+	// aclmode onto another that replaced it at the same path, which is the same
+	// wrong answer the stacked-mount case gives and just as sticky, because a
+	// cached answer is never probed again.
+	previous := visibleRows(p.mounts)
+	current := visibleRows(mounts)
 	for mp, c := range caps {
-		if old, ok := p.caps[mp]; ok && old.FSType == c.FSType {
-			c.ACLBackend = old.ACLBackend
-			c.ACLXattr = old.ACLXattr
-			c.ZFSAclmode = old.ZFSAclmode
-			caps[mp] = c
+		old, ok := p.caps[mp]
+		if !ok || !sameMountRow(previous[mp], current[mp]) {
+			continue
 		}
+		c.ACLBackend = old.ACLBackend
+		c.ACLXattr = old.ACLXattr
+		c.ZFSAclmode = old.ZFSAclmode
+		caps[mp] = c
 	}
 	p.mounts = mounts
 	p.caps = caps
@@ -160,7 +173,13 @@ func Detect() *Platform {
 		return p
 	}
 	p.live = true
-	if err := p.Refresh(); err != nil {
+	// Start-up parses the table and then probes it ONCE, synchronously (Astra r2
+	// #14). The public Refresh kicks a background probe of what is new, and a
+	// Detect that went through it would have every daemon and every spawned
+	// worker probe the first batch of storage mounts twice — four datasets at the
+	// `zfs get` timeout is 24 s of start-up, past workerpool's hello timeout,
+	// before the machine has answered a single request.
+	if err := p.refresh(false); err != nil {
 		p.live = false
 	}
 
@@ -205,7 +224,23 @@ func (p *Platform) hasZFSMount() bool {
 
 // Refresh re-reads the mount table. It is a no-op when the table did not come
 // from /proc (FromMountinfo, or a non-Linux host).
-func (p *Platform) Refresh() error {
+//
+// It returns as soon as the table is parsed. A mount that appeared since the
+// last read carries no probed fields at all — setMounts can only carry them
+// across for mount points it already knew — and an unprobed storage mount is
+// exactly the dataset an operator is about to change permissions on (Astra M3
+// round-1 finding 1), so the new ones are probed; but the probing happens in the
+// BACKGROUND (Astra r2 #7). Refresh is reached from maybeRefresh on the request
+// path, a probe is an lgetxattr plus a `zfs get` with a 3 s timeout, and a batch
+// of sixteen of them is 48 s inside a 15 s handler that cannot cancel it. Until
+// the answer lands the mount's backend stays "", which the ACL ladder already
+// grades as the worst case — so the gap is pessimistic, not silent.
+func (p *Platform) Refresh() error { return p.refresh(true) }
+
+// refresh is Refresh with the probing decision made by the caller: start-up
+// probes synchronously and exactly once (Detect), every later refresh kicks the
+// background pass.
+func (p *Platform) refresh(probe bool) error {
 	p.mu.RLock()
 	live := p.live
 	p.mu.RUnlock()
@@ -224,14 +259,52 @@ func (p *Platform) Refresh() error {
 		return err
 	}
 	p.setMounts(mounts)
-	// A mount that appeared since the last read carries no probed fields at all:
-	// setMounts can only carry them across for mount points it already knew. An
-	// unprobed storage mount answers ACLBackend "" — and a dataset mounted after
-	// start-up is exactly the one an operator is about to change permissions on
-	// (Astra M3 round-1 finding 1). So the new ones are probed here, the same way
-	// start-up probes them, and the answer is cached in caps like every other.
-	p.probeMissing()
+	if probe {
+		p.kickProbe()
+	}
 	return nil
+}
+
+// kickProbe starts ONE background pass over the storage mounts that have never
+// been probed, and does nothing at all when a pass is already running or when
+// there is nothing to probe. Single flight matters for more than the wasted
+// syscalls: every For() on the request path reaches maybeRefresh, so a table
+// with fifty new datasets would otherwise start a goroutine per request, each
+// running the same `zfs get` invocations against the same pool.
+//
+// The pass that is already running will not see mounts that appeared after it
+// took its batch. That is the next refresh's work, and the unprobed-is-
+// pessimistic rule covers the gap.
+func (p *Platform) kickProbe() {
+	p.mu.Lock()
+	if p.probeDone != nil || len(p.pendingProbesLocked()) == 0 {
+		p.mu.Unlock()
+		return
+	}
+	done := make(chan struct{})
+	p.probeDone = done
+	p.mu.Unlock()
+
+	go func() {
+		defer func() {
+			p.mu.Lock()
+			p.probeDone = nil
+			p.mu.Unlock()
+			// Closed last, so a waiter that sees the pass finished sees the latch
+			// cleared and the results published too.
+			close(done)
+		}()
+		p.probeMissing()
+	}()
+}
+
+// probeInFlight returns the channel the running background probe closes when it
+// finishes, or nil when no pass is running. It is how the tests wait for a pass
+// they caused without polling, and how they tell one pass from two.
+func (p *Platform) probeInFlight() <-chan struct{} {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.probeDone
 }
 
 // maxProbesPerRefresh bounds what one refresh may spend on newly appeared
@@ -246,15 +319,49 @@ const maxProbesPerRefresh = 16
 // probeMissing fills in the ACL backend (and, on ZFS, the aclmode) of storage
 // mounts that have never been probed. It is Probe restricted to what is
 // missing, so a refresh costs nothing at all on the ordinary case where the
-// table did not change.
+// table did not change. It is the body of the background pass and it holds no
+// lock across the syscalls.
 func (p *Platform) probeMissing() {
+	for _, m := range p.pendingProbes() {
+		backend, xattr := p.aclBackend(m.MountPoint)
+		aclmode := ""
+		if strings.EqualFold(m.FSType, "zfs") {
+			aclmode = p.ZFSAclmode(m.Source)
+		}
+		p.publishProbe(m, backend, xattr, aclmode)
+	}
+}
+
+// pendingProbes picks what one pass probes: the VISIBLE row at each mount point
+// whose capabilities carry no backend yet, bounded by maxProbesPerRefresh.
+//
+// Visible is the point of it (Astra r2 #13). Two datasets stacked at the same
+// mount point are two mountinfo lines and one reachable filesystem, and caps —
+// like the kernel — describes the last line. Probing both put the lower row's
+// `zfs get` answer beside the upper row's xattr answer under a first-write-wins
+// assignment, so a passthrough dataset hidden under a discard one graded the
+// discard's chmod as L1 and cached that for as long as the mount lived.
+func (p *Platform) pendingProbes() []Mount {
 	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.pendingProbesLocked()
+}
+
+func (p *Platform) pendingProbesLocked() []Mount {
+	visible := visibleRows(p.mounts)
 	var pending []Mount
-	for _, m := range p.mounts {
+	seen := make(map[string]bool, len(visible))
+	for _, row := range p.mounts {
+		mp := row.MountPoint
+		if seen[mp] {
+			continue
+		}
+		seen[mp] = true
+		m := visible[mp]
 		if !IsStorageFS(m.FSType) {
 			continue
 		}
-		if c, ok := p.caps[m.MountPoint]; ok && c.ACLBackend != "" {
+		if c, ok := p.caps[mp]; ok && c.ACLBackend != "" {
 			continue // already probed, and the answer is cached
 		}
 		pending = append(pending, m)
@@ -262,23 +369,56 @@ func (p *Platform) probeMissing() {
 			break
 		}
 	}
-	p.mu.RUnlock()
+	return pending
+}
 
-	for _, m := range pending {
-		backend, xattr := p.aclBackend(m.MountPoint)
-		aclmode := ""
-		if strings.EqualFold(m.FSType, "zfs") {
-			aclmode = p.ZFSAclmode(m.Source)
-		}
-		p.mu.Lock()
-		if c, ok := p.caps[m.MountPoint]; ok && c.ACLBackend == "" {
-			c.ACLBackend = backend
-			c.ACLXattr = xattr
-			c.ZFSAclmode = aclmode
-			p.caps[m.MountPoint] = c
-		}
-		p.mu.Unlock()
+// publishProbe stores one probe's answer, if the mount it describes is still
+// the one at that mount point.
+//
+// A background pass outlives the table it was started from: a mount can be
+// unmounted, or replaced by another at the same path, while its `zfs get` is
+// still running. Publishing regardless would give the replacement the previous
+// filesystem's aclmode and cache it, which is the stacked-mount bug arriving a
+// second way (Astra r2 #13). An answer that no longer describes anything is
+// dropped, and the mount that IS there stays unprobed until the next refresh.
+func (p *Platform) publishProbe(m Mount, backend, xattr, aclmode string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !sameMountRow(visibleRows(p.mounts)[m.MountPoint], m) {
+		return
 	}
+	c, ok := p.caps[m.MountPoint]
+	if !ok || c.ACLBackend != "" {
+		return
+	}
+	c.ACLBackend = backend
+	c.ACLXattr = xattr
+	c.ZFSAclmode = aclmode
+	p.caps[m.MountPoint] = c
+}
+
+// visibleRows indexes a mount table by mount point, keeping the row the kernel
+// makes reachable: the LAST line for that path, which over-mounts the ones
+// before it. It is the same rule setMounts applies when it builds caps, stated
+// once so the probe and the capabilities cannot disagree about which filesystem
+// a mount point is.
+func visibleRows(mounts []Mount) map[string]Mount {
+	out := make(map[string]Mount, len(mounts))
+	for _, m := range mounts {
+		out[m.MountPoint] = m
+	}
+	return out
+}
+
+// sameMountRow reports whether two mountinfo rows are the same mount. The mount
+// ID is the kernel's own identity for it and is not reused while the mount
+// lives; the device numbers, source, type and in-filesystem root are compared
+// as well, so a table from a kernel that does not keep IDs stable still has to
+// describe the same filesystem for an answer to be kept.
+func sameMountRow(a, b Mount) bool {
+	return a.ID == b.ID && a.Major == b.Major && a.Minor == b.Minor &&
+		a.Root == b.Root && a.MountPoint == b.MountPoint &&
+		a.FSType == b.FSType && a.Source == b.Source
 }
 
 func (p *Platform) maybeRefresh() {
@@ -548,11 +688,25 @@ func (p *Platform) VolumeRoots() []Mount {
 }
 
 // Probe fills in the per-mount ACL backend and, for ZFS, the dataset aclmode.
-// It only touches storage mounts and is safe to call more than once.
+// It only touches storage mounts and is safe to call more than once. It is the
+// synchronous start-up pass; later refreshes probe what is new in the
+// background (kickProbe).
+//
+// One row per mount point, the visible one (Astra r2 #13): probing a shadowed
+// dataset costs a `zfs get` for an answer about a filesystem nothing can reach,
+// and it used to race the visible row's answer into caps.
 func (p *Platform) Probe() {
 	p.mu.RLock()
-	mounts := make([]Mount, len(p.mounts))
-	copy(mounts, p.mounts)
+	visible := visibleRows(p.mounts)
+	mounts := make([]Mount, 0, len(visible))
+	seen := make(map[string]bool, len(visible))
+	for _, row := range p.mounts {
+		if seen[row.MountPoint] {
+			continue
+		}
+		seen[row.MountPoint] = true
+		mounts = append(mounts, visible[row.MountPoint])
+	}
 	p.mu.RUnlock()
 
 	for _, m := range mounts {

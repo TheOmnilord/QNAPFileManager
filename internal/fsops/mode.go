@@ -195,17 +195,23 @@ func proveExpectation(r fsx.Root, plat *platform.Platform, tg jailPath, ref *ite
 		return fmt.Errorf("%q cannot be held long enough to prove what was confirmed: %w", tg.api, fsx.ErrChanged)
 	}
 	held := identityOfInfo(itemIdentityOf(ref), ref.fi, refFD(ref))
-	if !held.SameInode(expect.Identity) {
+	if !unidentifiableObject(held, expect.Identity) && !held.SameInode(expect.Identity) {
 		return fmt.Errorf(
 			"%q is not the item the confirmation was given for; it was replaced after it was described: %w",
 			tg.api, fsx.ErrChanged)
+	}
+	if expect.State == "" {
+		// Nothing was observed when the object was described, so there is no ACL
+		// claim to hold it to and the identity is the whole of the precondition
+		// (Astra r2 #1/#6). Probing again here would only invent one.
+		return nil
 	}
 	osPath, osErr := r.OS(tg.api)
 	if osErr != nil {
 		osPath = ""
 	}
 	_, _, state := probeOne(plat, osPath, ref)
-	if state != expect.State {
+	if !stateSatisfies(expect.State, state) {
 		// Either direction is a refusal. A state that has become MORE serious is
 		// the attack; one that has become less is still a tree that moved under a
 		// decision the user made about something else, and the honest answer is
@@ -215,6 +221,46 @@ func proveExpectation(r fsx.Root, plat *platform.Platform, tg jailPath, ref *ite
 			tg.api, aclWord(state), aclWord(expect.State), fsx.ErrChanged)
 	}
 	return nil
+}
+
+// stateSatisfies reports whether a re-probed ACL state honours the expectation.
+//
+// An EMPTY expectation is the absence of a claim and not a claim of absence
+// (Astra r2 #1 in its second costume). The route sends what the worker OBSERVED
+// when it described the object, so "" means "nothing was learned then" — and
+// comparing that literally against a fresh reading made this side of the gap
+// refuses a change nobody tampered with as soon as the two readings can differ
+// for an innocent reason. They now can: the mount probe that decides whether
+// there is a backend to read at all runs ASYNCHRONOUSLY after a refresh, so a
+// mount that was unplaced during Props can be "posix" by the time the chmod
+// arrives, and the object itself never moved. What "" leaves standing is the
+// identity, which is the half that catches the swap this precondition exists
+// for; the ACL half is proved when, and only when, there is an observation to
+// prove it against.
+func stateSatisfies(want, got string) bool {
+	if want == "" {
+		return true
+	}
+	return want == got
+}
+
+// unidentifiableObject reports that NEITHER side of an expectation carries an
+// inode number, on a platform that has none to carry (Astra r2 #6).
+//
+// SameInode reads a zero inode as "identifies nothing", which is exactly right
+// on Linux: an inode number that could not be read is not a proof, and a
+// precondition that cannot be proved is a refusal. Off Linux there is no inode
+// behind a FileInfo at all (inodeIdentity, copy_other.go), so BOTH the grade and
+// the held leaf report the platform's own zero identity and every dev-loop chmod
+// with a precondition failed "changed" — against §14, which asks the dev loop to
+// answer best effort and states its degradation rather than faking one.
+//
+// So a zero on both sides, where the platform has no identities at all, is
+// "nothing to compare" and the STATE alone is proved. On Linux nothing moves:
+// inodeIdentity is true there, so a zero inode from a real filesystem stays the
+// mismatch it has always been.
+func unidentifiableObject(held, want wproto.FSIdentityResp) bool {
+	return !inodeIdentity && held.Ino == 0 && want.Ino == 0
 }
 
 // aclWord spells an ACL state for the one sentence above, including the empty

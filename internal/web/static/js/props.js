@@ -105,6 +105,34 @@ export function pruneSizeJobs(now = Date.now()) {
 // cannot be overtaken by the first.
 export function createSizeRunner({report = () => {},track = trackJob,cancel = cancelJob,poll = awaitJob} = {}) {
  let held = null,run = 0;
+ // `cancelled` is ACKNOWLEDGED, never merely requested, and the distinction is
+ // the whole of Astra r2 #9. The entry used to be marked cancelled before the
+ // cancel was sent — so when the poll had given up because the connection was
+ // lost, the cancel went down the same dead wire, failed the same way, and the
+ // id was already out of reach: Stop, the close event and Recount then had
+ // nothing left to retry while the du walked on. `cancelling` is the one on the
+ // wire, so a request is never sent twice; a request that came back
+ // UNACKNOWLEDGED clears it and leaves the entry retryable.
+ function ack(entry,ok) { entry.cancelling = null; if (ok) entry.cancelled = true; return ok; }
+ // sendCancel is the only place a cancel is sent, and it answers a promise for
+ // whether the server acknowledged it. It never rejects: nothing that calls it
+ // is in a position to handle a failure other than by keeping the id.
+ function sendCancel(entry) {
+  if (!entry.id || entry.cancelled) return undefined;
+  if (entry.cancelling) return entry.cancelling;
+  // cancel() is called synchronously — Stop and the close event are asserted to
+  // have cancelled by the time they return.
+  let pending;
+  try { pending = Promise.resolve(cancel(entry.id)); }
+  catch(err) { pending = Promise.reject(err); }
+  entry.cancelling = pending.then(ok => ack(entry,ok !== false),() => ack(entry,false));
+  return entry.cancelling;
+ }
+ // needsStop is the question the runner keeps asking: is there still a walk on
+ // the server that this side could stop? A finished measurement has nothing to
+ // stop, an acknowledged cancel has already stopped it, and a job whose 202 has
+ // not landed yet has no id to name.
+ const needsStop = entry => !!entry && !entry.finishedAt && !entry.cancelled && !!entry.id;
  // abandon gives up on a measurement that never reached a terminal state.
  //
  // Whatever this side decided, the walk is still going on the server — so the
@@ -113,15 +141,13 @@ export function createSizeRunner({report = () => {},track = trackJob,cancel = ca
  // polling gave up left a du over a multi-terabyte share walking with nothing
  // able to stop it (round 1, finding 14). The entry is marked failed as well,
  // so the next dialog measures again rather than attaching to a walk nobody is
- // watching; `cancelled` makes this idempotent, because the poll giving up and
- // the dialog closing a moment later must not send two cancels for one job.
+ // watching.
  function abandon(entry) {
   if (!entry || entry.cancelled) return undefined;
-  entry.cancelled = true;
   entry.failed = true;
   if (sizeJobs.get(entry.key) === entry) sizeJobs.delete(entry.key);
   // The 202 may still be in flight; the submitting closure cancels it then.
-  return entry.id ? cancel(entry.id) : undefined;
+  return sendCancel(entry);
  }
  // release is this runner letting go of a shared measurement. The walk is
  // cancelled only when nobody is left holding it: a du over a multi-terabyte
@@ -140,9 +166,10 @@ export function createSizeRunner({report = () => {},track = trackJob,cancel = ca
  }
  const runner = {
   // jobId is the measurement this runner could still cancel, and only that: a
-  // finished one has nothing to stop, and neither has one already cancelled
-  // because its poll gave up.
-  get jobId() { return held && !held.finishedAt && !held.cancelled ? held.id : null; },
+  // finished one has nothing to stop, and neither has one whose cancel the
+  // server has ACKNOWLEDGED. One whose cancel never got there is still
+  // cancellable, and saying so is the point (Astra r2 #9).
+  get jobId() { return needsStop(held) ? held.id : null; },
   stop() {
    const had = held;
    run++; held = null;
@@ -160,14 +187,14 @@ export function createSizeRunner({report = () => {},track = trackJob,cancel = ca
     entry = null;
    }
    if (!entry) {
-    entry = {key,id:null,holders:0,job:null,finishedAt:0,abandoned:false,failed:false,cancelled:false};
+    entry = {key,id:null,holders:0,job:null,finishedAt:0,abandoned:false,failed:false,cancelled:false,cancelling:null};
     entry.promise = (async () => {
      const res = await api('api/jobs/size',{},{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify(sizeRequest(entries,{crossMounts}))});
      entry.id = res.job?.id ?? null;
      // Abandoned while the 202 was in flight: the job exists on the server and
      // nobody is waiting for it, so it is cancelled rather than left to walk.
-     if (entry.abandoned) { if (entry.id) cancel(entry.id); return null; }
+     if (entry.abandoned) { sendCancel(entry); return null; }
      // quiet: a measurement the user did not ask for as an operation must not
      // throw the Operations drawer over the dialog they are reading.
      track(res.job,{quiet:true});
@@ -200,7 +227,16 @@ export function createSizeRunner({report = () => {},track = trackJob,cancel = ca
     report(sizeReport(job));
     return job;
    } catch(err) {
-    if (ticket === run && valid()) { held = null; entry.holders--; report({state:'failed',text:err.message,result:null}); }
+    if (ticket !== run || !valid()) return null;
+    // Letting go of a failed measurement is what makes the next one a fresh
+    // start — but a measurement whose cancel never REACHED the server is still
+    // a walk this runner is the only one holding the id for, so it stays held
+    // until the cancel is acknowledged and Stop, the close event and Recount
+    // can each retry it (Astra r2 #9).
+    const letGo = () => { if (held === entry && ticket === run) { held = null; entry.holders--; } };
+    if (entry.cancelling) entry.cancelling.then(ok => { if (ok) letGo(); });
+    else if (!needsStop(entry)) letGo();
+    report({state:'failed',text:err.message,result:null});
     return null;
    }
   },

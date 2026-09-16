@@ -160,11 +160,14 @@ type modeJob struct {
 	// reading is a refusal rather than a pass.
 	traversedOK []bool
 
-	// parentDir/parentDev cache the device of the directory whose entries are
-	// currently being changed (devOfParent).
-	parentDir   *dirRef
-	parentDev   uint64
-	parentDevOK bool
+	// parentDir/parentID cache the MOUNT IDENTITY of the directory whose entries
+	// are currently being changed (identityOfParent).
+	parentDir *dirRef
+	parentID  mountIdentity
+
+	// refreshed says the mount table has already been re-read for this job, so
+	// a tree full of crossings costs one read rather than one per entry.
+	refreshed bool
 }
 
 // rootWorker reports whether this process is uid 0 — an administrator session's
@@ -321,8 +324,9 @@ func (j *modeJob) one(ctx context.Context, p string) error {
 	return walkFrom(ctx, j.r, j.plat, held, tg.api, ref.fi,
 		WalkOptions{CrossMounts: j.cross, Mutating: false, Protect: ProtectWrite},
 		Visitor{
-			Pre:    j.pre,
-			Opened: j.opened,
+			Pre:      j.pre,
+			Opened:   j.opened,
+			Unopened: j.unopened,
 			Post: func(it WalkItem) error {
 				if it.Depth == 0 {
 					// The root's own parent descriptor is the one this
@@ -352,6 +356,67 @@ func (j *modeJob) one(ctx context.Context, p string) error {
 func (j *modeJob) opened(it WalkItem, info os.FileInfo) error {
 	j.setTraversed(it.Depth, objectIDOf(nil, info))
 	return nil
+}
+
+// unopened handles a NESTED directory the walk could not enumerate (Astra
+// r2 #5).
+//
+// The round-1 fallback covered only the selected root, because that is the one
+// directory this file opens for itself. Everywhere below it the walker does the
+// opening, reports the failure through Warn and moves on — so a tree with a
+// 0000 directory three levels down had exactly the entry a recursive repair was
+// aimed at skipped, silently counted as one more refusal among thousands. Pre
+// defers directories to post-order and no post-order hook runs for a directory
+// that was never opened, so there was nowhere left for the change to happen.
+//
+// The change needs no read permission on the directory at all, only a reference
+// to it, and the walker has none to lend: the open that failed was the O_RDONLY
+// one. So the entry is re-opened O_PATH|O_NOFOLLOW relative to the HELD parent —
+// a name the walk is standing on, never a rebuilt pathname — and proved against
+// the lstat the enumeration classified it by before anything is changed. The
+// listing failure is then its own warning rather than a skip, because the entry
+// is not being skipped.
+func (j *modeJob) unopened(it WalkItem, err error) {
+	switch {
+	case it.parent == nil, !it.isDir():
+		// Neither shape reaches here from the walker, and neither is a thing to
+		// guess about.
+		j.fail(it.Path, err)
+		return
+	case errors.Is(err, fsx.ErrChanged), errors.Is(err, fsx.ErrProtected):
+		// The name means a different object now, or the walk refused the
+		// crossing outright (B4's unnamed mount). Nothing here was authorized
+		// and nothing is attempted.
+		j.fail(it.Path, err)
+		return
+	}
+	ref, rerr := itemRefIn(it.parent, it.Name)
+	if rerr != nil {
+		// Unlinked in between, or not addressable even O_PATH. The failure worth
+		// reporting is still the one that stopped the walk.
+		j.fail(it.Path, err)
+		return
+	}
+	defer ref.close()
+	if ref.fi == nil || !ref.fi.IsDir() || !objectIDOf(refFD(ref), ref.fi).same(objectIDOf(nil, it.Info)) {
+		// A second lookup of the name, so it is proved against the reading the
+		// enumeration made, exactly as the post-order path is proved against the
+		// reading the descent made (finding 7, r2 #2).
+		j.refuse(it.Path, fmt.Errorf(
+			"%q is not the folder the walk reached; it was replaced before it could be changed: %w",
+			it.Path, fsx.ErrChanged))
+		return
+	}
+	if j.crossesMount(it, ref) {
+		// The crossing decision the walk would have made from the descriptor it
+		// never got (r2 #4). A directory it may not enter is also one it may not
+		// change.
+		j.refuse(it.Path, crossingRefusal(it.Path))
+		return
+	}
+	j.emit.warnErr(it.Path, fmt.Errorf(
+		"%q could not be listed, so nothing inside it was changed: %w", it.Path, err))
+	j.applyRef(it.Path, it.parent, it.Name, ref, false)
 }
 
 // setTraversed files one reading under its depth, growing the slots as the walk
@@ -430,17 +495,26 @@ func (j *modeJob) applyEntry(it WalkItem) {
 		return
 	}
 	defer ref.close()
-	if ref.fi != nil && ref.fi.IsDir() {
+	if it.isDir() {
 		// Post-order, and the walker closed the descriptor it enumerated before
 		// calling us — so the openat above is a SECOND lookup of the name, and a
 		// second lookup proves nothing on its own (finding 7).
-		if !j.sameAsTraversed(it.Depth, ref) {
+		//
+		// The question is asked of the item the walk TRAVERSED, not of whatever
+		// the name means now (Astra r2 #2). Gating on the re-opened object's own
+		// type was half a proof: a nested directory renamed away and replaced by
+		// a regular FILE at its name fell through to the leaf branch and was
+		// chmod'ed or chown'ed like any other entry — precisely the substitution
+		// the traversal record exists to catch. A directory was descended into,
+		// so the object under that name is that directory or it is nothing this
+		// job may touch.
+		if ref.fi == nil || !ref.fi.IsDir() || !j.sameAsTraversed(it.Depth, ref) {
 			j.refuse(it.Path, fmt.Errorf(
 				"%q is not the folder the walk descended into; it was replaced while its contents were being changed: %w",
 				it.Path, fsx.ErrChanged))
 			return
 		}
-	} else if !j.cross && j.crossesMount(it, ref) {
+	} else if j.crossesMount(it, ref) {
 		// A regular file can be a bind mount of its own, and the walker's
 		// WalkItem.Mount only ever marks directories — so a file outside the
 		// tree was changed under crossMounts:false, and its nlink stays 1, so
@@ -452,43 +526,124 @@ func (j *modeJob) applyEntry(it WalkItem) {
 	j.applyRef(it.Path, it.parent, it.Name, ref, false)
 }
 
-// crossesMount reports whether a held non-directory leaf is on a different
-// device from the directory it was enumerated from.
+// crossesMount reports whether a held entry is a crossing this job may not make.
 //
-// A device that cannot be read on either side answers false, because the walk's
-// own crossing rule has always degraded that way (INV-2, and off Linux there is
-// no st_dev at all): refusing what cannot be measured would skip every entry on
-// a dev box.
+// It costs one statx per entry, which is the price of seeing a bind mount at
+// all: st_dev cannot, and a recursive chmod that changes files on another share
+// because they were bound into this one is the bug being paid off. Everything
+// else about the entry is already being opened, stat'ed and stat'ed again.
+//
+// It used to compare st_dev alone, and that was wrong twice over (Astra r2 #4).
+// A BIND mount keeps the device of what it was bound from — which is the shape
+// QTS builds its entire share layout out of — so a file bind-mounted from
+// another share answered "same device, carry on"; and crossMounts:true skipped
+// the question altogether, so "include mounted sub-folders" silently meant "any
+// mount at all", where a DIRECTORY of the same shape still has to satisfy
+// platform.MayCross.
+//
+// So the leaf is put through the walker's own mechanism: the statx mount id of
+// the held descriptor against the mount id of the directory it was enumerated
+// from (mountIdentity.differsFrom), and, when they differ, the same crossing
+// policy the walk applies to a child directory.
 func (j *modeJob) crossesMount(it WalkItem, ref *itemRef) bool {
-	parentDev, ok := j.devOfParent(it.parent)
-	if !ok {
-		return false
-	}
-	childDev, ok := devOf(ref.fi)
-	if !ok {
-		return false
-	}
-	return parentDev != childDev
+	return crossesLeafMount(j.identityOfParent(it.parent), itemIdentityOf(ref), j.cross,
+		func(parentID, childID mountIdentity) bool { return j.mayCrossToLeaf(it, parentID, childID) })
 }
 
-// devOfParent is devOfDir with a one-entry cache, because the answer belongs to
-// the DIRECTORY and the question is asked once per entry in it. A directory of a
-// million files would otherwise cost a million fstats of the same descriptor.
+// crossesLeafMount is the decision itself, with nothing in it that needs a
+// filesystem: two mount identities, the job's CrossMounts, and the storage-domain
+// question asked only where it matters. It is separated out because mounting
+// anything needs root and a mount namespace, and the arithmetic is the half a
+// test can state exactly.
+//
+// An unanswerable comparison is "not a crossing" — differsFrom's own rule, and
+// the degradation the walk has always accepted (INV-2, and off Linux there are
+// no mount ids at all): inventing a boundary out of missing data would skip
+// every entry on a dev box.
+func crossesLeafMount(parentID, childID mountIdentity, cross bool, may func(parentID, childID mountIdentity) bool) bool {
+	if !childID.differsFrom(parentID) {
+		return false
+	}
+	if !cross {
+		return true
+	}
+	return !may(parentID, childID)
+}
+
+// mayCrossToLeaf is walker.mayCrossInto's question for a leaf: the job was asked
+// to include mounted sub-folders, and this entry is on another mount, so the
+// mount table decides whether the two filesystems are one storage domain
+// (PLAN.md decision 9). No table, or a mount nobody can name, is a refusal —
+// the fail-closed half, because the descriptor has already proved the job is
+// about to leave the filesystem it started on.
+func (j *modeJob) mayCrossToLeaf(it WalkItem, parentID, childID mountIdentity) bool {
+	if j.plat == nil {
+		return false
+	}
+	childOS, err := j.r.OS(it.Path)
+	if err != nil || childOS == "" {
+		return false
+	}
+	parentOS, err := j.r.OS(parentAPIPath(it))
+	if err != nil || parentOS == "" {
+		return false
+	}
+	// A mount made since the job started is exactly what the identity comparison
+	// just caught, so the table is re-read before it is asked about it, as
+	// mayCrossInto does. Once per job and not once per crossing: a directory of
+	// bind-mounted files would otherwise re-read /proc/self/mountinfo once per
+	// entry, and the walk's own crossing decisions refresh it for the
+	// directories anyway.
+	if !j.refreshed {
+		j.refreshed = true
+		_ = j.plat.Refresh()
+	}
+	live := func() bool { return liveTableOf(j.plat) }
+	childCaps, ok := capsForMount(j.plat, live, childID, childOS, true)
+	if !ok {
+		return false
+	}
+	parentCaps, ok := capsForMount(j.plat, live, parentID, parentOS, false)
+	if !ok {
+		return false
+	}
+	return j.plat.MayCross(parentCaps, childCaps)
+}
+
+// parentAPIPath is the API path of the directory an item was enumerated from.
+// WalkItem carries the held parent descriptor but not its pathname, and the two
+// were joined to make Path in the first place (walker.children), so taking the
+// name back off is the same string the walk started with.
+func parentAPIPath(it WalkItem) string {
+	if it.Name == "" {
+		return ""
+	}
+	p := strings.TrimSuffix(it.Path, "/"+it.Name)
+	if p == "" {
+		return "/"
+	}
+	return p
+}
+
+// identityOfParent is identityFor with a one-entry cache, because the answer
+// belongs to the DIRECTORY and the question is asked once per entry in it. A
+// directory of a million files would otherwise cost a million statx calls on the
+// same descriptor.
 //
 // One slot is enough for a depth-first walk: the entries of one directory are
 // visited in a run, and the only thing that displaces the slot is descending
-// into a subdirectory and coming back — which costs one more fstat per
+// into a subdirectory and coming back — which costs one more statx per
 // directory, not per entry.
-func (j *modeJob) devOfParent(d *dirRef) (uint64, bool) {
+func (j *modeJob) identityOfParent(d *dirRef) mountIdentity {
 	if d == nil {
-		return 0, false
+		return mountIdentity{}
 	}
 	if j.parentDir == d {
-		return j.parentDev, j.parentDevOK
+		return j.parentID
 	}
-	dev, ok := devOfDir(d)
-	j.parentDir, j.parentDev, j.parentDevOK = d, dev, ok
-	return dev, ok
+	id := identityFor(d)
+	j.parentDir, j.parentID = d, id
+	return id
 }
 
 // applyRef is the whole per-entry decision: which spec applies, whether this

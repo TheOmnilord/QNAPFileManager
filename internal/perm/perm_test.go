@@ -346,15 +346,27 @@ const (
 	aceTypeAlarm uint32 = 3
 )
 
-// maskFull is every NFSv4 access bit, WRITE_ACL and WRITE_OWNER included — what
-// an ordinary ZFS object grants OWNER@. maskNoAdmin is the same without those
-// two, which is what a trivial GROUP@ or EVERYONE@ entry carries: the rights to
-// rewrite the ACL and to take ownership are exactly what a mode cannot express
-// (finding 3), so a helper that handed them to every principal would build ACLs
-// that are non-trivial by the rule under test.
+// The two masks the helpers build trivial ACEs out of: everything an rwx triple
+// can express and nothing it cannot (§6.1 as amended in round 2).
+//
+// maskFull is the OWNER@ form — read, write, execute and the two administrative
+// bits every ordinary ZFS object grants its owner. maskNoAdmin is the GROUP@ and
+// EVERYONE@ form, which drops them.
+//
+// Neither carries DELETE (0x10000) or DELETE_CHILD (0x40), and that is the
+// round-2 correction: the old constants were "every bit in 0x001f01ff", which
+// swept both in, so a helper meant to build a trivial ACL was building one the
+// mode cannot express at all (Astra r2 #3).
 const (
-	maskFull    uint32 = 0x001f01ff
-	maskNoAdmin uint32 = maskFull &^ (0x00040000 | 0x00080000)
+	maskRead      uint32 = 0x00000001 | 0x00000008 | 0x00000080 | 0x00020000 | 0x00100000
+	maskWrite     uint32 = 0x00000002 | 0x00000004 | 0x00000010 | 0x00000100
+	maskExecute   uint32 = 0x00000020
+	maskNoAdmin   uint32 = maskRead | maskWrite | maskExecute
+	maskFull      uint32 = maskNoAdmin | 0x00040000 | 0x00080000
+	maskReadExec  uint32 = maskRead | maskExecute
+	maskDelete    uint32 = 0x00010000
+	maskDeleteChl uint32 = 0x00000040
+	maskAppend    uint32 = 0x00000004
 )
 
 // nfs4ACL is nfs4ACLRaw for the flag-and-who cases: ALLOW entries with a mask
@@ -596,6 +608,44 @@ func TestNFS4StateReadsTypeAndMask(t *testing.T) {
 		{
 			"a group that is merely writable is trivial: WRITE_DATA is what 0770 means",
 			nfs4ACLRaw(owner, rawACE{typ: aceTypeAllow, mask: maskNoAdmin, who: "GROUP@"}, every),
+			fsx.ACLNFS4Trivial,
+		},
+		// Round 2 #3: excluding the two administrative bits was not
+		// mode-equivalence. An ALLOW mask is trivial only if every bit in it is
+		// one the three mode classes can express.
+		{
+			"EVERYONE@ ALLOW DELETE is a grant no rwx triple holds",
+			nfs4ACLRaw(owner, group, rawACE{typ: aceTypeAllow, mask: maskNoAdmin | maskDelete, who: "EVERYONE@"}),
+			fsx.ACLNFS4,
+		},
+		{
+			"GROUP@ with DELETE_CHILD likewise: 'may unlink what is in here' is not a mode bit",
+			nfs4ACLRaw(owner, rawACE{typ: aceTypeAllow, mask: maskNoAdmin | maskDeleteChl, who: "GROUP@"}, every),
+			fsx.ACLNFS4,
+		},
+		{
+			// An append-only file: add to the log, never rewrite it. A "w" that
+			// is granted or taken whole cannot say it.
+			"APPEND_DATA without WRITE_DATA is append-only, which a mode cannot express",
+			nfs4ACLRaw(owner, group,
+				rawACE{typ: aceTypeAllow, mask: maskReadExec | maskAppend, who: "EVERYONE@"}),
+			fsx.ACLNFS4,
+		},
+		{
+			"WRITE_DATA without APPEND_DATA is the mirror image and just as unsayable",
+			nfs4ACLRaw(owner, group,
+				rawACE{typ: aceTypeAllow, mask: maskNoAdmin &^ maskAppend, who: "EVERYONE@"}),
+			fsx.ACLNFS4,
+		},
+		{
+			// The control the whole rule is shaped around: 0755 as ZFS writes
+			// it. If this ever classified as nfs4, every hero chmod would ask
+			// for a typed phrase for nothing.
+			"a ZFS-shaped rwx/r-x/r-x triple is trivial",
+			nfs4ACLRaw(
+				rawACE{typ: aceTypeAllow, mask: maskFull, who: "OWNER@"},
+				rawACE{typ: aceTypeAllow, mask: maskReadExec, who: "GROUP@"},
+				rawACE{typ: aceTypeAllow, mask: maskReadExec, who: "EVERYONE@"}),
 			fsx.ACLNFS4Trivial,
 		},
 		{

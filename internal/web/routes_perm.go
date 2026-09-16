@@ -303,11 +303,22 @@ func (s *Server) chmodJobLadder(ladder *permLadder, targets []string, cross bool
 // pessimistic side is the half that matters, and it is the side that warns.
 //
 // The second return is the PRECONDITION the caller sends with the change
-// (contract §8.1 as amended): the state this graded on and the identity of the
-// object it was read from, so the worker refuses `changed` if either moved
+// (contract §8.1 as amended): the state the worker OBSERVED and the identity of
+// the object it read it from, so the worker refuses `changed` if either moved
 // between the grade and the chmod. It is nil when nothing was learned — the
 // route then promises nothing, because a precondition built from a failed probe
 // would refuse every change rather than the changed ones.
+//
+// Observed and GRADED are two different states and conflating them broke every
+// legitimate chmod on a mount the daemon could not place (Astra r2 #1). Grading
+// is pessimistic by design: an unprobed backend, or a worker reading this route
+// discarded as a downgrade, both land on ACLUnknown — but the worker holds the
+// object, and when it re-probes it will see exactly what it saw the first time.
+// Expecting the ladder's fallback therefore asks the worker to prove a state
+// nothing ever reported, and it answers `changed` for an object that never
+// moved. So the expectation carries the raw reading, whether or not the grade
+// was allowed to use it; an EMPTY state means "nothing was observed, prove the
+// identity only" and is not a claim that the object has no ACL.
 func (s *Server) entryACLFacts(ctx context.Context, who backend.Principal, apiPath string) (aclFacts, *wproto.ACLExpect) {
 	f := s.mountFacts(apiPath)
 	f.state = fsx.ACLUnknown
@@ -318,8 +329,15 @@ func (s *Server) entryACLFacts(ctx context.Context, who backend.Principal, apiPa
 	if err != nil {
 		return f, nil
 	}
+	// The raw reading, kept whatever the grading decides to do with it. ACLInfo
+	// is the descriptor-read answer (§8.3) and is what the worker re-probes; the
+	// entry's copy is the same value under a worker that fills only the entry.
+	observed := resp.ACL.State
+	if observed == "" {
+		observed = resp.Entry.ACL
+	}
 	// The backend first: whether the worker's reading is trusted at all decides
-	// whether its state may be taken.
+	// whether its state may be taken INTO THE GRADE.
 	trusted := true
 	if resp.ACL.Backend != "" {
 		if aclBackendRank(resp.ACL.Backend) >= aclBackendRank(f.backend) {
@@ -328,12 +346,8 @@ func (s *Server) entryACLFacts(ctx context.Context, who backend.Principal, apiPa
 			trusted = false
 		}
 	}
-	if trusted {
-		if resp.ACL.State != "" {
-			f.state = resp.ACL.State
-		} else if resp.Entry.ACL != "" {
-			f.state = resp.Entry.ACL
-		}
+	if trusted && observed != "" {
+		f.state = observed
 	}
 	if resp.ACL.Aclmode != "" {
 		f.aclmode = resp.ACL.Aclmode
@@ -341,7 +355,12 @@ func (s *Server) entryACLFacts(ctx context.Context, who backend.Principal, apiPa
 	if resp.ACL.Dataset != "" {
 		f.dataset = resp.ACL.Dataset
 	}
-	return f, &wproto.ACLExpect{State: f.state, Identity: resp.Identity}
+	// The identity travels exactly as Props reported it, zero included (Astra r2
+	// #6). Off Linux there is no inode to report and the zero value is the honest
+	// answer; the worker, seeing no inode on either side, proves the state alone.
+	// Suppressing the expectation on that account would drop the ACL half with
+	// it, and inventing an identity would be a proof of nothing.
+	return f, &wproto.ACLExpect{State: observed, Identity: resp.Identity}
 }
 
 // aclBackendRank orders the ACL backends by how much a chmod can destroy under
@@ -762,11 +781,12 @@ func (s *Server) chmod(w http.ResponseWriter, r *http.Request, sess *session) {
 	// above graded this change on an ACL state read by pathname in a separate
 	// round trip; between that read and this one the name can be re-pointed at a
 	// different object, and the ACL the user was told about is then not the ACL
-	// the chmod destroys. Expect carries what was graded — the state and the
-	// object's identity — and the worker re-probes its held descriptor and
-	// answers `changed` when either has moved, which is exactly the refusal a
-	// symlink among the canonical components already gets. When nothing was
-	// learned (no Props answer) there is nothing to promise and expect is nil.
+	// the chmod destroys. Expect carries what Props OBSERVED — that state and the
+	// object's identity, never the ladder's pessimistic fallback (Astra r2 #1) —
+	// and the worker re-probes its held descriptor and answers `changed` when
+	// either has moved, which is exactly the refusal a symlink among the canonical
+	// components already gets. When nothing was learned (no Props answer) there is
+	// nothing to promise and expect is nil.
 	resp, err := s.mutator.Chmod(r.Context(), sess.who, wproto.ChmodReq{Path: []byte(target), Spec: spec, Expect: expect})
 	detail := asked
 	if err == nil {
@@ -1316,7 +1336,18 @@ func (s *Server) permScan(ctx context.Context, who backend.Principal, roots []st
 	}
 	var total int64
 	for _, root := range roots {
-		res, err := s.transferSize(scanCtx, who, root, cross, modeScanMaxEntries)
+		// The budget is what is LEFT of the selection's allowance, not a fresh one
+		// per root (Astra r2 #8). A per-root bound is no bound at all on a
+		// selection: eight roots of half a million entries each walked four million
+		// and reported the sum as a measured count, so the cap that exists to keep
+		// an unconfirmed POST from walking a NAS was multiplied by the number of
+		// paths in the body — which the caller chooses. A root that arrives with
+		// nothing left is the capped case itself and answers -1 without walking.
+		remaining := modeScanMaxEntries - total
+		if remaining <= 0 {
+			return -1
+		}
+		res, err := s.transferSize(scanCtx, who, root, cross, remaining)
 		// Capped is not a count: the walk stopped at the entry bound, so what it
 		// carries is a minimum and the ladder must read the whole answer as
 		// unknown (which it grades as large).

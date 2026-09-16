@@ -128,6 +128,13 @@ kernel refuses (INV-2).
      ALARM entry of any kind is non-trivial — and requires that `GROUP@`/`EVERYONE@` carry neither `WRITE_ACL` nor
      `WRITE_OWNER`, the bits a mode cannot express. The type and the mask were being ignored, so an
      `EVERYONE@ DENY DELETE` ACL passed as trivial and a `discard` chmod would have destroyed it without L2.
+     *Round 2 (#3):* excluding two admin bits was not mode-equivalence. An ALLOW for a special principal is
+     trivial only if its mask is within the **representable set** — read (`READ_DATA`, `READ_ATTRIBUTES`,
+     `READ_NAMED_ATTRS`, `READ_ACL`, `SYNCHRONIZE`), write (`WRITE_DATA`, `APPEND_DATA`, `WRITE_ATTRIBUTES`,
+     `WRITE_NAMED_ATTRS`) with `WRITE_DATA` and `APPEND_DATA` both or neither, execute, and for `OWNER@` alone
+     `WRITE_ACL`/`WRITE_OWNER`. `DELETE`, `DELETE_CHILD` and an append-only grant are not representable and are
+     non-trivial. **Hardware check:** if QNAP's own trivial ACLs carry `DELETE_CHILD` on directories, every hero
+     chmod will ask for the typed phrase; the rule is then widened with the real bytes in hand, not guessed.
    - A read or parse failure is `unknown`, never `none`, and `unknown` shows the badge with the pessimistic text.
      The existing NFSv4 parser shapes in `internal/fsops/acl_linux.go` are reused; `internal/perm` holds the
      trivial/non-trivial judgement so it is testable everywhere.
@@ -150,7 +157,13 @@ kernel refuses (INV-2).
    dataset. A path the literal lookup cannot place has unknown facts and is graded pessimistically.
 5. *Added, Astra round 1 (#1):* a dataset mounted **after** start-up is probed on the next mount-table refresh,
    exactly as at start-up; until then, and whenever the backend of a storage mount is simply unknown (`""`), the
-   ladder grades it as the worst case (L2 with the unknown suffix) rather than as "no ACL backend". The accepted
+   ladder grades it as the worst case (L2 with the unknown suffix) rather than as "no ACL backend". *Round 2
+   (#7, #13, #14):* the probe runs **asynchronously** after the refresh — `zfs get` has a 3 s timeout and a batch of
+   new datasets probed inline would sit inside a 15 s request — and the unknown-is-pessimistic rule covers the gap.
+   Only the **visible** row of a mount point is probed (the last mountinfo line, the rule the table already uses),
+   and a result is published only if that row is still the one mounted there — two datasets stacked at one path
+   were answering with the upper one's attribute and the lower one's `aclmode`. Start-up probes once,
+   synchronously; a refresh never repeats a finished probe. The accepted
    race is a mount that appears after the token is issued (§17.3), not one that existed before the request.
 
 ## 7. The `aclmode` confirm ladder
@@ -195,7 +208,11 @@ non-recursively cannot be redeemed recursively.
    the chmod is a second RPC, the sync chmod route sends what it graded: `ChmodReq.Expect *ACLExpect{State,
    Identity}`; the worker re-proves the identity on the held descriptor and re-probes the state, and refuses
    `changed` if either differs. A worker that could not detect a backend answers unknown, and the route never lets
-   the worker's answer downgrade a backend the daemon already knows.
+   the worker's answer downgrade a backend the daemon already knows. *Round 2 (#1, #6):* the expectation carries
+   the state the worker **observed**, never the ladder's fallback grade — grading pessimistically and expecting
+   pessimistically are different things, and confusing them made every legitimate chmod on an unplaced mount fail
+   `changed`; with nothing observed the expectation carries identity only. Off Linux there is no inode to prove,
+   so the worker proves the state alone (§14's best-effort loop stands).
 4. **Size reuses the existing size job.** Opening the dialog on a directory submits `POST /api/jobs/size` for that
    one path, polls `/api/jobs` as every job is polled, and `POST /api/jobs/{id}/cancel` when the dialog closes or
    Stop is pressed; Recount resubmits. No new job kind, no new route, no second size implementation. `#pImpact` in
@@ -329,7 +346,8 @@ redeemed, so the tree is scanned once per confirmed job.
 
 *Amended, Astra round 1 (#6, #10, #11):* "nothing in M3 needs an admission slot" was wrong about the pre-scan,
 which is recursive work an unconfirmed POST can start at will. The pre-scan takes a `ClassMetadata` slot like the
-job it precedes and carries the 500 000-entry budget on the wire (`MaxEntries`; a `Capped` result is `-1`); a `-1`
+job it precedes and carries the 500 000-entry budget on the wire (`MaxEntries`; a `Capped` result is `-1`; round
+2 #8: the budget is the **remaining** allowance root to root, so the sum over a selection is what is capped); a `-1`
 is remembered in the issued-cost ledger as an explicit capped outcome, so the confirmed repost reuses it instead of
 walking the tree again. A recursive job is also checked for **containment** (`Guard.Contains` over every root, as
 the transfer routes do) — a recursive change over an ancestor of the daemon's own installation is refused exactly as

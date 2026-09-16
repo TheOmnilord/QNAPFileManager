@@ -361,12 +361,24 @@ export function pollJobs() {
  refreshJobs().then(again => { if (again) poller.start(); }).catch(err => error(err));
 }
 
+// cancelJob answers whether the service ACKNOWLEDGED the cancel, which is not
+// the same question as whether one was sent (Astra r2 #9). A size job's runner
+// cancels precisely when its poll has just given up, and the usual reason a poll
+// gives up is that the connection went away — so the cancel goes down the same
+// dead wire, and treating "sent" as "stopped" leaves a du over a multi-terabyte
+// share walking with nothing left able to stop it. Anything the service answered
+// — a 404 for a job it has already reaped included — is an answer; only a
+// transport failure is not, and only that one is worth retrying.
 export async function cancelJob(id) {
  const valid = sessionGuard();
  try {
   await api(`api/jobs/${id}/cancel`,{},{method:'POST'});
   if (valid()) pollJobs();
- } catch(err) { if (valid()) error(err); }
+  return true;
+ } catch(err) {
+  if (valid()) error(err);
+  return !err?.network;
+ }
 }
 
 // trackJob shows the panel for a job that was just submitted and starts polling.

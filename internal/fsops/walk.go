@@ -153,11 +153,22 @@ func (it WalkItem) isDir() bool { return it.Info != nil && it.Info.IsDir() }
 // particular object — the copy engine refusing to descend into its own output —
 // has to be able to refuse it there, because by the time Pre is called for the
 // first child the directory has already been read.
+//
+// Unopened, when set, REPLACES the warning for a directory the walk could not
+// open at all, and it is the only hook that hears about one: Pre still runs (the
+// item was reached), Opened never does, the descent does not happen and neither
+// does Post. A caller that has something to do with such a directory anyway —
+// the recursive chmod, whose whole purpose on an owner-set 0000 directory is to
+// repair exactly the mode that made it unreadable (Astra r2 #5) — needs the
+// item, not just the pathname a warning carries, because the item is what names
+// the entry relative to the held parent. It reports the failure itself, which is
+// why the walker does not also warn.
 type Visitor struct {
-	Pre    func(it WalkItem) error
-	Post   func(it WalkItem) error
-	Opened func(it WalkItem, info os.FileInfo) error
-	Warn   func(apiPath string, err error)
+	Pre      func(it WalkItem) error
+	Post     func(it WalkItem) error
+	Opened   func(it WalkItem, info os.FileInfo) error
+	Unopened func(it WalkItem, err error)
+	Warn     func(apiPath string, err error)
 }
 
 // dirOpener opens (or re-opens) one directory of the walk. A re-open is what
@@ -559,6 +570,10 @@ func (w *walker) directory(ctx context.Context, parentDir *dirRef, it WalkItem, 
 		if verr := w.visit(ctx, it, nil); verr != nil {
 			return verr
 		}
+		if w.v.Unopened != nil {
+			w.v.Unopened(it, err)
+			return nil
+		}
 		w.warn(it.Path, err)
 		return nil
 	}
@@ -719,8 +734,22 @@ func (w *walker) mayCrossInto(parentOS string, parentID mountIdentity, childPath
 // PLAN.md decision 15) whose row IDs are invented and can never equal a running
 // kernel's, so no descriptor could ever match one.
 func (w *walker) capsFor(id mountIdentity, osPath string, requireMount bool) (platform.FSCaps, bool) {
+	return capsForMount(w.plat, w.liveTable, id, osPath, requireMount)
+}
+
+// capsForMount is walker.capsFor's body, as a function of the table rather than
+// of a walk. The recursive mode job asks the same question about a LEAF it holds
+// (mode_job.go, Astra r2 #4), and one crossing rule with two implementations is
+// two crossing rules a year from now.
+//
+// live is the B5 predicate, taken lazily because it copies the whole table and
+// is only ever needed when a mount id has already failed to match a row.
+func capsForMount(plat *platform.Platform, live func() bool, id mountIdentity, osPath string, requireMount bool) (platform.FSCaps, bool) {
+	if plat == nil {
+		return platform.FSCaps{}, false
+	}
 	if id.hasMnt {
-		for _, m := range w.plat.Mounts() {
+		for _, m := range plat.Mounts() {
 			if uint64(m.ID) == id.mnt {
 				// B7: the caps come from the matched ROW, not from
 				// For(m.MountPoint). Going back through the mount point would
@@ -737,15 +766,15 @@ func (w *walker) capsFor(id mountIdentity, osPath string, requireMount bool) (pl
 				return platform.CapsFor(m), true
 			}
 		}
-		if w.liveTable() {
+		if live != nil && live() {
 			// B5: the kernel's own mount ID, absent from the kernel's own table.
 			return platform.FSCaps{}, false
 		}
 	}
-	if requireMount && !w.plat.IsMountPointByTable(osPath) {
+	if requireMount && !plat.IsMountPointByTable(osPath) {
 		return platform.FSCaps{}, false
 	}
-	return w.plat.For(osPath), true
+	return plat.For(osPath), true
 }
 
 // mountIdentity is what a held directory descriptor says about the filesystem it

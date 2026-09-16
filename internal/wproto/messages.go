@@ -125,6 +125,31 @@ type ChmodReq struct {
 // ACLExpect is what the confirmation was graded against (m3-contract §8.1 as
 // amended): the per-object ACL state and the identity of the object the state
 // was read from.
+//
+// Both halves are OBSERVATIONS, not grades (Astra M3 round-2 finding 1). The
+// route grades an unreadable or unplaceable object pessimistically and still
+// sends what Props actually saw, because the worker can only re-prove what was
+// seen. An EMPTY State therefore means "nothing was observed", never "this
+// object has no ACL".
+//
+// So the worker reads a request exactly three ways, and nothing else:
+//
+//   - No expectation at all (nil): nothing is proved. That is a recursive job,
+//     which grades no entry individually and can promise nothing about one.
+//   - State "": the IDENTITY alone is proved. There is no observation to hold
+//     the object to, and re-probing to manufacture one would refuse a change
+//     nobody tampered with — the mount probe that decides whether there is a
+//     backend to read runs asynchronously after a refresh, so an unplaced mount
+//     during Props can be a real backend by the time the chmod arrives.
+//   - State non-empty: the identity AND the state are proved, and either moving
+//     is `changed`.
+//
+// The identity half has its own degradation, and it is the mirror of the above:
+// where NEITHER side carries an inode, on a platform that has none to carry
+// (off Linux, §14), there is nothing to compare and the state alone is proved.
+// An expectation with an empty state on such a platform proves nothing, which is
+// correct rather than lax — the route sent nothing it had learned, and the
+// kernel that decides is not this one (INV-2).
 type ACLExpect struct {
 	State    string         `json:"s"`
 	Identity FSIdentityResp `json:"id"`

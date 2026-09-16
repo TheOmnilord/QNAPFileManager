@@ -6,12 +6,68 @@
 // show and a packet capture should not have to.
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
-import {OCTAL_REFUSAL,applyBlocked,applyPlan,applyScope,chownGateMessage,clearIdCache,impactNote,impactRoots,impactText,loadIds,octalState,permsApplies,reportResult} from './static/js/perms.js';
-import {update} from './static/js/state.js';
-import {createSizeRunner,flagsText,modeText,ownerText,propsSections,sizeReport,sizeRequest} from './static/js/props.js';
-import {warningCode,warningLine,warningsLabel} from './static/js/jobs.js';
-import {actionMessage} from './static/js/actions.js';
-import {EMPTY,SETUID,jobSpecs,parseOctal,toggleBit} from './static/js/perm.js';
+
+// A document double, so the dialog's OWN handlers can be driven. Two of the
+// things this file has to prove live in the wiring rather than in the pure
+// functions — which handler recomputes the octal verdict (Astra r2 #10), and
+// what Apply posts in what order (Astra r2 #12) — and a test that calls the
+// exported arithmetic directly cannot see either. Nothing below reaches into
+// perms.js for a function: an event is delivered to whatever the module
+// registered for it, exactly as the browser would.
+class Node {
+ constructor(sel = '') {
+  this.sel = sel; this.attrs = {}; this.children = []; this.listeners = {};
+  this.textContent = ''; this.hidden = false; this.disabled = false; this.checked = false;
+  this.indeterminate = false; this.value = ''; this.title = ''; this.open = false;
+  this.scrollTop = 0; this.clientHeight = 360; this.classes = new Set();
+  this.classList = {
+   toggle:(n,on) => on ? this.classes.add(n) : this.classes.delete(n),
+   add:n => this.classes.add(n),remove:n => this.classes.delete(n),contains:n => this.classes.has(n),
+  };
+ }
+ setAttribute(k,v) { this.attrs[k] = String(v); }
+ getAttribute(k) { return this.attrs[k] ?? null; }
+ append(...kids) { this.children.push(...kids); }
+ replaceChildren(...kids) { this.children = kids; }
+ addEventListener(type,fn) { (this.listeners[type] ||= []).push(fn); }
+ removeEventListener(type,fn) { this.listeners[type] = (this.listeners[type] || []).filter(f => f !== fn); }
+ querySelector() { return null; }
+ querySelectorAll() { return []; }
+ contains() { return false; }
+ closest() { return null; }
+ focus() { document.activeElement = this; }
+ showModal() { this.open = true; }
+ close() { if (this.open) { this.open = false; fire(this,'close'); } }
+}
+const nodes = new Map();
+const $ = sel => { if (!nodes.has(sel)) nodes.set(sel,new Node(sel)); return nodes.get(sel); };
+// fire delivers one event and hands back what the handlers returned, so an
+// async handler — Apply is one — can be awaited.
+const fire = (node,type,ev = {}) => (node.listeners[type] || []).map(fn => fn({target:node,...ev}));
+// settle drains the microtasks a press leaves behind. Every wait in this file is
+// an explicit one: nothing is timed out and nothing is slept on.
+const settle = async (turns = 6) => { for (let i = 0;i < turns;i++) await new Promise(resolve => setTimeout(resolve,0)); };
+globalThis.document = {
+ querySelector:$,querySelectorAll:() => [],createElement:() => new Node(),
+ addEventListener() {},activeElement:null,hidden:false,getElementById:() => null,styleSheets:[],
+};
+globalThis.window = {addEventListener() {}};
+globalThis.matchMedia = () => ({matches:false});
+globalThis.location = {hash:''};
+
+const {
+ OCTAL_REFUSAL,applyBlocked,applyPlan,applyScope,chownGateMessage,clearIdCache,impactNote,impactRoots,
+ impactText,initPerms,loadIds,octalState,openPerms,permsApplies,reportResult,
+} = await import('./static/js/perms.js');
+const {update} = await import('./static/js/state.js');
+const {createSizeRunner,flagsText,modeText,ownerText,propsSections,sizeReport,sizeRequest} = await import('./static/js/props.js');
+const {warningCode,warningLine,warningsLabel} = await import('./static/js/jobs.js');
+const {actionMessage} = await import('./static/js/actions.js');
+const {EMPTY,SETUID,jobSpecs,parseOctal,toggleBit} = await import('./static/js/perm.js');
+
+// The handlers under test are the ones the app registers, so they are registered
+// here the way the app registers them — once, at start-up.
+initPerms();
 
 const dir = (path,rest = {}) => ({path,name:path.split('/').pop(),type:'dir',mode:'0755',uid:0,gid:0,...rest});
 const file = (path,rest = {}) => ({path,name:path.split('/').pop(),type:'file',mode:'0644',uid:1003,gid:100,...rest});
@@ -194,11 +250,11 @@ test('chown is posted BEFORE chmod, because a chown clears setuid (§3.2)', () =
  assert.deepEqual(plan[1].body,{path:'/share/a',mask:SETUID,value:SETUID});
 });
 
-test('the ordering is JOBS too: the chmod waits for the chown to FINISH (§3.2)', () => {
- // Both halves of a multi-item or recursive apply are jobs, and a 202 only
- // means accepted — so the two used to walk the same tree at once in the
- // metadata pool and a 4755 could land with setuid cleared by the chown behind
- // it (round 1, finding 12). The dialog gates on the chown job's terminal state.
+test('the gate’s SENTENCE names the outcome it is refusing to proceed from (§3.2)', () => {
+ // This is the wording and the plan shape only. That the dialog actually WAITS
+ // is proved where it can be proved — by pressing Apply (Astra r2 #12): this
+ // test stayed green with the `await awaitJob` taken out of applyNow, which is
+ // exactly as much as a test of a pure function can be expected to see.
  const plan = applyPlan({entries:[file('/share/a'),file('/share/b')],spec:toggleBit(EMPTY,SETUID,true),owner:1003});
  assert.deepEqual(plan.map(r => r.op),['chown','chmod']);
  assert.ok(plan.every(r => r.job),'both halves are jobs here, which is why the gate is needed');
@@ -534,3 +590,127 @@ test('a trivial NFSv4 ACL is stated as harmless rather than badged', () => {
  assert.match(acl[1],/changing the mode is safe here/);
  assert.ok(permissions.rows.some(([label,value]) => label === 'ZFS aclmode' && /discard \(dataset tank\/share\)/.test(value)));
 });
+
+// --- the dialog's own handlers, driven (Astra r2 #10, #12) --------------------
+//
+// Everything above this line asks the exported arithmetic what it would do.
+// What follows opens the real dialog, delivers real events to the handlers
+// initPerms registered, and reads what came out — because both failures below
+// were invisible to the arithmetic: one handler not recomputing what another
+// handler owns, and an ordering that lives in applyNow rather than in the plan
+// it dispatches.
+
+const SESSION = {user:'admin',uid:0,admin:true,canWrite:true,groups:[0],family:'qts'};
+
+// openDialogFor opens #dlgPerms over `entries` with the id pickers answered, and
+// leaves the dialog and the session cleaned up after the test.
+async function openDialogFor(t,entries,fetchMock) {
+ t.after(() => { $('#dlgPerms').close(); clearIdCache(); update({session:null}); });
+ t.mock.method(globalThis,'fetch',fetchMock);
+ update({session:{...SESSION}});
+ clearIdCache();
+ await openPerms(entries);
+ assert.equal($('#dlgPerms').open,true,'the dialog is what the rest of this test is driving');
+}
+
+test('a grid tick after an unparseable mode clears the refusal it replaced (Astra r2 #10)', async t => {
+ await openDialogFor(t,[file('/share/Public/a.txt')],
+  async () => new Response(JSON.stringify({items:[],truncated:false}),{status:200}));
+ // 0788 is not a mode. Apply is refused, and the error line says why.
+ $('#pOctal').value = '0788';
+ fire($('#pOctal'),'input');
+ assert.equal($('#pApply').disabled,true);
+ assert.equal($('#permsError').textContent,OCTAL_REFUSAL);
+ assert.equal($('#permsError').hidden,false);
+ // Ticking a box rewrites the field with a mode that IS one — and only onOctal
+ // used to clear octalInvalid, so Apply stayed grey under an error line about a
+ // 0788 that was no longer on screen.
+ fire($('#pGW'),'change',{target:{checked:true}});
+ assert.match($('#pOctal').value,/^[0-7]{4}$/,'the grid wrote a real mode into the field');
+ assert.equal($('#pOctal').value,'0664','0644 with group write ticked');
+ assert.equal($('#permsError').textContent,'','the refusal went with the text it was about');
+ assert.equal($('#permsError').hidden,true);
+ assert.equal($('#pApply').disabled,false,'and Apply may be pressed again');
+ // The same holds the other way round: UN-ticking a box writes the field too.
+ $('#pOctal').value = '0788';
+ fire($('#pOctal'),'input');
+ assert.equal($('#pApply').disabled,true);
+ fire($('#pGW'),'change',{target:{checked:false}});
+ assert.equal($('#pOctal').value,'0644');
+ assert.equal($('#permsError').hidden,true);
+ assert.equal($('#pApply').disabled,false);
+});
+
+// deferred is the chown job that has not finished yet: the fetch for its status
+// answers only when the test says so, so "did the chmod go out early?" is asked
+// at a moment that is chosen rather than raced for.
+const deferred = () => { let settleIt; return {promise:new Promise(resolve => { settleIt = resolve; }),resolve:job => settleIt(job)}; };
+
+// applyRoutes is the server for these tests: it records every call and answers
+// the three routes Apply uses, with the chown job's status held back.
+function applyRoutes(calls,chownJob) {
+ return async (url,options = {}) => {
+  const path = String(url).split('?')[0],method = options.method || 'GET';
+  calls.push({path,method,body:options.body ? JSON.parse(options.body) : null});
+  if (path === 'api/ids') return new Response(JSON.stringify({items:[],truncated:false}),{status:200});
+  if (path === 'api/jobs/chown') return new Response(JSON.stringify({job:{id:'chown-1',state:'queued'}}),{status:202});
+  if (path === 'api/jobs/chmod') return new Response(JSON.stringify({job:{id:'chmod-1',state:'queued'}}),{status:202});
+  if (path === 'api/jobs/chown-1') return new Response(JSON.stringify({job:await chownJob.promise}),{status:200});
+  // Everything else — the job listing, the reload of the list and the tree — is
+  // answered emptily: this test is about what Apply posts, and in what order.
+  return new Response(JSON.stringify({}),{status:200});
+ };
+}
+
+// pressApply fills in "change owner to 1003" and a 4755 over two items, so both
+// halves are jobs, then presses the button and hands back what it returned.
+async function pressApply(t,chownJob) {
+ const calls = [];
+ await openDialogFor(t,[file('/share/a'),file('/share/b')],applyRoutes(calls,chownJob));
+ $('#pOwnerChange').checked = true;
+ fire($('#pOwnerChange'),'change');
+ $('#pOwnerId').value = '1003';
+ fire($('#pOwnerId'),'input');
+ $('#pOctal').value = '4755';
+ fire($('#pOctal'),'input');
+ assert.equal($('#permsError').hidden,true,'nothing is wrong with what was typed');
+ assert.equal($('#pApply').disabled,false);
+ const [pressed] = fire($('#pApply'),'click');
+ return {calls,pressed,posts:() => calls.filter(c => c.method === 'POST').map(c => c.path)};
+}
+
+test('Apply does not post the chmod until the chown JOB has finished (Astra r2 #12)', async t => {
+ // A 202 is only "accepted". With the `await awaitJob` taken out of applyNow
+ // the chmod goes out while the chown is still walking, the two meet in the
+ // metadata pool, and the kernel clears the setuid this dialog was asked to set
+ // (round 1, finding 12). The plan's order alone cannot show that.
+ const chownJob = deferred();
+ const {pressed,posts,calls} = await pressApply(t,chownJob);
+ await settle();
+ assert.deepEqual(posts(),['api/jobs/chown'],'the owner change goes first, alone');
+ assert.ok(calls.some(c => c.path === 'api/jobs/chown-1'),'and the dialog is waiting on that job');
+ await settle();
+ assert.deepEqual(posts(),['api/jobs/chown'],'still nothing else while the chown is running');
+ chownJob.resolve({id:'chown-1',state:'done'});
+ await pressed;
+ assert.deepEqual(posts(),['api/jobs/chown','api/jobs/chmod'],'the mode change goes only afterwards');
+ assert.equal($('#permsError').hidden,true);
+});
+
+for (const outcome of ['failed','cancelled']) {
+ test(`a chown job that ${outcome} stops the chmod and says so (Astra r2 #12)`,async t => {
+  // A chown that did not finish leaves a tree whose ownership is not what the
+  // mode was computed against; sending the mode anyway would write it over a
+  // half-changed tree and report success.
+  const chownJob = deferred();
+  const {pressed,posts} = await pressApply(t,chownJob);
+  await settle();
+  chownJob.resolve({id:'chown-1',state:outcome});
+  await pressed;
+  assert.deepEqual(posts(),['api/jobs/chown'],'no mode change over a tree whose owner change did not land');
+  assert.equal($('#permsError').hidden,false);
+  assert.equal($('#permsError').textContent,chownGateMessage({state:outcome}));
+  assert.match($('#permsError').textContent,/apply the permissions again/);
+  assert.equal($('#dlgPerms').open,true,'the dialog stays open, holding the sentence');
+ });
+}

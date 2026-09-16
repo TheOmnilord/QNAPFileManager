@@ -15,6 +15,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -23,6 +24,28 @@ import (
 	"qnapfilemanager/internal/fsx"
 	"qnapfilemanager/internal/platform"
 )
+
+// nfs4Unavailable reports that this fixture's ZFS cannot stage an NFSv4 ACL.
+//
+// It is a SKIP on an ordinary runner and a FAILURE under QFM_NFS4_TEST=1 (Astra
+// M3 round-2 finding 11). A skip is the honest outcome where the attribute does
+// not exist — CI's upstream OpenZFS on Linux does not implement
+// system.nfs4_acl, and nothing this app does can stage one — but on a runner
+// that HAS it, a detection regression would then skip rather than fail, which
+// is the one thing a test must never do quietly. The environment variable is
+// how such a runner says so; on the NAS itself this is the hardware check the
+// contract already lists (§6.1).
+func nfs4Unavailable(t *testing.T, format string, args ...any) {
+	t.Helper()
+	msg := fmt.Sprintf(format, args...)
+	msg += fmt.Sprintf("; %s is QNAP's fork, and CI's upstream OpenZFS on Linux cannot stage it"+
+		" — set QFM_NFS4_TEST=1 on a runner that has the attribute to make this a failure"+
+		" (contract §6.1: the hardware check)", platform.XattrNFS4ACL)
+	if os.Getenv("QFM_NFS4_TEST") == "1" {
+		t.Fatalf("QFM_NFS4_TEST=1: %s", msg)
+	}
+	t.Skip(msg)
+}
 
 // nfs4ACLWithNamedACE builds a system.nfs4_acl attribute holding exactly one
 // ALLOW ACE for a named principal: a big-endian ACE count, then type, flag,
@@ -60,7 +83,7 @@ func nfs4ACLWithNamedACE(who string) []byte {
 func TestZFSFixtureNamedNFS4ACEBadgesAsNFS4(t *testing.T) {
 	plat := zfsFixture(t)
 	if b := plat.For(zfsPublic).ACLBackend; b != platform.ACLNFS4 {
-		t.Skipf("this OpenZFS build reports ACL backend %q on %s, not %q; QNAP's fork exposes the NFSv4 attribute",
+		nfs4Unavailable(t, "this OpenZFS build reports ACL backend %q on %s, not %q",
 			b, zfsPublic, platform.ACLNFS4)
 	}
 
@@ -77,7 +100,7 @@ func TestZFSFixtureNamedNFS4ACEBadgesAsNFS4(t *testing.T) {
 		xattr = platform.XattrNFS4ACL
 	}
 	if err := syscall.Setxattr(osPath, xattr, nfs4ACLWithNamedACE("qfmacl@qfm.test"), 0); err != nil {
-		t.Skipf("this fixture refuses setxattr of %s: %v (errno %d)", xattr, err, errnoOf(err))
+		nfs4Unavailable(t, "this fixture refuses setxattr of %s: %v (errno %d)", xattr, err, errnoOf(err))
 	}
 
 	ctx := context.Background()

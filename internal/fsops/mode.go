@@ -56,8 +56,14 @@ import (
 // never saw; ChmodReq.Follow is the ROUTE's instruction to resolve the link and
 // re-guard the target as a path of its own, so by the time a request reaches
 // here the spelling is already the target (§1.4).
-func Chmod(ctx context.Context, r fsx.Root, plat *platform.Platform, apiPath string, spec perm.ModeSpec) (wproto.ModeResp, error) {
-	return modeOne(ctx, r, plat, apiPath, spec, -1, -1, false)
+//
+// expect, when the caller supplies one, is the PRECONDITION the confirmation
+// ladder was graded against, and it is proved on the held leaf before a single
+// bit is changed (§8.1 as amended; Astra M3 round-1 finding 4). Nil means the
+// caller asserted nothing.
+func Chmod(ctx context.Context, r fsx.Root, plat *platform.Platform, apiPath string,
+	spec perm.ModeSpec, expect *wproto.ACLExpect) (wproto.ModeResp, error) {
+	return modeOne(ctx, r, plat, apiPath, spec, -1, -1, false, expect)
 }
 
 // Chown changes owner and/or group of one already-canonical path. -1 leaves
@@ -74,7 +80,9 @@ func Chmod(ctx context.Context, r fsx.Root, plat *platform.Platform, apiPath str
 // group-executable file, when ownership changes — which no call can prevent and
 // which the returned diff is there to report (§3.2).
 func Chown(ctx context.Context, r fsx.Root, plat *platform.Platform, apiPath string, uid, gid int) (wproto.ModeResp, error) {
-	return modeOne(ctx, r, plat, apiPath, perm.ModeSpec{}, uid, gid, true)
+	// No ACL precondition: a chown neither reads nor rewrites an ACL, so there
+	// is no ladder grade for one to protect.
+	return modeOne(ctx, r, plat, apiPath, perm.ModeSpec{}, uid, gid, true, nil)
 }
 
 // modeOne is the shared body of Chmod and Chown: one canonical walk, one held
@@ -86,9 +94,8 @@ func Chown(ctx context.Context, r fsx.Root, plat *platform.Platform, apiPath str
 // diff is a mode difference (the setuid the kernel cleared), which a chown-only
 // path would have had no reason to look for.
 func modeOne(ctx context.Context, r fsx.Root, plat *platform.Platform, apiPath string,
-	spec perm.ModeSpec, uid, gid int, allowSymlink bool) (wproto.ModeResp, error) {
+	spec perm.ModeSpec, uid, gid int, allowSymlink bool, expect *wproto.ACLExpect) (wproto.ModeResp, error) {
 
-	_ = plat
 	clean, err := fsx.Clean(apiPath)
 	if err != nil {
 		return wproto.ModeResp{}, err
@@ -124,6 +131,10 @@ func modeOne(ctx context.Context, r fsx.Root, plat *platform.Platform, apiPath s
 			clean, fsx.ErrUnsupported)
 	}
 
+	if err := proveExpectation(r, plat, tg, ref, expect); err != nil {
+		return wproto.ModeResp{}, err
+	}
+
 	var afterInfo os.FileInfo
 	if allowSymlink {
 		afterInfo, err = chownHeld(parent, name, ref, uid, gid)
@@ -151,4 +162,66 @@ func modeOne(ctx context.Context, r fsx.Root, plat *platform.Platform, apiPath s
 		Entry:  after,
 		Diffs:  perm.DiffOf(spec, uid, gid, before, after),
 	}, nil
+}
+
+// proveExpectation re-proves, on the HELD leaf, the two facts the confirmation
+// ladder was graded against: which object this is, and what its ACL says
+// (m3-contract §8.1 as amended; Astra M3 round-1 finding 4).
+//
+// It exists because the grading and the change are two round trips and the gap
+// between them belongs to the client. Props describes an object, the front end
+// decides from that description whether a typed phrase is needed, and the chmod
+// arrives later — so somebody who can write in the parent directory can let a
+// trivial file be graded, swap a non-trivial one over the name, and have the
+// chmod discard an ACL nobody was ever warned about. The canonical walk already
+// refuses a symlink among the components, but a plain rename of a sibling over
+// the leaf's name is not a symlink and was never caught.
+//
+// Both halves are asked of the descriptor this call is holding, never of a name.
+// The identity comparison is the one every pinned authorization in this app uses
+// (device and inode, plus birth time when both sides have one), and the ACL is
+// re-probed through /proc/self/fd/N of that same descriptor, which is what makes
+// "the state has not moved" a statement about an inode.
+//
+// A nil expectation asserts nothing and is the ordinary case for a job, which
+// grades no entry individually and can promise nothing about one.
+func proveExpectation(r fsx.Root, plat *platform.Platform, tg jailPath, ref *itemRef, expect *wproto.ACLExpect) error {
+	if expect == nil {
+		return nil
+	}
+	if ref == nil {
+		// Nothing is held, so nothing can be proved — and an unprovable
+		// precondition is a refusal, not a pass.
+		return fmt.Errorf("%q cannot be held long enough to prove what was confirmed: %w", tg.api, fsx.ErrChanged)
+	}
+	held := identityOfInfo(itemIdentityOf(ref), ref.fi, refFD(ref))
+	if !held.SameInode(expect.Identity) {
+		return fmt.Errorf(
+			"%q is not the item the confirmation was given for; it was replaced after it was described: %w",
+			tg.api, fsx.ErrChanged)
+	}
+	osPath, osErr := r.OS(tg.api)
+	if osErr != nil {
+		osPath = ""
+	}
+	_, _, state := probeOne(plat, osPath, ref)
+	if state != expect.State {
+		// Either direction is a refusal. A state that has become MORE serious is
+		// the attack; one that has become less is still a tree that moved under a
+		// decision the user made about something else, and the honest answer is
+		// to ask again rather than to act on a grade nobody gave.
+		return fmt.Errorf(
+			"%q now has a %s ACL where the confirmation described %s; nothing was changed: %w",
+			tg.api, aclWord(state), aclWord(expect.State), fsx.ErrChanged)
+	}
+	return nil
+}
+
+// aclWord spells an ACL state for the one sentence above, including the empty
+// state, which is "not probed" and not a fact about the file.
+func aclWord(state string) string {
+	if state == "" {
+		return "an unprobed"
+	}
+	return state
 }

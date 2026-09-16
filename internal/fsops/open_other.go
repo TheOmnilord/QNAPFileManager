@@ -80,6 +80,13 @@ func openItemRef(j fsx.Jail, rel string) (*itemRef, error) {
 
 func (ref *itemRef) close() {}
 
+// restat does nothing off Linux: there is no descriptor behind a held item
+// here, so there is nothing to re-read that would not simply be the pathname
+// again — and re-stating by name is the one thing the caller wanted to avoid.
+// The stale reading is kept, which is the same INV-2 degradation every identity
+// check in this file accepts; the CI Linux jobs hold the real descriptor.
+func (ref *itemRef) restat() {}
+
 // refFD is nil off Linux: there is no descriptor behind a held item here, so
 // every caller falls back to addressing the entry by name through os.Root.
 func refFD(ref *itemRef) *os.File { return nil }

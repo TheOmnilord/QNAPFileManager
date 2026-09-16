@@ -158,7 +158,11 @@ func (s *session) jobWork(ctx context.Context, req wproto.JobReq, e *progEmitter
 		if err := jobBody(req.Body, &body); err != nil {
 			return wproto.JobResult{}, err
 		}
-		return fsops.Size(ctx, s.root, s.plat, pathsOf(body.Paths), body.CrossMounts, emit)
+		// MaxEntries is the caller's own bound and is passed through as it came:
+		// an ordinary folder-size job sends zero and gets the real number, and
+		// the permissions pre-scan sends the contract's 500 000 so an enormous
+		// tree ends the walk instead of the request (finding 10).
+		return fsops.Size(ctx, s.root, s.plat, pathsOf(body.Paths), body.CrossMounts, body.MaxEntries, emit)
 
 	case wproto.JobSearch:
 		var body wproto.SearchReq

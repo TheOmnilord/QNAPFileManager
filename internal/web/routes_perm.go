@@ -109,6 +109,13 @@ const (
 	// a 15 s deadline is a number that can never be reached, and one that reads as
 	// a promise the route cannot keep.
 	permScanReserve = 2 * time.Second
+	// modeScanMaxEntries is the entry budget the pre-scan hands the size walk
+	// (contract §13: 500 000, as delete and size use). Without it the walk is
+	// bounded by the request deadline alone, which on a tree of tens of millions
+	// of entries means the whole 15 s is spent producing a number nobody gets —
+	// with the bound the walk ends, says Capped, and the ladder says "unknown",
+	// which is the same answer at a fraction of the cost.
+	modeScanMaxEntries = 500_000
 	// idsMax bounds /api/ids (contract §13).
 	idsMax = 2000
 	// idsQueryMax bounds the q= prefix, which is only ever a name fragment.
@@ -130,6 +137,18 @@ type aclFacts struct {
 	// fold counts them as two rather than collapsing them into one (round-5).
 	mount string
 	state string // fsx.ACL* — "" and ACLUnknown are read the same, pessimistically
+	// storage says the mount holds user data (FSCaps.Storage). It is what makes
+	// an EMPTY backend a fact worth warning about rather than a shrug: a storage
+	// mount whose backend this daemon has not probed may be a ZFS dataset under
+	// aclmode=discard, and "we have not looked" is not "there is nothing there"
+	// (Astra M3 round-1 finding 1).
+	storage bool
+	// unknown says the daemon HAS a mount table and it could not place this
+	// path in it. That is different from having no table at all — the dev box,
+	// where the whole mount half of the ladder is inert by design (contract
+	// §14) — and it grades pessimistically, because a path the table cannot
+	// place is one whose aclmode nobody can state.
+	unknown bool
 }
 
 // key identifies one dataset for de-duplication. The name is the identity when
@@ -143,7 +162,15 @@ func (f aclFacts) key() string {
 }
 
 // mountFacts fills the mount-table half of aclFacts. Nothing branches on QTS vs
-// hero: the question asked is always Platform.For (PLAN decision 8).
+// hero: the question asked is always the mount table (PLAN decision 8).
+//
+// The lookup is the LITERAL one (Platform.ForLiteral, M2-C round 3), never For
+// or MountFor. Those normalise first — a backslash becomes a separator and the
+// result is Cleaned — and on Linux a backslash is an ordinary character in a
+// filename, so a file literally named `danger/..\safe/file` would be graded on
+// the `safe` dataset while the chmod changed the inode on `danger` (Astra M3
+// round-1 finding 2). A spelling the literal table cannot place is not graded
+// leniently: it is marked unknown, and unknown warns.
 func (s *Server) mountFacts(apiPath string) aclFacts {
 	var f aclFacts
 	if s.platform == nil {
@@ -153,9 +180,20 @@ func (s *Server) mountFacts(apiPath string) aclFacts {
 	if mapped, err := s.Root.OS(apiPath); err == nil {
 		osPath = mapped
 	}
-	caps := s.platform.For(osPath)
-	f.backend, f.aclmode = caps.ACLBackend, caps.ZFSAclmode
-	if m, ok := s.platform.MountFor(osPath); ok {
+	caps, ok := s.platform.ForLiteral(osPath)
+	if !ok {
+		// A table with rows in it describes a whole filesystem — every Linux
+		// mountinfo has a "/" line — so a spelling it cannot place is a spelling
+		// nobody can state an aclmode for, and that warns. An EMPTY table is the
+		// other thing entirely: the dev box and any build without /proc, where the
+		// mount half of the ladder is inert by design (contract §14). Reading that
+		// as "unknown, therefore destroy" would put a typed phrase in front of
+		// every chmod on a machine that has no datasets at all.
+		f.unknown = len(s.platform.Mounts()) > 0
+		return f
+	}
+	f.backend, f.aclmode, f.storage = caps.ACLBackend, caps.ZFSAclmode, caps.Storage
+	if m, ok := s.platform.MountForLiteral(osPath); ok {
 		f.dataset, f.mount = m.Source, m.MountPoint
 	}
 	return f
@@ -191,8 +229,17 @@ func (s *Server) ladderFacts(apiRoot string, cross bool) []aclFacts {
 		if mp == rootOS || !underRoot(mp, rootOS) {
 			continue
 		}
-		caps := s.platform.For(m.MountPoint)
-		out = append(out, aclFacts{backend: caps.ACLBackend, aclmode: caps.ZFSAclmode, dataset: m.Source, mount: m.MountPoint, state: fsx.ACLUnknown})
+		// The literal lookup again (finding 2): a mount point is bytes the kernel
+		// wrote, and For would normalise a backslash in one into a separator and
+		// then answer for a mount that is not this one.
+		caps, ok := s.platform.ForLiteral(m.MountPoint)
+		child := aclFacts{dataset: m.Source, mount: m.MountPoint, state: fsx.ACLUnknown}
+		if ok {
+			child.backend, child.aclmode, child.storage = caps.ACLBackend, caps.ZFSAclmode, caps.Storage
+		} else {
+			child.unknown = true
+		}
+		out = append(out, child)
 	}
 	return out
 }
@@ -242,25 +289,51 @@ func (s *Server) chmodJobLadder(ladder *permLadder, targets []string, cross bool
 // (contract §8.1). Where the worker answered with facts of its own they win:
 // it holds the descriptor, and its mount identity is the authoritative one.
 //
+// With one exception, which is Astra M3 round-1 finding 5: the worker's backend
+// may never DOWNGRADE the daemon's. A worker runs as the user, and a user who
+// cannot read the dataset root's attribute gets "none" out of its own Detect —
+// letting that overwrite a known nfs4 would delete the discard warning for
+// exactly the sessions least able to check. So the more pessimistic of the two
+// is kept (aclBackendRank), and when the worker's answer is the one discarded,
+// the STATE it read on that reading is discarded with it: a state derived from
+// an ACL model this object does not use says nothing about this object, and
+// unknown is where §6.1 says to land.
+//
 // A failure to LEARN the state is fsx.ACLUnknown, never ACLNone (§6.1): the
 // pessimistic side is the half that matters, and it is the side that warns.
-func (s *Server) entryACLFacts(ctx context.Context, who backend.Principal, apiPath string) aclFacts {
+//
+// The second return is the PRECONDITION the caller sends with the change
+// (contract §8.1 as amended): the state this graded on and the identity of the
+// object it was read from, so the worker refuses `changed` if either moved
+// between the grade and the chmod. It is nil when nothing was learned — the
+// route then promises nothing, because a precondition built from a failed probe
+// would refuse every change rather than the changed ones.
+func (s *Server) entryACLFacts(ctx context.Context, who backend.Principal, apiPath string) (aclFacts, *wproto.ACLExpect) {
 	f := s.mountFacts(apiPath)
 	f.state = fsx.ACLUnknown
 	if s.backend == nil {
-		return f
+		return f, nil
 	}
 	resp, err := s.backend.Props(ctx, who, wproto.PropsReq{Path: []byte(apiPath)})
 	if err != nil {
-		return f
+		return f, nil
 	}
-	if resp.ACL.State != "" {
-		f.state = resp.ACL.State
-	} else if resp.Entry.ACL != "" {
-		f.state = resp.Entry.ACL
-	}
+	// The backend first: whether the worker's reading is trusted at all decides
+	// whether its state may be taken.
+	trusted := true
 	if resp.ACL.Backend != "" {
-		f.backend = resp.ACL.Backend
+		if aclBackendRank(resp.ACL.Backend) >= aclBackendRank(f.backend) {
+			f.backend = resp.ACL.Backend
+		} else {
+			trusted = false
+		}
+	}
+	if trusted {
+		if resp.ACL.State != "" {
+			f.state = resp.ACL.State
+		} else if resp.Entry.ACL != "" {
+			f.state = resp.Entry.ACL
+		}
 	}
 	if resp.ACL.Aclmode != "" {
 		f.aclmode = resp.ACL.Aclmode
@@ -268,7 +341,25 @@ func (s *Server) entryACLFacts(ctx context.Context, who backend.Principal, apiPa
 	if resp.ACL.Dataset != "" {
 		f.dataset = resp.ACL.Dataset
 	}
-	return f
+	return f, &wproto.ACLExpect{State: f.state, Identity: resp.Identity}
+}
+
+// aclBackendRank orders the ACL backends by how much a chmod can destroy under
+// one, which is the order in which they must be believed when two sources
+// disagree: nfs4 (a mode change can take the whole ACL) beats posix (it rewrites
+// the mask), which beats "not probed" — and "not probed" beats "none", because
+// "we did not look" is not a report that there is nothing there.
+func aclBackendRank(name string) int {
+	switch name {
+	case platform.ACLNFS4:
+		return 3
+	case platform.ACLPosix:
+		return 2
+	case platform.ACLNone:
+		return 0
+	default: // "" — nothing was probed
+		return 1
+	}
 }
 
 // maxNamedDatasets bounds how many datasets an L2 sentence spells out. A
@@ -320,13 +411,27 @@ func datasetList(sources []string) string {
 // promoted even under aclmode=discard (there is nothing to destroy), and a
 // state this daemon could not read is treated as a real ACL, because a parse or
 // read failure fails towards the pessimistic side.
+//
+// Two rungs are the pessimistic reading of a fact this daemon does NOT have,
+// which is the half Astra's round-1 review found missing:
+//
+//   - On a POSIX backend an UNKNOWN state is the mask notice, not silence
+//     (finding 9). A job grades every entry as unknown because it cannot probe a
+//     tree it has not walked, and "we did not look" is not "there is no ACL" —
+//     the same change through the sync route, which does look, is L1.
+//   - A storage mount whose BACKEND is empty, or a path the mount table could
+//     not place at all, is the L2 discard sentence with the unknown-aclmode
+//     suffix (finding 1). An empty backend is the answer for a dataset that was
+//     mounted after the table was probed, and reading it as "no ACLs here"
+//     silently removed the one warning that exists for destroying them.
 func chmodACLNotice(f aclFacts) (grade int, notice string, discards bool) {
-	switch f.backend {
-	case platform.ACLPosix:
-		if f.state == fsx.ACLPosix {
+	switch {
+	case f.backend == platform.ACLPosix:
+		switch f.state {
+		case fsx.ACLPosix, fsx.ACLUnknown, "":
 			return gradeConfirm, aclPosixMaskNotice, false
 		}
-	case platform.ACLNFS4:
+	case f.backend == platform.ACLNFS4, f.unknown, f.storage && f.backend == "":
 		switch f.state {
 		case fsx.ACLNone, fsx.ACLNFS4Trivial:
 			// Nothing that the mode does not already describe: normal rules.
@@ -342,7 +447,9 @@ func chmodACLNotice(f aclFacts) (grade int, notice string, discards bool) {
 		default:
 			// "discard", and "" — which is READ as discard, never as
 			// passthrough: when zfs get is unavailable the pessimistic
-			// reading is the only honest one (identity plan §4.4).
+			// reading is the only honest one (identity plan §4.4). An
+			// unprobed backend has no aclmode either, so it lands here with
+			// the suffix, which is what it should say.
 			sentence := fmt.Sprintf(aclDiscardFmt, datasetList([]string{f.dataset}))
 			if f.aclmode == "" {
 				sentence += aclUnknownModeSuffix
@@ -621,7 +728,7 @@ func (s *Server) chmod(w http.ResponseWriter, r *http.Request, sess *session) {
 	ladder.guardReasons(s.guard, guard.OpChmod, p, guardPath, target)
 	// The ACL that is about to be rewritten belongs to the object the change
 	// LANDS on, which is the target whenever one was followed.
-	facts := s.entryACLFacts(r.Context(), sess.who, target)
+	facts, expect := s.entryACLFacts(r.Context(), sess.who, target)
 	grade, notice, discards := chmodACLNotice(facts)
 	ladder.add(grade, notice)
 	ladder.discards = discards
@@ -650,7 +757,17 @@ func (s *Server) chmod(w http.ResponseWriter, r *http.Request, sess *session) {
 	// (contract §1.4, there being no lchmod), so handing it the link and a Follow
 	// flag could only ever answer unsupported. ChmodReq.Follow therefore stays off
 	// the wire; the field remains, documented inert for M3.
-	resp, err := s.mutator.Chmod(r.Context(), sess.who, wproto.ChmodReq{Path: []byte(target), Spec: spec})
+	//
+	// The PRECONDITION travels with it (Astra M3 round-1 finding 4). The ladder
+	// above graded this change on an ACL state read by pathname in a separate
+	// round trip; between that read and this one the name can be re-pointed at a
+	// different object, and the ACL the user was told about is then not the ACL
+	// the chmod destroys. Expect carries what was graded — the state and the
+	// object's identity — and the worker re-probes its held descriptor and
+	// answers `changed` when either has moved, which is exactly the refusal a
+	// symlink among the canonical components already gets. When nothing was
+	// learned (no Props answer) there is nothing to promise and expect is nil.
+	resp, err := s.mutator.Chmod(r.Context(), sess.who, wproto.ChmodReq{Path: []byte(target), Spec: spec, Expect: expect})
 	detail := asked
 	if err == nil {
 		detail = asked + " -> " + resp.Entry.Mode + diffDetail(resp.Diffs)
@@ -972,6 +1089,29 @@ func (s *Server) submitPermJob(w http.ResponseWriter, r *http.Request, sess *ses
 	}
 	// Every spelling the ladder, the class checks and the re-check must consider.
 	allSpellings := append(append(append([]string(nil), paths...), resolved...), targets...)
+	// A RECURSIVE job reaches everything BELOW its roots, and the guard's root
+	// check never names any of it: /share/CACHEDEV1_DATA/.qpkg passes OpChmod
+	// while the walk underneath it reaches this daemon's own config, credential
+	// and audit files — the very paths that are refused when they are named
+	// (Astra M3 round-1 finding 6). Containment is the static, INV-1-safe answer
+	// the transfer and upload routes already use: the prefix table, on every
+	// spelling, with a deny beneath a root refusing the job exactly as naming
+	// that location would, and a warn-class one asking for the typed phrase.
+	var containReasons []string
+	if pj.recursive && s.guard != nil {
+		for _, p := range allSpellings {
+			hit, ok := s.guard.Contains(p)
+			if !ok {
+				continue
+			}
+			verdict := guard.ErrConfirmRequired
+			if hit.Deny {
+				verdict = guard.ErrProtected
+			}
+			checks = append(checks, verdict)
+			containReasons = append(containReasons, hit.Reason)
+		}
+	}
 	m := mutation{op: pj.op, path: paths[0], files: int64(len(paths))}
 	verdict := worstGuard(checks...)
 	if guardRefuses(verdict) {
@@ -985,6 +1125,11 @@ func (s *Server) submitPermJob(w http.ResponseWriter, r *http.Request, sess *ses
 	}
 	var ladder permLadder
 	ladder.guardReasons(s.guard, guardOp, allSpellings...)
+	// The containment reasons are the guard's own path-free ones, as everywhere,
+	// and they justify the confirmation the verdict above already demanded.
+	if len(containReasons) > 0 {
+		ladder.add(gradeTyped, containReasons...)
+	}
 	if pj.op == "chown" {
 		ladder.add(gradeConfirm, chownClearsNotice)
 	} else {
@@ -1027,15 +1172,20 @@ func (s *Server) submitPermJob(w http.ResponseWriter, r *http.Request, sess *ses
 	}
 	// Files is what was MEASURED, and zero when nothing was: a recursion the
 	// pre-scan could not finish reports no count rather than the root count,
-	// which would read as "this touches three items". That is also what decides
-	// whether the count is worth remembering against the token — an unmeasured
-	// one is not, so its re-post measures again and reaches the same pessimistic
-	// answer rather than inheriting a number nobody established.
+	// which would read as "this touches three items".
+	//
+	// Zero is not the whole answer, though, and Astra's round-1 finding 11 is
+	// what the missing half cost: a summary of zero looked like nothing worth
+	// remembering, so the ledger dropped it and the CONFIRMED re-post walked the
+	// tree again — the very tree whose walk had just proved too big to finish, a
+	// second time, inside a token that expires in sixty seconds. Capped records
+	// the outcome itself, so the redemption inherits "unknown" and dispatches.
 	files := int64(len(paths))
+	capped := false
 	if pj.recursive {
-		files = max(scanned, 0)
+		files, capped = max(scanned, 0), scanned < 0
 	}
-	summary := guard.Summary{Files: files, Warnings: ladder.warnings}
+	summary := guard.Summary{Files: files, Capped: capped, Warnings: ladder.warnings}
 	extra := ladder.grade > gradeNone || pj.confirm != ""
 	m.files = summary.Files
 	if !s.authorizeGraded(w, r, sess, verdict, extra, m, "", parts, true, pj.confirm, summary, ladder.grade) {
@@ -1149,10 +1299,28 @@ func (s *Server) permScan(ctx context.Context, who backend.Principal, roots []st
 		scanCtx, cancel = context.WithDeadline(ctx, deadline.Add(-permScanReserve))
 	}
 	defer cancel()
+	// A pre-scan is a full tree walk with a job's cost and no job's limits, and
+	// contract §13's "nothing in M3 needs an admission slot" overlooked it: a
+	// handful of unconfirmed POSTs put an unbounded number of these on a NAS that
+	// deliberately allows four metadata jobs at a time (Astra M3 round-1 finding
+	// 10). So it takes the same ClassMetadata slot the recursive job it is
+	// measuring for will take, waits for it under the scan's own budget, and a
+	// wait that outlives that budget is -1 — the ladder's pessimistic reading —
+	// rather than a request that overstays it.
+	if s.jobMgr != nil {
+		release, err := s.jobMgr.Admit(scanCtx, jobs.ClassMetadata)
+		if err != nil {
+			return -1
+		}
+		defer release()
+	}
 	var total int64
 	for _, root := range roots {
-		res, err := s.transferSize(scanCtx, who, root, cross)
-		if err != nil || res.Cancelled || res.Files < 0 || res.Dirs < 0 {
+		res, err := s.transferSize(scanCtx, who, root, cross, modeScanMaxEntries)
+		// Capped is not a count: the walk stopped at the entry bound, so what it
+		// carries is a minimum and the ladder must read the whole answer as
+		// unknown (which it grades as large).
+		if err != nil || res.Cancelled || res.Capped || res.Files < 0 || res.Dirs < 0 {
 			return -1
 		}
 		total += res.Files + res.Dirs
@@ -1177,7 +1345,18 @@ func (s *Server) peekScan(token, op string, parts []string) (int64, bool) {
 		return 0, false
 	}
 	cost, ok := s.guard.Peek(token, op, parts, true)
-	if !ok || cost.Files <= 0 {
+	if !ok {
+		return 0, false
+	}
+	// A capped outcome is an ANSWER, and the one most worth reusing: it is the
+	// tree that could not be measured inside a request, so measuring it again on
+	// the re-post is the one walk guaranteed to fail twice (finding 11). It comes
+	// back as -1, which is what the ladder and the milestone rule already read as
+	// "large, and we cannot say how large".
+	if cost.Capped {
+		return -1, true
+	}
+	if cost.Files <= 0 {
 		return 0, false
 	}
 	return cost.Files, true

@@ -224,7 +224,61 @@ func (p *Platform) Refresh() error {
 		return err
 	}
 	p.setMounts(mounts)
+	// A mount that appeared since the last read carries no probed fields at all:
+	// setMounts can only carry them across for mount points it already knew. An
+	// unprobed storage mount answers ACLBackend "" — and a dataset mounted after
+	// start-up is exactly the one an operator is about to change permissions on
+	// (Astra M3 round-1 finding 1). So the new ones are probed here, the same way
+	// start-up probes them, and the answer is cached in caps like every other.
+	p.probeMissing()
 	return nil
+}
+
+// maxProbesPerRefresh bounds what one refresh may spend on newly appeared
+// mounts. A probe is an lgetxattr plus, on ZFS, a `zfs get` with its own
+// timeout, and a pool can present a dataset per share and per sub-folder — so a
+// storage server that mounts fifty datasets at once must not make the next
+// For() wait for fifty `zfs get` invocations. What is left over is simply not
+// probed yet: its ACLBackend stays "", which every caller reads pessimistically,
+// and the next refresh takes the next batch.
+const maxProbesPerRefresh = 16
+
+// probeMissing fills in the ACL backend (and, on ZFS, the aclmode) of storage
+// mounts that have never been probed. It is Probe restricted to what is
+// missing, so a refresh costs nothing at all on the ordinary case where the
+// table did not change.
+func (p *Platform) probeMissing() {
+	p.mu.RLock()
+	var pending []Mount
+	for _, m := range p.mounts {
+		if !IsStorageFS(m.FSType) {
+			continue
+		}
+		if c, ok := p.caps[m.MountPoint]; ok && c.ACLBackend != "" {
+			continue // already probed, and the answer is cached
+		}
+		pending = append(pending, m)
+		if len(pending) >= maxProbesPerRefresh {
+			break
+		}
+	}
+	p.mu.RUnlock()
+
+	for _, m := range pending {
+		backend, xattr := p.aclBackend(m.MountPoint)
+		aclmode := ""
+		if strings.EqualFold(m.FSType, "zfs") {
+			aclmode = p.ZFSAclmode(m.Source)
+		}
+		p.mu.Lock()
+		if c, ok := p.caps[m.MountPoint]; ok && c.ACLBackend == "" {
+			c.ACLBackend = backend
+			c.ACLXattr = xattr
+			c.ZFSAclmode = aclmode
+			p.caps[m.MountPoint] = c
+		}
+		p.mu.Unlock()
+	}
 }
 
 func (p *Platform) maybeRefresh() {
@@ -325,6 +379,39 @@ func (p *Platform) MountByLiteralPath(osPath string) (FSCaps, bool) {
 	defer p.mu.RUnlock()
 	c, ok := p.caps[key]
 	return c, ok
+}
+
+// MountForLiteral is MountFor without the normalisation, the companion of
+// ForLiteral: the longest mount point that is the path or a path-boundary
+// prefix of it, matched byte for byte.
+//
+// It exists because the two halves of one answer must come from the same
+// lookup. A caller that took FSCaps from ForLiteral and the dataset name from
+// MountFor could be told the aclmode of the filesystem the bytes really live on
+// and the NAME of a sibling that normalisation walked to — which is a sentence
+// naming the wrong dataset in a dialog about destroying an ACL.
+func (p *Platform) MountForLiteral(osPath string) (Mount, bool) {
+	p.maybeRefresh()
+	key := literalMountKey(osPath)
+	if key == "" {
+		return Mount{}, false
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	best := -1
+	for i, m := range p.mounts {
+		if !pathHasPrefix(key, m.MountPoint) {
+			continue
+		}
+		// Longest wins; on ties the later line over-mounts the earlier.
+		if best < 0 || len(m.MountPoint) >= len(p.mounts[best].MountPoint) {
+			best = i
+		}
+	}
+	if best < 0 {
+		return Mount{}, false
+	}
+	return p.mounts[best], true
 }
 
 // MountFor returns the mount holding osPath, or false when none matches.

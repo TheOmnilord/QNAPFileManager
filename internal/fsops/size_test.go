@@ -13,7 +13,7 @@ func TestSizeCountsFilesDirectoriesAndBytes(t *testing.T) {
 	r := newRoot(t, base)
 	var log jobLog
 
-	res, err := Size(context.Background(), r, nil, []string{"/a"}, false, log.emit())
+	res, err := Size(context.Background(), r, nil, []string{"/a"}, false, 0, log.emit())
 	if err != nil {
 		t.Fatalf("Size: %v", err)
 	}
@@ -44,7 +44,7 @@ func TestSizeNeverFollowsASymlink(t *testing.T) {
 	r := newRoot(t, base)
 	var log jobLog
 
-	res, err := Size(context.Background(), r, nil, []string{"/a"}, false, log.emit())
+	res, err := Size(context.Background(), r, nil, []string{"/a"}, false, 0, log.emit())
 	if err != nil {
 		t.Fatalf("Size: %v", err)
 	}
@@ -68,7 +68,7 @@ func TestSizeAppliesTheCrossingRule(t *testing.T) {
 	)
 
 	var off jobLog
-	res, err := Size(context.Background(), r, plat, []string{api + "/a"}, false, off.emit())
+	res, err := Size(context.Background(), r, plat, []string{api + "/a"}, false, 0, off.emit())
 	if err != nil {
 		t.Fatalf("Size: %v", err)
 	}
@@ -77,7 +77,7 @@ func TestSizeAppliesTheCrossingRule(t *testing.T) {
 	}
 
 	var on jobLog
-	res, err = Size(context.Background(), r, plat, []string{api + "/a"}, true, on.emit())
+	res, err = Size(context.Background(), r, plat, []string{api + "/a"}, true, 0, on.emit())
 	if err != nil {
 		t.Fatalf("Size: %v", err)
 	}
@@ -91,7 +91,7 @@ func TestSizeWarnsForAPathThatIsNotThere(t *testing.T) {
 	r := newRoot(t, base)
 	var log jobLog
 
-	res, err := Size(context.Background(), r, nil, []string{"/nope", "/a/one.txt"}, false, log.emit())
+	res, err := Size(context.Background(), r, nil, []string{"/nope", "/a/one.txt"}, false, 0, log.emit())
 	if err != nil {
 		t.Fatalf("Size: %v", err)
 	}

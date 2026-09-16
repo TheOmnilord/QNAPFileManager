@@ -49,6 +49,10 @@ type fakeBackend struct {
 	propsFS    wproto.FSInfo     // what Props reports about the filesystem
 	propsACL   wproto.ACLInfo    // what Props reports about the ACL
 	aclState   map[string]string // per-path ACL state override
+	// propsIdentity is the mount/inode identity Props reports for the object it
+	// described. The sync chmod sends it back as the precondition the change is
+	// bound to (Astra M3 round-1 finding 4), so a test can pin what travelled.
+	propsIdentity wproto.FSIdentityResp
 }
 
 func (b *fakeBackend) osPath(p string) string {
@@ -257,7 +261,7 @@ func (b *fakeBackend) Props(ctx context.Context, p backend.Principal, req wproto
 	if err != nil {
 		return wproto.PropsResp{}, err
 	}
-	resp := wproto.PropsResp{Entry: e, FS: b.propsFS, ACL: b.propsACL}
+	resp := wproto.PropsResp{Entry: e, FS: b.propsFS, ACL: b.propsACL, Identity: b.propsIdentity}
 	if acl, ok := b.aclState[name]; ok {
 		resp.ACL.State = acl
 		resp.Entry.ACL = acl

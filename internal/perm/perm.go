@@ -294,8 +294,33 @@ const (
 	nfs4ACEHeader   = 16
 )
 
+// NFSv4 ACE types. ALLOW is the only one a mode can also express; DENY, AUDIT
+// and ALARM say things the nine permission bits have no vocabulary for at all —
+// "everyone@ may not delete this", "log every open" — so an ACL carrying one is
+// never what the mode already describes.
+const (
+	nfs4TypeAllow = 0x00000000
+)
+
+// The two access-mask bits a mode cannot express. WRITE_ACL is the right to
+// rewrite the ACL itself and WRITE_OWNER the right to take ownership; granted
+// to GROUP@ or EVERYONE@ they are a delegation no rwx triple can state, and a
+// chmod that regenerates the three mode classes takes them away silently.
+//
+// They are not asked about OWNER@, which holds both on every ordinary ZFS
+// object: refusing them there would badge the whole NAS, which is the failure
+// §6.1 exists to avoid.
+const (
+	nfs4WriteACL   = 0x00040000
+	nfs4WriteOwner = 0x00080000
+)
+
 // The three special principals an NFSv4 ACL uses for what the mode describes.
 var nfs4TrivialWho = map[string]bool{"OWNER@": true, "GROUP@": true, "EVERYONE@": true}
+
+// nfs4Owner is the one special principal for which the two mask bits above are
+// ordinary.
+const nfs4Owner = "OWNER@"
 
 // NFS4State classifies a system.nfs4_acl attribute as fsx.ACLNFS4Trivial,
 // fsx.ACLNFS4 or fsx.ACLUnknown.
@@ -304,8 +329,20 @@ var nfs4TrivialWho = map[string]bool{"OWNER@": true, "GROUP@": true, "EVERYONE@"
 // carries one, so presence would badge the entire NAS. The question that means
 // something is whether the ACL says anything the MODE does not — which is what
 // ls -V calls trivial, and which is our heuristic and not the kernel's (§6.1).
-// An ACE naming somebody other than OWNER@/GROUP@/EVERYONE@, or carrying
-// FILE_INHERIT or DIRECTORY_INHERIT, is such a thing.
+//
+// Four things are such a thing, and an ACE showing any of them makes the whole
+// attribute non-trivial:
+//
+//   - An ACE that is not ALLOW. A DENY, an AUDIT or an ALARM entry states
+//     something no rwx triple can: "everyone@ DENY DELETE" is a protection the
+//     mode cannot hold, and a discard chmod destroys it without a word.
+//   - A who other than OWNER@, GROUP@ or EVERYONE@ — a named user or group.
+//   - FILE_INHERIT or DIRECTORY_INHERIT: an entry passed down to new children
+//     describes more than any mode ever could.
+//   - WRITE_ACL or WRITE_OWNER granted to GROUP@ or EVERYONE@. Those are the
+//     rights to rewrite the ACL and to take ownership, and the mode has no bit
+//     for either; OWNER@ holds both on every ordinary ZFS object, so they are
+//     only meaningful on the other two principals (M3 Astra round 1, finding 3).
 //
 // The attribute is a big-endian ACE count followed by that many entries of type,
 // flag, access mask, who-length and the who string padded up to four bytes. A
@@ -328,7 +365,9 @@ func NFS4State(acl []byte) string {
 		if off+nfs4ACEHeader > len(acl) {
 			return fsx.ACLUnknown
 		}
+		aceType := binary.BigEndian.Uint32(acl[off : off+4])
 		flag := binary.BigEndian.Uint32(acl[off+4 : off+8])
+		mask := binary.BigEndian.Uint32(acl[off+8 : off+12])
 		whoLen := int(binary.BigEndian.Uint32(acl[off+12 : off+16]))
 		off += nfs4ACEHeader
 		if whoLen < 0 || off+whoLen > len(acl) {
@@ -352,7 +391,7 @@ func NFS4State(acl []byte) string {
 				off = len(acl)
 			}
 		}
-		if flag&(nfs4FileInherit|nfs4DirInherit) != 0 || !nfs4TrivialWho[who] {
+		if !trivialACE(aceType, flag, mask, who) {
 			// Judged rather than returned at once, because a later ACE may still
 			// be truncated — and "unknown" is the more pessimistic answer of the
 			// two, so an attribute this cannot finish reading must not be
@@ -373,4 +412,29 @@ func NFS4State(acl []byte) string {
 		return fsx.ACLNFS4Trivial
 	}
 	return fsx.ACLNFS4
+}
+
+// trivialACE reports whether one ACE says nothing the mode does not already
+// say. Every clause is the same question asked of a different field, and all
+// four have to answer yes for the ACE to be trivial; the caller makes a single
+// non-trivial ACE decide the whole attribute.
+func trivialACE(aceType, flag, mask uint32, who string) bool {
+	if aceType != nfs4TypeAllow {
+		// DENY, AUDIT, ALARM. A mode grants; it has no way to deny, and no way
+		// to ask for a log line.
+		return false
+	}
+	if flag&(nfs4FileInherit|nfs4DirInherit) != 0 {
+		return false
+	}
+	if !nfs4TrivialWho[who] {
+		return false
+	}
+	if who != nfs4Owner && mask&(nfs4WriteACL|nfs4WriteOwner) != 0 {
+		// Handing GROUP@ or EVERYONE@ the right to rewrite the ACL or to take
+		// ownership. The owner has both as a matter of course, which is why the
+		// question is not asked there.
+		return false
+	}
+	return true
 }

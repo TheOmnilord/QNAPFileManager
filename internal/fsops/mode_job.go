@@ -135,6 +135,36 @@ type modeJob struct {
 	// which the hardlink rule in applyRef bites. It is read once, at job start:
 	// a worker's credentials are fixed at fork time and cannot change under it.
 	linkGuard bool
+
+	// traversed is the identity of the directory the walk actually ENUMERATED,
+	// one slot per depth, and it is what makes the post-order change safe
+	// (Astra M3 round-1 finding 7).
+	//
+	// The walker closes a directory's descriptor before it calls Post, so
+	// applyEntry has to name the directory a second time to get a reference to
+	// change. That second lookup proves nothing on its own: a directory renamed
+	// away while its own children were being walked, with another one dropped in
+	// its place, would receive the post-order chmod or chown — and a MOUNT placed
+	// there would take it having bypassed the crossing decision entirely. So the
+	// re-opened object is compared with the one the walk descended into, and a
+	// mismatch is "changed" for that entry.
+	//
+	// A slice indexed by depth is enough because the walk is depth first: exactly
+	// one directory is open at each level at any moment. Pre clears the slot
+	// before the descent, Opened fills it with the fstat of the held descriptor —
+	// not with the lstat of the pathname it was reached by, which is the very
+	// thing being guarded against — and Post reads it.
+	traversed []objectID
+	// traversedOK says whether the slot at that depth holds a reading. A
+	// directory whose descriptor could not be fstat'ed leaves none, and no
+	// reading is a refusal rather than a pass.
+	traversedOK []bool
+
+	// parentDir/parentDev cache the device of the directory whose entries are
+	// currently being changed (devOfParent).
+	parentDir   *dirRef
+	parentDev   uint64
+	parentDevOK bool
 }
 
 // rootWorker reports whether this process is uid 0 — an administrator session's
@@ -269,17 +299,42 @@ func (j *modeJob) one(ctx context.Context, p string) error {
 	// a single entry is read (reopenDir).
 	held, err := reopenDir(parent, name, ref)
 	if err != nil {
-		j.fail(tg.api, err)
+		if errors.Is(err, fsx.ErrChanged) {
+			// The name means a different object now. There is nothing here that
+			// was authorized, so nothing is changed and nothing is entered.
+			j.fail(tg.api, err)
+			return nil
+		}
+		// The directory cannot be LISTED — an owner-set 0000 is the ordinary
+		// way — but the metadata change on the directory itself needs no read
+		// permission at all, and it is exactly the change that repairs this
+		// (Astra M3 round-1 finding 8). Skipping the directory too meant a
+		// recursive repair could not repair precisely the directories that
+		// needed repairing. So the failure to traverse is reported as its own
+		// warning and the change is still attempted on the reference this
+		// process is holding.
+		j.emit.warnErr(tg.api, fmt.Errorf(
+			"%q could not be listed, so nothing inside it was changed: %w", tg.api, err))
+		j.applyRef(tg.api, parent, name, ref, true)
 		return nil
 	}
 	return walkFrom(ctx, j.r, j.plat, held, tg.api, ref.fi,
 		WalkOptions{CrossMounts: j.cross, Mutating: false, Protect: ProtectWrite},
 		Visitor{
-			Pre: j.pre,
+			Pre:    j.pre,
+			Opened: j.opened,
 			Post: func(it WalkItem) error {
 				if it.Depth == 0 {
 					// The root's own parent descriptor is the one this
 					// function holds; the walk never had it.
+					//
+					// Its fstat is re-read first (finding 20). ref.fi was taken
+					// before the subtree walk, and a mode change made elsewhere
+					// while that walk ran — a setgid cleared by another session
+					// — would otherwise be reinstated from the stale snapshot
+					// and hidden from the diff, which reports against the
+					// before-image it is given.
+					ref.restat()
 					j.applyRef(it.Path, parent, name, ref, true)
 					return nil
 				}
@@ -290,19 +345,70 @@ func (j *modeJob) one(ctx context.Context, p string) error {
 		})
 }
 
+// opened records the identity of a directory the walk has just OPENED, before
+// any of its entries is read. It never refuses anything: the hook exists here
+// only so that Post can prove the directory it is about to change is the one
+// that was descended into (finding 7).
+func (j *modeJob) opened(it WalkItem, info os.FileInfo) error {
+	j.setTraversed(it.Depth, objectIDOf(nil, info))
+	return nil
+}
+
+// setTraversed files one reading under its depth, growing the slots as the walk
+// goes deeper.
+func (j *modeJob) setTraversed(depth int, id objectID) {
+	for len(j.traversed) <= depth {
+		j.traversed = append(j.traversed, objectID{})
+		j.traversedOK = append(j.traversedOK, false)
+	}
+	j.traversed[depth], j.traversedOK[depth] = id, true
+}
+
+// clearTraversed forgets the slot at one depth, so that a sibling's reading can
+// never be mistaken for this directory's. It is called from Pre, before the
+// descent that fills it again.
+func (j *modeJob) clearTraversed(depth int) {
+	if depth < len(j.traversedOK) {
+		j.traversedOK[depth] = false
+	}
+}
+
+// sameAsTraversed reports whether a re-opened directory is the object the walk
+// enumerated at that depth. No reading — an fstat that failed, or a directory
+// the walk never opened — is a refusal: an unprovable identity is not a proof.
+func (j *modeJob) sameAsTraversed(depth int, ref *itemRef) bool {
+	if depth >= len(j.traversedOK) || !j.traversedOK[depth] {
+		return false
+	}
+	return j.traversed[depth].same(objectIDOf(refFD(ref), ref.fi))
+}
+
 // pre changes everything that is not a directory. Directories wait for post,
 // after their children, so that removing a search bit cannot lock the walk out
 // of the tree it is changing.
 func (j *modeJob) pre(it WalkItem) error {
 	if it.Mount {
-		j.refuse(it.Path, fmt.Errorf("%q is a mount point and was left alone: %w", it.Path, fsx.ErrProtected))
+		j.refuse(it.Path, crossingRefusal(it.Path))
 		return fs.SkipDir
 	}
-	if it.Depth == 0 || it.isDir() {
+	if it.isDir() {
+		// The walk is about to open this directory. Forget whatever a sibling
+		// left in this depth's slot, so its Post can only ever match a reading
+		// that this descent made (finding 7).
+		j.clearTraversed(it.Depth)
+		return nil
+	}
+	if it.Depth == 0 {
 		return nil
 	}
 	j.applyEntry(it)
 	return nil
+}
+
+// crossingRefusal is the one sentence a crossing skip produces, for directories
+// and for the bind-mounted regular files that are crossings too (finding 19).
+func crossingRefusal(apiPath string) error {
+	return fmt.Errorf("%q is a mount point and was left alone: %w", apiPath, fsx.ErrProtected)
 }
 
 // applyEntry pins one entry of the directory the walk is standing in and
@@ -324,7 +430,65 @@ func (j *modeJob) applyEntry(it WalkItem) {
 		return
 	}
 	defer ref.close()
+	if ref.fi != nil && ref.fi.IsDir() {
+		// Post-order, and the walker closed the descriptor it enumerated before
+		// calling us — so the openat above is a SECOND lookup of the name, and a
+		// second lookup proves nothing on its own (finding 7).
+		if !j.sameAsTraversed(it.Depth, ref) {
+			j.refuse(it.Path, fmt.Errorf(
+				"%q is not the folder the walk descended into; it was replaced while its contents were being changed: %w",
+				it.Path, fsx.ErrChanged))
+			return
+		}
+	} else if !j.cross && j.crossesMount(it, ref) {
+		// A regular file can be a bind mount of its own, and the walker's
+		// WalkItem.Mount only ever marks directories — so a file outside the
+		// tree was changed under crossMounts:false, and its nlink stays 1, so
+		// the hardlink rule did not catch it either (finding 19, adversarial).
+		// The same crossing policy is applied here, with the same sentence.
+		j.refuse(it.Path, crossingRefusal(it.Path))
+		return
+	}
 	j.applyRef(it.Path, it.parent, it.Name, ref, false)
+}
+
+// crossesMount reports whether a held non-directory leaf is on a different
+// device from the directory it was enumerated from.
+//
+// A device that cannot be read on either side answers false, because the walk's
+// own crossing rule has always degraded that way (INV-2, and off Linux there is
+// no st_dev at all): refusing what cannot be measured would skip every entry on
+// a dev box.
+func (j *modeJob) crossesMount(it WalkItem, ref *itemRef) bool {
+	parentDev, ok := j.devOfParent(it.parent)
+	if !ok {
+		return false
+	}
+	childDev, ok := devOf(ref.fi)
+	if !ok {
+		return false
+	}
+	return parentDev != childDev
+}
+
+// devOfParent is devOfDir with a one-entry cache, because the answer belongs to
+// the DIRECTORY and the question is asked once per entry in it. A directory of a
+// million files would otherwise cost a million fstats of the same descriptor.
+//
+// One slot is enough for a depth-first walk: the entries of one directory are
+// visited in a run, and the only thing that displaces the slot is descending
+// into a subdirectory and coming back — which costs one more fstat per
+// directory, not per entry.
+func (j *modeJob) devOfParent(d *dirRef) (uint64, bool) {
+	if d == nil {
+		return 0, false
+	}
+	if j.parentDir == d {
+		return j.parentDev, j.parentDevOK
+	}
+	dev, ok := devOfDir(d)
+	j.parentDir, j.parentDev, j.parentDevOK = d, dev, ok
+	return dev, ok
 }
 
 // applyRef is the whole per-entry decision: which spec applies, whether this

@@ -188,6 +188,53 @@ test('a cancelled or failed measurement is never reused as an answer', () => {
  assert.equal(sizeJobUsable(null, now), false);
 });
 
+// --- a poll that gives up must not lose the job id ----------------------------
+//
+// awaitJob answers null when it runs out of tries and throws on a transient
+// fetch failure. Neither is a terminal state, and both used to leave the walk
+// running with nothing able to stop it: the entry recorded finishedAt (or was
+// dropped by the failure handler) and Stop, close and Recount all cancel by id
+// (round 1, finding 14).
+
+test('a poll that GIVES UP cancels the walk instead of losing its id', async t => {
+ resetSizeJobs();
+ const {runner, posts, cancelled, reports} = harness({poll: async () => null});
+ mockFetch(t, posts);
+ assert.equal(await runner.start([dir('/share/CACHEDEV1_DATA/_IMAGES')]), null);
+ assert.deepEqual(cancelled, ['s1'], 'the du is stopped explicitly, by the id the entry still held');
+ assert.equal(reports.at(-1).state, 'failed', 'and the dialog says so rather than reading "still measuring"');
+ assert.equal(runner.jobId, null);
+ runner.stop();                                   // the dialog's close event, a moment later
+ assert.deepEqual(cancelled, ['s1'], 'one job, one cancel');
+});
+
+test('a poll that THROWS cancels the walk too, and reports the error', async t => {
+ resetSizeJobs();
+ const {runner, posts, cancelled, reports} = harness({poll: async () => { throw new Error('network went away'); }});
+ mockFetch(t, posts);
+ assert.equal(await runner.start([dir('/share/CACHEDEV1_DATA/Video')]), null);
+ assert.deepEqual(cancelled, ['s1']);
+ assert.equal(reports.at(-1).state, 'failed');
+ assert.equal(reports.at(-1).text, 'network went away');
+ runner.stop();
+ assert.deepEqual(cancelled, ['s1'], 'stop() after an abandoned poll does not cancel a second time');
+});
+
+test('an abandoned measurement is not reused: the next start measures again', async t => {
+ resetSizeJobs();
+ let tries = 0;
+ const {runner, posts, cancelled} = harness({
+  poll: async id => { tries++; return tries === 1 ? null : {id, state: 'done', result: {bytes: 1, files: 1, dirs: 0}}; },
+ });
+ mockFetch(t, posts, () => (posts.length > 1 ? 's2' : 's1'));
+ assert.equal(await runner.start([dir('/share/Public')]), null);
+ assert.deepEqual(cancelled, ['s1']);
+ const second = await runner.start([dir('/share/Public')]);
+ assert.equal(posts.length, 2, 'a walk nobody watched is not an answer to attach to');
+ assert.equal(second.state, 'done');
+ runner.stop();
+});
+
 test('a measurement that could not be submitted is not cached as an answer', async t => {
  resetSizeJobs();
  const {runner, reports} = harness();

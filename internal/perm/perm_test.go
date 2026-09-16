@@ -306,21 +306,27 @@ func TestCapsFor(t *testing.T) {
 	})
 }
 
-// nfs4ACL builds a system.nfs4_acl attribute: a big-endian count followed by
+// rawACE is one hand-built ACE with every field spelled out: the type, the
+// flags, the access mask and the principal. nfs4ACLRaw encodes a list of them.
+type rawACE struct {
+	typ  uint32
+	flag uint32
+	mask uint32
+	who  string
+}
+
+// nfs4ACLRaw builds a system.nfs4_acl attribute: a big-endian count followed by
 // ACEs of type, flag, access mask, who-length and the who string padded to four
 // bytes. Building them by hand is what lets the trivial judgement be tested on
 // a box with no ZFS (contract §15).
-func nfs4ACL(aces ...struct {
-	flag uint32
-	who  string
-}) []byte {
+func nfs4ACLRaw(aces ...rawACE) []byte {
 	b := make([]byte, 4)
 	binary.BigEndian.PutUint32(b, uint32(len(aces)))
 	for _, a := range aces {
 		var h [16]byte
-		binary.BigEndian.PutUint32(h[0:4], 0)      // ALLOW
-		binary.BigEndian.PutUint32(h[4:8], a.flag) // flags
-		binary.BigEndian.PutUint32(h[8:12], 0x001f01ff)
+		binary.BigEndian.PutUint32(h[0:4], a.typ)
+		binary.BigEndian.PutUint32(h[4:8], a.flag)
+		binary.BigEndian.PutUint32(h[8:12], a.mask)
 		binary.BigEndian.PutUint32(h[12:16], uint32(len(a.who)))
 		b = append(b, h[:]...)
 		b = append(b, a.who...)
@@ -329,6 +335,38 @@ func nfs4ACL(aces ...struct {
 		}
 	}
 	return b
+}
+
+// aceTypeAllow, aceTypeDeny, aceTypeAudit and aceTypeAlarm are the four ACE
+// types RFC 8881 defines, in the order it numbers them.
+const (
+	aceTypeAllow uint32 = 0
+	aceTypeDeny  uint32 = 1
+	aceTypeAudit uint32 = 2
+	aceTypeAlarm uint32 = 3
+)
+
+// maskFull is every NFSv4 access bit, WRITE_ACL and WRITE_OWNER included — what
+// an ordinary ZFS object grants OWNER@. maskNoAdmin is the same without those
+// two, which is what a trivial GROUP@ or EVERYONE@ entry carries: the rights to
+// rewrite the ACL and to take ownership are exactly what a mode cannot express
+// (finding 3), so a helper that handed them to every principal would build ACLs
+// that are non-trivial by the rule under test.
+const (
+	maskFull    uint32 = 0x001f01ff
+	maskNoAdmin uint32 = maskFull &^ (0x00040000 | 0x00080000)
+)
+
+// nfs4ACL is nfs4ACLRaw for the flag-and-who cases: ALLOW entries with a mask
+// that grants everything a mode can express and nothing it cannot. The byte
+// layout is identical, so the length-sensitive rows below (truncation, padding)
+// measure exactly what they did before.
+func nfs4ACL(aces ...ace) []byte {
+	raw := make([]rawACE, 0, len(aces))
+	for _, a := range aces {
+		raw = append(raw, rawACE{typ: aceTypeAllow, flag: a.flag, mask: maskNoAdmin, who: a.who})
+	}
+	return nfs4ACLRaw(raw...)
 }
 
 type ace = struct {
@@ -471,6 +509,103 @@ func TestNFS4State(t *testing.T) {
 			func() []byte {
 				b := nfs4ACL(ace{0, "alice"}, ace{0, "GROUP@"})
 				binary.BigEndian.PutUint32(b[:4], 5)
+				return b
+			}(),
+			fsx.ACLUnknown,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := NFS4State(c.acl); got != c.want {
+				t.Fatalf("NFS4State = %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
+// TestNFS4StateReadsTypeAndMask is finding 3 of the M3 Astra review: the
+// heuristic used to look at the who and the inheritance flags alone, so
+// "EVERYONE@ DENY DELETE" and "GROUP@ ALLOW WRITE_ACL" were both trivial — and a
+// chmod on an aclmode=discard dataset destroyed them with no level-2
+// confirmation, because there was nothing to confirm.
+//
+// Everything here is one ACE among otherwise ordinary mode classes, which is how
+// it arrives in life: a ZFS object with its three trivial entries and one more
+// that somebody added.
+func TestNFS4StateReadsTypeAndMask(t *testing.T) {
+	owner := rawACE{typ: aceTypeAllow, mask: maskFull, who: "OWNER@"}
+	group := rawACE{typ: aceTypeAllow, mask: maskNoAdmin, who: "GROUP@"}
+	every := rawACE{typ: aceTypeAllow, mask: maskNoAdmin, who: "EVERYONE@"}
+
+	const (
+		writeACL   uint32 = 0x00040000
+		writeOwner uint32 = 0x00080000
+		deleteBit  uint32 = 0x00010000
+	)
+
+	cases := []struct {
+		name string
+		acl  []byte
+		want string
+	}{
+		{
+			// The control: the three classes as ZFS writes them, OWNER@ with the
+			// administrative bits it always has.
+			"the three mode classes, owner with WRITE_ACL and WRITE_OWNER, are trivial",
+			nfs4ACLRaw(owner, group, every),
+			fsx.ACLNFS4Trivial,
+		},
+		{
+			"EVERYONE@ DENY DELETE is a protection the mode cannot hold",
+			nfs4ACLRaw(owner, group, rawACE{typ: aceTypeDeny, mask: deleteBit, who: "EVERYONE@"}),
+			fsx.ACLNFS4,
+		},
+		{
+			"a DENY of nothing at all is still not an ALLOW",
+			nfs4ACLRaw(owner, group, rawACE{typ: aceTypeDeny, mask: 0, who: "OWNER@"}),
+			fsx.ACLNFS4,
+		},
+		{
+			"an AUDIT entry is not something a mode can ask for",
+			nfs4ACLRaw(owner, group, rawACE{typ: aceTypeAudit, mask: maskNoAdmin, who: "EVERYONE@"}),
+			fsx.ACLNFS4,
+		},
+		{
+			"nor an ALARM entry",
+			nfs4ACLRaw(owner, group, rawACE{typ: aceTypeAlarm, mask: maskNoAdmin, who: "GROUP@"}),
+			fsx.ACLNFS4,
+		},
+		{
+			"GROUP@ ALLOW WRITE_ACL delegates what no rwx triple can say",
+			nfs4ACLRaw(owner, rawACE{typ: aceTypeAllow, mask: maskNoAdmin | writeACL, who: "GROUP@"}, every),
+			fsx.ACLNFS4,
+		},
+		{
+			"EVERYONE@ ALLOW WRITE_OWNER likewise",
+			nfs4ACLRaw(owner, group, rawACE{typ: aceTypeAllow, mask: maskNoAdmin | writeOwner, who: "EVERYONE@"}),
+			fsx.ACLNFS4,
+		},
+		{
+			// The narrowness of the rule, pinned: OWNER@ holds both bits on every
+			// ordinary ZFS object, so asking about them there would badge the whole
+			// NAS — the exact failure §6.1 exists to avoid.
+			"OWNER@ with only the administrative bits is still trivial",
+			nfs4ACLRaw(rawACE{typ: aceTypeAllow, mask: writeACL | writeOwner, who: "OWNER@"}, group, every),
+			fsx.ACLNFS4Trivial,
+		},
+		{
+			"a group that is merely writable is trivial: WRITE_DATA is what 0770 means",
+			nfs4ACLRaw(owner, rawACE{typ: aceTypeAllow, mask: maskNoAdmin, who: "GROUP@"}, every),
+			fsx.ACLNFS4Trivial,
+		},
+		{
+			// The pessimistic direction survives the new clauses: an attribute that
+			// cannot be read to the end is unknown whether or not the ACEs read so
+			// far were trivial.
+			"a DENY inside a truncated attribute is still unknown, not nfs4",
+			func() []byte {
+				b := nfs4ACLRaw(rawACE{typ: aceTypeDeny, mask: deleteBit, who: "EVERYONE@"})
+				binary.BigEndian.PutUint32(b[:4], 3)
 				return b
 			}(),
 			fsx.ACLUnknown,

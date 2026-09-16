@@ -464,6 +464,37 @@ func (m *Manager) run(ctx context.Context, cancel context.CancelFunc, e *entry, 
 	e.finish(m.now(), res, err, ctx.Err())
 }
 
+// Admit takes one of a class's concurrency slots for work that is NOT a job and
+// returns the function that gives it back. It blocks until a slot is free or
+// ctx is done, and returns ctx.Err() in the second case — so a caller under a
+// request deadline waits exactly as long as its request may.
+//
+// It exists because some work has a job's cost without a job's shape. The M3
+// permissions pre-scan walks a whole tree, inside an ordinary POST, to state how
+// many items a recursive change would touch; run outside the semaphore, a
+// handful of unconfirmed clicks put an unbounded number of full-tree walks on a
+// NAS that deliberately allows four (Astra M3 round-1 finding 10). Such a caller
+// must take the same slot the equivalent job would have taken, from the same
+// pool, or the limit is only a limit for the callers that ask for it.
+//
+// It is deliberately NOT a queue: there is no queue-depth refusal and no job
+// record, because the caller is already bounded by its own request budget and
+// by the session limits in front of it. An unknown class is admitted without a
+// slot rather than blocking for ever on a nil channel.
+func (m *Manager) Admit(ctx context.Context, class Class) (release func(), err error) {
+	sem := m.sem[class]
+	if sem == nil {
+		return func() {}, nil
+	}
+	select {
+	case sem <- struct{}{}:
+		var once sync.Once
+		return func() { once.Do(func() { <-sem }) }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 // call runs the work function and turns a panic into a failed job. A panic in
 // one user's copy must not take down a daemon that is running as root for
 // everybody else.

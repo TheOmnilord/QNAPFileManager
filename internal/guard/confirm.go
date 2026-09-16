@@ -45,6 +45,17 @@ type Summary struct {
 	Files    int64    `json:"files"`
 	Bytes    int64    `json:"bytes"`
 	Warnings []string `json:"warnings,omitempty"`
+	// Capped says the totals above are not a measurement: the scan that should
+	// have produced them was bounded, cancelled or failed, so the operation's
+	// size is UNKNOWN and Files is zero because nothing was counted, not because
+	// there is nothing there.
+	//
+	// It is an outcome in its own right, and the ledger keeps it: without it the
+	// zero totals of an unmeasurable recursion look exactly like "nothing worth
+	// remembering", so the confirmed re-post walks the very largest trees a
+	// second time — the walk that was already too big to finish (Astra M3
+	// round-1 finding 11).
+	Capped bool `json:"capped,omitempty"`
 }
 
 func newServerKey() []byte {
@@ -65,6 +76,7 @@ func newServerKey() []byte {
 // client asked for rather than of how many tokens are live.
 type issuedCost struct {
 	files, bytes int64
+	capped       bool
 	exp          int64
 }
 
@@ -110,7 +122,7 @@ func (g *Guard) Issue(op string, summary Summary, parts []string, ordered bool) 
 // first. Beyond maxIssuedCosts live records it records nothing: the ledger is an
 // optimisation, and a caller that finds no record measures again.
 func (g *Guard) recordCost(key string, summary Summary, exp int64) {
-	if summary.Files == 0 && summary.Bytes == 0 {
+	if summary.Files == 0 && summary.Bytes == 0 && !summary.Capped {
 		return // nothing measured; nothing worth remembering
 	}
 	g.seenMu.Lock()
@@ -122,7 +134,7 @@ func (g *Guard) recordCost(key string, summary Summary, exp int64) {
 	if len(g.issued) >= maxIssuedCosts {
 		return
 	}
-	g.issued[key] = issuedCost{files: summary.Files, bytes: summary.Bytes, exp: exp}
+	g.issued[key] = issuedCost{files: summary.Files, bytes: summary.Bytes, capped: summary.Capped, exp: exp}
 }
 
 // Peek verifies a token WITHOUT spending it and returns the measured totals that
@@ -149,7 +161,7 @@ func (g *Guard) Peek(token, op string, parts []string, ordered bool) (Summary, b
 	if !found {
 		return Summary{}, false
 	}
-	return Summary{Files: rec.files, Bytes: rec.bytes}, true
+	return Summary{Files: rec.files, Bytes: rec.bytes, Capped: rec.capped}, true
 }
 
 // verifyToken performs the stateless half of redemption: decoding, the canonical

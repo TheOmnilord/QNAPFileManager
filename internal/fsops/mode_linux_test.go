@@ -60,7 +60,7 @@ func TestChmodAppliesAndReportsNoDiff(t *testing.T) {
 	}
 	r := newRoot(t, base)
 
-	resp, err := Chmod(context.Background(), r, nil, "/f.txt", perm.ModeSpec{Mask: 0o7777, Value: 0o0600})
+	resp, err := Chmod(context.Background(), r, nil, "/f.txt", perm.ModeSpec{Mask: 0o7777, Value: 0o0600}, nil)
 	if err != nil {
 		t.Fatalf("Chmod = %v", err)
 	}
@@ -90,7 +90,7 @@ func TestChmodAppliesOnlyTheMaskedBits(t *testing.T) {
 	r := newRoot(t, base)
 
 	// "tick the group-write box" and nothing else.
-	if _, err := Chmod(context.Background(), r, nil, "/f.txt", perm.ModeSpec{Mask: 0o020, Value: 0o020}); err != nil {
+	if _, err := Chmod(context.Background(), r, nil, "/f.txt", perm.ModeSpec{Mask: 0o020, Value: 0o020}, nil); err != nil {
 		t.Fatalf("Chmod = %v", err)
 	}
 	if got := modeOf(t, filepath.Join(base, "f.txt")); got != 0o660 {
@@ -110,7 +110,7 @@ func TestChmodRefusesASymlinkComponent(t *testing.T) {
 	}
 	r := newRoot(t, base)
 
-	_, err := Chmod(context.Background(), r, nil, "/link/f.txt", perm.ModeSpec{Mask: 0o7777, Value: 0o0600})
+	_, err := Chmod(context.Background(), r, nil, "/link/f.txt", perm.ModeSpec{Mask: 0o7777, Value: 0o0600}, nil)
 	if !errors.Is(err, fsx.ErrChanged) {
 		t.Fatalf("Chmod through a symlink component = %v, want changed", err)
 	}
@@ -120,7 +120,7 @@ func TestChmodRefusesASymlinkComponent(t *testing.T) {
 	// The same path spelled canonically is fine: the refusal is about the
 	// symlink, not about the file.
 	if _, err := Chmod(context.Background(), r, nil, "/real/f.txt",
-		perm.ModeSpec{Mask: 0o7777, Value: 0o0600}); err != nil {
+		perm.ModeSpec{Mask: 0o7777, Value: 0o0600}, nil); err != nil {
 		t.Fatalf("Chmod of the canonical spelling = %v", err)
 	}
 }
@@ -139,7 +139,7 @@ func TestChmodFallsBackToFchmodWithoutProc(t *testing.T) {
 	noProcFD = true
 	t.Cleanup(func() { noProcFD = false })
 
-	resp, err := Chmod(context.Background(), r, nil, "/f.txt", perm.ModeSpec{Mask: 0o7777, Value: 0o0640})
+	resp, err := Chmod(context.Background(), r, nil, "/f.txt", perm.ModeSpec{Mask: 0o7777, Value: 0o0640}, nil)
 	if err != nil {
 		t.Fatalf("Chmod without /proc = %v", err)
 	}
@@ -175,7 +175,7 @@ func TestChmodWithoutProcSurfacesTheKernelsRefusal(t *testing.T) {
 	noProcFD = true
 	t.Cleanup(func() { noProcFD = false })
 
-	_, err := Chmod(context.Background(), r, nil, "/wo.txt", perm.ModeSpec{Mask: 0o7777, Value: 0o0644})
+	_, err := Chmod(context.Background(), r, nil, "/wo.txt", perm.ModeSpec{Mask: 0o7777, Value: 0o0644}, nil)
 	if !errors.Is(err, fs.ErrPermission) {
 		t.Fatalf("Chmod = %v, want the kernel's own permission refusal", err)
 	}
@@ -292,7 +292,7 @@ func TestNamingAHardlinkDirectlyStillWorks(t *testing.T) {
 
 	// The single-item route: no job, no recursion, no rule.
 	if _, err := Chmod(context.Background(), r, nil, "/share/tree/named",
-		perm.ModeSpec{Mask: 0o7777, Value: 0o0640}); err != nil {
+		perm.ModeSpec{Mask: 0o7777, Value: 0o0640}, nil); err != nil {
 		t.Fatalf("Chmod of a named hardlink = %v", err)
 	}
 	if got := modeOf(t, filepath.Join(base, "target.txt")); got != 0o640 {
@@ -530,7 +530,7 @@ func TestAReopenedNameThatWentAwayIsChanged(t *testing.T) {
 	base := tempDir(t)
 	r := newRoot(t, base)
 	if _, err := Chmod(context.Background(), r, nil, "/nope",
-		perm.ModeSpec{Mask: 0o7777, Value: 0o0644}); !errors.Is(err, fs.ErrNotExist) {
+		perm.ModeSpec{Mask: 0o7777, Value: 0o0644}, nil); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("Chmod of a path that was never there = %v, want not_found", err)
 	}
 }
@@ -1020,33 +1020,35 @@ func TestACLProbeStopsAtItsBounds(t *testing.T) {
 	target := filepath.Join(base, "f.txt")
 
 	t.Run("the entry bound", func(t *testing.T) {
-		p := &aclProbe{backend: platform.ACLPosix, xattr: platform.XattrPosixACL, entries: fsx.ACLProbeMaxEntries}
-		if state, ok := p.probe(target); ok {
+		p := &aclProbe{backend: platform.ACLPosix, xattr: platform.XattrPosixACL,
+			bud: &aclBudget{entries: fsx.ACLProbeMaxEntries}}
+		if state, ok := p.probe(aclTarget{osPath: target}); ok {
 			t.Fatalf("probe past the entry bound answered %q", state)
 		}
-		if !p.capped {
+		if !p.bud.capped {
 			t.Fatal("the probe must record that it stopped at a bound")
 		}
 	})
 	t.Run("the byte bound", func(t *testing.T) {
-		p := &aclProbe{backend: platform.ACLNFS4, xattr: platform.XattrNFS4ACL, bytes: fsx.ACLProbeMaxBytes}
-		if _, ok := p.probe(target); ok {
+		p := &aclProbe{backend: platform.ACLNFS4, xattr: platform.XattrNFS4ACL,
+			bud: &aclBudget{bytes: fsx.ACLProbeMaxBytes}}
+		if _, ok := p.probe(aclTarget{osPath: target}); ok {
 			t.Fatal("probe past the byte bound still answered")
 		}
-		if !p.capped {
+		if !p.bud.capped {
 			t.Fatal("the probe must record that it stopped at a bound")
 		}
 	})
 	t.Run("below the bounds it answers", func(t *testing.T) {
-		p := &aclProbe{backend: platform.ACLPosix, xattr: platform.XattrPosixACL}
-		state, ok := p.probe(target)
+		p := &aclProbe{backend: platform.ACLPosix, xattr: platform.XattrPosixACL, bud: &aclBudget{}}
+		state, ok := p.probe(aclTarget{osPath: target})
 		if !ok {
 			t.Fatal("a fresh probe must answer")
 		}
 		if state != fsx.ACLNone {
 			t.Fatalf("state = %q, want none", state)
 		}
-		if p.capped {
+		if p.bud.capped {
 			t.Fatal("a probe that answered has not capped")
 		}
 	})

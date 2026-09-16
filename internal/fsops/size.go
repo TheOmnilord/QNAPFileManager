@@ -235,9 +235,26 @@ func scanTrees(ctx context.Context, r fsx.Root, plat *platform.Platform, paths [
 // question nobody asked with a number nobody could use. "@Recycle" is counted —
 // it is an ordinary directory whose bytes are really there, and decision 10 only
 // forbids WRITING to it.
-func Size(ctx context.Context, r fsx.Root, plat *platform.Platform, paths []string, crossMounts bool, emit Emit) (wproto.JobResult, error) {
-	res, err := scanTrees(ctx, r, plat, paths, crossMounts, emit, sizeScanLimits, false, ProtectSnapshots)
-	out := wproto.JobResult{Files: res.files, Dirs: res.dirs, Bytes: res.bytes}
+// maxEntries bounds the walk, and zero is the unbounded default above. It is
+// there for the one caller that measures in order to DECIDE something rather
+// than to display it: the permissions pre-scan, which runs inside a 15-second
+// request and must not turn an enormous tree into a timed-out POST (M3 Astra
+// round-1 finding 10). A walk that hits the bound stops where it stands, reports
+// what it counted so far, and says Capped — and a capped measurement is not a
+// count, so the caller reads the whole answer as "unknown" rather than as the
+// number it happens to carry.
+func Size(ctx context.Context, r fsx.Root, plat *platform.Platform, paths []string,
+	crossMounts bool, maxEntries int64, emit Emit) (wproto.JobResult, error) {
+
+	lim := sizeScanLimits
+	if maxEntries > 0 && (lim.maxEntries <= 0 || maxEntries < lim.maxEntries) {
+		// The tighter of the two wins. sizeScanLimits is unbounded in production
+		// and is only ever narrowed by a test, so "the smaller bound" is the rule
+		// that keeps both honest.
+		lim.maxEntries = maxEntries
+	}
+	res, err := scanTrees(ctx, r, plat, paths, crossMounts, emit, lim, false, ProtectSnapshots)
+	out := wproto.JobResult{Files: res.files, Dirs: res.dirs, Bytes: res.bytes, Capped: res.capped}
 	if err != nil {
 		return out, err
 	}

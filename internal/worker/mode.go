@@ -27,7 +27,10 @@ func (s *session) chmod(ctx context.Context, f wproto.Frame) {
 		s.replyErr(f.ID, err, nil)
 		return
 	}
-	resp, err := fsops.Chmod(ctx, s.root, s.plat, string(req.Path), req.Spec)
+	// req.Expect travels through untouched: it is the precondition the route's
+	// confirmation ladder was graded against, and only the worker — which holds
+	// the leaf — can prove it (M3 Astra round-1 finding 4).
+	resp, err := fsops.Chmod(ctx, s.root, s.plat, string(req.Path), req.Spec, req.Expect)
 	if err != nil {
 		s.replyErr(f.ID, err, req.Path)
 		return

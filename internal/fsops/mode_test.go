@@ -45,7 +45,7 @@ func TestChmodRefusesASymlinkLeaf(t *testing.T) {
 	}
 	r := newRoot(t, base)
 
-	_, err := Chmod(context.Background(), r, nil, "/link", perm.ModeSpec{Mask: 0o7777, Value: 0o0600})
+	_, err := Chmod(context.Background(), r, nil, "/link", perm.ModeSpec{Mask: 0o7777, Value: 0o0600}, nil)
 	if !errors.Is(err, fsx.ErrUnsupported) {
 		t.Fatalf("Chmod of a symlink = %v, want unsupported", err)
 	}
@@ -66,7 +66,7 @@ func TestChmodRefusesASymlinkLeaf(t *testing.T) {
 // address it through, and nobody means to chmod the root of a filesystem.
 func TestChmodRefusesTheRootOfTheTree(t *testing.T) {
 	r := newRoot(t, tempDir(t))
-	_, err := Chmod(context.Background(), r, nil, "/", perm.ModeSpec{Mask: 0o7777, Value: 0o0755})
+	_, err := Chmod(context.Background(), r, nil, "/", perm.ModeSpec{Mask: 0o7777, Value: 0o0755}, nil)
 	if !errors.Is(err, fsx.ErrBadName) {
 		t.Fatalf("Chmod of / = %v, want bad_request", err)
 	}

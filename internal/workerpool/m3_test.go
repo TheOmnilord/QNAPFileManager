@@ -19,6 +19,7 @@ import (
 	"qnapfilemanager/internal/backend"
 	"qnapfilemanager/internal/fsx"
 	"qnapfilemanager/internal/perm"
+	"qnapfilemanager/internal/platform"
 	"qnapfilemanager/internal/wproto"
 )
 
@@ -140,8 +141,14 @@ func TestPropsRoundTripsThroughAWorker(t *testing.T) {
 	if resp.Target != nil {
 		t.Fatalf("a plain file has no target: %+v", resp.Target)
 	}
-	if resp.ACL.Backend == "" {
-		t.Fatal("ACLInfo must always say which backend the mount has, even when it is none")
+	// The backend is one of the table's words. "" is among them since Astra
+	// round 1 (#2, #5): it means the literal mount lookup could not place the
+	// path — the dev box's empty mount table, here — and the ROUTE grades that
+	// pessimistically; the worker no longer promotes "could not tell" to none.
+	switch resp.ACL.Backend {
+	case "", platform.ACLNone, platform.ACLPosix, platform.ACLNFS4:
+	default:
+		t.Fatalf("ACLInfo.Backend = %q, not a word of the platform table", resp.ACL.Backend)
 	}
 	if resp.Identity.Dir {
 		t.Fatal("the identity describes a directory for a regular file")

@@ -122,7 +122,16 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ env.GO_VERSION }}
-      - run: sudo -E env "PATH=$PATH" go test ./internal/workerpool/... ./internal/fsops/... ./internal/worker/... -run . -count=1
+      # setfacl is what gives the POSIX-ACL badge test a real ACL to look at.
+      # Without it that test skips, and a silently skipped ACL test is the gap
+      # Astra M3 round 1 (finding 16) found in the first place. Conditional, so
+      # it costs nothing on an image that already ships it.
+      - name: Make sure setfacl is available
+        run: command -v setfacl || sudo apt-get install -y --no-install-recommends acl
+      # ./cmd/... is here because the break-glass credential-store mode test
+      # skips off-root, and this is the only job that is root: leaving it out
+      # meant nothing ever executed it (Astra M4 round 1, finding 17).
+      - run: sudo -E env "PATH=$PATH" go test ./internal/workerpool/... ./internal/fsops/... ./internal/worker/... ./cmd/qnapfilemanager/... -run . -count=1
 
   # QuTS hero mounts one ZFS dataset per shared folder, and that single fact
   # drives the crossing rule, the EXDEV pre-flight, the trash root and the

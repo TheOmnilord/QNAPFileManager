@@ -196,6 +196,28 @@ func (ref *itemRef) close() {
 	}
 }
 
+// restat re-reads the fstat of the held descriptor, so that a caller which took
+// its reference some time ago describes the inode as it is NOW.
+//
+// It is the DESCRIPTOR that is re-stat'ed, not the name: the object is the same
+// one throughout — that is what holding it buys — and what has moved is only its
+// metadata. A recursive job takes its root's reference before the subtree walk
+// and does not use it again until the post-order call minutes later, which is
+// long enough for another session to clear a setgid bit that would then be
+// reinstated from the stale snapshot and never appear in the diff (M3 Astra
+// round-1 finding 20).
+//
+// A stat that fails leaves the previous one in place: an unreadable descriptor
+// is not a reason to lose the reading that was already made.
+func (ref *itemRef) restat() {
+	if ref == nil || ref.f == nil {
+		return
+	}
+	if fi, err := ref.f.Stat(); err == nil {
+		ref.fi = fi
+	}
+}
+
 // refFD is the descriptor behind a held item, for the callers that address it
 // with AT_EMPTY_PATH instead of by name (the copy engine's chown and utimensat).
 // Off Linux there is no descriptor and this is nil.

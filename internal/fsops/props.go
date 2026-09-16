@@ -122,7 +122,10 @@ func Props(ctx context.Context, r fsx.Root, plat *platform.Platform, apiPath, ta
 		osPath = ""
 	}
 	res.FS = fsInfoFor(plat, osPath)
-	res.ACL = aclInfoFor(plat, osPath)
+	// ref, not osPath alone: the ACL state this reports is what the confirmation
+	// ladder grades, so it has to describe the inode the dialog is about to offer
+	// a chmod of rather than whatever answers to its name (finding 4).
+	res.ACL = aclInfoFor(plat, osPath, ref)
 	if avail, total, ok := statfsHeld(ref); ok {
 		res.FS.Avail, res.FS.Total = avail, total
 	}
@@ -220,34 +223,46 @@ func mountIsReadOnly(m platform.Mount) bool {
 // situation: the mount's backend and aclmode from the table, the dataset name
 // the level-2 dialog has to be able to say, and this object's own probed state.
 //
+// Every lookup here is the LITERAL one (finding 2). Platform.For and MountFor
+// normalise — a backslash becomes a separator and the result is Cleaned — and on
+// Linux a backslash is an ordinary character in a filename, so a file literally
+// named `danger/..\safe/file` was graded on the `safe` dataset while the chmod
+// changed an inode on `danger`. ForLiteral and MountForLiteral answer from the
+// same byte-exact match, so the aclmode and the dataset NAME in the level-2
+// sentence describe one mount rather than two.
+//
+// An unmatched literal lookup leaves Backend empty, and empty means UNKNOWN. It
+// is deliberately not promoted to platform.ACLNone: "none" is the one answer
+// that silences the warning, and a mount this could not identify has not earned
+// it. The caller grades an empty backend pessimistically.
+//
 // ZFSAclmode is reported exactly as the table holds it, empty included. An empty
 // value means `zfs get` could not be called or gave no answer, and the front end
 // treats that as "discard" — the pessimistic reading, which is the only honest
 // one (identity plan §4.4 is explicit: never guess). Filling in a plausible
 // default here would take that decision away from the side that has to make it.
-func aclInfoFor(plat *platform.Platform, osPath string) wproto.ACLInfo {
+func aclInfoFor(plat *platform.Platform, osPath string, ref *itemRef) wproto.ACLInfo {
 	if plat == nil || osPath == "" {
+		// There is no mount table to ask and no path to ask about — the dev
+		// loop's degradation (§14), not a mount this failed to identify.
 		return wproto.ACLInfo{Backend: platform.ACLNone}
 	}
-	caps := plat.For(osPath)
+	caps, _ := plat.ForLiteral(osPath)
 	info := wproto.ACLInfo{
 		Backend: caps.ACLBackend,
 		Xattr:   caps.ACLXattr,
 		Aclmode: caps.ZFSAclmode,
 	}
-	if info.Backend == "" {
-		info.Backend = platform.ACLNone
-	}
-	if m, ok := plat.MountFor(osPath); ok && strings.EqualFold(m.FSType, "zfs") {
+	if m, ok := plat.MountForLiteral(osPath); ok && strings.EqualFold(m.FSType, "zfs") {
 		info.Dataset = m.Source
 	}
-	backend, xattr, state := probeOne(plat, osPath)
+	backend, xattr, state := probeOne(plat, osPath, ref)
 	if state != "" {
 		info.State = state
 		if info.Xattr == "" {
 			info.Xattr = xattr
 		}
-		if info.Backend == platform.ACLNone {
+		if info.Backend == "" || info.Backend == platform.ACLNone {
 			info.Backend = backend
 		}
 	}

@@ -366,7 +366,7 @@ func TestSizeSkipsSnapshotsAndCountsTheRecycleBin(t *testing.T) {
 	r := newRoot(t, base)
 	var log jobLog
 
-	res, err := Size(context.Background(), r, nil, []string{"/a"}, false, log.emit())
+	res, err := Size(context.Background(), r, nil, []string{"/a"}, false, 0, log.emit())
 	if err != nil {
 		t.Fatalf("Size: %v", err)
 	}

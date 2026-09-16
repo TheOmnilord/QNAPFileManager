@@ -1,6 +1,7 @@
 package wproto
 
 import (
+	"bytes"
 	"encoding/json"
 	"testing"
 
@@ -172,5 +173,86 @@ func TestM3OpsAndJobKindsExist(t *testing.T) {
 	}
 	if JobChmod != "chmod" || JobChown != "chown" {
 		t.Fatalf("job kinds = %q/%q", JobChmod, JobChown)
+	}
+}
+
+// TestChmodReqExpectIsAPrecondition is Astra round-1 finding 4 on the wire: the
+// ACL state and the identity the confirmation ladder graded travel with the
+// chmod, so the worker can prove on the held leaf that it is about to change the
+// object the user was warned about.
+//
+// The nil case matters as much as the set one. A job grades nothing per entry
+// and sends no precondition, and "no precondition" has to be ABSENT on the wire
+// rather than a zero ACLExpect — an empty State and a zero identity would
+// otherwise read as "expect an object with inode 0", which nothing matches.
+func TestChmodReqExpectIsAPrecondition(t *testing.T) {
+	req := ChmodReq{
+		Path: []byte("/share/Public/f"),
+		Spec: perm.ModeSpec{Mask: 0o7777, Value: 0o0644},
+		Expect: &ACLExpect{
+			State: fsx.ACLNFS4,
+			Identity: FSIdentityResp{
+				Dev: 66305, Ino: 4242, Btime: 1758000000000000000, HasBtime: true,
+			},
+		},
+	}
+	f, err := NewReq(7, OpChmod, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back ChmodReq
+	if err := f.Unmarshal(&back); err != nil {
+		t.Fatal(err)
+	}
+	if back.Expect == nil {
+		t.Fatal("the precondition did not survive the wire")
+	}
+	if back.Expect.State != fsx.ACLNFS4 {
+		t.Fatalf("expected state = %q", back.Expect.State)
+	}
+	if !back.Expect.Identity.SameInode(req.Expect.Identity) {
+		t.Fatalf("identity = %+v, want %+v", back.Expect.Identity, req.Expect.Identity)
+	}
+
+	b, err := json.Marshal(ChmodReq{Path: []byte("/x"), Spec: perm.ModeSpec{Mask: 0o777}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(b, []byte(`"x"`)) {
+		t.Fatalf("a request with no precondition still encodes one: %s", b)
+	}
+}
+
+// TestSizeReqCarriesAnEntryBudget is finding 10's half of the wire: a caller
+// that measures in order to DECIDE something — the permissions pre-scan, inside
+// a 15 s request — bounds the walk, and a bounded walk says when it stopped
+// short. Zero stays unbounded, which is what the ordinary folder-size job asks
+// for, so neither field may travel when nobody set it.
+func TestSizeReqCarriesAnEntryBudget(t *testing.T) {
+	f, err := NewReq(8, OpJob, SizeReq{Paths: [][]byte{[]byte("/share/Public")}, MaxEntries: 500000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back SizeReq
+	if err := f.Unmarshal(&back); err != nil {
+		t.Fatal(err)
+	}
+	if back.MaxEntries != 500000 {
+		t.Fatalf("MaxEntries = %d", back.MaxEntries)
+	}
+
+	capped, err := json.Marshal(JobResult{Files: 12, Dirs: 3, Capped: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(capped, []byte(`"cp":true`)) {
+		t.Fatalf("a capped result does not say so: %s", capped)
+	}
+	plain, err := json.Marshal(JobResult{Files: 12})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(plain, []byte(`"cp"`)) || bytes.Contains(plain, []byte(`"me"`)) {
+		t.Fatalf("an unbounded measurement carries the bound anyway: %s", plain)
 	}
 }

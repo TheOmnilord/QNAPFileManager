@@ -6,7 +6,7 @@
 // show and a packet capture should not have to.
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
-import {applyBlocked,applyPlan,applyScope,clearIdCache,impactNote,impactRoots,impactText,loadIds,permsApplies,reportResult} from './static/js/perms.js';
+import {OCTAL_REFUSAL,applyBlocked,applyPlan,applyScope,chownGateMessage,clearIdCache,impactNote,impactRoots,impactText,loadIds,octalState,permsApplies,reportResult} from './static/js/perms.js';
 import {update} from './static/js/state.js';
 import {createSizeRunner,flagsText,modeText,ownerText,propsSections,sizeReport,sizeRequest} from './static/js/props.js';
 import {warningCode,warningLine,warningsLabel} from './static/js/jobs.js';
@@ -116,6 +116,36 @@ test('Apply is blocked by ONE rule, and an attempt never overrides it', () => {
  assert.equal(applyBlocked({applying:true,recursive:false,specs:clears}),'applying');
  assert.equal(applyBlocked({canWrite:false,specs:clears}),'readOnly');
  assert.equal(applyBlocked(),'');
+ // A field that is not a mode is a reason of its own, and it outranks the
+ // recursive special-bit refusal: there is nothing to grade until it parses.
+ assert.equal(applyBlocked({octalInvalid:true}),'octal');
+ assert.equal(applyBlocked({octalInvalid:true,recursive:true,specs:sets}),'octal');
+ assert.equal(applyBlocked({octalInvalid:true,canWrite:false}),'readOnly');
+});
+
+test('the octal field never stands for a PREFIX of what it is showing', () => {
+ // Typing 0788 recorded the 0007 that parsed at "07" and Apply sent that while
+ // the field read 0788; clearing the field left the previous spec standing
+ // (round 1, finding 13). Three states, told apart explicitly.
+ assert.deepEqual(octalState('0755'),{state:'valid',spec:parseOctal('0755')});
+ assert.deepEqual(octalState(' 2755 '),{state:'valid',spec:parseOctal('2755')});
+ // The keystrokes of 0788, one at a time: the last one is invalid and STAYS
+ // invalid — it must never be read as the 07 before it.
+ assert.equal(octalState('0').state,'valid');
+ assert.equal(octalState('07').state,'valid');
+ assert.equal(octalState('078').state,'invalid');
+ assert.equal(octalState('0788').state,'invalid');
+ assert.equal(octalState('0788').spec,null,'an invalid field carries no spec at all');
+ assert.equal(applyBlocked({octalInvalid:octalState('0788').state === 'invalid'}),'octal');
+ // An EMPTIED field is "unchanged/mixed", which is the spec the dialog opens
+ // with — not the last thing that happened to parse.
+ assert.deepEqual(octalState(''),{state:'empty',spec:EMPTY});
+ assert.deepEqual(octalState('   '),{state:'empty',spec:EMPTY});
+ assert.deepEqual(octalState(null),{state:'empty',spec:EMPTY});
+ assert.deepEqual(applyPlan({entries:[file('/share/a')],spec:octalState('').spec}),[],'so Apply posts nothing for it');
+ // Five digits, letters and a stray sign are not modes either.
+ for (const bad of ['07777x','077777','-755','7 5 5']) assert.equal(octalState(bad).state,'invalid',bad);
+ assert.match(OCTAL_REFUSAL,/four octal digits/);
 });
 
 test('smart X is ignored when the change is not recursive', () => {
@@ -162,6 +192,28 @@ test('chown is posted BEFORE chmod, because a chown clears setuid (§3.2)', () =
  assert.equal(plan[0].endpoint,'api/fs/chown');
  assert.equal(plan[1].endpoint,'api/fs/chmod');
  assert.deepEqual(plan[1].body,{path:'/share/a',mask:SETUID,value:SETUID});
+});
+
+test('the ordering is JOBS too: the chmod waits for the chown to FINISH (§3.2)', () => {
+ // Both halves of a multi-item or recursive apply are jobs, and a 202 only
+ // means accepted — so the two used to walk the same tree at once in the
+ // metadata pool and a 4755 could land with setuid cleared by the chown behind
+ // it (round 1, finding 12). The dialog gates on the chown job's terminal state.
+ const plan = applyPlan({entries:[file('/share/a'),file('/share/b')],spec:toggleBit(EMPTY,SETUID,true),owner:1003});
+ assert.deepEqual(plan.map(r => r.op),['chown','chmod']);
+ assert.ok(plan.every(r => r.job),'both halves are jobs here, which is why the gate is needed');
+ assert.equal(chownGateMessage({state:'done'}),'','a finished chown lets the mode change go');
+ // Anything short of done stops the chmod, and says which it was.
+ assert.match(chownGateMessage({state:'failed'}),/^The change of owner failed, so the permissions were not changed\./);
+ assert.match(chownGateMessage({state:'cancelled'}),/^The change of owner was cancelled, so the permissions were not changed\./);
+ assert.match(chownGateMessage({state:'running'}),/ended running/);
+ // A poll that gave up, or a 202 with no id at all, is not a terminal state
+ // either — and guessing "it probably worked" is what the gate exists to refuse.
+ assert.match(chownGateMessage(null),/could not be followed to the end/);
+ assert.match(chownGateMessage(undefined),/could not be followed to the end/);
+ for (const job of [null,{state:'failed'},{state:'cancelled'}]) {
+  assert.match(chownGateMessage(job),/apply the permissions again/,'and it says what to do next');
+ }
 });
 
 test('applyPlan refuses to invent work out of nothing', () => {

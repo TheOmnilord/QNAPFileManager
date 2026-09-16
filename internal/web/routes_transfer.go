@@ -57,12 +57,17 @@ func transferTitle(mode string, paths []string, dest string) string {
 
 // transferSize measures a root through the user's worker, never the root
 // front-end. The shared request deadline bounds the whole pre-flight scan.
-func (s *Server) transferSize(ctx context.Context, who backend.Principal, root string, cross bool) (wproto.JobResult, error) {
+//
+// maxEntries is the walk's own entry budget, or 0 for the size job's default.
+// A transfer pre-flight passes 0 — it is already bounded by its 30 s context and
+// it wants the real totals for the dialog; M3's permissions pre-scan passes the
+// contract's bound and reads Capped as "unknown".
+func (s *Server) transferSize(ctx context.Context, who backend.Principal, root string, cross bool, maxEntries int64) (wproto.JobResult, error) {
 	id, err := jobs.NewID()
 	if err != nil {
 		return wproto.JobResult{}, err
 	}
-	body, err := json.Marshal(wproto.SizeReq{Paths: [][]byte{[]byte(root)}, CrossMounts: cross})
+	body, err := json.Marshal(wproto.SizeReq{Paths: [][]byte{[]byte(root)}, CrossMounts: cross, MaxEntries: maxEntries})
 	if err != nil {
 		return wproto.JobResult{}, err
 	}
@@ -223,7 +228,7 @@ func (s *Server) jobTransfer(w http.ResponseWriter, r *http.Request, sess *sessi
 		destID, destErr = s.jobRunner.FSIdentity(ctx, who, rdest)
 	}
 	for i, root := range resolved {
-		size, sizeErr := s.transferSize(ctx, who, root, body.CrossMounts)
+		size, sizeErr := s.transferSize(ctx, who, root, body.CrossMounts, 0)
 		// Files counts every entry the job will create — directories included,
 		// since a hundred empty folders are as much "one big operation" for the
 		// ladder and the audit milestone as a hundred files. Size reports them

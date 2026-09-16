@@ -546,12 +546,17 @@ func orUnknown(s string) string {
 }
 
 // TestACLLadderPosixBackend covers the other backend row: the POSIX mask
-// rewrite is L1, and only when the entry actually carries a POSIX ACL.
+// rewrite is L1 when the entry carries a POSIX ACL — and equally when nobody
+// LOOKED, which is Astra round-1 finding 9. A chmod job grades every entry
+// unknown because it cannot probe a tree it has not walked, and an uninspected
+// POSIX ACL is not a harmless one: the same change through the sync route, which
+// does probe, asks for the acknowledgement.
 func TestACLLadderPosixBackend(t *testing.T) {
 	for state, wantGrade := range map[string]int{
 		fsx.ACLPosix:   gradeConfirm,
 		fsx.ACLNone:    gradeNone,
-		fsx.ACLUnknown: gradeNone,
+		fsx.ACLUnknown: gradeConfirm,
+		"":             gradeConfirm,
 	} {
 		grade, notice, discards := chmodACLNotice(aclFacts{backend: platform.ACLPosix, state: state})
 		if grade != wantGrade || discards {

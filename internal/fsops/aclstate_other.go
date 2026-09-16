@@ -13,9 +13,15 @@ import "qnapfilemanager/internal/fsx"
 // xattrProbeAvailable is false: this platform reads no extended attributes.
 const xattrProbeAvailable = false
 
-func lgetxattrSize(path, name string) (int, error) { return 0, fsx.ErrUnsupported }
+// xattrSize and xattrRead answer "unsupported" from either route. viaFD is
+// false because there is no descriptor route here to have taken — which is the
+// honest input to aclTarget.grade, even though nothing off Linux ever builds a
+// probe to ask it.
+func (t aclTarget) xattrSize(name string) (int, bool, error) { return 0, false, fsx.ErrUnsupported }
 
-func lgetxattrRead(path, name string, size int) ([]byte, error) { return nil, fsx.ErrUnsupported }
+func (t aclTarget) xattrRead(name string, size int) ([]byte, bool, error) {
+	return nil, false, fsx.ErrUnsupported
+}
 
 // absentXattrErr is never consulted here, because nothing probes; it answers
 // false so that any future caller reads an unsupported probe as "unknown"

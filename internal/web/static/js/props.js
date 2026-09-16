@@ -105,6 +105,24 @@ export function pruneSizeJobs(now = Date.now()) {
 // cannot be overtaken by the first.
 export function createSizeRunner({report = () => {},track = trackJob,cancel = cancelJob,poll = awaitJob} = {}) {
  let held = null,run = 0;
+ // abandon gives up on a measurement that never reached a terminal state.
+ //
+ // Whatever this side decided, the walk is still going on the server — so the
+ // ID is the thing that must not be lost. Stop, the close event and Recount all
+ // cancel by id, and an entry whose id stopped being reachable the moment
+ // polling gave up left a du over a multi-terabyte share walking with nothing
+ // able to stop it (round 1, finding 14). The entry is marked failed as well,
+ // so the next dialog measures again rather than attaching to a walk nobody is
+ // watching; `cancelled` makes this idempotent, because the poll giving up and
+ // the dialog closing a moment later must not send two cancels for one job.
+ function abandon(entry) {
+  if (!entry || entry.cancelled) return undefined;
+  entry.cancelled = true;
+  entry.failed = true;
+  if (sizeJobs.get(entry.key) === entry) sizeJobs.delete(entry.key);
+  // The 202 may still be in flight; the submitting closure cancels it then.
+  return entry.id ? cancel(entry.id) : undefined;
+ }
  // release is this runner letting go of a shared measurement. The walk is
  // cancelled only when nobody is left holding it: a du over a multi-terabyte
  // share must not outlive the last dialog that asked — and must not be killed
@@ -117,15 +135,14 @@ export function createSizeRunner({report = () => {},track = trackJob,cancel = ca
   // opening it again on the same folder a second later must not walk it twice.
   // sizeJobUsable ages it out, and pruneSizeJobs collects it.
   if (entry.finishedAt) return undefined;
-  if (sizeJobs.get(entry.key) === entry) sizeJobs.delete(entry.key);
   entry.abandoned = true;
-  // The 202 may still be in flight; the submitting closure cancels it then.
-  return entry.id ? cancel(entry.id) : undefined;
+  return abandon(entry);
  }
  const runner = {
   // jobId is the measurement this runner could still cancel, and only that: a
-  // finished one has nothing to stop.
-  get jobId() { return held && !held.finishedAt ? held.id : null; },
+  // finished one has nothing to stop, and neither has one already cancelled
+  // because its poll gave up.
+  get jobId() { return held && !held.finishedAt && !held.cancelled ? held.id : null; },
   stop() {
    const had = held;
    run++; held = null;
@@ -143,7 +160,7 @@ export function createSizeRunner({report = () => {},track = trackJob,cancel = ca
     entry = null;
    }
    if (!entry) {
-    entry = {key,id:null,holders:0,job:null,finishedAt:0,abandoned:false,failed:false};
+    entry = {key,id:null,holders:0,job:null,finishedAt:0,abandoned:false,failed:false,cancelled:false};
     entry.promise = (async () => {
      const res = await api('api/jobs/size',{},{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify(sizeRequest(entries,{crossMounts}))});
@@ -154,7 +171,16 @@ export function createSizeRunner({report = () => {},track = trackJob,cancel = ca
      // quiet: a measurement the user did not ask for as an operation must not
      // throw the Operations drawer over the dialog they are reading.
      track(res.job,{quiet:true});
-     const job = await poll(entry.id);
+     // A poll that answers null has NOT seen a terminal state: awaitJob ran out
+     // of tries, or the session changed under it. Storing that as the answer set
+     // finishedAt and put the entry out of cancelling reach, so the walk carried
+     // on with nobody able to stop it; a thrown fetch error lost it the same way
+     // (round 1, finding 14). Either way the job is cancelled by the id the
+     // entry still holds, and the failure is what this measurement reports.
+     let job;
+     try { job = await poll(entry.id); }
+     catch(err) { abandon(entry); throw err; }
+     if (!job) { abandon(entry); throw new Error('The measurement did not answer, and it was stopped. Press Recount to measure again.'); }
      entry.job = job; entry.finishedAt = Date.now();
      return job;
     })();

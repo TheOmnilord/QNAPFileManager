@@ -4,7 +4,7 @@ import {whyDisabled} from './why.js';
 import {state,sessionGuard,listingActions,subscribe} from './state.js';
 import {isDirectory,isSymlink,hasTarget,fileTarget} from './badges.js';
 import {runMutation,confirmDialog,actionMessage} from './actions.js';
-import {trackJob} from './jobs.js';
+import {trackJob,awaitJob} from './jobs.js';
 import {loadList,selectionEntries,activeSelection,extraActions} from './list.js';
 import {loadTree} from './tree.js';
 import {createSizeRunner,propsTarget,capsHint} from './props.js';
@@ -74,6 +74,44 @@ export function applyPlan({
   }
  }
  return requests;
+}
+
+// chownGateMessage is §3.2 carried into the JOB world, as a sentence.
+//
+// Posting the chown first is only half the ordering. Both requests are jobs for
+// a multi-item or recursive selection, and a 202 means "accepted", not "done" —
+// so the two ran side by side in the metadata pool and a 4755 asked for after a
+// change of owner could be cleared by the chown still walking behind it: exactly
+// the silent undoing the ordering exists to prevent (round 1, finding 12). The
+// mode change therefore waits for the owner change to REACH a terminal state.
+//
+// It returns '' when the chmod may go ahead, and otherwise why it will not. A
+// chown that failed or was cancelled leaves a tree whose ownership is not what
+// the mode was computed against, and sending the mode anyway would write it over
+// a half-changed tree and report success.
+export function chownGateMessage(job) {
+ const state = String(job?.state ?? '');
+ if (state === 'done') return '';
+ const what = state === 'cancelled' ? 'was cancelled'
+  : state === 'failed' ? 'failed'
+  : state ? `ended ${state}`
+  : 'could not be followed to the end';
+ return `The change of owner ${what}, so the permissions were not changed. Check Operations, then apply the permissions again.`;
+}
+
+// octalState grades what #pOctal is showing RIGHT NOW, as data.
+//
+// The field used to keep the last spec that parsed, so typing 0788 recorded
+// 0007 at "07" and Apply sent that while the field read 0788 — and clearing the
+// field left the previous spec in place (round 1, finding 13). Three states, and
+// the dialog has to tell them apart: an EMPTY field is "unchanged/mixed" and
+// carries no mode at all, a VALID one is its absolute spec, and an INVALID one
+// blocks Apply rather than quietly standing for a prefix of itself.
+export const OCTAL_REFUSAL = 'A mode is up to four octal digits, for example 0755.';
+export function octalState(text) {
+ if (String(text ?? '').trim() === '') return {state:'empty',spec:{...EMPTY}};
+ const parsed = parseOctal(text);
+ return parsed ? {state:'valid',spec:parsed} : {state:'invalid',spec:null};
 }
 
 // permsApplies is the line under the title: what this dialog is about to change
@@ -229,9 +267,10 @@ function paintWarnings() {
 // left the dialog offering to send it again, and the second press went through
 // the same refusal with the warning still on screen. Every repaint and every
 // end of an attempt now asks this instead of setting the property itself.
-export function applyBlocked({applying = false,canWrite = true,recursive = false,specs = null} = {}) {
+export function applyBlocked({applying = false,canWrite = true,recursive = false,specs = null,octalInvalid = false} = {}) {
  if (applying) return 'applying';
  if (!canWrite) return 'readOnly';
+ if (octalInvalid) return 'octal';
  if (recursive && recursiveSetsSpecial(specs)) return 'special';
  return '';
 }
@@ -239,6 +278,11 @@ export function applyBlocked({applying = false,canWrite = true,recursive = false
 // applying is true while a plan is in flight, so the button cannot be pressed
 // twice into the same dialog.
 let applying = false;
+// octalInvalid is whether #pOctal is showing something that is not a mode. It is
+// tracked rather than re-derived because the model deliberately does NOT follow
+// an unparseable field: what the user sees and what Apply would send must agree,
+// and while they cannot, Apply does not go.
+let octalInvalid = false;
 
 function currentSpecs() {
  return jobSpecs({spec:model.spec,apply:applyMode(),smartX:$('#pSmartX').checked});
@@ -247,7 +291,7 @@ function currentSpecs() {
 function refreshApply() {
  const blocked = applyBlocked({
   applying,canWrite:state.session ? !!state.session.canWrite : true,
-  recursive:recursive(),specs:currentSpecs(),
+  recursive:recursive(),specs:currentSpecs(),octalInvalid,
  });
  // The dialog's primary button goes through the shared reason table (M4
  // contract §7.1) so read-only mode says here exactly what it says on the
@@ -266,6 +310,7 @@ function refreshApply() {
  const pending={
   applying:'The change is being sent.',
   readOnly:'',   // the verdict says this one, and says it better
+  octal:OCTAL_REFUSAL,
   special:RECURSIVE_SPECIAL_REFUSAL,
  }[blocked] ?? '';
  applyWhy('#pApply',verdict,blocked ? pending || true : '');
@@ -287,8 +332,12 @@ function idErrors() {
  ].filter(Boolean);
 }
 
-function paintIdErrors() {
- const problems = idErrors();
+// paintErrors is the ONE writer of #permsError, and it composes every reason at
+// once. The octal field used to write its own sentence there from its `change`
+// handler, so the next keystroke in the uid field wiped it — and the mode the
+// dialog was refusing to send stopped saying why.
+function paintErrors() {
+ const problems = [octalInvalid ? OCTAL_REFUSAL : '',...idErrors()].filter(Boolean);
  $('#permsError').textContent = problems.join(' ');
  $('#permsError').hidden = !problems.length;
  return problems;
@@ -358,7 +407,7 @@ export async function openPerms(entries) {
  $('#pDiff').textContent = ''; $('#pDiff').hidden = true;
  $('#permsError').textContent = ''; $('#permsError').hidden = true;
  $('#pImpact').textContent = '';
- applying = false;
+ applying = false; octalInvalid = false;
  ownerEnabled(); repaint();
  openDialog('#dlgPerms');
  $('#pOctal').focus?.();
@@ -432,7 +481,7 @@ async function applyNow() {
  if (!state.session?.canWrite || !targets.length) return;
  // A ticked "change owner" with an unreadable id stops here rather than being
  // read as "no owner change" by applyPlan.
- if (paintIdErrors().length) return;
+ if (paintErrors().length) return;
  const valid = sessionGuard();
  const spec = model.spec;
  const plan = applyPlan({
@@ -453,12 +502,28 @@ async function applyNow() {
   group:targets[0].group || '',
  };
  try {
-  for (const request of plan) {
+  for (const [at,request] of plan.entries()) {
    const res = await runMutation(request.endpoint,request.body,(confirm,message) =>
     askPermConfirm(confirm,message,{...ctx,op:request.op}));
    if (!valid()) return;
    if (res === null) return;                       // declined: nothing after it runs either
-   if (request.job) { trackJob(res.job); announce(`${request.op === 'chown' ? 'Changing owner' : 'Changing permissions'} — see Operations.`); continue; }
+   if (request.job) {
+    trackJob(res.job);
+    announce(`${request.op === 'chown' ? 'Changing owner' : 'Changing permissions'} — see Operations.`);
+    // A 202 is "accepted", not "done" (chownGateMessage). The single-item path
+    // above already awaits the chown's RESULT; the job path has to wait for the
+    // job, or the two walk the same tree at once and the kernel clears the
+    // setuid this dialog was asked to set.
+    if (request.op === 'chown' && plan.slice(at+1).some(r => r.op === 'chmod')) {
+     announce('Waiting for the change of owner to finish before changing the permissions.');
+     const id = res.job?.id;
+     const finished = id ? await awaitJob(id) : null;
+     if (!valid()) return;
+     const stopped = chownGateMessage(finished);
+     if (stopped) { $('#permsError').textContent = stopped; $('#permsError').hidden = false; loadList(); loadTree(); return; }
+    }
+    continue;
+   }
    const {warned,lines,tone} = reportResult(res,{op:request.op,group:ctx.group});
    if (warned) showDiff(lines,tone);
    else announce(request.op === 'chown' ? 'Owner changed.' : 'Permissions changed.');
@@ -496,23 +561,29 @@ export function initPerms() {
    repaint();
   });
  }
- $('#pOctal').addEventListener('input',ev => {
-  const parsed = parseOctal(ev.target.value);
-  if (!parsed) return;                     // half-typed text is not an error yet
-  model = {...model,spec:parsed};
-  paintGrid(false); paintWarnings();
- });
- $('#pOctal').addEventListener('change',ev => {
-  if (ev.target.value.trim() === '') return;     // cleared: back to "mixed"
-  if (!parseOctal(ev.target.value)) { $('#permsError').textContent = 'A mode is up to four octal digits, for example 0755.'; $('#permsError').hidden = false; }
- });
+ // The field and the spec move together, or Apply does not go. Half-typed text
+ // used to be "not an error yet" and simply left the previous spec standing:
+ // 0788 sent the 0007 recorded at "07", and clearing the field sent whatever was
+ // last typed into it. An EMPTY field now means "unchanged/mixed" — no mode spec
+ // at all, exactly as the dialog opened — and an INVALID one blocks Apply.
+ const onOctal = ev => {
+  const {state:kind,spec} = octalState(ev.target.value);
+  octalInvalid = kind === 'invalid';
+  // Repainting the grid from a spec the field does not spell would put a third
+  // reading on screen, so an invalid field leaves the grid where it was and the
+  // error line says why nothing may be sent.
+  if (!octalInvalid) { model = {...model,spec}; paintGrid(false); paintWarnings(); }
+  paintErrors(); refreshApply();
+ };
+ $('#pOctal').addEventListener('input',onOctal);
+ $('#pOctal').addEventListener('change',onOctal);
  $('#pRecursive').addEventListener('change',() => {
   repaint();
   if (targets.some(isDirectory)) startImpact();
  });
  for (const id of ['pApplyAll','pApplyFiles','pApplyDirs','pSmartX']) $(`#${id}`).addEventListener('change',paintWarnings);
- for (const id of ['pOwnerChange','pGroupChange']) $(`#${id}`).addEventListener('change',() => { ownerEnabled(); paintIdErrors(); });
- for (const id of ['pOwnerId','pGroupId']) $(`#${id}`).addEventListener('input',paintIdErrors);
+ for (const id of ['pOwnerChange','pGroupChange']) $(`#${id}`).addEventListener('change',() => { ownerEnabled(); paintErrors(); });
+ for (const id of ['pOwnerId','pGroupId']) $(`#${id}`).addEventListener('input',paintErrors);
  $('#pOwner').addEventListener('change',ev => { if (ev.target.value !== '') $('#pOwnerId').value = ev.target.value; });
  $('#pGroup').addEventListener('change',ev => { if (ev.target.value !== '') $('#pGroupId').value = ev.target.value; });
  $('#pRecount').addEventListener('click',() => { if (targets.length) startImpact(); });

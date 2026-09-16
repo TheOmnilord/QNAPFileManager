@@ -112,6 +112,22 @@ type ChmodReq struct {
 	// field is kept so the wire shape does not move under a worker that was
 	// built against it.
 	Follow bool `json:"f,omitempty"`
+	// Expect, when set, is the precondition the route graded on: the ACL state
+	// and the filesystem identity Props reported for this object a moment ago.
+	// The worker re-probes the held descriptor and refuses `changed` when either
+	// has moved (Astra M3 round-1 finding 4) — swapping a non-trivial file over
+	// the name between the confirmation and the change would otherwise discard an
+	// ACL the user was never warned about. A job grades with ACLUnknown and can
+	// promise nothing per entry, so it sends none.
+	Expect *ACLExpect `json:"x,omitempty"`
+}
+
+// ACLExpect is what the confirmation was graded against (m3-contract §8.1 as
+// amended): the per-object ACL state and the identity of the object the state
+// was read from.
+type ACLExpect struct {
+	State    string         `json:"s"`
+	Identity FSIdentityResp `json:"id"`
 }
 
 // ChownReq changes ownership. -1 leaves that half alone, matching chown(2).
@@ -590,12 +606,23 @@ type JobResult struct {
 	// Hits are a search job's matches in walk order, capped by SearchReq.MaxHits
 	// (M2-C). Detail says when the cap was hit.
 	Hits []fsx.Entry `json:"hits,omitempty"`
+	// Capped marks a measurement that stopped at SizeReq.MaxEntries. The counts
+	// are then a MINIMUM, not a total, and a caller deciding something from them
+	// (the M3 pre-scan) must read the whole answer as "unknown" rather than as
+	// the number it happens to carry.
+	Capped bool `json:"cp,omitempty"`
 }
 
 // SizeReq measures trees: files, directories and bytes under each path.
 type SizeReq struct {
 	Paths       [][]byte `json:"p"`
 	CrossMounts bool     `json:"x,omitempty"`
+	// MaxEntries bounds the walk. Zero is the size job's own default; a caller
+	// that is measuring in order to decide something — the M3 permissions
+	// pre-scan, which runs inside a 15 s request — passes the contract's 500 000
+	// bound so an enormous tree ends the walk instead of the request. A walk that
+	// hit the bound answers Capped, and a capped measurement is not a count.
+	MaxEntries int64 `json:"me,omitempty"`
 }
 
 // TrashListReq lists the caller's own trashed items (OpTrashList — a plain

@@ -124,6 +124,10 @@ kernel refuses (INV-2).
      inheritance flags (what the mode alone describes); `nfs4` when any ACE names somebody else or carries
      `FILE_INHERIT`/`DIRECTORY_INHERIT`. This is `ls -V`'s notion of trivial, and it is **our heuristic, not the
      kernel's**.
+   - *Amended, Astra round 1 (#3):* "trivial" additionally requires every ACE to be **ALLOW** — a DENY, AUDIT or
+     ALARM entry of any kind is non-trivial — and requires that `GROUP@`/`EVERYONE@` carry neither `WRITE_ACL` nor
+     `WRITE_OWNER`, the bits a mode cannot express. The type and the mask were being ignored, so an
+     `EVERYONE@ DENY DELETE` ACL passed as trivial and a `discard` chmod would have destroyed it without L2.
    - A read or parse failure is `unknown`, never `none`, and `unknown` shows the badge with the pessimistic text.
      The existing NFSv4 parser shapes in `internal/fsops/acl_linux.go` are reused; `internal/perm` holds the
      trivial/non-trivial judgement so it is testable everywhere.
@@ -139,8 +143,15 @@ kernel refuses (INV-2).
    NFSv4: *"This item's real permissions are an NFSv4 ACL. The mode shown is a summary the filesystem derives from
    it. Changing the mode may **discard or reduce** the ACL, and that cannot be undone from this app."* `unknown`
    gets the NFSv4 text plus *"this app could not read the ACL to say more"*.
-4. **Nothing branches on QTS vs hero.** The badge, the text and the ladder all ask `Platform.For(path)` for
-   `ACLBackend` and `ZFSAclmode` (decision 8).
+4. **Nothing branches on QTS vs hero.** The badge, the text and the ladder all ask the platform table for
+   `ACLBackend` and `ZFSAclmode` (decision 8). *Amended, Astra round 1 (#2):* they ask through the **literal**
+   lookup (`ForLiteral`, M2-C round 3), never `For`/`MountFor`, whose normalisation turns a backslash — an ordinary
+   byte in a Linux filename — into a separator and cleans `..`, so `danger/..\safe/file` was graded on the wrong
+   dataset. A path the literal lookup cannot place has unknown facts and is graded pessimistically.
+5. *Added, Astra round 1 (#1):* a dataset mounted **after** start-up is probed on the next mount-table refresh,
+   exactly as at start-up; until then, and whenever the backend of a storage mount is simply unknown (`""`), the
+   ladder grades it as the worst case (L2 with the unknown suffix) rather than as "no ACL backend". The accepted
+   race is a mount that appears after the token is issued (§17.3), not one that existed before the request.
 
 ## 7. The `aclmode` confirm ladder
 
@@ -150,7 +161,7 @@ read the same data-driven table, so they agree by construction (the trash-root a
 
 | Situation | Grade | What the dialog says |
 |---|---|---|
-| chmod, `ACLBackend == "posix"`, `ACL == "posix"` | **L1** | the mode's group bits become the ACL **mask**, so named entries may lose effective access; the ACL itself survives |
+| chmod, `ACLBackend == "posix"`, `ACL == "posix"` **or `unknown`** (Astra round 1 #9: jobs grade with `unknown`, and an uninspected POSIX ACL is not harmless) | **L1** | the mode's group bits become the ACL **mask**, so named entries may lose effective access; the ACL itself survives |
 | chmod, `ACLBackend == "nfs4"`, `ACL` non-trivial or `unknown`, `ZFSAclmode` is `discard` **or empty (unknown)** | **L2** (typed phrase + ack) | names the **dataset** (`Mount.Source`) and states plainly that the ACL will be destroyed and cannot be restored from this app |
 | same, `ZFSAclmode == "groupmask"` | **L1** | the ACL will be **silently reduced** to the group bits |
 | same, `ZFSAclmode == "passthrough"` | **L1** | the mode is set and the owner/group/everyone entries are regenerated; other entries are kept |
@@ -178,7 +189,13 @@ non-recursively cannot be redeemed recursively.
    `Avail`/`Total` from `fstatfs` on the descriptor. On a per-share hero dataset those are the dataset's numbers,
    which is the right answer and better than the pool's.
 3. `ACLInfo{Backend, Xattr, State, Aclmode, Dataset}` — the authoritative display copy, filled by the worker from
-   `s.plat` and the held descriptor's mount identity.
+   `s.plat` and the held descriptor's mount identity. *Amended, Astra round 1 (#4, #5):* the state is read from the
+   **held leaf** (`lgetxattr` on `/proc/self/fd/N`, the chmod idiom), not from the pathname — the listing badge may
+   be a pathname probe because it is display only (§17.2); this answer feeds the ladder, so it may not. And because
+   the chmod is a second RPC, the sync chmod route sends what it graded: `ChmodReq.Expect *ACLExpect{State,
+   Identity}`; the worker re-proves the identity on the held descriptor and re-probes the state, and refuses
+   `changed` if either differs. A worker that could not detect a backend answers unknown, and the route never lets
+   the worker's answer downgrade a backend the daemon already knows.
 4. **Size reuses the existing size job.** Opening the dialog on a directory submits `POST /api/jobs/size` for that
    one path, polls `/api/jobs` as every job is polled, and `POST /api/jobs/{id}/cancel` when the dialog closes or
    Stop is pressed; Recount resubmits. No new job kind, no new route, no second size implementation. `#pImpact` in
@@ -310,6 +327,14 @@ for the dispatch), not by a separate 30 s constant; a scan that runs out of budg
 that as large (L2). The measured count travels in the confirmation's summary and is reused when the token is
 redeemed, so the tree is scanned once per confirmed job.
 
+*Amended, Astra round 1 (#6, #10, #11):* "nothing in M3 needs an admission slot" was wrong about the pre-scan,
+which is recursive work an unconfirmed POST can start at will. The pre-scan takes a `ClassMetadata` slot like the
+job it precedes and carries the 500 000-entry budget on the wire (`MaxEntries`; a `Capped` result is `-1`); a `-1`
+is remembered in the issued-cost ledger as an explicit capped outcome, so the confirmed repost reuses it instead of
+walking the tree again. A recursive job is also checked for **containment** (`Guard.Contains` over every root, as
+the transfer routes do) — a recursive change over an ancestor of the daemon's own installation is refused exactly as
+naming it directly is.
+
 ## 14. Degradation off Linux (the dev loop)
 
 `chmod_other.go` applies `os.Chmod` best effort (Windows mode bits are a fiction and the dev loop only needs the
@@ -404,6 +429,13 @@ in-app drag-and-drop and the trash janitor stay deferred.
 12. **Link target spelling (round 4).** `properties` without `follow` still reports `LinkResolved` from the worker's
     own resolution, as the listing has since M1; the `follow` refusal protects the target's attributes, not its
     spelling. Accepted as M1 behaviour.
+13. **Nested directories and the post-order change (Astra round 1 #7, #8, #19, #20).** The walker closes a
+    directory before its post-order chmod/chown; the reopen is now compared (dev, ino) with what was traversed and
+    a substitution is reported as `changed` for that entry. A directory the worker cannot enumerate still gets the
+    change on its held reference, with the listing failure reported beside it. A non-directory entry on another
+    device (a regular-file bind mount) is a crossing under `crossMounts:false` and is skipped like a directory
+    crossing. The recursive root is re-`fstat`ed before its own mode is built, so a special bit cleared elsewhere
+    during the walk is not reinstated from a stale snapshot.
 
 **To confirm on hardware first (both units):** that `zfs get -Hp -o value aclmode` is callable at all as root on
 hero and what it returns for an ordinary share — the entire L2 promotion hangs on it, and an empty answer means every

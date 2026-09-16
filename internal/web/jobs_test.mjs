@@ -1,7 +1,7 @@
 // Run with: node --test internal/web/jobs_test.mjs
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
-import {formatBytes,formatRate,formatETA,jobPercent,jobBarState,jobDetailLine,shouldPoll,jobLive,createPoller,jobTransitions,seedJob,trackedStates} from './static/js/jobs.js';
+import {formatBytes,formatRate,formatETA,jobPercent,jobBarState,jobDetailLine,shouldPoll,jobLive,createPoller,jobTransitions,seedJob,trackedStates,cancelAcknowledged} from './static/js/jobs.js';
 
 test('formatBytes reads in binary units', () => {
  assert.equal(formatBytes(0),'0 B');
@@ -162,6 +162,24 @@ test('a size job finishing does not reload the file list', () => {
  const {events,refresh} = jobTransitions([{id:'s1',state:'done',kind:'size'}],seen);
  assert.equal(events.length,1);
  assert.equal(refresh,false);
+});
+
+// --- what counts as the service acknowledging a cancel (Astra r3 #2) ----------
+
+test('only the manager saying "no such job" acknowledges a failed cancel', () => {
+ // The one case: the manager has no such job, so there is no walk to stop.
+ assert.equal(cancelAcknowledged({status:404,code:'not_found'}),true);
+ // The QTS proxy answering 502 with an HTML page is an error with a status and
+ // no `network` flag — the shape that used to pass for an acknowledgement and
+ // marked a running job cancelled for good.
+ assert.equal(cancelAcknowledged({status:502}),false);
+ assert.equal(cancelAcknowledged({status:503,code:'worker_gone'}),false);
+ assert.equal(cancelAcknowledged({status:429,code:'queue_full'}),false);
+ assert.equal(cancelAcknowledged({status:403,code:'permission'}),false);
+ // A 404 QTS composed itself carries no code of ours, so it is not the manager.
+ assert.equal(cancelAcknowledged({status:404}),false);
+ assert.equal(cancelAcknowledged({network:true}),false);
+ assert.equal(cancelAcknowledged(undefined),false);
 });
 
 test('a poll that arrives after stop does not restart the loop', async () => {

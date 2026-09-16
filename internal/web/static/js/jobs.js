@@ -361,14 +361,30 @@ export function pollJobs() {
  refreshJobs().then(again => { if (again) poller.start(); }).catch(err => error(err));
 }
 
+// cancelAcknowledged classifies a FAILED cancel: did the service nevertheless
+// say the job is stopped? One answer means that, and it is not merely
+// "something answered" (Astra r3 #2).
+//
+// The QTS reverse proxy answers for the service whenever the service does not,
+// and its 502 carries an HTML body — an error with a status and no `network`
+// flag, which the old "anything that is not a transport failure is an answer"
+// rule counted as an acknowledgement. A running job was then marked cancelled
+// for good while the du walked on. So: a 404 whose code is `not_found` is the
+// manager saying it has no such job (jobCancel, routes_jobs.go) and there is
+// nothing left to stop; every other status — 5xx, 429, a 4xx that is not that
+// one — and every transport failure is retryable.
+export function cancelAcknowledged(err) {
+ return err?.status === 404 && err?.code === 'not_found';
+}
+
 // cancelJob answers whether the service ACKNOWLEDGED the cancel, which is not
 // the same question as whether one was sent (Astra r2 #9). A size job's runner
 // cancels precisely when its poll has just given up, and the usual reason a poll
 // gives up is that the connection went away — so the cancel goes down the same
 // dead wire, and treating "sent" as "stopped" leaves a du over a multi-terabyte
-// share walking with nothing left able to stop it. Anything the service answered
-// — a 404 for a job it has already reaped included — is an answer; only a
-// transport failure is not, and only that one is worth retrying.
+// share walking with nothing left able to stop it. api() resolves only for a
+// 2xx, which is the service itself saying it has the cancel; anything else goes
+// to cancelAcknowledged, which admits one case and no others.
 export async function cancelJob(id) {
  const valid = sessionGuard();
  try {
@@ -377,7 +393,7 @@ export async function cancelJob(id) {
   return true;
  } catch(err) {
   if (valid()) error(err);
-  return !err?.network;
+  return cancelAcknowledged(err);
  }
 }
 

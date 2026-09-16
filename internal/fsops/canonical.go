@@ -133,13 +133,32 @@ type objectID struct {
 	hasBtime bool
 }
 
+// btimeCarrier is a FileInfo that already knows when its object was created,
+// because whatever produced it read the birth time while it still held the
+// descriptor the stat came from (statFileInfo, open_linux.go).
+//
+// It exists so that an identity taken from a FileInfo ALONE is not automatically
+// the weaker kind. The walk's per-entry lstat closes its O_PATH descriptor
+// before the caller ever sees the result, so without this the identity a walk
+// recorded for a directory was device and inode only — and a later comparison
+// against a re-opened descriptor then skipped the birth time, because `same`
+// compares it only when both sides have one. An inode number handed back to a
+// directory recreated at the same name passed as the same object (Astra r3 #9).
+type btimeCarrier interface {
+	birthTime() (int64, bool)
+}
+
 // objectIDOf reads an identity from a HELD descriptor and the stat that was
 // taken of it. f may be nil, in which case only what a FileInfo carries is
-// available — which is why every check that matters is made on a descriptor.
+// available — which is why every check that matters is made on a descriptor, and
+// why a FileInfo that carries its own birth time is asked for it.
 func objectIDOf(f *os.File, fi os.FileInfo) objectID {
 	var id objectID
 	id.key, id.have = inodeOf(fi)
 	if f == nil {
+		if c, ok := fi.(btimeCarrier); ok {
+			id.btime, id.hasBtime = c.birthTime()
+		}
 		return id
 	}
 	rc, err := f.SyscallConn()

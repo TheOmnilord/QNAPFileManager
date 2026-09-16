@@ -402,6 +402,14 @@ func (j *modeJob) unopened(it WalkItem, err error) {
 		// A second lookup of the name, so it is proved against the reading the
 		// enumeration made, exactly as the post-order path is proved against the
 		// reading the descent made (finding 7, r2 #2).
+		//
+		// The enumeration's side is a FileInfo and not a descriptor — lstatIn
+		// closed the O_PATH it read through — so for a long time this compared
+		// device and inode and nothing else, and an unreadable empty directory
+		// removed and recreated between the two lookups passed whenever the
+		// allocator handed the inode number back. The walk's lstat now carries a
+		// directory's birth time with it, which is what makes this comparison
+		// about the object rather than about the number (Astra r3 #9).
 		j.refuse(it.Path, fmt.Errorf(
 			"%q is not the folder the walk reached; it was replaced before it could be changed: %w",
 			it.Path, fsx.ErrChanged))

@@ -184,7 +184,10 @@ func modeOne(ctx context.Context, r fsx.Root, plat *platform.Platform, apiPath s
 // "the state has not moved" a statement about an inode.
 //
 // A nil expectation asserts nothing and is the ordinary case for a job, which
-// grades no entry individually and can promise nothing about one.
+// grades no entry individually and can promise nothing about one. An expectation
+// whose STATE is empty still asserts the identity, and — since round 3 — still
+// re-probes, because an empty observation is not the same thing as an observed
+// absence (Astra r3 #7).
 func proveExpectation(r fsx.Root, plat *platform.Platform, tg jailPath, ref *itemRef, expect *wproto.ACLExpect) error {
 	if expect == nil {
 		return nil
@@ -200,17 +203,37 @@ func proveExpectation(r fsx.Root, plat *platform.Platform, tg jailPath, ref *ite
 			"%q is not the item the confirmation was given for; it was replaced after it was described: %w",
 			tg.api, fsx.ErrChanged)
 	}
-	if expect.State == "" {
-		// Nothing was observed when the object was described, so there is no ACL
-		// claim to hold it to and the identity is the whole of the precondition
-		// (Astra r2 #1/#6). Probing again here would only invent one.
-		return nil
-	}
 	osPath, osErr := r.OS(tg.api)
 	if osErr != nil {
 		osPath = ""
 	}
-	_, _, state := probeOne(plat, osPath, ref)
+	_, _, state := proofProbe(plat, osPath, ref)
+	if expect.State == "" {
+		// Nothing was observed when the object was described. Round 2 read that
+		// as "there is no claim to hold it to" and stopped at the identity — but
+		// on Linux an empty observation now has a second meaning, and it is the
+		// dangerous one: the mount probe that decides whether there is a backend
+		// to read at all runs ASYNCHRONOUSLY after a refresh, so Props could have
+		// described this object before its dataset was placed and graded an ACL
+		// it simply could not see. Returning here would then let a discard chmod
+		// reduce or destroy an ACL that the RE-PROBE can now read perfectly well
+		// (Astra r3 #7).
+		//
+		// So the re-probe happens either way, and what it finds decides. A state
+		// that is still unobservable, or that is harmless — no ACL, or an NFSv4
+		// one that says only what the mode already says — leaves the identity as
+		// the whole of the precondition, exactly as before. Anything else means
+		// the ladder graded something it could not see, and the safe answer is
+		// not to guess at the grade it would have given but to make the caller
+		// grade again.
+		if state != "" && !harmlessACLState(state) {
+			return fmt.Errorf(
+				"%q has a %s ACL that was not visible when it was described, so the confirmation did not cover it;"+
+					" nothing was changed: %w",
+				tg.api, aclWord(state), fsx.ErrChanged)
+		}
+		return nil
+	}
 	if !stateSatisfies(expect.State, state) {
 		// Either direction is a refusal. A state that has become MORE serious is
 		// the attack; one that has become less is still a tree that moved under a
@@ -221,6 +244,24 @@ func proveExpectation(r fsx.Root, plat *platform.Platform, tg jailPath, ref *ite
 			tg.api, aclWord(state), aclWord(expect.State), fsx.ErrChanged)
 	}
 	return nil
+}
+
+// proofProbe is probeOne, named so a test can stand in for it. The gap this
+// precondition is about is two syscalls wide on a real dataset and there is no
+// ZFS on the dev box, so the only way to exercise what an empty expectation does
+// with a re-probed state is to say what the re-probe returns (Astra r3 #7).
+var proofProbe = probeOne
+
+// harmlessACLState reports that an observed ACL state is one a chmod cannot
+// destroy anything with: no ACL at all, or an NFSv4 ACL that is only what the
+// mode already describes.
+//
+// It is deliberately a whitelist. "posix", "nfs4" and "unknown" are all things
+// the confirmation ladder has words for, and a state this function has never
+// heard of is treated as one of those rather than waved through — the direction
+// every other judgement about ACLs in this app takes.
+func harmlessACLState(state string) bool {
+	return state == fsx.ACLNone || state == fsx.ACLNFS4Trivial
 }
 
 // stateSatisfies reports whether a re-probed ACL state honours the expectation.
@@ -237,6 +278,12 @@ func proveExpectation(r fsx.Root, plat *platform.Platform, tg jailPath, ref *ite
 // identity, which is the half that catches the swap this precondition exists
 // for; the ACL half is proved when, and only when, there is an observation to
 // prove it against.
+//
+// Round 3 (#7) narrowed what "left standing" means without changing this
+// function: an empty expectation still imposes no EQUALITY, but the caller now
+// refuses outright when the re-probe reads a state that is neither empty nor
+// harmless, because the innocent reason above explains an ungraded posix or
+// nfs4 ACL just as well as an attack does and neither may be chmod'd blind.
 func stateSatisfies(want, got string) bool {
 	if want == "" {
 		return true

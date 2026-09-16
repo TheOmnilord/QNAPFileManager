@@ -176,10 +176,7 @@ func (s *Server) mountFacts(apiPath string) aclFacts {
 	if s.platform == nil {
 		return f
 	}
-	osPath := apiPath
-	if mapped, err := s.Root.OS(apiPath); err == nil {
-		osPath = mapped
-	}
+	osPath := s.osPathFor(apiPath)
 	caps, ok := s.platform.ForLiteral(osPath)
 	if !ok {
 		// A table with rows in it describes a whole filesystem — every Linux
@@ -197,6 +194,17 @@ func (s *Server) mountFacts(apiPath string) aclFacts {
 		f.dataset, f.mount = m.Source, m.MountPoint
 	}
 	return f
+}
+
+// osPathFor spells an API path the way the daemon's mount table spells its mount
+// points, which on the NAS is the identity and on a jailed dev box is the jail's
+// own mapping. A path the jail cannot map is graded by its API spelling, which is
+// what the table has to be asked about anyway.
+func (s *Server) osPathFor(apiPath string) string {
+	if mapped, err := s.Root.OS(apiPath); err == nil {
+		return mapped
+	}
+	return apiPath
 }
 
 // ladderFacts is every dataset one root of a permissions JOB can reach, each
@@ -302,6 +310,12 @@ func (s *Server) chmodJobLadder(ladder *permLadder, targets []string, cross bool
 // A failure to LEARN the state is fsx.ACLUnknown, never ACLNone (§6.1): the
 // pessimistic side is the half that matters, and it is the side that warns.
 //
+// And the worker's facts are believed only about the MOUNT the two sides agree
+// this object is on (Astra r3 #8). Over the window the asynchronous refresh
+// opens, a worker's table and the daemon's disagree about a dataset that has just
+// appeared, and a reading taken on the enclosing share is a reading of another
+// filesystem: it is carried as an observation and kept out of the grade.
+//
 // The second return is the PRECONDITION the caller sends with the change
 // (contract §8.1 as amended): the state the worker OBSERVED and the identity of
 // the object it read it from, so the worker refuses `changed` if either moved
@@ -336,9 +350,38 @@ func (s *Server) entryACLFacts(ctx context.Context, who backend.Principal, apiPa
 	if observed == "" {
 		observed = resp.Entry.ACL
 	}
+	// Which MOUNT the two halves are talking about, before anything they say
+	// about it (Astra r3 #8). A worker is a long-lived process with a mount table
+	// of its own, and the daemon's refresh is asynchronous by design (r2 #7), so
+	// the two can disagree: a dataset mounted a moment ago is a row the daemon has
+	// and the worker has not, and the worker then answers for the enclosing share.
+	// Its probe of the new inode asks that share's question — the POSIX attribute
+	// — gets ENOTSUP, and reports `posix` with state `none`, which outranks "not
+	// probed" and takes the L2 warning away from the one mount nobody has looked
+	// at. The identical wrong answer satisfies the precondition afterwards, so the
+	// chmod goes through and the ACL is what pays for it.
+	agrees, haveRow := s.workerMountAgrees(apiPath, resp)
+	// A worker that named a mount the daemon's row contradicts is describing
+	// another filesystem. What it read ON that filesystem — the state, the aclmode,
+	// the dataset name — says nothing about this path and is not folded in; the
+	// BACKEND still is, because the rank rule only ever moves that half towards the
+	// pessimistic side and the worker may genuinely hold the fresher table.
+	elsewhere := haveRow && resp.FS.Mount != "" && !agrees
+
+	// The unknown-storage floor comes first of all. A storage mount whose backend
+	// this daemon has not probed, and a path its table cannot place, both grade L2
+	// (§7, round-1 finding 1) precisely because nobody has looked; and a row nobody
+	// has looked at is a row a worker's claim cannot be checked against. So while
+	// the floor is up the worker's reading of this object is carried on the wire as
+	// an observation and kept out of the grade entirely — the pessimistic reading
+	// is the only honest one, and it lasts until the daemon's own probe lands.
+	if f.unknown || (f.storage && f.backend == "") {
+		return f, &wproto.ACLExpect{State: observed, Identity: resp.Identity}
+	}
+
 	// The backend first: whether the worker's reading is trusted at all decides
 	// whether its state may be taken INTO THE GRADE.
-	trusted := true
+	trusted := !elsewhere
 	if resp.ACL.Backend != "" {
 		if aclBackendRank(resp.ACL.Backend) >= aclBackendRank(f.backend) {
 			f.backend = resp.ACL.Backend
@@ -349,11 +392,13 @@ func (s *Server) entryACLFacts(ctx context.Context, who backend.Principal, apiPa
 	if trusted && observed != "" {
 		f.state = observed
 	}
-	if resp.ACL.Aclmode != "" {
-		f.aclmode = resp.ACL.Aclmode
-	}
-	if resp.ACL.Dataset != "" {
-		f.dataset = resp.ACL.Dataset
+	if !elsewhere {
+		if resp.ACL.Aclmode != "" {
+			f.aclmode = resp.ACL.Aclmode
+		}
+		if resp.ACL.Dataset != "" {
+			f.dataset = resp.ACL.Dataset
+		}
 	}
 	// The identity travels exactly as Props reported it, zero included (Astra r2
 	// #6). Off Linux there is no inode to report and the zero value is the honest
@@ -361,6 +406,45 @@ func (s *Server) entryACLFacts(ctx context.Context, who backend.Principal, apiPa
 	// Suppressing the expectation on that account would drop the ACL half with
 	// it, and inventing an identity would be a proof of nothing.
 	return f, &wproto.ACLExpect{State: observed, Identity: resp.Identity}
+}
+
+// workerMountAgrees reports whether the worker's Props answer describes the same
+// mount the daemon's own table places this path on, and whether the daemon has a
+// row for it at all (Astra r3 #8).
+//
+// The mount POINT is the comparison that always applies: both sides took it from
+// a mountinfo table, and a worker whose table is a refresh behind names the
+// enclosing share where the daemon names the dataset. The domain and the mount ID
+// are added where each is available — the ID only on a LIVE table, because statx
+// STATX_MNT_ID is mountinfo's first field for the running kernel and a static
+// fixture's IDs are the fixture's (PLAN decision 15).
+//
+// A worker that names NO mount — the dev box, where the mount half of the ladder
+// is inert by design (§14) — is not contradicting anything, and the caller reads
+// the pair accordingly.
+func (s *Server) workerMountAgrees(apiPath string, resp wproto.PropsResp) (agrees, haveRow bool) {
+	if s.platform == nil {
+		return false, false
+	}
+	osPath := s.osPathFor(apiPath)
+	row, ok := s.platform.MountForLiteral(osPath)
+	if !ok {
+		return false, false
+	}
+	if resp.FS.Mount == "" {
+		return false, true
+	}
+	if slashPath(resp.FS.Mount) != slashPath(row.MountPoint) {
+		return false, true
+	}
+	if caps, ok := s.platform.ForLiteral(osPath); ok &&
+		resp.FS.Domain != "" && caps.Domain != "" && resp.FS.Domain != caps.Domain {
+		return false, true
+	}
+	if s.platform.Live() && resp.Identity.HasMount && row.ID >= 0 && resp.Identity.Mount != uint64(row.ID) {
+		return false, true
+	}
+	return true, true
 }
 
 // aclBackendRank orders the ACL backends by how much a chmod can destroy under

@@ -47,6 +47,25 @@ func nfs4Unavailable(t *testing.T, format string, args ...any) {
 	t.Skip(msg)
 }
 
+// nfs4Fixture is zfsFixture with the NFSv4 opt-in's own prerequisites checked
+// FIRST (Astra r3 #6).
+//
+// QFM_NFS4_TEST=1 is a runner saying "the attribute exists here, so a detection
+// regression must fail rather than skip" — but zfsFixture skips before any of
+// that is reached unless QFM_ZFS_TEST=1 is set as well, so the opt-in alone
+// bought nothing and did so silently, which is exactly the outcome it exists to
+// prevent. Asking for the NFSv4 tests therefore now asks for the fixture they
+// run on, and a missing prerequisite is named rather than skipped past. Without
+// the opt-in nothing changes: an ordinary runner still skips.
+func nfs4Fixture(t *testing.T) *platform.Platform {
+	t.Helper()
+	if os.Getenv("QFM_NFS4_TEST") == "1" && os.Getenv("QFM_ZFS_TEST") != "1" {
+		t.Fatal("QFM_NFS4_TEST=1 asks for the NFSv4 ACL tests, and those need the ZFS fixture:" +
+			" set QFM_ZFS_TEST=1 after running scripts/ci-zfs-setup.sh, or unset QFM_NFS4_TEST to skip")
+	}
+	return zfsFixture(t)
+}
+
 // nfs4ACLWithNamedACE builds a system.nfs4_acl attribute holding exactly one
 // ALLOW ACE for a named principal: a big-endian ACE count, then type, flag,
 // access mask and who-length, then the who string padded up to four bytes
@@ -81,7 +100,7 @@ func nfs4ACLWithNamedACE(who string) []byte {
 // so "nfs4" rather than "nfs4-trivial" is the whole distinction the badge
 // exists to draw (contract §6.1).
 func TestZFSFixtureNamedNFS4ACEBadgesAsNFS4(t *testing.T) {
-	plat := zfsFixture(t)
+	plat := nfs4Fixture(t)
 	if b := plat.For(zfsPublic).ACLBackend; b != platform.ACLNFS4 {
 		nfs4Unavailable(t, "this OpenZFS build reports ACL backend %q on %s, not %q",
 			b, zfsPublic, platform.ACLNFS4)
@@ -139,7 +158,7 @@ func TestZFSFixtureNamedNFS4ACEBadgesAsNFS4(t *testing.T) {
 // else. scripts/ci-zfs-setup.sh sets Public to discard and Media to
 // passthrough, and the warning ladder is built on the difference.
 func TestZFSFixturePropsReportsTheDatasetAclmode(t *testing.T) {
-	plat := zfsFixture(t)
+	plat := nfs4Fixture(t)
 	ctx := context.Background()
 	var r fsx.Root
 

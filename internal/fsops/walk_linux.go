@@ -63,6 +63,16 @@ func (d *dirRef) names(n int) ([]string, error) {
 // The two-step openat(O_PATH|O_NOFOLLOW)+fstat is the same one readDirInfos
 // makes, for the same reason: O_PATH asks the kernel for nothing but the name,
 // and O_NOFOLLOW makes a symlink describe itself.
+//
+// A DIRECTORY's birth time comes back with it (Astra r3 #9). This is the stat a
+// walk classifies an entry by, and a directory is the one kind of entry whose
+// name the walk looks up a second time — to descend into it, to change it in
+// post-order, or to reach it through the fallback for a directory that could not
+// be opened. Device and inode alone cannot tell "the same directory" from "a
+// directory created at that name after the first one was removed", because the
+// allocator is free to hand the number straight back; the birth time can, and
+// reading it here is the only place it describes the object the walk classified
+// rather than whatever answers to the name later.
 func (d *dirRef) lstat(name string) (os.FileInfo, error) {
 	rc, err := d.f.SyscallConn()
 	if err != nil {
@@ -72,7 +82,7 @@ func (d *dirRef) lstat(name string) (os.FileInfo, error) {
 		fi   fs.FileInfo
 		serr error
 	)
-	if cerr := rc.Control(func(pfd uintptr) { fi, serr = lstatIn(int(pfd), name) }); cerr != nil {
+	if cerr := rc.Control(func(pfd uintptr) { fi, serr = lstatIn(int(pfd), name, true) }); cerr != nil {
 		return nil, cerr
 	}
 	if serr != nil {

@@ -128,13 +128,16 @@ kernel refuses (INV-2).
      ALARM entry of any kind is non-trivial — and requires that `GROUP@`/`EVERYONE@` carry neither `WRITE_ACL` nor
      `WRITE_OWNER`, the bits a mode cannot express. The type and the mask were being ignored, so an
      `EVERYONE@ DENY DELETE` ACL passed as trivial and a `discard` chmod would have destroyed it without L2.
-     *Round 2 (#3):* excluding two admin bits was not mode-equivalence. An ALLOW for a special principal is
-     trivial only if its mask is within the **representable set** — read (`READ_DATA`, `READ_ATTRIBUTES`,
-     `READ_NAMED_ATTRS`, `READ_ACL`, `SYNCHRONIZE`), write (`WRITE_DATA`, `APPEND_DATA`, `WRITE_ATTRIBUTES`,
-     `WRITE_NAMED_ATTRS`) with `WRITE_DATA` and `APPEND_DATA` both or neither, execute, and for `OWNER@` alone
-     `WRITE_ACL`/`WRITE_OWNER`. `DELETE`, `DELETE_CHILD` and an append-only grant are not representable and are
-     non-trivial. **Hardware check:** if QNAP's own trivial ACLs carry `DELETE_CHILD` on directories, every hero
-     chmod will ask for the typed phrase; the rule is then widened with the real bytes in hand, not guessed.
+     *Round 2 (#3), restated round 3 (#1):* excluding two admin bits was not mode-equivalence, and neither was a
+     subset rule (`EVERYONE@ ALLOW WRITE_NAMED_ATTRS` alone passed). An ALLOW for a special principal is trivial
+     only if it is **exactly what a mode produces**: strip the base bits ZFS writes for that principal regardless
+     of the mode — `READ_ATTRIBUTES`, `READ_NAMED_ATTRS`, `READ_ACL`, `SYNCHRONIZE` for every principal, and
+     `WRITE_ATTRIBUTES`, `WRITE_NAMED_ATTRS`, `WRITE_ACL`, `WRITE_OWNER` for `OWNER@` only — and what remains must
+     be one of the eight rwx combinations of `READ_DATA`, `WRITE_DATA|APPEND_DATA` (always together) and
+     `EXECUTE`. Anything else — `DELETE`, `DELETE_CHILD`, an append-only grant, an owner-only base bit on
+     `GROUP@`/`EVERYONE@` — is non-trivial. **Hardware check:** if QNAP's own trivial ACLs differ from upstream
+     ZFS's (a `DELETE_CHILD` on directories, say), every hero chmod will ask for the typed phrase; the rule is then
+     widened with the real bytes in hand, not guessed.
    - A read or parse failure is `unknown`, never `none`, and `unknown` shows the badge with the pessimistic text.
      The existing NFSv4 parser shapes in `internal/fsops/acl_linux.go` are reused; `internal/perm` holds the
      trivial/non-trivial judgement so it is testable everywhere.
@@ -163,7 +166,10 @@ kernel refuses (INV-2).
    Only the **visible** row of a mount point is probed (the last mountinfo line, the rule the table already uses),
    and a result is published only if that row is still the one mounted there — two datasets stacked at one path
    were answering with the upper one's attribute and the lower one's `aclmode`. Start-up probes once,
-   synchronously; a refresh never repeats a finished probe. The accepted
+   synchronously; a refresh never repeats a finished probe. *Round 3 (#10):* "still the one mounted there" is a
+   per-mount **incarnation**, bumped whenever the row disappears or changes across a refresh, captured when the
+   probe starts and required when it publishes — comparing row values admits an ABA remount (mount ids are
+   reused, and a remounted dataset keeps every compared field while its `aclmode` changes). The accepted
    race is a mount that appears after the token is issued (§17.3), not one that existed before the request.
 
 ## 7. The `aclmode` confirm ladder
@@ -212,7 +218,13 @@ non-recursively cannot be redeemed recursively.
    the state the worker **observed**, never the ladder's fallback grade — grading pessimistically and expecting
    pessimistically are different things, and confusing them made every legitimate chmod on an unplaced mount fail
    `changed`; with nothing observed the expectation carries identity only. Off Linux there is no inode to prove,
-   so the worker proves the state alone (§14's best-effort loop stands).
+   so the worker proves the state alone (§14's best-effort loop stands). *Round 3 (#7, #8):* "identity only" is
+   not "no probe" — on Linux an empty observation can mean the asynchronous mount probe had not finished, so the
+   worker still re-probes and refuses `changed` when it now sees a state that is not harmless (`none`,
+   `nfs4-trivial`): the ladder graded something it could not see, and the honest answer is to grade again. And a
+   worker's facts lift the unknown-storage floor only when the worker's mount identification for the object
+   matches the daemon's row for the path; a worker holding an older mount table answers for the enclosing mount,
+   and that answer is unverified.
 4. **Size reuses the existing size job.** Opening the dialog on a directory submits `POST /api/jobs/size` for that
    one path, polls `/api/jobs` as every job is polled, and `POST /api/jobs/{id}/cancel` when the dialog closes or
    Stop is pressed; Recount resubmits. No new job kind, no new route, no second size implementation. `#pImpact` in

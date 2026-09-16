@@ -505,7 +505,9 @@ func readDirInfos(f *os.File, n int, showHidden bool) ([]dirEntryInfo, error) {
 				out = append(out, dirEntryInfo{name: name})
 				continue
 			}
-			fi, serr := lstatIn(int(pfd), name)
+			// No birth time: a listing entry is never compared to anything, so
+			// the statx would be one syscall per name for a fact nobody reads.
+			fi, serr := lstatIn(int(pfd), name, false)
 			out = append(out, dirEntryInfo{name: name, info: fi, err: serr})
 		}
 	}); cerr != nil {
@@ -516,7 +518,15 @@ func readDirInfos(f *os.File, n int, showHidden bool) ([]dirEntryInfo, error) {
 
 // lstatIn is lstat(2) for one name inside an open directory, addressed by that
 // directory's descriptor and never by a path.
-func lstatIn(dirfd int, name string) (fs.FileInfo, error) {
+//
+// wantBtime asks for the object's birth time as well, read from the SAME O_PATH
+// descriptor this already holds, so the two facts are two readings of one inode
+// and not two lookups of one name (Astra r3 #9). It is taken for DIRECTORIES
+// only and only where the caller asks: a walk re-opens a directory's name a
+// second time and has to prove the second lookup against the first, whereas a
+// listing never compares its entries to anything and must not pay a statx for
+// fifty thousand of them.
+func lstatIn(dirfd int, name string, wantBtime bool) (fs.FileInfo, error) {
 	var (
 		fd   int
 		serr error
@@ -535,6 +545,9 @@ func lstatIn(dirfd int, name string) (fs.FileInfo, error) {
 	if err := syscall.Fstat(fd, &fi.st); err != nil {
 		return nil, &fs.PathError{Op: "fstat", Path: name, Err: err}
 	}
+	if wantBtime && fi.st.Mode&syscall.S_IFMT == syscall.S_IFDIR {
+		fi.btime, fi.hasBtime = birthTimeOf(fd)
+	}
 	return fi, nil
 }
 
@@ -552,10 +565,22 @@ func lstatIn(dirfd int, name string) (fs.FileInfo, error) {
 // else. Nothing needs it to be: OpenRead's identity check compares FileInfos
 // from statAt, which are still the os package's own, and a listing entry is
 // never compared to anything.
+//
+// btime is the one field that is not in the Stat_t at all, and it is here
+// because there is nowhere else it could honestly come from: it is read while
+// lstatIn still holds the descriptor, so it describes the inode this stat
+// describes and not whatever the name means afterwards (Astra r3 #9). It is
+// unset unless the caller asked for it.
 type statFileInfo struct {
-	name string
-	st   syscall.Stat_t
+	name     string
+	st       syscall.Stat_t
+	btime    int64
+	hasBtime bool
 }
+
+// birthTime satisfies btimeCarrier, which is how objectIDOf finds a birth time
+// for an identity taken from a FileInfo alone.
+func (fi *statFileInfo) birthTime() (int64, bool) { return fi.btime, fi.hasBtime }
 
 func (fi *statFileInfo) Name() string      { return fi.name }
 func (fi *statFileInfo) Size() int64       { return fi.st.Size }

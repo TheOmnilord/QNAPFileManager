@@ -105,6 +105,16 @@ export function pruneSizeJobs(now = Date.now()) {
 // cannot be overtaken by the first.
 export function createSizeRunner({report = () => {},track = trackJob,cancel = cancelJob,poll = awaitJob} = {}) {
  let held = null,run = 0;
+ // `stopping` is the measurements this runner has ASKED the service to stop and
+ // that the service has not acknowledged stopping. It is the whole of Astra r3
+ // #3: Stop dropped its reference to the entry before the cancel was sent, and
+ // abandon drops the entry from the shared cache, so when the RETRY cancel
+ // failed too nothing on this side still named the walk — jobId went null and a
+ // second Stop sent nothing while the du carried on. Ownership of an
+ // unacknowledged cancel therefore survives Stop, the close event and Recount:
+ // jobId keeps naming it, and each of those user actions retries it exactly
+ // once — never a loop — until the service answers.
+ const stopping = new Set();
  // `cancelled` is ACKNOWLEDGED, never merely requested, and the distinction is
  // the whole of Astra r2 #9. The entry used to be marked cancelled before the
  // cancel was sent — so when the poll had given up because the connection was
@@ -113,12 +123,19 @@ export function createSizeRunner({report = () => {},track = trackJob,cancel = ca
  // nothing left to retry while the du walked on. `cancelling` is the one on the
  // wire, so a request is never sent twice; a request that came back
  // UNACKNOWLEDGED clears it and leaves the entry retryable.
- function ack(entry,ok) { entry.cancelling = null; if (ok) entry.cancelled = true; return ok; }
+ function ack(entry,ok) {
+  entry.cancelling = null;
+  if (ok) { entry.cancelled = true; stopping.delete(entry); }
+  return ok;
+ }
  // sendCancel is the only place a cancel is sent, and it answers a promise for
  // whether the server acknowledged it. It never rejects: nothing that calls it
  // is in a position to handle a failure other than by keeping the id.
  function sendCancel(entry) {
-  if (!entry.id || entry.cancelled) return undefined;
+  if (!entry.id || entry.cancelled) { stopping.delete(entry); return undefined; }
+  // Asking is what makes this runner responsible for the stopping, and it stays
+  // responsible until the service answers (Astra r3 #3).
+  stopping.add(entry);
   if (entry.cancelling) return entry.cancelling;
   // cancel() is called synchronously — Stop and the close event are asserted to
   // have cancelled by the time they return.
@@ -127,6 +144,21 @@ export function createSizeRunner({report = () => {},track = trackJob,cancel = ca
   catch(err) { pending = Promise.reject(err); }
   entry.cancelling = pending.then(ok => ack(entry,ok !== false),() => ack(entry,false));
   return entry.cancelling;
+ }
+ // retryStopping resends the cancels nobody has acknowledged. One attempt per
+ // user action — sendCancel returns the request already on the wire rather than
+ // starting a second — so a connection that stays down costs one request per
+ // Stop, close or Recount and never a busy loop. `skip` is the entry this action
+ // has just cancelled on its own account.
+ function retryStopping(skip) {
+  const sent = [];
+  for (const entry of [...stopping]) {
+   if (entry === skip) continue;
+   if (!needsStop(entry)) { stopping.delete(entry); continue; }
+   const pending = sendCancel(entry);
+   if (pending) sent.push(pending);
+  }
+  return sent;
  }
  // needsStop is the question the runner keeps asking: is there still a walk on
  // the server that this side could stop? A finished measurement has nothing to
@@ -168,12 +200,27 @@ export function createSizeRunner({report = () => {},track = trackJob,cancel = ca
   // jobId is the measurement this runner could still cancel, and only that: a
   // finished one has nothing to stop, and neither has one whose cancel the
   // server has ACKNOWLEDGED. One whose cancel never got there is still
-  // cancellable, and saying so is the point (Astra r2 #9).
-  get jobId() { return needsStop(held) ? held.id : null; },
+  // cancellable, and saying so is the point (Astra r2 #9) — including after the
+  // Stop, close or Recount that let go of it, because letting go of the hold is
+  // not the same as having stopped the walk (Astra r3 #3).
+  get jobId() {
+   if (needsStop(held)) return held.id;
+   // A request still ON THE WIRE is being attended to, and this side has nothing
+   // to do about that walk until it answers. One that came BACK unacknowledged
+   // is the one still waiting for another attempt, and it keeps its name until
+   // it gets one (Astra r3 #3).
+   for (const entry of stopping) if (!entry.cancelling && needsStop(entry)) return entry.id;
+   return null;
+  },
+  // stop() lets go of the measurement this runner holds and, in the same breath,
+  // has one more go at every cancel still waiting to be acknowledged. The answer
+  // is awaitable, so a test — and a caller that cares — can wait for the service
+  // rather than for the request.
   stop() {
    const had = held;
    run++; held = null;
-   return release(had);
+   const sent = [release(had),...retryStopping(had)].filter(Boolean);
+   return sent.length ? Promise.all(sent).then(() => undefined) : undefined;
   },
   async start(entries,{crossMounts = false} = {}) {
    runner.stop();

@@ -27,6 +27,24 @@ const (
 // mountinfoPath is the kernel table we parse on Linux.
 const mountinfoPath = "/proc/self/mountinfo"
 
+// openMountinfo opens the kernel's mount table, and newXattrProbe and
+// newCommandRunner are the two syscall seams a freshly built Platform starts
+// with. All three are variables so that the REAL start-up and refresh paths —
+// Detect's sequence and refresh(), not Probe() and kickProbe() called by hand —
+// can be driven over a synthetic table (Astra r3 #5).
+//
+// The instance setters (SetXattrProbe, SetCommandRunner) cannot reach the
+// Platform Detect constructs for itself: by the time Detect returns it, the
+// start-up probe has already run. A test that instead assembles the sequence
+// itself proves nothing about the order Detect puts it in, which is exactly what
+// round-2 #14 was about, so the tests take the whole path and these are the only
+// places where the syscalls are replaced. Production never assigns to them.
+var (
+	openMountinfo                  = func() (io.ReadCloser, error) { return os.Open(mountinfoPath) }
+	newXattrProbe    XattrProbe    = defaultGetxattr
+	newCommandRunner CommandRunner = defaultRunner
+)
+
 // uLinuxConfPath holds the QNAP firmware configuration.
 const uLinuxConfPath = "/etc/config/uLinux.conf"
 
@@ -68,6 +86,16 @@ type Platform struct {
 	order  []string          // mount points, longest first
 	read   time.Time         // when the table was last parsed
 	live   bool              // true when /proc/self/mountinfo is readable
+	// incarnation counts, per mount point, how many distinct mounts have
+	// occupied it. A row that survives a refresh unchanged keeps its number; one
+	// that changes, disappears, or appears takes the next one, and the numbers
+	// only ever go up. It is what an in-flight probe carries and checks before it
+	// publishes (Astra r3 #10): comparing the mountinfo FIELDS cannot see a mount
+	// that went away and came back between the probe and the publish, because
+	// Linux reuses mount IDs and a remount of the same dataset repeats every
+	// field the row has while its aclmode changes underneath.
+	incarnation map[string]uint64
+	nextInc     uint64
 	// probeDone is the in-flight background probe pass, or nil when none is
 	// running. It is the single-flight latch AND the way a test waits for the
 	// pass it started: the channel is closed after the results are published.
@@ -93,10 +121,11 @@ func FromMountinfo(r io.Reader) (*Platform, error) {
 
 func newPlatform() *Platform {
 	return &Platform{
-		Family:   FamilyUnknown,
-		caps:     map[string]FSCaps{},
-		getxattr: defaultGetxattr,
-		run:      defaultRunner,
+		Family:      FamilyUnknown,
+		caps:        map[string]FSCaps{},
+		incarnation: map[string]uint64{},
+		getxattr:    newXattrProbe,
+		run:         newCommandRunner,
 	}
 }
 
@@ -147,9 +176,20 @@ func (p *Platform) setMounts(mounts []Mount) {
 	// cached answer is never probed again.
 	previous := visibleRows(p.mounts)
 	current := visibleRows(mounts)
+	incarnation := make(map[string]uint64, len(caps))
 	for mp, c := range caps {
+		// The same mount still at that point keeps its incarnation, and with it
+		// whatever was probed for it; anything else is a NEW incarnation, whose
+		// number no earlier probe of that point can hold (Astra r3 #10).
+		if n, ok := p.incarnation[mp]; ok && sameMountRow(previous[mp], current[mp]) {
+			incarnation[mp] = n
+		} else {
+			p.nextInc++
+			incarnation[mp] = p.nextInc
+			continue
+		}
 		old, ok := p.caps[mp]
-		if !ok || !sameMountRow(previous[mp], current[mp]) {
+		if !ok {
 			continue
 		}
 		c.ACLBackend = old.ACLBackend
@@ -159,6 +199,7 @@ func (p *Platform) setMounts(mounts []Mount) {
 	}
 	p.mounts = mounts
 	p.caps = caps
+	p.incarnation = incarnation
 	p.order = order
 	p.read = time.Now()
 }
@@ -167,11 +208,21 @@ func (p *Platform) setMounts(mounts []Mount) {
 // reads the firmware version and looks for ZFS signals; everywhere else it
 // returns an empty table with Family "unknown".
 func Detect() *Platform {
-	p := newPlatform()
 	if runtime.GOOS != "linux" {
+		p := newPlatform()
 		p.Family = FamilyUnknown
 		return p
 	}
+	return detectLive()
+}
+
+// detectLive is Detect on a machine that has a kernel mount table: the start-up
+// sequence itself, with only the GOOS gate left behind. It is separate so that
+// the sequence — which is the thing round-2 #14 was about, and which builds its
+// own Platform and so cannot be reached by the instance setters — is what the
+// tests run, over the mountinfo and syscall seams (Astra r3 #5).
+func detectLive() *Platform {
+	p := newPlatform()
 	p.live = true
 	// Start-up parses the table and then probes it ONCE, synchronously (Astra r2
 	// #14). The public Refresh kicks a background probe of what is new, and a
@@ -249,7 +300,7 @@ func (p *Platform) refresh(probe bool) error {
 		// silently replaced by the running system's mounts.
 		return nil
 	}
-	f, err := os.Open(mountinfoPath)
+	f, err := openMountinfo()
 	if err != nil {
 		return err
 	}
@@ -322,14 +373,28 @@ const maxProbesPerRefresh = 16
 // table did not change. It is the body of the background pass and it holds no
 // lock across the syscalls.
 func (p *Platform) probeMissing() {
-	for _, m := range p.pendingProbes() {
-		backend, xattr := p.aclBackend(m.MountPoint)
-		aclmode := ""
-		if strings.EqualFold(m.FSType, "zfs") {
-			aclmode = p.ZFSAclmode(m.Source)
-		}
-		p.publishProbe(m, backend, xattr, aclmode)
+	for _, t := range p.pendingProbes() {
+		backend, xattr, aclmode := p.probeOne(t.mount)
+		p.publishProbe(t, backend, xattr, aclmode, false)
 	}
+}
+
+// probeOne asks the kernel about one mount. It holds no lock: an lgetxattr and a
+// `zfs get` with its own timeout are not things to hold a table lock across.
+func (p *Platform) probeOne(m Mount) (backend, xattr, aclmode string) {
+	backend, xattr = p.aclBackend(m.MountPoint)
+	if strings.EqualFold(m.FSType, "zfs") {
+		aclmode = p.ZFSAclmode(m.Source)
+	}
+	return backend, xattr, aclmode
+}
+
+// probeTarget is one row to probe together with the incarnation its mount point
+// had when the row was chosen. The pair is what makes a published answer
+// provably about the filesystem that was asked (Astra r3 #10).
+type probeTarget struct {
+	mount Mount
+	inc   uint64
 }
 
 // pendingProbes picks what one pass probes: the VISIBLE row at each mount point
@@ -341,15 +406,15 @@ func (p *Platform) probeMissing() {
 // `zfs get` answer beside the upper row's xattr answer under a first-write-wins
 // assignment, so a passthrough dataset hidden under a discard one graded the
 // discard's chmod as L1 and cached that for as long as the mount lived.
-func (p *Platform) pendingProbes() []Mount {
+func (p *Platform) pendingProbes() []probeTarget {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return p.pendingProbesLocked()
 }
 
-func (p *Platform) pendingProbesLocked() []Mount {
+func (p *Platform) pendingProbesLocked() []probeTarget {
 	visible := visibleRows(p.mounts)
-	var pending []Mount
+	var pending []probeTarget
 	seen := make(map[string]bool, len(visible))
 	for _, row := range p.mounts {
 		mp := row.MountPoint
@@ -364,7 +429,7 @@ func (p *Platform) pendingProbesLocked() []Mount {
 		if c, ok := p.caps[mp]; ok && c.ACLBackend != "" {
 			continue // already probed, and the answer is cached
 		}
-		pending = append(pending, m)
+		pending = append(pending, probeTarget{mount: m, inc: p.incarnation[mp]})
 		if len(pending) >= maxProbesPerRefresh {
 			break
 		}
@@ -373,22 +438,39 @@ func (p *Platform) pendingProbesLocked() []Mount {
 }
 
 // publishProbe stores one probe's answer, if the mount it describes is still
-// the one at that mount point.
+// the one at that mount point — the same mount, and the same INCARNATION of it.
 //
-// A background pass outlives the table it was started from: a mount can be
-// unmounted, or replaced by another at the same path, while its `zfs get` is
-// still running. Publishing regardless would give the replacement the previous
-// filesystem's aclmode and cache it, which is the stacked-mount bug arriving a
-// second way (Astra r2 #13). An answer that no longer describes anything is
-// dropped, and the mount that IS there stays unprobed until the next refresh.
-func (p *Platform) publishProbe(m Mount, backend, xattr, aclmode string) {
+// A probe outlives the table it was started from: a mount can be unmounted, or
+// replaced by another at the same path, while its `zfs get` is still running.
+// Publishing regardless would give the replacement the previous filesystem's
+// aclmode and cache it, which is the stacked-mount bug arriving a second way
+// (Astra r2 #13). An answer that no longer describes anything is dropped, and the
+// mount that IS there stays unprobed until the next pass takes it.
+//
+// Comparing the row's fields is not enough on its own (Astra r3 #10). The fields
+// are the mount ID, the device, the source, the type and the in-filesystem root,
+// and a dataset that is unmounted and mounted again repeats every one of them —
+// Linux hands mount IDs back out — while `zfs set aclmode=discard` in between
+// changes the only thing the probe went to find. That is an A-B-A, and the
+// incarnation counter is what sees it: the number the probe captured when it
+// took the row is not the number the mount point carries now.
+//
+// overwrite distinguishes the two callers: the start-up pass (Probe) states the
+// answer for every storage mount, and the background pass fills in only what has
+// none, so that a refresh every five seconds costs nothing on a table that did
+// not change.
+func (p *Platform) publishProbe(t probeTarget, backend, xattr, aclmode string, overwrite bool) {
+	m := t.mount
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.incarnation[m.MountPoint] != t.inc {
+		return
+	}
 	if !sameMountRow(visibleRows(p.mounts)[m.MountPoint], m) {
 		return
 	}
 	c, ok := p.caps[m.MountPoint]
-	if !ok || c.ACLBackend != "" {
+	if !ok || (!overwrite && c.ACLBackend != "") {
 		return
 	}
 	c.ACLBackend = backend
@@ -431,6 +513,20 @@ func (p *Platform) maybeRefresh() {
 	// Refresh takes the write lock itself; a concurrent caller may refresh
 	// twice at worst, which is harmless.
 	_ = p.Refresh()
+}
+
+// Live reports whether this table came from the running kernel
+// (/proc/self/mountinfo) rather than from a static one built by FromMountinfo —
+// the golden QTS and hero tables, and the tests (PLAN.md decision 15).
+//
+// Only a live table's mount IDs are the numbers statx reports as STATX_MNT_ID,
+// so only on a live table may a worker's reported mount ID be compared with a
+// row of this one; a static table's IDs are the fixture's. Diag publishes the
+// same fact, but Diag copies the whole table, and this is asked per request.
+func (p *Platform) Live() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.live
 }
 
 // Mounts returns a copy of the current mount table.
@@ -698,34 +794,26 @@ func (p *Platform) VolumeRoots() []Mount {
 func (p *Platform) Probe() {
 	p.mu.RLock()
 	visible := visibleRows(p.mounts)
-	mounts := make([]Mount, 0, len(visible))
+	targets := make([]probeTarget, 0, len(visible))
 	seen := make(map[string]bool, len(visible))
 	for _, row := range p.mounts {
 		if seen[row.MountPoint] {
 			continue
 		}
 		seen[row.MountPoint] = true
-		mounts = append(mounts, visible[row.MountPoint])
-	}
-	p.mu.RUnlock()
-
-	for _, m := range mounts {
+		m := visible[row.MountPoint]
 		if !IsStorageFS(m.FSType) {
 			continue
 		}
-		backend, xattr := p.aclBackend(m.MountPoint)
-		aclmode := ""
-		if strings.EqualFold(m.FSType, "zfs") {
-			aclmode = p.ZFSAclmode(m.Source)
-		}
-		p.mu.Lock()
-		if c, ok := p.caps[m.MountPoint]; ok {
-			c.ACLBackend = backend
-			c.ACLXattr = xattr
-			c.ZFSAclmode = aclmode
-			p.caps[m.MountPoint] = c
-		}
-		p.mu.Unlock()
+		targets = append(targets, probeTarget{mount: m, inc: p.incarnation[m.MountPoint]})
+	}
+	p.mu.RUnlock()
+
+	for _, t := range targets {
+		backend, xattr, aclmode := p.probeOne(t.mount)
+		// Overwriting, because Probe states the answer rather than filling a gap —
+		// but still only onto the mount it asked about (Astra r2 #13, r3 #10).
+		p.publishProbe(t, backend, xattr, aclmode, true)
 	}
 }
 

@@ -187,17 +187,23 @@ func TestExpectationStillRefusesAZeroInodeOnLinux(t *testing.T) {
 // nlink stays 1, so the hardlink rule did not catch it either.
 //
 // Mounting needs root, so this is the CI root job's test (PLAN.md decision 14).
+//
+// The selected directory is three levels down. Astra r3 #4: it used to be
+// "/share", which modeJob.run refuses outright as too near the root of the
+// filesystem to change recursively (§4.5) — so on the one runner that can
+// actually perform the bind mount, the test failed before the crossing it was
+// written for was ever exercised.
 func TestBindMountedFileIsACrossing(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("a bind mount needs root; the CI root job runs this one")
 	}
 	base := tempDir(t)
 	mkdir(t, base, "other")
-	mkdir(t, base, "share")
+	mkdir(t, base, "share/vol/tree")
 	write(t, base, "other/secret.txt", "somebody else's file")
-	write(t, base, "share/leaf.txt", "")
+	write(t, base, "share/vol/tree/leaf.txt", "")
 	secret := filepath.Join(base, "other/secret.txt")
-	leaf := filepath.Join(base, "share/leaf.txt")
+	leaf := filepath.Join(base, "share/vol/tree/leaf.txt")
 	if err := os.Chmod(secret, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -208,7 +214,7 @@ func TestBindMountedFileIsACrossing(t *testing.T) {
 
 	var log jobLog
 	res, err := ChmodTree(context.Background(), newRoot(t, base), nil,
-		[]string{"/share"},
+		[]string{"/share/vol/tree"},
 		ChmodOptions{
 			Files:     perm.ModeSpec{Mask: 0o7777, Value: 0o0666},
 			Dirs:      perm.ModeSpec{Mask: 0o7777, Value: 0o0755},
@@ -222,9 +228,9 @@ func TestBindMountedFileIsACrossing(t *testing.T) {
 		t.Fatalf("the bind-mounted file's mode = %s, want 0600 — the walk crossed into it", perm.Octal(got))
 	}
 	if res.Files != 0 || res.Dirs != 1 || res.Skipped != 1 {
-		t.Fatalf("result = %+v, want the share itself changed and the leaf refused", res)
+		t.Fatalf("result = %+v, want the selected directory changed and the leaf refused", res)
 	}
-	w, ok := log.warnFor("/share/leaf.txt")
+	w, ok := log.warnFor("/share/vol/tree/leaf.txt")
 	if !ok || !strings.Contains(w.Message, "mount point") {
 		t.Fatalf("warns = %+v, want the crossing named", log.warns)
 	}

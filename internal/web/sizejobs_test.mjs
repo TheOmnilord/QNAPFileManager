@@ -244,9 +244,10 @@ test('an abandoned measurement is not reused: the next start measures again', as
 // Requested is not acknowledged.
 
 test('cancelJob answers whether the cancel was ACKNOWLEDGED, not whether it was sent', async t => {
- // The runner's retry is only as good as this answer. A service that replied —
- // even to say the job is gone — has stopped the walk or never had one; a
- // request that never left the machine has stopped nothing at all.
+ // The runner's retry is only as good as this answer. The SERVICE saying it has
+ // the cancel, or that it has no such job, has stopped the walk or never had
+ // one; anything else — including an answer somebody else composed — has stopped
+ // nothing at all.
  t.mock.method(globalThis, 'fetch', async () => new Response(null, {status: 204}));
  assert.equal(await cancelJob('s1'), true, 'a 204 is the service answering');
  t.mock.restoreAll();
@@ -256,6 +257,24 @@ test('cancelJob answers whether the cancel was ACKNOWLEDGED, not whether it was 
  t.mock.restoreAll();
  t.mock.method(globalThis, 'fetch', async () => { throw new TypeError('fetch failed'); });
  assert.equal(await cancelJob('s1'), false, 'this one never reached the service, so the du may still be walking');
+});
+
+test('a proxy answering for the service is not the service acknowledging (Astra r3 #2)', async t => {
+ // The QTS reverse proxy replies 502 with an HTML page when the daemon is slow
+ // or restarting. It is an error with a status and no `network` flag, and the
+ // old rule — anything that is not a transport failure is an answer — marked a
+ // job that is still walking cancelled for good.
+ t.mock.method(globalThis, 'fetch', async () =>
+  new Response('<html><body><h1>502 Bad Gateway</h1></body></html>', {status: 502, headers: {'Content-Type': 'text/html'}}));
+ assert.equal(await cancelJob('s1'), false, 'the proxy spoke, not the manager: the du may still be walking');
+ t.mock.restoreAll();
+ t.mock.method(globalThis, 'fetch', async () =>
+  new Response(JSON.stringify({error: {code: 'queue_full', message: 'Too many requests.'}}), {status: 429}));
+ assert.equal(await cancelJob('s1'), false, 'a refusal to take the request is a reason to send it again');
+ t.mock.restoreAll();
+ t.mock.method(globalThis, 'fetch', async () =>
+  new Response(JSON.stringify({error: {code: 'permission', message: 'Not yours.'}}), {status: 403}));
+ assert.equal(await cancelJob('s1'), false, 'a 4xx that is not "no such job" says nothing about the walk');
 });
 
 test('a cancel that did NOT reach the server leaves the walk retryable, and the next Stop retries it', async t => {
@@ -304,6 +323,70 @@ test('a cancel that THREW is retryable too, and an acknowledged one is never res
   'Recount retried the cancel the poll failure could not send, and stopped its own walk too');
  await runner.stop();
  assert.deepEqual(cancelled, ['s1', 's1', 's2'], 'both are acknowledged now, and neither is resent');
+});
+
+// --- a cancel nobody acknowledged is still this runner's to retry (r3 #3) -----
+//
+// Stop dropped its reference to the entry before the cancel was sent, and
+// abandon drops the entry from the shared cache — so when the RETRY failed too,
+// nothing on this side still named the walk: jobId went null and the next Stop
+// sent nothing at all. Letting go of the hold is not the same as having stopped
+// the du.
+
+test('Stop letting go is not the walk stopping: an unacknowledged cancel is retried by the next action', async t => {
+ resetSizeJobs();
+ const posts = [], cancelled = [];
+ let acknowledge = false;                         // the wire is down to begin with
+ const runner = createSizeRunner({
+  report: () => {},
+  track: () => {},
+  cancel: async id => { cancelled.push(id); return acknowledge; },
+  poll: () => new Promise(() => {}),              // the walk is still going
+ });
+ mockFetch(t, posts);
+ runner.start([dir('/share/CACHEDEV1_DATA/_IMAGES')]);
+ await new Promise(resolve => setTimeout(resolve, 0));
+ assert.equal(runner.jobId, 's1');
+ await runner.stop();                             // the dialog's close event
+ assert.deepEqual(cancelled, ['s1'], 'the cancel was attempted');
+ assert.equal(runner.jobId, 's1', 'unacknowledged: the id is still this runner’s to name');
+ await runner.stop();                             // Stop pressed again
+ assert.deepEqual(cancelled, ['s1', 's1'], 'each user action retries once — and once is enough');
+ assert.equal(runner.jobId, 's1');
+ acknowledge = true;                              // the service is back
+ await runner.stop();
+ assert.deepEqual(cancelled, ['s1', 's1', 's1']);
+ assert.equal(runner.jobId, null, 'acknowledged at last: there is nothing left to stop');
+ await runner.stop();
+ assert.deepEqual(cancelled, ['s1', 's1', 's1'], 'and nothing is sent after that');
+});
+
+test('Recount retries the cancel it could not send, and still measures again', async t => {
+ resetSizeJobs();
+ const posts = [], cancelled = [];
+ let acknowledge = false;
+ const runner = createSizeRunner({
+  report: () => {},
+  track: () => {},
+  cancel: async id => { cancelled.push(id); return acknowledge; },
+  // The first walk never answers; the one Recount submits does.
+  poll: async id => (id === 's1' ? new Promise(() => {}) : {id, state: 'done', result: {bytes: 1, files: 1, dirs: 0}}),
+ });
+ mockFetch(t, posts, () => (posts.length > 1 ? 's2' : 's1'));
+ runner.start([dir('/share/Public')]);
+ await new Promise(resolve => setTimeout(resolve, 0));
+ assert.equal(runner.jobId, 's1');
+ const second = await runner.start([dir('/share/Public')]);   // Recount
+ assert.equal(posts.length, 2, 'a walk nobody watched is not an answer to attach to');
+ assert.equal(second.state, 'done');
+ assert.deepEqual(cancelled, ['s1'], 'Recount stopped the walk it replaced');
+ assert.equal(runner.jobId, 's1', 'which the service never acknowledged, so it is still named');
+ await runner.stop();                             // the dialog closes on the new answer
+ assert.deepEqual(cancelled, ['s1', 's1'], 'and the old walk is retried, though this one finished');
+ acknowledge = true;
+ await runner.stop();
+ assert.deepEqual(cancelled, ['s1', 's1', 's1']);
+ assert.equal(runner.jobId, null);
 });
 
 test('a measurement that could not be submitted is not cached as an answer', async t => {

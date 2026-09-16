@@ -346,27 +346,36 @@ const (
 	aceTypeAlarm uint32 = 3
 )
 
-// The two masks the helpers build trivial ACEs out of: everything an rwx triple
-// can express and nothing it cannot (§6.1 as amended in round 2).
+// The masks the helpers build ACEs out of, spelled the way ZFS writes them
+// (§6.1 as restated in round 3).
 //
-// maskFull is the OWNER@ form — read, write, execute and the two administrative
-// bits every ordinary ZFS object grants its owner. maskNoAdmin is the GROUP@ and
-// EVERYONE@ form, which drops them.
+// maskBase is the four bits every principal carries whatever the mode is:
+// READ_ATTRIBUTES, READ_NAMED_ATTRS, READ_ACL and SYNCHRONIZE. maskOwnerBase
+// adds the four more OWNER@ always carries: the attribute writes, WRITE_ACL and
+// WRITE_OWNER. Those two are the free sets; on top of them go the rwx bits a
+// chmod actually varies.
 //
-// Neither carries DELETE (0x10000) or DELETE_CHILD (0x40), and that is the
-// round-2 correction: the old constants were "every bit in 0x001f01ff", which
-// swept both in, so a helper meant to build a trivial ACL was building one the
-// mode cannot express at all (Astra r2 #3).
+// maskFull is therefore the OWNER@ rwx form and maskNoAdmin the GROUP@ and
+// EVERYONE@ rwx form. The round-3 correction is that the two differ by more than
+// WRITE_ACL and WRITE_OWNER: WRITE_ATTRIBUTES and WRITE_NAMED_ATTRS are owner-only
+// too, and a helper that handed them to GROUP@ was building an ACL no mode writes
+// while claiming to build a trivial one (Astra r3 #1).
+//
+// Nothing here carries DELETE (0x10000) or DELETE_CHILD (0x40), which is the
+// round-2 correction kept: the mode has no word for either.
 const (
-	maskRead      uint32 = 0x00000001 | 0x00000008 | 0x00000080 | 0x00020000 | 0x00100000
-	maskWrite     uint32 = 0x00000002 | 0x00000004 | 0x00000010 | 0x00000100
+	maskBase      uint32 = 0x00000080 | 0x00000008 | 0x00020000 | 0x00100000
+	maskOwnerBase uint32 = maskBase | 0x00000100 | 0x00000010 | 0x00040000 | 0x00080000
+	maskReadData  uint32 = 0x00000001
+	maskWriteData uint32 = 0x00000002 | 0x00000004
 	maskExecute   uint32 = 0x00000020
-	maskNoAdmin   uint32 = maskRead | maskWrite | maskExecute
-	maskFull      uint32 = maskNoAdmin | 0x00040000 | 0x00080000
+	maskAppend    uint32 = 0x00000004
+	maskRead      uint32 = maskBase | maskReadData
 	maskReadExec  uint32 = maskRead | maskExecute
+	maskNoAdmin   uint32 = maskBase | maskReadData | maskWriteData | maskExecute
+	maskFull      uint32 = maskOwnerBase | maskReadData | maskWriteData | maskExecute
 	maskDelete    uint32 = 0x00010000
 	maskDeleteChl uint32 = 0x00000040
-	maskAppend    uint32 = 0x00000004
 )
 
 // nfs4ACL is nfs4ACLRaw for the flag-and-who cases: ALLOW entries with a mask
@@ -550,9 +559,11 @@ func TestNFS4StateReadsTypeAndMask(t *testing.T) {
 	every := rawACE{typ: aceTypeAllow, mask: maskNoAdmin, who: "EVERYONE@"}
 
 	const (
-		writeACL   uint32 = 0x00040000
-		writeOwner uint32 = 0x00080000
-		deleteBit  uint32 = 0x00010000
+		writeACL        uint32 = 0x00040000
+		writeOwner      uint32 = 0x00080000
+		writeAttrs      uint32 = 0x00000100
+		writeNamedAttrs uint32 = 0x00000010
+		deleteBit       uint32 = 0x00010000
 	)
 
 	cases := []struct {
@@ -646,6 +657,47 @@ func TestNFS4StateReadsTypeAndMask(t *testing.T) {
 				rawACE{typ: aceTypeAllow, mask: maskFull, who: "OWNER@"},
 				rawACE{typ: aceTypeAllow, mask: maskReadExec, who: "GROUP@"},
 				rawACE{typ: aceTypeAllow, mask: maskReadExec, who: "EVERYONE@"}),
+			fsx.ACLNFS4Trivial,
+		},
+		// Round 3 #1: a SUBSET of the representable bits was not
+		// mode-equivalence either. The bits a mode writes depend on the
+		// principal, so what remains once the base bits are stripped has to be
+		// one of the eight rwx combinations exactly.
+		{
+			// The finding itself. WRITE_NAMED_ATTRS is a bit no mode ever gives
+			// EVERYONE@, so an ACL holding it is saying something of its own — and
+			// under the subset rule it passed, because the bit was on the allowed
+			// list and the data-write pair it was checked against was absent.
+			"EVERYONE@ ALLOW WRITE_NAMED_ATTRS alone is a grant no mode writes",
+			nfs4ACLRaw(owner, group, rawACE{typ: aceTypeAllow, mask: writeNamedAttrs, who: "EVERYONE@"}),
+			fsx.ACLNFS4,
+		},
+		{
+			"GROUP@ with WRITE_ATTRIBUTES likewise: a mode writes that bit for OWNER@ alone",
+			nfs4ACLRaw(owner, rawACE{typ: aceTypeAllow, mask: maskNoAdmin | writeAttrs, who: "GROUP@"}, every),
+			fsx.ACLNFS4,
+		},
+		{
+			// 0644 as ZFS writes it — ls -V's rw-p--aARWcCos, r-----a-R-c--s,
+			// r-----a-R-c--s — which is the commonest object on a hero NAS. The
+			// control for the other direction: if this badged, every hero chmod
+			// would ask for a typed phrase for nothing.
+			"the ZFS-shaped 0644 triple is trivial",
+			nfs4ACLRaw(
+				rawACE{typ: aceTypeAllow, mask: maskOwnerBase | maskReadData | maskWriteData, who: "OWNER@"},
+				rawACE{typ: aceTypeAllow, mask: maskRead, who: "GROUP@"},
+				rawACE{typ: aceTypeAllow, mask: maskRead, who: "EVERYONE@"}),
+			fsx.ACLNFS4Trivial,
+		},
+		{
+			// Mode 000: the base bits and not one rwx bit anywhere. An empty
+			// remainder is one of the eight combinations too, and a rule that
+			// demanded at least one grant would badge every locked-down file.
+			"the base bits alone — mode 000 — are trivial",
+			nfs4ACLRaw(
+				rawACE{typ: aceTypeAllow, mask: maskOwnerBase, who: "OWNER@"},
+				rawACE{typ: aceTypeAllow, mask: maskBase, who: "GROUP@"},
+				rawACE{typ: aceTypeAllow, mask: maskBase, who: "EVERYONE@"}),
 			fsx.ACLNFS4Trivial,
 		},
 		{

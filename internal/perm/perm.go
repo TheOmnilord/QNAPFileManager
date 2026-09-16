@@ -323,24 +323,28 @@ const (
 	nfs4Synchronize    = 0x00100000
 )
 
-// The three halves of the REPRESENTABLE set: the bits an rwx triple actually
-// spells (§6.1 as amended in round 2).
+// The two sets the mode-equivalence rule is built from (§6.1 as restated in
+// round 3): the BASE bits, which ZFS writes for a principal whatever the mode
+// is, and the rwx bits, which are the only thing a mode actually varies.
 //
-// "r" on a ZFS object is not READ_DATA alone — it is READ_DATA together with
-// the attribute and ACL reads and SYNCHRONIZE, which every ordinary object
-// carries and which no chmod ever varies — so those travel with it. "w" is the
-// matching write set. Everything outside the three is something the mode has no
-// vocabulary for: DELETE and DELETE_CHILD above all, which is where the round-1
-// rule was still wrong.
+// nfs4BaseBits are the four every principal carries on an ordinary object: the
+// attribute reads, the ACL read and SYNCHRONIZE. No chmod ever adds or removes
+// them, so their presence or absence says nothing either way and they are
+// simply removed before the mask is judged.
+//
+// nfs4OwnerBaseBits are the four more that OWNER@ carries on every ordinary ZFS
+// object: the attribute writes, the right to rewrite the ACL and the right to
+// take ownership. Refusing them on OWNER@ would badge the whole NAS, which is
+// the failure §6.1 exists to avoid — but the same bits on GROUP@ or EVERYONE@
+// are a delegation no rwx triple can state, so they stay outside the free set
+// for those two and a mask carrying one is non-trivial.
+//
+// nfs4RWXBits are what is left to compare: "r", "w" (WRITE_DATA and APPEND_DATA
+// inseparably, because a mode grants or withholds the whole write) and "x".
 const (
-	nfs4ReadBits  = nfs4ReadData | nfs4ReadNamedAttrs | nfs4ReadAttributes | nfs4ReadACL | nfs4Synchronize
-	nfs4WriteBits = nfs4WriteData | nfs4AppendData | nfs4WriteNamedAttr | nfs4WriteAttribute
-	// nfs4OwnerBits are the two a mode cannot express and that OWNER@ holds on
-	// every ordinary ZFS object anyway: the right to rewrite the ACL and the
-	// right to take ownership. Refusing them on OWNER@ would badge the whole
-	// NAS, which is the failure §6.1 exists to avoid; granting them to GROUP@ or
-	// EVERYONE@ is a delegation no rwx triple can state.
-	nfs4OwnerBits = nfs4WriteACL | nfs4WriteOwner
+	nfs4BaseBits      = nfs4ReadAttributes | nfs4ReadNamedAttrs | nfs4ReadACL | nfs4Synchronize
+	nfs4OwnerBaseBits = nfs4WriteAttribute | nfs4WriteNamedAttr | nfs4WriteACL | nfs4WriteOwner
+	nfs4RWXBits       = nfs4ReadData | nfs4WriteData | nfs4AppendData | nfs4Execute
 )
 
 // The three special principals an NFSv4 ACL uses for what the mode describes.
@@ -367,11 +371,13 @@ const nfs4Owner = "OWNER@"
 //   - A who other than OWNER@, GROUP@ or EVERYONE@ — a named user or group.
 //   - FILE_INHERIT or DIRECTORY_INHERIT: an entry passed down to new children
 //     describes more than any mode ever could.
-//   - A mask outside the REPRESENTABLE set — the bits an rwx triple can spell,
-//     plus WRITE_ACL and WRITE_OWNER on OWNER@ alone. DELETE, DELETE_CHILD and
-//     an append-only grant are the ones that arrive in life, and none of them
-//     survives a chmod that regenerates the three mode classes (M3 Astra
-//     round 1 finding 3, narrowed to mode-equivalence in round 2 #3).
+//   - A mask that is not what a mode WRITES for that principal. Strip the base
+//     bits ZFS sets regardless of the mode and what remains must be one of the
+//     eight rwx combinations exactly; DELETE, DELETE_CHILD, an append-only grant
+//     and an owner-only base bit on GROUP@ or EVERYONE@ are the ones that arrive
+//     in life, and none of them survives a chmod that regenerates the three mode
+//     classes (M3 Astra round 1 #3, narrowed to a subset rule in round 2 #3 and
+//     to mode-equivalence in round 3 #1).
 //
 // The attribute is a big-endian ACE count followed by that many entries of type,
 // flag, access mask, who-length and the who string padded up to four bytes. A
@@ -462,35 +468,44 @@ func trivialACE(aceType, flag, mask uint32, who string) bool {
 	return representableMask(mask, who == nfs4Owner)
 }
 
-// representableMask reports whether an ALLOW mask for a special principal says
-// only what an rwx triple says (Astra r2 #3).
+// representableMask reports whether an ALLOW mask for a special principal is
+// EXACTLY what a mode produces for that principal (Astra r3 #1).
 //
-// Excluding the two administrative bits was not the same question, and that is
-// what round 1 got wrong: EVERYONE@ ALLOW DELETE carries neither of them and is
-// still a grant no mode can hold, so a chmod on an aclmode=discard dataset threw
-// it away with nothing to confirm. The rule asked here is the whole of it —
-// every bit set has to be one the three mode classes can express — so a bit
-// nobody has thought about yet is non-trivial by default, which is the direction
-// this file's every other failure takes.
+// Two earlier shapes of this rule were both too weak. Round 1 excluded two
+// administrative bits, which let EVERYONE@ ALLOW DELETE through. Round 2 asked
+// for a SUBSET of the representable bits, which let EVERYONE@ ALLOW
+// WRITE_NAMED_ATTRS alone through — a grant that is a subset of nothing any mode
+// writes, because no mode writes that bit for EVERYONE@ at all. Both passed as
+// trivial and a discard chmod then destroyed them with no level-2 confirmation.
 //
-// owner widens the set by WRITE_ACL and WRITE_OWNER, which OWNER@ holds on every
-// ordinary ZFS object.
+// The question is equivalence, and it is asked in two steps. First the base bits
+// are removed: those are fixed for the principal, so their presence or absence
+// carries no information. What remains must then be exactly one of the eight rwx
+// combinations — "r", "w" as WRITE_DATA and APPEND_DATA together, "x" — which is
+// what the three mode classes have words for and nothing more. Anything left
+// over is something a chmod cannot reproduce: DELETE, DELETE_CHILD, an
+// owner-only base bit handed to GROUP@ or EVERYONE@, an append-only grant, or a
+// bit the standard has not defined yet.
+//
+// owner says the principal is OWNER@, whose free set is the wider one.
 func representableMask(mask uint32, owner bool) bool {
-	allowed := uint32(nfs4ReadBits | nfs4WriteBits | nfs4Execute)
+	base := uint32(nfs4BaseBits)
 	if owner {
-		allowed |= nfs4OwnerBits
+		base |= nfs4OwnerBaseBits
 	}
-	if mask&^allowed != 0 {
-		// DELETE, DELETE_CHILD, the administrative bits on a principal that may
-		// not hold them, and anything the standard adds later.
+	rwx := mask &^ base
+	if rwx&^nfs4RWXBits != 0 {
+		// DELETE, DELETE_CHILD, an owner-only base bit on a principal that no
+		// mode ever gives it to, and anything the standard adds later.
 		return false
 	}
-	if mask&nfs4WriteData == 0 != (mask&nfs4AppendData == 0) {
+	if (rwx&nfs4WriteData == 0) != (rwx&nfs4AppendData == 0) {
 		// An APPEND_DATA grant without WRITE_DATA is an append-only file — a
 		// log somebody may add to and may not rewrite — and "w" cannot say that;
 		// a chmod would either hand over the whole write or take it all away.
 		// WRITE_DATA without APPEND_DATA is the mirror image and just as
-		// unsayable.
+		// unsayable. This is what makes the remainder one of EIGHT combinations
+		// rather than sixteen.
 		return false
 	}
 	return true

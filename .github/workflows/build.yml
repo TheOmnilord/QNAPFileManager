@@ -131,7 +131,11 @@ jobs:
       # ./cmd/... is here because the break-glass credential-store mode test
       # skips off-root, and this is the only job that is root: leaving it out
       # meant nothing ever executed it (Astra M4 round 1, finding 17).
-      - run: sudo -E env "PATH=$PATH" go test ./internal/workerpool/... ./internal/fsops/... ./internal/worker/... ./cmd/qnapfilemanager/... -run . -count=1
+      # ./internal/breakglass/... for the same reason (Astra r3 #5): the key
+      # pair's ownership refusals — a key given away to another uid is the one
+      # that only root can even set up — skip everywhere else, so the rule that
+      # decides whether the emergency door binds was never executed in CI.
+      - run: sudo -E env "PATH=$PATH" go test ./internal/workerpool/... ./internal/fsops/... ./internal/worker/... ./internal/breakglass/... ./cmd/qnapfilemanager/... -run . -count=1
 
   # QuTS hero mounts one ZFS dataset per shared folder, and that single fact
   # drives the crossing rule, the EXDEV pre-flight, the trash root and the

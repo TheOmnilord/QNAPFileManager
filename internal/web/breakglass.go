@@ -1112,19 +1112,53 @@ func (s refusalShape) summary() refusalEvent {
 // writeRefusal writes one line in its event's own shape — the single place that
 // knows how each shape is recorded, so a new caller cannot reach for d.audit and
 // silently give a sessionless event the door's root-administrator actor.
-func (d *breakGlassDoor) writeRefusal(r *http.Request, ev refusalEvent, detail string) {
+//
+// It reports whether the line was ADMITTED (Astra r3 #2). An aggregate line
+// stands for refusals whose counters are cleared when it is written, so a
+// caller that clears them without knowing whether the write landed has thrown
+// the burst away; the two aggregates below ask.
+func (d *breakGlassDoor) writeRefusal(r *http.Request, ev refusalEvent, detail string) error {
 	if ev.shape == refusalSessionless {
-		// auditUnauthenticated reads the request for the peer and the path, so a
-		// sessionless line with no request to read is dropped rather than written
-		// in the other shape. Nothing reaches it that way today: both callers of
-		// this shape are on a request goroutine.
+		// The sessionless line names no actor: the listener's door and the path
+		// are the whole of what is known, and the request is where both come
+		// from — so a sessionless line with no request to read is dropped rather
+		// than written in the other shape. Nothing reaches it that way today:
+		// both callers of this shape are on a request goroutine.
 		if d.srv == nil || r == nil {
-			return
+			return nil
 		}
-		d.srv.auditUnauthenticated(r, ev.code, detail)
-		return
+		return d.srv.auditSessionlessRefusal(r, ev.code, detail)
 	}
-	d.audit(r, ev.op, "denied", ev.code, detail)
+	return d.audit(r, ev.op, "denied", ev.code, detail)
+}
+
+// auditSessionlessRefusal is auditUnauthenticated's event, written with a
+// context the peer cannot cancel (Astra r3 #2).
+//
+// The shape is the one routes_mutate.go's auditUnauthenticated writes, and
+// assertSessionlessShape in breakglass_astra2_test.go pins both to it: no
+// actor, the LISTENER's door, the path, Op "auth". What differs is the context.
+// A per-request denial is request-scoped on purpose — a cancelled request must
+// not go on waiting for a wedged sink — but an AGGREGATE stands for refusals
+// that are already counted and forgotten, and a returning peer that hangs up
+// while the four durable-writer slots are busy would take the whole summary
+// with it. WriteSync's own writeSyncTimeout still bounds the wait, so dropping
+// the cancellation cannot block a request goroutine for longer than that.
+func (s *Server) auditSessionlessRefusal(r *http.Request, code, detail string) error {
+	if s.auditor == nil {
+		return nil
+	}
+	return s.auditor.WriteSync(context.WithoutCancel(r.Context()), audit.Event{
+		IP:             ClientIP(r),
+		Door:           doorOf(r),
+		Op:             "auth",
+		Path:           r.URL.Path,
+		Phase:          "result",
+		Result:         "denied",
+		Code:           code,
+		Detail:         detail,
+		ForceMilestone: true,
+	})
 }
 
 type refusalState struct {
@@ -1217,14 +1251,26 @@ func (d *breakGlassDoor) noteRefusalEvent(r *http.Request, ip, detail string, ev
 		// refusal by the root administrator account.
 		d.dropped[ev.shape]++
 		dropped := d.dropped[ev.shape]
-		report := d.droppedAt[ev.shape].IsZero() || now.Sub(d.droppedAt[ev.shape]) >= refusalWindow
+		was := d.droppedAt[ev.shape]
+		report := was.IsZero() || now.Sub(was) >= refusalWindow
 		if report {
 			d.droppedAt[ev.shape], d.dropped[ev.shape] = now, 0
 		}
 		d.mu.Unlock()
 		if report {
-			d.writeRefusal(r, ev.shape.summary(),
-				fmt.Sprintf("door=local %d refusals from untracked sources; the %d-source table is full", dropped, breakglass.MaxSources))
+			if err := d.writeRefusal(r, ev.shape.summary(),
+				fmt.Sprintf("door=local %d refusals from untracked sources; the %d-source table is full", dropped, breakglass.MaxSources)); err != nil {
+				// The count was cleared for a line that never landed, so it goes
+				// back (Astra r3 #2): the next refusal from an untracked source
+				// reports the whole burst instead of restarting from one, and the
+				// rate stamp is put back as it was so that next refusal may report
+				// at all. Whatever arrived in the meantime is added to, not
+				// overwritten.
+				d.mu.Lock()
+				d.dropped[ev.shape] += dropped
+				d.droppedAt[ev.shape] = was
+				d.mu.Unlock()
+			}
 		}
 		return
 	}
@@ -1249,7 +1295,22 @@ func (d *breakGlassDoor) noteRefusalEvent(r *http.Request, ip, detail string, ev
 			line = refusalSessionless.summary()
 		}
 	}
-	d.writeRefusal(r, line, detail)
+	if err := d.writeRefusal(r, line, detail); err != nil && carried > 0 {
+		// The same rule as the two aggregates (Astra r3 #2): this line carried a
+		// closed window's count, and the count was zeroed to write it. A write
+		// that was not admitted puts it back on the window that is now open, so
+		// the next line for this source reports it rather than losing it. The
+		// shape only ever moves towards sessionless, exactly as it does when a
+		// refusal is suppressed.
+		d.mu.Lock()
+		if current := d.refusals[ip]; current != nil && current.opened.Equal(now) {
+			current.suppressed += carried
+			if previous == refusalSessionless {
+				current.shape = refusalSessionless
+			}
+		}
+		d.mu.Unlock()
+	}
 }
 
 // flushRefusals writes the one summary line a source earns when it comes back
@@ -1268,18 +1329,55 @@ func (d *breakGlassDoor) flushRefusals(r *http.Request, ip string) {
 		d.mu.Unlock()
 		return
 	}
-	suppressed, shape := state.suppressed, state.shape
-	delete(d.refusals, ip)
+	suppressed, shape, opened := state.suppressed, state.shape, state.opened
+	if suppressed == 0 {
+		// Nothing to report, so the closed window is simply forgotten.
+		delete(d.refusals, ip)
+		d.mu.Unlock()
+		return
+	}
+	// The count is CLAIMED here and the entry kept until the write is admitted
+	// (Astra r3 #2). Claiming it under the lock is what stops two returning
+	// requests from writing the same summary twice; keeping the entry is what
+	// stops a summary from being thrown away by a write that never landed,
+	// because the state is the only place the burst still exists.
+	state.suppressed = 0
 	d.mu.Unlock()
-	if suppressed > 0 {
-		// In the shape of what the window COUNTED, not of the login that happens
-		// to be collecting it (Astra r2 #6). Only a login reaches this function,
-		// so writing the summary through d.audit gave every flush the door's
-		// root-administrator actor — including the flush of a window that held
-		// nothing but sessionless mutation denials from a host that had not
-		// authenticated and was not trying to.
-		d.writeRefusal(r, shape.summary(),
-			fmt.Sprintf("door=local ip=%s %d further refusals suppressed; the source is inside its budget again", ip, suppressed))
+	// In the shape of what the window COUNTED, not of the login that happens to
+	// be collecting it (Astra r2 #6). Only a login reaches this function, so
+	// writing the summary through d.audit gave every flush the door's
+	// root-administrator actor — including the flush of a window that held
+	// nothing but sessionless mutation denials from a host that had not
+	// authenticated and was not trying to.
+	err := d.writeRefusal(r, shape.summary(),
+		fmt.Sprintf("door=local ip=%s %d further refusals suppressed; the source is inside its budget again", ip, suppressed))
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	current := d.refusals[ip]
+	if current == nil {
+		// Pruned while the write was in flight. A summary that landed is done,
+		// and one that did not is stale news by the time anything could collect
+		// it — re-inserting an entry here would spend a slot in a table this
+		// source no longer holds one in.
+		return
+	}
+	if err != nil {
+		// Put the burst back and let the next return collect it. Whatever the
+		// source did in the meantime is added to, never overwritten, and the
+		// shape moves only towards sessionless, exactly as it does when a refusal
+		// is suppressed.
+		current.suppressed += suppressed
+		if shape == refusalSessionless {
+			current.shape = refusalSessionless
+		}
+		return
+	}
+	// Admitted. The entry goes only if it is still the window that was flushed
+	// and nothing has been counted against it since: a refusal that arrived while
+	// the summary was being written has a window of its own to be reported in,
+	// and deleting it here would hand the source a fresh unthrottled line.
+	if current.suppressed == 0 && current.opened.Equal(opened) {
+		delete(d.refusals, ip)
 	}
 }
 
@@ -1288,15 +1386,19 @@ func (d *breakGlassDoor) flushRefusals(r *http.Request, ip string) {
 // construction, so the QuLog volume is bounded by how often it is used, and an
 // operator asking "who got in when Apache was down" must not have to
 // reconstruct it from the JSON lines.
-func (d *breakGlassDoor) audit(r *http.Request, op, result, code, detail string) {
+//
+// It returns the durable write's verdict. Almost every caller ignores it — the
+// line is a record, not a gate — but the aggregate refusal lines do not, because
+// they clear the counters they stand for (Astra r3 #2).
+func (d *breakGlassDoor) audit(r *http.Request, op, result, code, detail string) error {
 	if d.srv == nil || d.srv.auditor == nil {
-		return
+		return nil
 	}
 	ctx, ip := context.Background(), ""
 	if r != nil {
 		ctx, ip = context.WithoutCancel(r.Context()), peerHost(r)
 	}
-	_ = d.srv.auditor.WriteSync(ctx, audit.Event{
+	return d.srv.auditor.WriteSync(ctx, audit.Event{
 		Actor: "break-glass", UID: 0, Admin: true, Root: true,
 		IP: ip, Door: audit.DoorLocal, Op: op, Phase: "result",
 		Result: result, Code: code, Detail: detail, ForceMilestone: true,

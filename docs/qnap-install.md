@@ -99,6 +99,11 @@ body the door will look at — that is a bound on what an attacker may send, not
 running takes effect on the next attempt, and the listener on 8771 comes up on its own once a credential exists. If the
 port is still refused, restart the app from App Center.
 
+The one case where a restart *is* needed is a certificate that had to be **replaced** — an expired pair, or one torn in
+half by a crash between the two file writes. The command prints that pair under `next fingerprint:` and says so: a
+running app holds its own certificate in memory and will go on serving the old one until it is stopped and started again
+from App Center. The password half is live either way; only the certificate waits for the restart.
+
 **Do not run `break-glass set-password` while somebody is changing settings in the app.** The CLI and the daemon's
 read-only toggle both rewrite `config.json`, and they coordinate through a lock file that waits at most two seconds
 before giving up. It is a moment's wait, not a corrupted file — but the command can fail with a lock timeout, and the fix

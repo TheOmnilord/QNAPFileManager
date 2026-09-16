@@ -214,6 +214,13 @@ func TestTheStoredHashMustBeABcryptHash(t *testing.T) {
 		{"$2y$ likewise", "$2y$" + real10[4:], true},
 		{"$2x$ is the broken variant", "$2x$" + real10[4:], false},
 		{"a standard-base64 character bcrypt never writes", real10[:59] + "+", false},
+		// Astra r3 #4: the last character of each half carries only the tail of
+		// a byte, and base64 writes the spare bits as zero. Both of these are in
+		// the alphabet, are the right length and have a valid header — and no
+		// password can ever match them, which is a door that arms and then
+		// refuses the operator who just set the password.
+		{"a checksum whose last character sets bits bcrypt never writes", real10[:59] + "A", false},
+		{"a salt whose last character sets bits bcrypt never writes", real10[:28] + "B" + real10[29:], false},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			cfg := Default()
@@ -232,6 +239,21 @@ func TestTheStoredHashMustBeABcryptHash(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// The other direction of Astra r3 #4, and the one an operator would feel rather
+// than an attacker: a mask in the wrong place refuses hashes bcrypt really did
+// write, and it would do it only some of the time — one sample proves nothing
+// about a four-bit rule. Sixteen real hashes is enough that a misplaced or
+// inverted mask cannot get through on luck.
+func TestRealHashesAreNeverRefusedForTheirSpareBits(t *testing.T) {
+	for i := 0; i < 16; i++ {
+		cfg := Default()
+		cfg.Auth.Local.Hash = realHash(t, MinLocalCost)
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("a real bcrypt hash was refused: %v", err)
+		}
 	}
 }
 

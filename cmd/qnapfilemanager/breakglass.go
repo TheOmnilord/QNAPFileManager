@@ -401,12 +401,34 @@ func breakGlassSetPassword(args []string, stdin io.Reader, stdout, stderr io.Wri
 			// next start) will generate the certificate itself. Saying so is
 			// better than implying the whole command failed.
 			fmt.Fprintf(stderr, "warning: the certificate could not be prepared (%v); the app will generate it when the listener binds\n", cerr)
+		} else if cert.Replaced() {
+			// The pair on disk was REPLACED, not created (Astra r3 #1). The
+			// running daemon holds its own pair in memory and the credential
+			// watcher stopped the moment the door was armed, so nothing in that
+			// process will ever look at this file again: the fingerprint below is
+			// the NEXT one, not the one a browser will be shown. Printing it as
+			// the fingerprint to compare — under a line saying no restart is
+			// needed — is how an operator comes to see a mismatch and conclude, by
+			// every rule this document gave them, that they are being intercepted.
+			fmt.Fprintf(stdout, "certificate:      %s\n", certFile)
+			fmt.Fprintf(stdout, "next fingerprint: sha256:%s\n", cert.Fingerprint)
+			fmt.Fprintf(stdout, "The old certificate was %s, so a new pair was generated. A RUNNING app keeps serving the OLD\n", cert.Reason)
+			fmt.Fprintln(stdout, "one from memory: restart the app (App Center: stop, then start) before comparing this")
+			fmt.Fprintln(stdout, "fingerprint in the browser, and tell anyone else who compares it.")
 		} else {
 			fmt.Fprintf(stdout, "certificate: %s\n", certFile)
 			fmt.Fprintf(stdout, "fingerprint: sha256:%s\n", cert.Fingerprint)
 			fmt.Fprintln(stdout, "Compare that fingerprint in the browser before typing this password into a page it has warned about.")
 		}
-		fmt.Fprintf(stdout, "The listener binds %s; a running app picks the password up within a minute, and a restart is not needed.\n", cfg.Web.BreakGlass.Addr)
+		if cert.Replaced() {
+			// The password half is still live — the door re-reads the credential
+			// per attempt — but the certificate half is not, and saying "a restart
+			// is not needed" here would be saying it about the one thing that does
+			// need one.
+			fmt.Fprintf(stdout, "The listener binds %s; a running app picks the PASSWORD up within a minute, but it serves the\ncertificate above only after a restart.\n", cfg.Web.BreakGlass.Addr)
+		} else {
+			fmt.Fprintf(stdout, "The listener binds %s; a running app picks the password up within a minute, and a restart is not needed.\n", cfg.Web.BreakGlass.Addr)
+		}
 	} else {
 		fmt.Fprintln(stdout, "web.breakGlass.enabled is false, so the listener stays off and this password is inert.")
 	}
@@ -583,10 +605,19 @@ func breakGlassCert(args []string, stdout, stderr io.Writer) error {
 		// the two and sees a mismatch must be able to recognise this, rather
 		// than conclude they are being intercepted (Astra r1 #16).
 		fmt.Fprintln(stdout, "The fingerprint has CHANGED. A running app keeps serving the OLD pair until it is restarted,")
-		fmt.Fprintln(stdout, "so restart it before comparing this fingerprint in a browser, and tell anyone else who compares it.")
+		fmt.Fprintln(stdout, "so restart it (App Center: stop, then start) before comparing this fingerprint in a browser,")
+		fmt.Fprintln(stdout, "and tell anyone else who compares it.")
 	}
 	fmt.Fprintf(stdout, "certificate: %s\n", certFile)
-	fmt.Fprintf(stdout, "fingerprint: sha256:%s\n", cert.Fingerprint)
+	// Labelled for what it is (Astra r3 #1): until the restart above, the
+	// fingerprint of a pair that was just written is the NEXT one, and a label
+	// that said otherwise would be the first line an operator reads while
+	// deciding whether to trust a browser warning.
+	if cert.Generated {
+		fmt.Fprintf(stdout, "next fingerprint: sha256:%s\n", cert.Fingerprint)
+	} else {
+		fmt.Fprintf(stdout, "fingerprint: sha256:%s\n", cert.Fingerprint)
+	}
 	fmt.Fprintf(stdout, "expires:     %s\n", cert.NotAfter.UTC().Format(time.RFC3339))
 	// The renewal window is a REMINDER, not a countdown to something automatic
 	// (Astra r2 #3): no daemon start and no password change rotates this pair,
@@ -595,7 +626,11 @@ func breakGlassCert(args []string, stdout, stderr io.Writer) error {
 	if !cert.Generated && !time.Now().Add(breakglass.RenewWithin).Before(cert.NotAfter) {
 		fmt.Fprintf(stdout, "This certificate expires in %d days. Nothing rotates it for you: run `break-glass cert -regenerate`\nand restart the app when you are ready to compare a new fingerprint.\n", daysUntil(cert.NotAfter, time.Now()))
 	}
-	fmt.Fprintln(stdout, "Compare this fingerprint in the browser before typing a password into a page it has warned about.")
+	if cert.Generated {
+		fmt.Fprintln(stdout, "Restart the app, then compare that fingerprint in the browser before typing a password into a page it has warned about.")
+	} else {
+		fmt.Fprintln(stdout, "Compare this fingerprint in the browser before typing a password into a page it has warned about.")
+	}
 	return nil
 }
 

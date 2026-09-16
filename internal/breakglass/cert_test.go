@@ -507,6 +507,99 @@ func TestExplicitPairRefusesASymlinkChainIntoAWritableDirectory(t *testing.T) {
 	}
 }
 
+// Astra r3 #3: the same arrangement read backwards. Astra r2 #1 closed the
+// chain that pointed OUT of a tight directory into a writable share; this is
+// links that point IN — from a root-owned 0700 directory that happens to sit
+// under a writable share, to a pair that is perfectly safe under a directory
+// nobody else can touch. The resolved walk approves the target and says nothing
+// about where the names live, while generate publishes by renaming over those
+// names: the links are replaced and the new private key is written into the
+// directory under the share. The pair that was checked and the pair that was
+// written were never the same pair.
+func TestExplicitPairRefusesSymlinksPointingAtASafeTarget(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("ownership and POSIX modes are a Linux question (contract §15)")
+	}
+	root := t.TempDir()
+	bindTreeTop(t, root)
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// The target is beyond reproach: a 0700 directory with a tight ancestry.
+	safe := filepath.Join(root, "safe")
+	if err := os.Mkdir(safe, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	safeCert := filepath.Join(safe, "cert.pem")
+	safeKey := filepath.Join(safe, "key.pem")
+	target, err := EnsureUsable(safeCert, safeKey, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The configured location: a root-owned 0700 directory of links, under a
+	// share anybody can write.
+	share := filepath.Join(root, "share")
+	if err := os.Mkdir(share, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(share, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	tight := filepath.Join(share, "tight")
+	if err := os.Mkdir(tight, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	certFile := filepath.Join(tight, "breakglass-cert.pem")
+	keyFile := filepath.Join(tight, "breakglass-key.pem")
+	if err := os.Symlink(safeCert, certFile); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(safeKey, keyFile); err != nil {
+		t.Fatal(err)
+	}
+
+	loc := Location{CertFile: certFile, KeyFile: keyFile, Explicit: true}
+	if _, err := loc.Load(); !errors.Is(err, ErrUnsafeLocation) {
+		t.Fatalf("Load through a link whose NAME lives in a writable ancestry = %v, want ErrUnsafeLocation", err)
+	}
+	// And nothing is generated over it: that is the write this finding is about.
+	// An expired pair is enough to reach it without anybody deciding to.
+	got, err := loc.EnsureUsable(time.Now().Add(Validity + 24*time.Hour))
+	if !errors.Is(err, ErrUnsafeLocation) {
+		t.Fatalf("EnsureUsable = (%+v, %v), want ErrUnsafeLocation", got, err)
+	}
+	for _, p := range []string{certFile, keyFile} {
+		fi, err := os.Lstat(p)
+		if err != nil {
+			t.Fatalf("%s: %v", p, err)
+		}
+		if fi.Mode()&os.ModeSymlink == 0 {
+			t.Fatalf("%s was replaced by a real file: a key pair was published into %s", p, tight)
+		}
+	}
+	// The safe pair is untouched too — a refusal writes nothing anywhere.
+	after, err := Load(safeCert, safeKey)
+	if err != nil || after.Fingerprint != target.Fingerprint {
+		t.Fatalf("the target pair changed: %v %+v", err, after)
+	}
+
+	// The plain case behind the links: names spelled directly in that same
+	// directory are refused for the ancestry alone, whether or not they exist.
+	plain := Location{
+		CertFile: filepath.Join(tight, "plain-cert.pem"),
+		KeyFile:  filepath.Join(tight, "plain-key.pem"),
+		Explicit: true,
+	}
+	if _, err := plain.EnsureUsable(time.Now()); !errors.Is(err, ErrUnsafeLocation) {
+		t.Fatalf("EnsureUsable under a world-writable share = %v, want ErrUnsafeLocation", err)
+	}
+	if _, err := os.Stat(plain.KeyFile); !os.IsNotExist(err) {
+		t.Fatalf("a key was published under the writable share (%v)", err)
+	}
+}
+
 // The other half of the rule: a plain pair in a tight, owner-only ancestry is
 // served. Run as root — the CI root job — this is the production rule exactly,
 // every ancestor owned by uid 0.

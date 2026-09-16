@@ -72,10 +72,42 @@ type Cert struct {
 	// audit milestone: a silently changed fingerprint and a man in the middle
 	// look identical from the browser.
 	Generated bool
-	// Reason says why it was generated ("absent", "unreadable", "expiring"),
+	// Reason says why it was generated — one of the Reason* constants below —
 	// for the log line and the milestone detail. Empty when it was loaded.
 	Reason string
 }
+
+// Why a pair was generated. They are constants because the CLI decides what to
+// TELL an operator from them (Astra r3 #1), and a decision that turns on a
+// string literal spelled in two places is one refactor away from being wrong in
+// the one moment this door is used.
+const (
+	// ReasonAbsent: there was no pair at all. Nothing was replaced, so nothing
+	// is being served from memory either — a daemon that had armed this door
+	// would have generated one.
+	ReasonAbsent = "absent"
+	// ReasonUnreadable: something was there and could not be read as a pair.
+	ReasonUnreadable = "unreadable"
+	// ReasonMismatched: a certificate beside a key that is not its own, which is
+	// what a crash between the two renames leaves.
+	ReasonMismatched = "mismatched"
+	// ReasonExpired: a pair no browser will accept any more.
+	ReasonExpired = "expired"
+	// ReasonRequested: `break-glass cert -regenerate`, the only rotation there
+	// is.
+	ReasonRequested = "requested"
+)
+
+// Replaced reports that this call generated a pair over one that was ALREADY
+// there — expired, torn, unreadable, or rotated on request (Astra r3 #1).
+//
+// It is the question the CLI has to answer before it prints a fingerprint: a
+// running daemon holds its pair in memory and the credential watcher has
+// stopped once the door is armed, so a REPLACEMENT is not what the browser will
+// be shown until the app is restarted. A first generation (ReasonAbsent) is the
+// opposite case — no daemon can be serving a pair that did not exist — and the
+// documented first run rightly says no restart is needed.
+func (c Cert) Replaced() bool { return c.Generated && c.Reason != ReasonAbsent }
 
 // ErrPairMismatch is a certificate and a key on disk that are not each other's.
 //
@@ -151,20 +183,20 @@ func (l Location) EnsureUsable(now time.Time) (Cert, error) {
 	case errors.Is(err, ErrUnsafeLocation):
 		return Cert{}, err
 	case err != nil && os.IsNotExist(err):
-		reason = "absent"
+		reason = ReasonAbsent
 	case errors.Is(err, ErrPairMismatch):
 		// Named separately from "unreadable" so the start-up log and the audit
 		// milestone say what actually happened: a half-published pair is a very
 		// different event from a corrupt file, and an operator who sees
 		// "mismatched" knows a write was interrupted.
-		reason = "mismatched"
+		reason = ReasonMismatched
 	case err != nil:
-		reason = "unreadable"
+		reason = ReasonUnreadable
 	case !now.Before(loaded.NotAfter):
 		// EXPIRED, not expiring. A certificate no browser will accept opens
 		// nothing, so replacing it costs the operator nothing either — and the
 		// new fingerprint is logged and audited like every other generation.
-		reason = "expired"
+		reason = ReasonExpired
 	default:
 		return loaded, nil
 	}
@@ -189,7 +221,7 @@ func (l Location) Regenerate(now time.Time) (Cert, error) {
 	if err != nil {
 		return Cert{}, err
 	}
-	c.Generated, c.Reason = true, "requested"
+	c.Generated, c.Reason = true, ReasonRequested
 	return c, nil
 }
 
@@ -258,6 +290,14 @@ func (l Location) read(path string, isKey bool) ([]byte, error) {
 		return nil, err
 	}
 	if l.Explicit {
+		// The LITERAL name first (Astra r3 #3), then the resolved ancestry. A
+		// final component that is a symlink means the two are different
+		// directories, and then neither check is about the other's: whoever can
+		// write the directory holding the link decides which file the door
+		// serves, while the walk below approves the target they pointed it at.
+		if err := l.literalStrict(path); err != nil {
+			return nil, err
+		}
 		if err := treeStrict(resolved); err != nil {
 			return nil, err
 		}
@@ -284,6 +324,43 @@ func (l Location) read(path string, isKey bool) ([]byte, error) {
 	return data, nil
 }
 
+// literalStrict checks the name as it is SPELLED, which is the direction a
+// write goes (Astra r3 #3).
+//
+// Astra r2 #1 closed the chain that pointed outwards: a tight directory of
+// symlinks into a share anybody could write. The same arrangement read
+// backwards was still open. Put root-owned symlinks in a root-owned 0700
+// directory that sits under a writable share, point them at a perfectly safe
+// pair under /root, and the resolved walk approves /root — but writePrivate
+// publishes by renaming a temporary file over CertFile and KeyFile THEMSELVES,
+// so a regeneration replaces the links and writes the new private key into the
+// directory under the share. The pair the check approved and the pair that was
+// written were in two different places, and an expired-pair start-up is enough
+// to trigger it without anybody choosing to.
+//
+// So: the final component may not be a symlink at all, and the directory the
+// rename lands in — the literal parent, with its own ancestry — must be
+// root-only. A link is REFUSED rather than silently replaced, because a refusal
+// names the path and the app stays out of a location it cannot reason about.
+// Nothing is lost by the rule: an operator who wants the pair elsewhere names
+// it elsewhere in web.breakGlass.certFile / keyFile.
+func (l Location) literalStrict(path string) error {
+	if path == "" {
+		return fmt.Errorf("breakglass: certificate paths are empty")
+	}
+	// Lstat, so the link itself is what is stat'ed rather than what it points
+	// at. An absent name is not an error here: the directory below is what a
+	// pair that does not exist yet is about to be published into.
+	if fi, err := os.Lstat(path); err == nil {
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%w: %s is a symbolic link, and the pair is published by renaming over that name — the key would be written in %s, not where the link points", ErrUnsafeLocation, path, filepath.Dir(path))
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("%w: %s could not be read: %v", ErrUnsafeLocation, path, err)
+	}
+	return treeStrict(filepath.Dir(path))
+}
+
 // Fingerprint is the SHA-256 of a DER certificate as lowercase hex.
 func Fingerprint(der []byte) string {
 	sum := sha256.Sum256(der)
@@ -297,10 +374,15 @@ func (l Location) generate(now time.Time) (Cert, error) {
 		// and the moment that matters most is this one: publishing a fresh
 		// private key into a directory somebody else can write hands them the
 		// key (Astra r2 #1).
-		if err := treeStrict(l.KeyFile); err != nil {
+		//
+		// The directory that is checked is the one the rename will really land
+		// in (Astra r3 #3): literalStrict walks the LITERAL parent and refuses a
+		// final component that is a symlink, because writePrivate publishes over
+		// these names rather than through them.
+		if err := l.literalStrict(l.KeyFile); err != nil {
 			return Cert{}, err
 		}
-		if err := treeStrict(l.CertFile); err != nil {
+		if err := l.literalStrict(l.CertFile); err != nil {
 			return Cert{}, err
 		}
 	}

@@ -24,6 +24,21 @@ import (
 
 func armFixture(t *testing.T, mutate func(*config.Config)) (*server, config.Config, string, *bytes.Buffer) {
 	t.Helper()
+	srv, cfg, configPath, logged, err := armFixtureErr(t, mutate)
+	if err != nil {
+		t.Fatalf("armBreakGlass: %v", err)
+	}
+	return srv, cfg, configPath, logged
+}
+
+// armFixtureErr is armFixture for the one case where the ARM ITSELF is what is
+// under test. A refusal a later tick could resolve is a returned errArmRefused
+// now rather than a logged line the daemon shrugs at (Astra r2 #2) — that is
+// what makes the watcher retry it — so the test that asserts the refusal has to
+// be handed the error. Everywhere else an error means the fixture is broken,
+// which is why armFixture goes on fataling.
+func armFixtureErr(t *testing.T, mutate func(*config.Config)) (*server, config.Config, string, *bytes.Buffer, error) {
+	t.Helper()
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.json")
 	cfg := config.Default()
@@ -37,10 +52,8 @@ func armFixture(t *testing.T, mutate func(*config.Config)) (*server, config.Conf
 	logger := log.New(&logged, "", 0)
 	srv := &server{cfg: cfg, logger: logger}
 	frontend := web.New(cfg, nil, nil, nil, nil, nil, "test", logger, nil, nil, nil)
-	if err := armBreakGlass(srv, frontend, cfg, configPath, logger); err != nil {
-		t.Fatalf("armBreakGlass: %v", err)
-	}
-	return srv, cfg, configPath, &logged
+	err := armBreakGlass(srv, frontend, cfg, configPath, logger)
+	return srv, cfg, configPath, &logged, err
 }
 
 // §2.5, the property the qemu smoke also asserts and the one most likely to
@@ -266,17 +279,23 @@ func TestAWritableKeyDirectoryStopsTheListenerBinding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, _, _, logged := armFixture(t, func(c *config.Config) {
+	srv, _, _, _, err := armFixtureErr(t, func(c *config.Config) {
 		c.Auth.Local = config.Local{Hash: hash, Cost: breakglass.MinCost, Updated: "2026-09-13T12:00:00Z"}
 		c.Web.BreakGlass.KeyFile = filepath.Join(loose, "breakglass-key.pem")
 		c.Web.BreakGlass.CertFile = filepath.Join(loose, "breakglass-cert.pem")
 	})
+	// A RETURNED refusal, not a logged one (Astra r2 #2). The reason may be
+	// fixed while the daemon runs — a chmod is all it takes — so the caller has
+	// to see it: the start-up path logs it once, the watcher retries and logs it
+	// once per distinct reason, and neither could do either with a nil error.
+	if !errors.Is(err, errArmRefused) {
+		t.Fatalf("armBreakGlass = %v, want errArmRefused", err)
+	}
 	if srv.bgHandler != nil || srv.bgCert != nil || srv.bgAddr != "" {
 		t.Fatalf("the listener armed over a world-writable key directory: %+v", srv)
 	}
-	out := logged.String()
-	if !strings.Contains(out, "will not bind") || !strings.Contains(out, "writable") {
-		t.Fatalf("the log must say why the door is off:\n%s", out)
+	if out := err.Error(); !strings.Contains(out, "will not bind") || !strings.Contains(out, "writable") {
+		t.Fatalf("the refusal must say why the door is off:\n%s", out)
 	}
 	// Nothing was generated into it either: a key written there is a key
 	// somebody else can replace.

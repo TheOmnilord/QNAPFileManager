@@ -323,8 +323,12 @@ func TestInteractivePromptReadsTwoLines(t *testing.T) {
 func fingerprintOf(t *testing.T, out string) string {
 	t.Helper()
 	for _, line := range strings.Split(out, "\n") {
-		if strings.HasPrefix(line, "fingerprint:") {
-			return strings.TrimSpace(strings.TrimPrefix(line, "fingerprint:"))
+		// "next fingerprint:" is the same value under the label a freshly
+		// written pair earns until the app is restarted (Astra r3 #1).
+		for _, label := range []string{"fingerprint:", "next fingerprint:"} {
+			if strings.HasPrefix(line, label) {
+				return strings.TrimSpace(strings.TrimPrefix(line, label))
+			}
 		}
 	}
 	t.Fatalf("no fingerprint in:\n%s", out)
@@ -502,6 +506,61 @@ func TestSetPasswordDoesNotRenewAnExpiringCertificate(t *testing.T) {
 	_, regen, _ := run(t, "", "cert", "-config", p, "-regenerate")
 	if !strings.Contains(regen, "restart") || !strings.Contains(strings.ToLower(regen), "old") {
 		t.Fatalf("`cert -regenerate` must say the running app serves the OLD pair until restarted:\n%s", regen)
+	}
+}
+
+// Astra r3 #1: a daemon that has been running past its certificate's expiry
+// holds that expired pair in memory — the credential watcher stopped the moment
+// the door was armed, and nothing in the process re-reads the file — so the pair
+// EnsureUsable writes here is not what a browser will be shown. set-password
+// printed it as the fingerprint to compare and said in the next breath that a
+// restart was not needed, which is exactly how an operator comes to see two
+// different fingerprints and conclude, by every rule they were given, that the
+// emergency door is being intercepted.
+func TestSetPasswordSaysAReplacedCertificateNeedsARestart(t *testing.T) {
+	p := newConfig(t)
+	certFile, keyFile := config.Default().BreakGlassFiles(p)
+	// Expired yesterday, which is the one state EnsureUsable replaces: no
+	// browser will open a door with it, so it is worth nothing.
+	expired, err := breakglass.Regenerate(certFile, keyFile, time.Now().Add(-breakglass.Validity-24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, stdout, stderr := run(t, "a long enough password\n", "set-password", "-config", p, "-cost", "10", "-stdin")
+	if code != 0 {
+		t.Fatalf("set-password = %d\n%s\n%s", code, stdout, stderr)
+	}
+	replaced, err := breakglass.Load(certFile, keyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replaced.Fingerprint == expired.Fingerprint {
+		t.Fatal("an expired pair was not replaced, so this test is proving nothing")
+	}
+	if !strings.Contains(stdout, "next fingerprint: sha256:"+replaced.Fingerprint) {
+		t.Fatalf("a replaced pair's fingerprint must be labelled as the NEXT one:\n%s", stdout)
+	}
+	if !strings.Contains(stdout, "App Center") || !strings.Contains(stdout, "restart") {
+		t.Fatalf("set-password must say how to make the app serve the new pair:\n%s", stdout)
+	}
+	if strings.Contains(stdout, "restart is not needed") {
+		t.Fatalf("set-password said no restart was needed about a certificate that needs one:\n%s", stdout)
+	}
+
+	// Run again over the pair it just wrote: nothing is generated, so the
+	// wording goes back to the one the documented first run depends on.
+	code, second, stderr := run(t, "a long enough password\n", "set-password", "-config", p, "-cost", "10", "-stdin")
+	if code != 0 {
+		t.Fatalf("set-password = %d\n%s\n%s", code, second, stderr)
+	}
+	if strings.Contains(second, "next fingerprint") {
+		t.Fatalf("a usable pair was reported as a replacement:\n%s", second)
+	}
+	if !strings.Contains(second, "fingerprint: sha256:"+replaced.Fingerprint) {
+		t.Fatalf("set-password must report the pair the daemon will serve:\n%s", second)
+	}
+	if !strings.Contains(second, "restart is not needed") {
+		t.Fatalf("nothing was generated, so the password-only wording stands:\n%s", second)
 	}
 }
 

@@ -133,9 +133,17 @@ the credential body.
    - **Per-source-IP token bucket**: 10 attempts per minute, burst 10, at most 256 tracked sources (LRU-evicted).
      The peer here is a real LAN address — this listener is not behind the QTS proxy — so unlike the main listener's
      budget (PLAN "must verify" item 10) it can key on something honest.
-   - **Account lockout**: 5 consecutive failures lock *the account* for 60 s, doubling per further failure to a
-     1800 s cap; a success resets it. Locked answers `429 locked_out` with `Retry-After` and never reveals whether
-     the password offered was right.
+   - **Lockout, per source** (*amended, Astra round 1 #4* — it was per account): 5 consecutive failures from one
+     source lock **that source** for 60 s, doubling per further failure to a 1800 s cap; a success from that source
+     resets it. Locked answers `429 locked_out` with `Retry-After` and never reveals whether the password offered
+     was right. The table is the bucket's bounded LRU (256 sources). An account-wide lockout let any LAN peer shut
+     the emergency door for the operator — five wrong passwords, renewed at each expiry inside the peer's own
+     budget, and a password change did not reset it — which is the worse failure for a door that exists for the
+     moment the NAS is broken. The bound on guessing across many sources is the serialised bcrypt plus each source's
+     bucket (§18.12).
+   - *Added, Astra round 1 (#7):* the lockout verdict is read, and the outcome committed, **inside** the serialised
+     verification, so queued attempts cannot act on a stale verdict — four wrong passwords behind a fourth failure
+     enter one rung, not four, and a correct password queued behind a lockout-entering failure is refused as locked.
    - **One verification at a time**: a semaphore of 1 around `bcrypt.CompareHashAndPassword` with a queue depth of 4;
      the fifth concurrent attempt is `429 rate_limited`. bcrypt at cost 11 is the most expensive thing an
      unauthenticated caller can ask this process to do.
@@ -177,6 +185,12 @@ the credential body.
    | `selection` (nothing selected, wrong kind, too many) | *"Select a file or folder first."* / *"This is a device file, so it cannot be edited as text."* |
    | `capability` (uid/gid arithmetic, `perm.CapsFor`) | *"Owned by `backup` (uid 1003). Only the owner or an administrator can change permissions. You are signed in as `sveinung`."* |
    | `guard` (protected path class) | the guard's own path-free reason, unchanged |
+
+   *Amended, Astra round 1 (#6):* the `guard` cause applies to **mutating** actions only — View, Download, Properties
+   and Search are never guard-disabled in the UI; the server answers `403 protected` itself where it must. And the
+   listing's `class` (`browse.go`'s lexical `/etc`, `/usr`, `/var`… list) is a display hint, not the guard's verdict;
+   it drives the badge and the path notice, never `guard.denied`. Reading it as a denial disabled the repair
+   operations an administrator opens this app for.
 
    Every mutating control renders `disabled` **and** `aria-disabled="true"` **and** `title=sentence` **and** points
    `aria-describedby` at a `.visually-hidden` node holding the same sentence — `title` alone is invisible to a
@@ -382,7 +396,14 @@ README:
    `ReadTimeout` and no `WriteTimeout` (multi-gigabyte uploads and downloads — backend plan §4.3). The break-glass
    server adds `TLSConfig{MinVersion: tls.VersionTLS12, NextProtos: []string{"http/1.1"}}`: HTTP/2 is declined on
    purpose, because every streaming, admission and deadline argument in M2-C was reasoned over HTTP/1.1 semantics and
-   a release is not the place to re-derive them. Shutdown drains both listeners inside the existing 20 s budget
+   a release is not the place to re-derive them. *Amended, Astra round 1 (#2):* `NextProtos` alone does not decline
+   it — `ServeTLS` appends `h2` and a client offering only `h2` negotiated it — so the server sets `Protocols` to
+   HTTP/1 only and an empty `TLSNextProto`, and the test dials with `h2` and asserts the negotiation, not the
+   config. *Added (#8):* the JSON routes decode and drain their bounded body under a **read deadline**
+   (`ResponseController.SetReadDeadline`), because neither `MaxBytesReader` nor the handler context interrupts a
+   socket read; a drain that times out closes the connection rather than counting as consumed. *Added (#3):* a
+   sessionless denial on a mutation route on this listener is accounted like a refusal — one audit line per source
+   per window — never a forced milestone per packet. Shutdown drains both listeners inside the existing 20 s budget
    (`QPKG_TIMEOUT="30,60"`).
 6. **A separate session store**, not a shared map with a flag: its own mutex, its own map, its own CSRF tokens, cap
    **8** live sessions, idle timeout **15 minutes**, absolute lifetime **4 hours**. A shared store with a `door`
@@ -391,10 +412,13 @@ README:
 ## 14. Caps and limits
 
 Break-glass sessions 8, idle 15 min, absolute 4 h; login attempts 10/min per source IP over at most 256 tracked
-sources; 5 consecutive failures → 60 s lockout doubling to 1800 s; one bcrypt verification at a time with queue depth
-4; minimum failure latency 400 ms; password minimum 12 bytes, maximum 1024 (bcrypt truncates at 72 — the CLI says so
-rather than silently ignoring the tail); bcrypt cost 11 (10–15); certificate validity 397 days, regenerated within 30
-days of expiry; login body 4 KiB. Everything else is the existing budget: the 1 MiB JSON body cap, the 15 s handler
+sources; 5 consecutive failures from a source → 60 s lockout of that source doubling to 1800 s (Astra round 1 #4);
+one bcrypt verification at a time with queue depth 4; minimum failure latency 400 ms; password **12–72 bytes when
+set** (bcrypt's own limit — the CLI refuses a longer one rather than truncating; *corrected, Astra round 1 #19*: the
+earlier "maximum 1024 with truncation" was wrong) and a login **candidate** of at most 1024 bytes, which is the
+body bound, not a password rule; bcrypt cost 11 (10–15), and a stored hash must parse with a cost in that range
+(#10); certificate validity 397 days, regenerated within 30 days of expiry by the daemon or `cert` — never by
+`set-password`, which leaves a usable pair alone (#16); login body 4 KiB. Everything else is the existing budget: the 1 MiB JSON body cap, the 15 s handler
 context, the admission slots and deadlines M2-C settled, `MaxHeaderBytes` 64 KiB.
 
 ## 15. Degradation off Linux (the dev loop)
@@ -519,6 +543,18 @@ certificate and a running daemon binds the listener when a credential appears, s
 11. **Every M1–M3 residual stands unchanged** (PLAN §2.0, §2.4, §2.5, §2.6, §2.7, and the M3 list). M4 adds a door
     and a coat of paint; it closes none of them, and the CHANGELOG's `Security` section says so rather than letting a
     v1.0.0 tag imply they were fixed.
+12. **A distributed guess is bounded by bcrypt, not by a lockout (Astra round 1 #4).** With the lockout per
+    source, an attacker with many LAN addresses is limited only by the serialised verification (one bcrypt at a
+    time, cost 11 — a few per second on NAS silicon) and each source's 10/min bucket. Against a 12-byte-minimum
+    password that is hopeless; against a weak one the operator chose anyway, it is the residual. Every attempt is
+    still a milestone, and a spray across sources is counted and reported (§5, the dropped-source summary).
+13. **Explicit certificate and key paths are the operator's** (Astra round 1 #9). The daemon refuses to arm when
+    the key's parent directory is group- or other-writable or not root-owned, and logs why; it does not otherwise
+    guard those locations, and an administrator who points the key at a share and then downloads it through the app
+    has only exercised the root they already had.
+14. **Sessionless denials on 8771 are throttled like refusals** (#3), so a flood of forged mutations shows as one
+    line per source per window plus a summary, not as one line per packet — the operator sees that it happened and
+    how often, not each packet.
 
 **To confirm on hardware first (both units):** that **8771 is free** and QuFirewall does not block it — the whole
 feature is inert otherwise, and `netstat -tlnp` before the first release is the check; that the listener **does not
@@ -526,8 +562,9 @@ bind** before `break-glass set-password` is run, and does bind within one restar
 reaches `https://<nas>:8771/`, shows the expected self-signed warning (not a *different* warning — a missing IP SAN
 produces one, §3.3), and that the fingerprint in the page matches the one in the app log; that logging in yields an
 **administrator** session whose banner says root-owned, and that a file created through it is in fact `root:root`;
-that five wrong passwords lock the account and that QuLog Center shows the milestone lines for the attempts, the
-lockout and the login; that `break-glass set-password` run while the daemon is up takes effect on the next attempt
+that five wrong passwords lock **the source they came from** (a second machine still gets in) and that QuLog
+Center shows the milestone lines for the attempts, the lockout and the login; that a correct password entered in
+the page signs in without a manual reload (Astra round 1 #1 — the 204 was being treated as a failure); that `break-glass set-password` run while the daemon is up takes effect on the next attempt
 and evicts a live break-glass session; that the QTS desktop window at its default size passes the 768 px rung with no
 horizontal scroll and every toolbar action reachable; an NVDA pass over browse → select → permissions → confirm →
 job; and finally that a package built from the tagged commit installs from a clean App Center install and reports the

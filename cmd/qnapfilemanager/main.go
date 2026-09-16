@@ -483,6 +483,17 @@ func armBreakGlass(srv *server, frontend *web.Server, cfg config.Config, configP
 		srv.bgPending = true
 		return nil
 	}
+	// An explicitly configured key location is checked before anything is
+	// generated into it (Astra r1 #9): a group- or other-writable parent, or one
+	// not owned by root, lets someone other than root replace the key this
+	// listener terminates TLS with. Logged and NOT bound, rather than refusing
+	// to start: the main listener and the QTS door are unaffected, and a daemon
+	// that will not start at all is a worse outcome than one whose emergency
+	// door is off and says so.
+	if err := cfg.CheckBreakGlassKeyDir(configPath); err != nil {
+		logger.Printf("break-glass is enabled but the listener will not bind: %v. Fix the directory (root-owned, mode 0700) or remove web.breakGlass.certFile/keyFile to use the QPKG's own config directory.", err)
+		return nil
+	}
 	certFile, keyFile := cfg.BreakGlassFiles(configPath)
 	// Under the credential-store lock: the pair is two files and therefore two
 	// publications, so a CLI `cert -regenerate` running at the same moment as
@@ -557,6 +568,18 @@ func (s *server) watchForCredential(ctx context.Context, frontend *web.Server, c
 		}
 		cfg, err := config.LoadDev(configPath, s.dev)
 		if err != nil || !cfg.Web.BreakGlass.Enabled || cfg.Auth.Local.Hash == "" {
+			continue
+		}
+		// The SAME forcing the start-up path applies (Astra r1 #5). This path
+		// re-reads the file from disk, so without it a -dev daemon that binds
+		// late — the documented first run, where the password is set after the
+		// daemon is already up — would take the config's own 0.0.0.0 default and
+		// open a LAN port on a development box, which contract §15 says never
+		// happens. Validated afterwards for the same reason start-up validates
+		// after forcing: the forced address could collide with web.listen.
+		cfg = forceLoopbackBreakGlass(cfg, s.dev)
+		if err := cfg.ValidateDev(s.dev); err != nil {
+			s.logger.Printf("break-glass: the reloaded configuration is not usable: %v", err)
 			continue
 		}
 		if cfg.Auth.Local.Hash != armedFor {
@@ -818,11 +841,25 @@ func (s *server) listenBreakGlass() (*http.Server, net.Listener, error) {
 		IdleTimeout:       2 * time.Minute,
 		MaxHeaderBytes:    64 << 10,
 		TLSConfig: &tls.Config{
-			MinVersion:   tls.VersionTLS12,
+			MinVersion: tls.VersionTLS12,
+			// Advertised, but NOT what does the declining (Astra r1 #2):
+			// ServeTLS appends "h2" to whatever NextProtos holds when HTTP/2 is
+			// still enabled on the server, so a client offering only h2
+			// negotiated it and the listener spoke a protocol none of M2-C's
+			// streaming, admission and deadline reasoning was done over.
 			NextProtos:   []string{"http/1.1"},
 			Certificates: []tls.Certificate{*s.bgCert},
 		},
+		// This is what declines it. Protocols says HTTP/1 and nothing else, so
+		// net/http neither appends h2 to NextProtos nor configures an HTTP/2
+		// server; the empty TLSNextProto is the older half of the same
+		// statement, kept because it is what an ALPN-negotiated "h2" would be
+		// looked up in if anything ever put it back.
+		TLSNextProto: map[string]func(*http.Server, *tls.Conn, http.Handler){},
 	}
+	protocols := new(http.Protocols)
+	protocols.SetHTTP1(true)
+	srv.Protocols = protocols
 	s.logger.Printf("break-glass listening on %s (TLS, local administrator account only)", ln.Addr())
 	if s.auditBG != nil {
 		s.auditBG("breakglass-listen", "ok", fmt.Sprintf("door=local listener bound %s", ln.Addr()))

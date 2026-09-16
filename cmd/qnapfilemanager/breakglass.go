@@ -73,9 +73,101 @@ func runBreakGlass(args []string, stdin io.Reader, stdout, stderr io.Writer) int
 	return 0
 }
 
-// defaultConfigPath is where the QPKG keeps the config. A subcommand run with
-// no -config on a NAS should act on the file the daemon actually reads.
-const defaultConfigPath = "/share/CACHEDEV1_DATA/.qpkg/QNAPFileManager/config/config.json"
+// The fallback config location, and the QPKG registry the real one comes from.
+//
+// The hard-coded path is right on exactly one kind of unit: a QTS box whose
+// first volume is CACHEDEV1_DATA. On QuTS hero, or on any unit where App Center
+// installed to another volume, it names a file that does not exist — and a
+// subcommand acting on a file the daemon does not read is worse than one that
+// fails, because `status` then reports "no password" while the listener is
+// armed, and `disable` cannot revoke anything (Astra r1 #14).
+const (
+	legacyConfigPath = "/share/CACHEDEV1_DATA/.qpkg/QNAPFileManager/config/config.json"
+	qpkgSection      = "QNAPFileManager"
+	qpkgConfigKey    = "Install_Path"
+)
+
+// qpkgConfPath is where App Center records every installed QPKG's real install
+// path. It is a variable so a test can point it at a fixture; QNAPFileManager.sh
+// reads the same file with getcfg.
+var qpkgConfPath = "/etc/config/qpkg.conf"
+
+// defaultConfigPath resolves where the daemon's config actually is, in the same
+// order of confidence the service script uses: what App Center recorded, then
+// this executable's own installation tree, then the historical default.
+//
+// It returns the path and a short word naming where that path came from, so
+// `status` can print it: a subcommand silently acting on the wrong file is the
+// failure this exists to prevent, and the only way an operator can see which
+// file was chosen is if it is printed.
+func defaultConfigPath() (path, source string) {
+	if dir := qpkgInstallPath(qpkgConfPath, qpkgSection); dir != "" {
+		return filepath.Join(dir, "config", "config.json"), "qpkg.conf"
+	}
+	// The executable's own tree: <install>/bin/qnapfilemanager (or
+	// <install>/qnapfilemanager) beside <install>/config/config.json. Only
+	// accepted when the file is really there — an executable run from a build
+	// directory must not name a config that does not exist and thereby hide the
+	// fallback below.
+	if exe, err := os.Executable(); err == nil {
+		if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+			exe = resolved
+		}
+		dir := filepath.Dir(exe)
+		for _, root := range []string{dir, filepath.Dir(dir)} {
+			candidate := filepath.Join(root, "config", "config.json")
+			if fi, err := os.Stat(candidate); err == nil && !fi.IsDir() {
+				return candidate, "the installation tree"
+			}
+		}
+	}
+	return legacyConfigPath, "the default location"
+}
+
+// qpkgInstallPath reads one key out of one section of /etc/config/qpkg.conf.
+//
+// A tiny INI reader rather than a dependency or a shell-out to getcfg: this may
+// run on a NAS whose firmware is the thing being repaired, and a subcommand
+// that needs another program to find its own config file is one more thing that
+// can be broken. The file is small, root-owned and written by App Center.
+func qpkgInstallPath(path, section string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	// Bounded: this is a configuration file, not a stream, and a corrupt or
+	// hostile one must not be read without limit.
+	scanner := bufio.NewScanner(io.LimitReader(f, 1<<20))
+	scanner.Buffer(make([]byte, 0, 4096), 64<<10)
+	inSection := false
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			// QTS section names are case-insensitive in practice.
+			inSection = strings.EqualFold(strings.Trim(line, "[]"), section)
+			continue
+		}
+		if !inSection {
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok || !strings.EqualFold(strings.TrimSpace(key), qpkgConfigKey) {
+			continue
+		}
+		// getcfg strips surrounding quotes; so does this.
+		value = strings.TrimSpace(value)
+		value = strings.Trim(value, `"`)
+		if value == "" {
+			return ""
+		}
+		return value
+	}
+	return ""
+}
 
 // breakGlassFlags is the flag set every subcommand shares. -dev exists because
 // a daemon started with -dev may be running on a config whose auth.mode is
@@ -89,11 +181,13 @@ func breakGlassFlags(name string, args []string, stderr io.Writer) (fs *flag.Fla
 	return fs, path, dev
 }
 
-func resolveConfigPath(p string) string {
+// resolveConfigPath answers where a subcommand with no -config should act, and
+// says where that answer came from.
+func resolveConfigPath(p string) (path, source string) {
 	if p != "" {
-		return p
+		return p, "-config"
 	}
-	return defaultConfigPath
+	return defaultConfigPath()
 }
 
 // withCertLock serialises everything that WRITES the break-glass key pair
@@ -195,7 +289,7 @@ func breakGlassSetPassword(args []string, stdin io.Reader, stdout, stderr io.Wri
 	if fs.NArg() > 0 {
 		return fmt.Errorf("unexpected argument %q", fs.Arg(0))
 	}
-	p := resolveConfigPath(*path)
+	p, _ := resolveConfigPath(*path)
 	if err := guardCredentialStore(p, stderr); err != nil {
 		return err
 	}
@@ -271,9 +365,15 @@ func breakGlassSetPassword(args []string, stdin io.Reader, stdout, stderr io.Wri
 	if cfg.Web.BreakGlass.Enabled {
 		certFile, keyFile := cfg.BreakGlassFiles(p)
 		var cert breakglass.Cert
+		// EnsureUsable, not Ensure (Astra r1 #16): setting a password must never
+		// be the thing that RENEWS a certificate. A usable pair is left alone;
+		// only a missing or torn one is generated, which is what makes the
+		// documented first run — set the password, compare the fingerprint, open
+		// the page — work without a restart. Renewal is `cert -regenerate`'s job
+		// and says so.
 		cerr := withCertLock(p, func() error {
 			var err error
-			cert, err = breakglass.Ensure(certFile, keyFile, time.Now())
+			cert, err = breakglass.EnsureUsable(certFile, keyFile, time.Now())
 			return err
 		})
 		if cerr != nil {
@@ -301,7 +401,7 @@ func breakGlassDisable(args []string, stdout, stderr io.Writer) error {
 	if fs.NArg() > 0 {
 		return fmt.Errorf("unexpected argument %q", fs.Arg(0))
 	}
-	p := resolveConfigPath(*path)
+	p, _ := resolveConfigPath(*path)
 	if err := guardCredentialStore(p, stderr); err != nil {
 		return err
 	}
@@ -328,12 +428,16 @@ func breakGlassStatus(args []string, stdout, stderr io.Writer) error {
 	if fs.NArg() > 0 {
 		return fmt.Errorf("unexpected argument %q", fs.Arg(0))
 	}
-	p := resolveConfigPath(*path)
+	p, source := resolveConfigPath(*path)
 	cfg, err := config.LoadDev(p, *dev)
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(stdout, "config:      %s\n", p)
+	// Which file, and how it was found (Astra r1 #14). An operator whose unit
+	// installed to another volume needs to see that this is the file the daemon
+	// reads — "password: not set" against the wrong config is the exact wrong
+	// answer to give someone locked out of a NAS.
+	fmt.Fprintf(stdout, "config:      %s (from %s)\n", p, source)
 	fmt.Fprintf(stdout, "enabled:     %v\n", cfg.Web.BreakGlass.Enabled)
 	fmt.Fprintf(stdout, "addr:        %s\n", cfg.Web.BreakGlass.Addr)
 	// The hash itself is never printed. What an audit needs is whether one
@@ -374,7 +478,7 @@ func breakGlassCert(args []string, stdout, stderr io.Writer) error {
 	if fs.NArg() > 0 {
 		return fmt.Errorf("unexpected argument %q", fs.Arg(0))
 	}
-	p := resolveConfigPath(*path)
+	p, _ := resolveConfigPath(*path)
 	cfg, err := config.LoadDev(p, *dev)
 	if err != nil {
 		return err
@@ -411,7 +515,13 @@ func breakGlassCert(args []string, stdout, stderr io.Writer) error {
 	}
 	if cert.Generated {
 		fmt.Fprintf(stdout, "generated a new certificate (%s).\n", cert.Reason)
-		fmt.Fprintln(stdout, "The fingerprint has CHANGED: tell anyone who compares it, and restart the app so the listener serves it.")
+		// Said plainly, because the fingerprint below is NOT what a browser will
+		// show until the app restarts: the running daemon holds the old pair in
+		// memory and goes on terminating TLS with it. An operator who compares
+		// the two and sees a mismatch must be able to recognise this, rather
+		// than conclude they are being intercepted (Astra r1 #16).
+		fmt.Fprintln(stdout, "The fingerprint has CHANGED. A running app keeps serving the OLD pair until it is restarted,")
+		fmt.Fprintln(stdout, "so restart it before comparing this fingerprint in a browser, and tell anyone else who compares it.")
 	}
 	fmt.Fprintf(stdout, "certificate: %s\n", certFile)
 	fmt.Fprintf(stdout, "fingerprint: sha256:%s\n", cert.Fingerprint)

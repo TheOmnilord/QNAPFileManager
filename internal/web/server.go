@@ -491,7 +491,7 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request, sess *session)
 		// own cookie; there is no path by which one can revoke the other's.
 		if sess.door == audit.DoorLocal {
 			if s.bg != nil {
-				s.bg.destroy(sess.id)
+				s.bg.destroy(r, sess.id)
 				s.bg.clearCookie(w)
 			}
 		} else {

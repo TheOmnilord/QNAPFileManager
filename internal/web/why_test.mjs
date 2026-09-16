@@ -46,6 +46,10 @@ test('every action × every cause yields a non-empty, non-duplicated sentence', 
    // Both are facts about the table, not gaps in it.
    if (cause === 'readonly' && !spec.mutating) continue;
    if (cause === 'selection' && spec.needs === 'none') continue;
+   // Nor does a guard denial apply to an action that changes nothing: the
+   // guard refuses CHANGES to a protected region, not looking at one
+   // (Astra r1 #6). The test below is the one that states that positively.
+   if (cause === 'guard' && !spec.mutating) continue;
    const verdict = whyDisabled(name, contexts[cause]());
    assert.equal(verdict.cause, cause, `${name} × ${cause}`);
    assert.ok(verdict.sentence && verdict.sentence.trim().length > 0, `${name} × ${cause} has a sentence`);
@@ -101,6 +105,34 @@ test('a non-mutating action is never refused for read-only mode', () => {
  for (const name of names.filter(n => !ACTIONS[n].mutating)) {
   const verdict = whyDisabled(name, {...allowedCtx(), readOnly: true});
   assert.notEqual(verdict.cause, 'readonly', name);
+ }
+});
+
+// The finding this closes: list.js turned the listing's LEXICAL display class
+// (browse.go calls everything under /etc, /usr, /var, /root 'protected') into a
+// guard denial, and reasonsFor applied that cause to every row of the table —
+// so under /etc an administrator could not View, Download, inspect Properties or
+// Search, which are exactly the repair operations this app exists for. The guard
+// cause is a refusal to CHANGE; a read is the server's own call, and it answers
+// 403 protected itself where it means it.
+test('a guard denial disables the mutating actions and NONE of the reads (Astra r1 #6)', () => {
+ const guarded = () => ({...allowedCtx(), guard: {denied: true}});
+ for (const name of names.filter(n => ACTIONS[n].mutating)) {
+  const verdict = whyDisabled(name, guarded());
+  assert.equal(verdict.allowed, false, name);
+  assert.equal(verdict.cause, 'guard', name);
+  assert.equal(verdict.sentence, GUARD_SENTENCE, name);
+ }
+ for (const name of ['viewText', 'download', 'properties', 'search']) {
+  const verdict = whyDisabled(name, guarded());
+  assert.equal(verdict.allowed, true, `${name} must stay usable inside a protected region`);
+  assert.notEqual(verdict.cause, 'guard', name);
+  assert.equal(verdict.sentence, ACTIONS[name].enabled, name);
+  assert.deepEqual(reasonsFor(name, guarded()), [], `${name} has no guard reason to report at all`);
+ }
+ // Every non-mutating action in the table, not only the four named above.
+ for (const name of names.filter(n => !ACTIONS[n].mutating)) {
+  assert.equal(whyDisabled(name, guarded()).allowed, true, name);
  }
 });
 

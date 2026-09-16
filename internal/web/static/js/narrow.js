@@ -116,7 +116,14 @@ export function syncOverflow() {
   if (mirror.title) item.title = mirror.title;
   // The same hidden node the button points at: one sentence, two controls.
   if (mirror.describedBy) item.setAttribute('aria-describedby', mirror.describedBy);
-  item.addEventListener('click', () => { closeMore(); source?.click?.(); });
+  // Focus moves to the ⋯ button BEFORE the real button is pressed (Astra r1
+  // #18). closeMore() hides the menu item that was focused, and the toolbar
+  // button behind it is `display:none` at this width, so whatever a dialog then
+  // opened captured as its opener (dom.js openDialog reads document.activeElement)
+  // was invisible — More → New folder returned focus to nowhere on closing.
+  // The ⋯ button is the visible control the user actually pressed, so it is the
+  // one focus comes back to.
+  item.addEventListener('click', () => { closeMore(); button.focus?.(); source?.click?.(); });
   return item;
  }));
  return ids;

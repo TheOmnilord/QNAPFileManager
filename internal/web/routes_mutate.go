@@ -88,9 +88,25 @@ func validNewName(name string) error {
 // so a typo in a hand-made request is an error rather than a silent no-op. It
 // writes the error response itself and returns false on failure.
 func (s *Server) decodeBody(w http.ResponseWriter, r *http.Request, v any) bool {
+	// Decode AND drain under a read deadline (Astra r1 #8).
+	//
+	// Neither read is bounded in time by anything else. The 15 s handler context
+	// does not interrupt a socket read, and neither listener sets ReadTimeout
+	// (both serve multi-gigabyte uploads). So a caller that declared a large
+	// Content-Length, sent a valid JSON object and then simply stopped talking
+	// parked the handler goroutine indefinitely — on the break-glass listener,
+	// unauthenticated, from the LAN. A deadline here is the right place for it:
+	// it covers exactly the small JSON bodies, and leaves the streaming routes,
+	// which never reach decodeBody, untouched.
+	rc := http.NewResponseController(w)
+	// A ResponseWriter that cannot carry a deadline (httptest's recorder)
+	// answers ErrNotSupported; the bounded read still applies, which is what
+	// every handler-level test exercises.
+	_ = rc.SetReadDeadline(time.Now().Add(jsonBodyRead))
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
+		_ = rc.SetReadDeadline(time.Time{})
 		s.fail(w, r, "bad_request", "The request body could not be read.", "", err.Error())
 		return false
 	}
@@ -103,12 +119,28 @@ func (s *Server) decodeBody(w http.ResponseWriter, r *http.Request, v any) bool 
 	// Connection: close — one TCP handshake per request through the emergency
 	// door, which is the opposite of what that door is for. The read is bounded
 	// by the MaxBytesReader the caller already wrapped this body in (1 MiB on
-	// the shared routes), so draining cannot itself become a lever, and a
-	// failure here is not worth failing a request that has already been parsed:
-	// the worst case is the connection closing, which is what happened before.
-	_, _ = io.Copy(io.Discard, r.Body)
+	// the shared routes), so draining cannot itself become a lever.
+	_, drainErr := io.Copy(io.Discard, r.Body)
+	// Reset before answering: left armed, the deadline would land on the NEXT
+	// request's header read on this keep-alive connection.
+	_ = rc.SetReadDeadline(time.Time{})
+	if drainErr != nil {
+		// The declared body was never consumed — a drain that timed out, a
+		// client that went away mid-body. The request itself has been parsed and
+		// is answered normally, but the connection must not be reused: net/http
+		// would drain the remainder behind the response with no deadline at all,
+		// which is the very lever this closed. Saying so explicitly also tells
+		// the break-glass refusal wrapper, which keys on exactly this.
+		w.Header().Set("Connection", "close")
+		markBodyUnconsumed(w)
+	}
 	return true
 }
+
+// jsonBodyRead bounds how long a small JSON request body may take to arrive.
+// Generous for a few hundred bytes over a LAN, and far short of the handler's
+// own 15 s context.
+const jsonBodyRead = 15 * time.Second
 
 // mutationsReady reports whether the write spine is wired. A read-only build (or
 // a fixture without a guard) answers a clear 500 rather than panicking.

@@ -1,6 +1,6 @@
 import {api,apiURL} from './api.js';
 import {$,el,error,announce} from './dom.js';
-import {state,update,sessionGuard} from './state.js';
+import {state,sessionGuard} from './state.js';
 import {confirmDialog} from './actions.js';
 
 function fmtTime(t) { try { return new Date(t).toLocaleString(); } catch { return String(t); } }
@@ -43,9 +43,18 @@ export function readOnlyConfirmText(enabled) {
   : {title:'Turn off read-only mode',body:'This allows changes across the whole filesystem, including protected system paths. Continue?',danger:true};
 }
 
-// initSettings wires the settings controls. confirm is injectable so the toggle
-// confirmation can be unit tested without a live dialog.
-export function initSettings(confirm=confirmDialog) {
+// initSettings wires the settings controls. `confirm` is injectable so the
+// toggle confirmation can be unit tested without a live dialog.
+//
+// `showSession` is INJECTED rather than imported, for two reasons. app.js is the
+// entry module — importing it back would close a cycle that runs the whole app
+// inside a unit test — and the toggle is the one place the whole session-install
+// path has to run: installing the refreshed session with update({session}) alone
+// left "Read-only mode — no changes can be made" on screen after read-only had
+// been turned off, because paintBanners never ran (Astra r1 #11). It has no
+// default on purpose: a wiring left out fails loudly on the first toggle rather
+// than quietly repainting nothing.
+export function initSettings(confirm=confirmDialog,showSession) {
  $('#setReadOnly').addEventListener('change',async ev => {
   const enabled=ev.target.checked;
   // Require a deliberate confirmation before the toggle is sent (decision 7
@@ -56,12 +65,13 @@ export function initSettings(confirm=confirmDialog) {
    await api('api/settings',{},{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({readOnly:enabled})});
    if (!valid()) return;
    announce(enabled ? 'Read-only mode is on.' : 'Read-only mode is off. Changes are now possible.');
-   // Re-read the session so canWrite (and the toolbar) reflect the new state.
+   // Re-read the session so canWrite (and the toolbar) reflect the new state,
+   // and install it the ONE way a session is ever installed: showSession paints
+   // the banners, the chip, the identity line and the toolbar together, so the
+   // bar and the state it describes cannot disagree.
    const session=await api('api/session');
    if (!valid()) return;
-   update({session});
-   $('#setReadOnly').checked=session.readOnly;
-   $('#chipReadonly').hidden=!!session.canWrite;
+   showSession(session);
   } catch(err) { if (valid()) { ev.target.checked=!enabled; error(err); } }
  });
  $('#btnAuditRefresh').addEventListener('click',loadAudit);

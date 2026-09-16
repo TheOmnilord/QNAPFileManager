@@ -194,10 +194,10 @@ func TestADisabledPasswordCannotBeLockedOut(t *testing.T) {
 			t.Fatalf("attempt %d = %d %s, want the uniform 401", i+1, w.Code, w.Body)
 		}
 	}
-	if locked, _, _ := s.BreakGlassGate().Locked(); locked {
+	if locked, _, _ := s.BreakGlassGate().Locked(bgTestIP); locked {
 		t.Fatal("attempts against a disabled password locked the door")
 	}
-	if n := s.BreakGlassGate().Failures(); n != 0 {
+	if n := s.BreakGlassGate().Failures(bgTestIP); n != 0 {
 		t.Fatalf("%d consecutive failures recorded against a door with no password", n)
 	}
 	// And the operator's fresh password is accepted immediately.
@@ -238,10 +238,12 @@ func TestAQueuedLoginIsNotCalledWrong(t *testing.T) {
 	holding := make(chan struct{})
 	released := make(chan struct{})
 	go func() {
-		_ = s.bg.gate.Verify(context.Background(), func() error {
+		// A different source, so holding the slot does not itself touch the
+		// ladder of the source the request under test comes from.
+		_, _ = s.bg.gate.Verify(context.Background(), "10.0.0.250", func() breakglass.Outcome {
 			close(holding)
 			<-released
-			return nil
+			return breakglass.OutcomeNeutral
 		})
 	}()
 	<-holding
@@ -264,7 +266,7 @@ func TestAQueuedLoginIsNotCalledWrong(t *testing.T) {
 		t.Error("a queue-wait refusal must say when to try again")
 	}
 	// And it did not walk the ladder.
-	if n := s.BreakGlassGate().Failures(); n != 0 {
+	if n := s.BreakGlassGate().Failures(bgTestIP); n != 0 {
 		t.Fatalf("%d failures charged for a verification that never ran", n)
 	}
 }

@@ -78,7 +78,7 @@ QFM=$(/sbin/getcfg QNAPFileManager Install_Path -f /etc/config/qpkg.conf)
 echo "$QFM"        # e.g. /share/CACHEDEV1_DATA/.qpkg/QNAPFileManager
                    #  or  /share/ZFS530_DATA/.qpkg/QNAPFileManager on hero
 
-# 2. Set the password (typed twice, not echoed). Minimum 12 characters.
+# 2. Set the password (typed twice, not echoed). 12 to 72 bytes.
 #    This also generates the certificate if there is not one yet.
 "$QFM/bin/qnapfilemanager" break-glass set-password -config "$QFM/config/config.json"
 
@@ -88,8 +88,12 @@ echo "$QFM"        # e.g. /share/CACHEDEV1_DATA/.qpkg/QNAPFileManager
 ```
 
 The subcommand refuses to run unless it is uid 0 and the config file is owned by root and not group- or world-readable —
-a credential store with the wrong mode is worth stopping for. bcrypt truncates at 72 bytes and the command says so rather
-than silently ignoring a longer password.
+a credential store with the wrong mode is worth stopping for.
+
+**The password rule is 12 to 72 bytes**, with no composition rules. The upper bound is bcrypt's own: it cannot read past
+72 bytes, so a longer passphrase would carry entropy that is never checked. The command refuses one rather than accepting
+it and ignoring the tail, and it warns as you approach the limit. (1024 bytes appears elsewhere as the largest *login*
+body the door will look at — that is a bound on what an attacker may send, not a password you can set.)
 
 **No restart is needed.** The daemon re-reads the credential rather than caching it, so a password set while the app is
 running takes effect on the next attempt, and the listener on 8771 comes up on its own once a credential exists. If the

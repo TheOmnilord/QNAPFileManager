@@ -27,6 +27,11 @@ import (
 // attempt (cost 11 is what production writes).
 const bgTestPassword = "an emergency password"
 
+// bgTestIP is the peer every bgRequest comes from (httptest's default
+// RemoteAddr). The lockout ladder is keyed by it (Astra r1 #4), so a test that
+// asks about the ladder has to name the source it walked.
+const bgTestIP = "192.0.2.1"
+
 // bgFixture builds a server serving BOTH listeners, with a real auditor so the
 // Door stamp and the forced milestones are assertable, and a real credential in
 // a real config file so the reload path is the one under test.

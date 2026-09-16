@@ -421,11 +421,11 @@ func TestOnlyAWrongPasswordAdvancesTheLockoutLadder(t *testing.T) {
 			for i := 0; i < breakglass.LockoutAfter; i++ {
 				c.send(t, s)
 			}
-			locked, _, _ := s.BreakGlassGate().Locked()
+			locked, _, _ := s.BreakGlassGate().Locked(bgTestIP)
 			if locked != c.advances {
 				t.Fatalf("%s: locked=%v after %d attempts, want %v", c.name, locked, breakglass.LockoutAfter, c.advances)
 			}
-			if got := s.BreakGlassGate().Failures(); (got > 0) != c.advances {
+			if got := s.BreakGlassGate().Failures(bgTestIP); (got > 0) != c.advances {
 				t.Fatalf("%s: %d consecutive failures recorded, want advances=%v", c.name, got, c.advances)
 			}
 			// Whatever the cause, the answer the client sees is the same one.

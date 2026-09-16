@@ -13,6 +13,7 @@ import {initSearch,openSearch,closeResults,escapeReturnsToListing} from './searc
 import {initJobs,pollJobs} from './jobs.js';
 import {initTrash} from './trash.js';
 import {initSettings,loadAudit} from './settings.js';
+import {confirmDialog} from './actions.js';
 import {sessionBootstrap,transientAuthError} from './bootstrap.js';
 import {banners,bannerSignature,identityLabel} from './banners.js';
 import {initBreakGlass,hideLocalSignIn,listenerOf} from './breakglass.js';
@@ -129,7 +130,10 @@ export function paintBanners(session) {
 
 // initPerms runs after initActions so the context menu keeps the §3.3 order:
 // Rename… and Delete first, then Permissions… — extraActions is appended to.
-initList(); initViewer(); initProps(); initActions(); initPerms(); initTransfer(); initUpload(); initSearch(); initJobs(); initTrash(); initSettings();
+// Settings is handed showSession because a read-only toggle changes the SESSION,
+// and a session is installed in exactly one place (Astra r1 #11) — otherwise the
+// banner kept saying "no changes can be made" after changes had been re-enabled.
+initList(); initViewer(); initProps(); initActions(); initPerms(); initTransfer(); initUpload(); initSearch(); initJobs(); initTrash(); initSettings(confirmDialog,showSession);
 $('.skip').addEventListener('click',ev => { ev.preventDefault(); $('#list').focus(); });
 window.addEventListener('hashchange',navigate);
 $('#btnRetry').addEventListener('click',connect);

@@ -141,10 +141,50 @@ test('the form submits on Enter as well as on the button, and never navigates', 
  assert.equal(submitted, 1);
 });
 
-// --- the notice that must never appear here ----------------------------------
+// --- through the REAL api(), because the bug was in it (Astra r1 #1) ---------
+//
+// Everything above hands submitLogin a resolved stub, and a stub cannot answer
+// 204 — which is exactly what the login route answers: no body at all, the
+// session arriving as a cookie. api() called response.json() unconditionally, so
+// a CORRECT emergency password surfaced as "Request failed (204)" and onSignedIn
+// never ran. The cookie was set, so a manual reload worked; that is how the
+// hardware smoke test walked past it. These two exercise the real helper.
 
-const {signInNotice, connectionNotice} = await import('./static/js/api.js');
+const {api, signInNotice, connectionNotice} = await import('./static/js/api.js');
 const {state, update} = await import('./static/js/state.js');
+
+test('a 204 with no body is a SUCCESS: the session is re-read and the field cleared', async t => {
+ update({listener: 'local', session: null});
+ t.after(() => update({listener: '', session: null}));
+ const calls = [];
+ t.mock.method(globalThis, 'fetch', async (url, options) => { calls.push({url: String(url), options}); return new Response(null, {status: 204}); });
+ $('#bgPassword').value = 'correct horse battery';
+ $('#bgError').textContent = 'stale'; $('#bgError').hidden = false;
+ let reloaded = 0;
+ const ok = await submitLogin({api, onSignedIn: () => { reloaded++; }, password: 'correct horse battery'});
+ assert.equal(ok, true, 'an empty body is not a failure');
+ assert.equal(reloaded, 1, 'onSignedIn must run, or the page never learns it is signed in');
+ assert.equal(calls.length, 1);
+ assert.equal(calls[0].url, LOGIN_ROUTE);
+ assert.equal(calls[0].options.method, 'POST');
+ assert.equal($('#bgPassword').value, '', 'the password is not left in the field');
+ assert.equal($('#bgSignin').hidden, true, 'the form goes away');
+ assert.equal($('#bgError').hidden, true, 'and no error line is left behind');
+});
+
+test('a 401 carrying a JSON error is still a failure, and says which one', async t => {
+ update({listener: 'local', session: null});
+ t.after(() => update({listener: '', session: null}));
+ t.mock.method(globalThis, 'fetch', async () => new Response(JSON.stringify({error: {code: 'auth_failed', message: 'That password was not accepted.'}}),
+  {status: 401, headers: {'Content-Type': 'application/json'}}));
+ let reloaded = 0;
+ const ok = await submitLogin({api, onSignedIn: () => { reloaded++; }, password: 'wrong'});
+ assert.equal(ok, false);
+ assert.equal(reloaded, 0, 'a wrong password must never look like a sign-in');
+ assert.equal($('#bgSignin').hidden, false, 'the 401 re-shows this form, never the QTS notice');
+ assert.equal($('#bgError').hidden, false);
+ assert.equal($('#bgError').textContent, 'Wrong password.', 'the error line is set after the re-show, so it is the last word');
+});
 
 test('a sign-out on the emergency listener shows the password form, not the QTS notice', () => {
  update({listener: 'local', session: null});

@@ -74,8 +74,11 @@ async function page(number,generation) {
   if (number === 0) pageSize = data.limit;
   else if (data.limit !== pageSize) throw new Error('Listing page size changed. Refresh to continue.');
   const pages = new Map(state.pages); pages.set(number,data.entries);
-  // The guard's classification of the folder travels with its first page, and
-  // it is kept: it is the `guard` cause every mutating control consults (§7.1).
+  // The folder's display class travels with its first page and is kept: it is
+  // what the shield badge and the path notice are painted from (badges.js). It
+  // is a lexical hint, NOT the guard's verdict on an operation, so it is not
+  // what the reason table's `guard` cause is read from — see whyContext
+  // (Astra r1 #6).
   update(number === 0 ? {pages,total:data.total,loading:false,dirClass:data.class || ''} : {pages,total:data.total,loading:false});
   if (number === 0) directoryNotice(data);
   render();
@@ -226,12 +229,18 @@ export function whyContext(extra = {}) {
   count,one,kind,
   entry:one ? entry : null,
   session:state.session,
-  // The guard's own verdict on the folder, so every mutating control — and the
-  // empty state's single offer — knows that nothing may be created or changed
-  // inside a protected region. 'warn' is NOT a denial: the guard refuses
-  // specific operations there (a new folder directly under the /share RAM disk)
-  // and permits the rest, so the server stays the one that says no.
-  guard:{denied:state.dirClass==='protected'},
+  // The guard cause waits for the guard's OWN verdict, and the listing does not
+  // carry one (Astra r1 #6). `state.dirClass` is browse.go's `class` — a
+  // LEXICAL display hint ("Display hints only", browse.go) that calls everything
+  // under /etc, /usr, /var, /root and the rest 'protected', which is the badge
+  // and the path notice badges.js paints. It is not an operation verdict: the
+  // guard refuses SPECIFIC operations in those regions and permits the rest, and
+  // reading it as a blanket denial disabled the repair work an administrator
+  // signs in to do. So nothing is denied here; the server says no where it means
+  // it, in its own words, and the class stays advisory. When the listing one day
+  // reports the guard's verdict per operation, that field — not the class — is
+  // what belongs in this line.
+  guard:{denied:false},
   ...extra,
  };
 }

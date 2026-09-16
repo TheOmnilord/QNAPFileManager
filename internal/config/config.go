@@ -264,6 +264,43 @@ func (c Config) BreakGlassFiles(configPath string) (certFile, keyFile string) {
 	return certFile, keyFile
 }
 
+// CheckBreakGlassKeyDir refuses an EXPLICIT key location whose parent directory
+// anyone but root can write (Astra r1 #9, narrowed).
+//
+// An explicit web.breakGlass.keyFile is accepted — an operator may have reasons
+// to put the pair somewhere else — but the directory it lives in decides who
+// owns the key the emergency door serves. A group- or other-writable parent
+// lets anyone in that group replace the key with their own and terminate TLS
+// for the door, on a root daemon, and no mode on the key file itself prevents
+// it: replacing a file is a property of the directory, not of the file. sshd
+// refuses to use a key under such a directory for the same reason, and so does
+// this: at arm time the listener is not bound and the log says why.
+//
+// The DEFAULT location is not checked here. It sits beside config.json in the
+// QPKG's 0700 config/, which package_routines tightens and which the CLI's own
+// store guard checks whenever it writes a credential — checking it twice, with
+// two sets of rules, is how the two come to disagree.
+//
+// Ownership is a Linux question and is skipped elsewhere (contract §15): a
+// Windows dev box has no uid 0, and its mode bits are not POSIX ones.
+func (c Config) CheckBreakGlassKeyDir(configPath string) error {
+	explicit := map[string]bool{}
+	if c.Web.BreakGlass.KeyFile != "" {
+		explicit[filepath.Dir(c.Web.BreakGlass.KeyFile)] = true
+	}
+	if c.Web.BreakGlass.CertFile != "" {
+		// The certificate is public, but it is published into the same directory
+		// and a writable one lets a pair be swapped wholesale.
+		explicit[filepath.Dir(c.Web.BreakGlass.CertFile)] = true
+	}
+	for dir := range explicit {
+		if err := keyDirStrict(dir); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Save writes the config atomically — through jsonfile, which publishes by
 // rename after flushing, so a crash cannot leave a half-written file where the
 // last good one was — and then tightens the mode: this file holds the

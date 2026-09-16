@@ -51,12 +51,26 @@ export async function api(endpoint,params={},options={}) {
  catch { throw Object.assign(new Error('Cannot reach the QNAPFileManager service — is it still running?'),{network:true}); }
  if (response.status === 401 && valid()) signInNotice();
  const failure={status:response.status,retryAfter:response.headers.get('Retry-After')};
- let data;
- try { data = await response.json(); }
- catch {
-  // Proxies may return HTML for timeouts or overloads; preserve the status.
-  throw Object.assign(new Error(`Request failed (${response.status})`),failure,{network:response.ok});
+ // An answer with NO BODY is not a failure. The break-glass login route replies
+ // 204 and nothing else — the session arrives as a cookie — and response.json()
+ // on an empty body throws, so a CORRECT emergency password was reported as
+ // "Request failed (204)" and onSignedIn was never reached (Astra r1 #1). The
+ // rule is therefore: 204, or any 2xx whose body is empty, is `null`; a body
+ // that is there is parsed as before, and a non-2xx with nothing to quote still
+ // fails with its status.
+ let data=null,body='';
+ if (response.status!==204 && response.headers.get('Content-Length')!=='0') {
+  try { body = await response.text(); }
+  // A connection that dies mid-body is the network failure it looks like.
+  catch { throw Object.assign(new Error(`Request failed (${response.status})`),failure,{network:true}); }
  }
+ if (body.trim()) {
+  try { data = JSON.parse(body); }
+  catch {
+   // Proxies may return HTML for timeouts or overloads; preserve the status.
+   throw Object.assign(new Error(`Request failed (${response.status})`),failure,{network:response.ok});
+  }
+ } else if (!response.ok) throw Object.assign(new Error(`Request failed (${response.status})`),failure,{network:false});
  if (response.status===503 && data?.error?.code==='qts_unavailable' && state.session && valid()) {
   connectionNotice('QTS temporarily unavailable','Your session is being kept while QTS reconnects. Please retry shortly.');
  }

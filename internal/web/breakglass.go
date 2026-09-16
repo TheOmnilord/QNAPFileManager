@@ -150,7 +150,10 @@ type breakGlassDoor struct {
 // config, which is the fixture and dev-loop case. It must be called before the
 // server serves anything.
 func (s *Server) EnableBreakGlass(configPath string) {
-	cred := &localCred{path: configPath, pinned: s.cfg.Auth.Local}
+	// s.Dev is carried into the reload, not only into the settings route: a
+	// daemon started with -dev must go on being able to read the very file it
+	// started from (Astra r1 #15).
+	cred := &localCred{path: configPath, pinned: s.cfg.Auth.Local, dev: s.Dev}
 	// The cost is read from the hash that is actually IN FORCE, not from the
 	// snapshot this process started with (round-3 P3). A daemon that started
 	// with no password and armed the door later would otherwise measure the
@@ -158,7 +161,17 @@ func (s *Server) EnableBreakGlass(configPath string) {
 	// deadline to a queue four times faster than the real one — turning a
 	// correct password that waited its turn into "not accepted", which is the
 	// exact failure §5 exists to prevent.
-	live, _ := cred.get()
+	live, err := cred.get()
+	if err != nil {
+		// Not ignored (Astra r1 #15). The door still arms — the listener may be
+		// the operator's only way back in, and the credential is re-read per
+		// attempt, so a file that becomes readable again simply starts working —
+		// but a credential store that could not be read at arm time is the sort
+		// of thing an operator must find in the log rather than infer from every
+		// password being refused.
+		s.logger.Printf("break-glass: the credential could not be read at start-up (%v); the door treats it as absent until the file can be read", err)
+		live = config.Local{}
+	}
 	cost := live.LocalCost()
 	if c, err := breakglass.HashCost(live.Hash); err == nil {
 		cost = c
@@ -176,6 +189,27 @@ func (s *Server) EnableBreakGlass(configPath string) {
 		bcryptCost: cost,
 		dev:        s.Dev,
 	}
+	// The stamp moving under a live daemon is §6.2's last unaudited event: the
+	// CLI writes nothing by design, so this is the only place a rotation can be
+	// recorded at all (Astra r1 #12). Path-free and bounded, like every other
+	// break-glass detail.
+	cred.onChange = func(old, current string) {
+		s.bg.audit(nil, "breakglass-credential", "ok", "",
+			fmt.Sprintf("door=local the credential changed, stamp %s -> %s", shortStamp(old), shortStamp(current)))
+	}
+}
+
+// shortStamp bounds an `updated` stamp for an audit detail. Validation already
+// requires RFC3339, but the detail budget must not depend on validation having
+// run on the file this process happens to be reading.
+func shortStamp(s string) string {
+	if s == "" {
+		return "(none)"
+	}
+	if len(s) > 40 {
+		return s[:40] + "…"
+	}
+	return s
 }
 
 // BreakGlassGate exposes the door's bounds so a caller can inject a clock or
@@ -301,6 +335,29 @@ func (w *bgRefusal) Flush() {
 	}
 }
 
+// markBodyUnconsumed tells the refusal wrapper that this request's declared
+// body was NOT read to its end, whatever the status about to be written says
+// (Astra r1 #8). A drain that timed out leaves exactly that state, and the
+// tracker would normally have noticed on its own — the EOF that clears the flag
+// never arrived — but a handler that knows it gave up should say so rather than
+// depend on the absence of an EOF further down a wrapper chain. On the main
+// listener there is no wrapper and this is a no-op.
+func markBodyUnconsumed(w http.ResponseWriter) {
+	for w != nil {
+		if bg, ok := w.(*bgRefusal); ok {
+			if bg.st != nil {
+				bg.st.unconsumed = true
+			}
+			return
+		}
+		u, ok := w.(interface{ Unwrap() http.ResponseWriter })
+		if !ok {
+			return
+		}
+		w = u.Unwrap()
+	}
+}
+
 // Unwrap is how http.ResponseController reaches the real ResponseWriter, and so
 // the connection underneath it. Without it every SetReadDeadline on this
 // listener — the login body read included — answers ErrNotSupported and does
@@ -317,6 +374,18 @@ func (w *bgRefusal) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 type localCred struct {
 	path   string
 	pinned config.Local // used when path is empty (fixtures, the dev loop)
+	// dev carries `serve -dev` into the RELOAD (Astra r1 #15). Reloading with
+	// production validation meant a daemon started on a development config —
+	// auth.mode "local" or "both", which Validate refuses outside -dev — could
+	// never read its own credential again: every login after the first reload
+	// failed closed on a file the daemon itself had started from.
+	dev bool
+	// onChange is called once when a reload observes a different `updated`
+	// stamp than the one previously cached. The door turns it into the
+	// milestone contract §6.2 asks for: the CLI writes nothing by design, so
+	// without this a rotation under a live daemon left no record at all
+	// (Astra r1 #12).
+	onChange func(old, current string)
 
 	mu      sync.Mutex
 	have    bool
@@ -330,29 +399,44 @@ type localCred struct {
 // last successfully read `updated` stamp is kept so a transient unreadable
 // config cannot evict the live session of an operator who is mid-repair.
 func (c *localCred) get() (config.Local, error) {
+	local, changed, old, err := c.load()
+	// Reported outside the lock: the callback writes an audit line, and a
+	// durable write must not be held under the credential mutex.
+	if changed && c.onChange != nil {
+		c.onChange(old, local.Updated)
+	}
+	return local, err
+}
+
+func (c *localCred) load() (local config.Local, changed bool, old string, err error) {
 	if c.path == "" {
-		return c.pinned, nil
+		return c.pinned, false, "", nil
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	fi, err := os.Stat(c.path)
-	if err != nil {
-		if os.IsNotExist(err) && !c.have {
+	fi, statErr := os.Stat(c.path)
+	if statErr != nil {
+		if os.IsNotExist(statErr) && !c.have {
 			// No config file at all is the first-run state, not a failure: there
 			// is simply no password, and the listener will not have bound.
-			return config.Local{}, nil
+			return config.Local{}, false, "", nil
 		}
-		return config.Local{Updated: c.current.Updated}, err
+		return config.Local{Updated: c.current.Updated}, false, "", statErr
 	}
 	if c.have && fi.ModTime().Equal(c.mod) && fi.Size() == c.size {
-		return c.current, nil
+		return c.current, false, "", nil
 	}
-	loaded, err := config.Load(c.path)
-	if err != nil {
-		return config.Local{Updated: c.current.Updated}, err
+	loaded, loadErr := config.LoadDev(c.path, c.dev)
+	if loadErr != nil {
+		return config.Local{Updated: c.current.Updated}, false, "", loadErr
 	}
+	// Only a STAMP that moved is a change worth reporting; a config rewritten
+	// for some other key (the read-only toggle) touches mtime and size without
+	// touching the credential.
+	changed = c.have && c.current.Updated != loaded.Auth.Local.Updated
+	old = c.current.Updated
 	c.have, c.mod, c.size, c.current = true, fi.ModTime(), fi.Size(), loaded.Auth.Local
-	return c.current, nil
+	return c.current, changed, old, nil
 }
 
 // --- the listener's own pre-dispatch ----------------------------------------
@@ -401,7 +485,16 @@ func (s *Server) breakGlassAuth(w http.ResponseWriter, r *http.Request) (*sessio
 			return nil, false
 		}
 		if !safeMethod(r.Method) && isMutationRoute(r.URL.Path) {
-			s.auditUnauthenticated(r, "unauthorized", "no valid session on a mutation route")
+			// Through the bounded refusal accounting, not straight to
+			// auditUnauthenticated (Astra r1 #3). On the MAIN listener that call
+			// is fine: it sits behind the QTS proxy and a caller must already be
+			// on the NAS. Here it was reachable by any LAN host with a
+			// cookie-less POST, and each one forced a synchronous durable write
+			// plus a QuLog milestone — the same unbounded write amplifier the
+			// login route's throttle was built to close, re-opened on every
+			// mutation route beside it. One line per source per window, with the
+			// suppressed count carried into the next one.
+			s.bg.noteUnauthenticated(r)
 		}
 		s.fail(w, r, "unauthorized", "Sign in with the emergency password to continue.", "", "")
 		return nil, false
@@ -437,17 +530,17 @@ func (d *breakGlassDoor) resolve(w http.ResponseWriter, r *http.Request) *sessio
 	reason := ""
 	switch {
 	case !now.Before(sess.issued.Add(bgLifetime)):
-		reason = "absolute lifetime reached"
+		reason = bgRemovalLifetime
 	case !now.Before(sess.seen.Add(bgIdle)):
-		reason = "idle timeout"
+		reason = bgRemovalIdle
 	case credErr == nil && sess.updated != live.Updated:
-		reason = "the break-glass password changed"
+		reason = bgRemovalPassword
 	}
 	if reason != "" {
-		d.removeLocked(sess)
+		note := d.removeLocked(sess, reason)
 		d.mu.Unlock()
 		d.clearCookie(w)
-		d.audit(r, "breakglass-session", "denied", "session_expired", fmt.Sprintf("door=local ip=%s destroyed: %s", peerHost(r), reason))
+		d.auditRemoval(r, note)
 		return nil
 	}
 	sess.seen = now
@@ -455,6 +548,15 @@ func (d *breakGlassDoor) resolve(w http.ResponseWriter, r *http.Request) *sessio
 	d.mu.Unlock()
 	d.setCookie(w, sess.id, int(bgIdle.Seconds()))
 	return snap
+}
+
+// logf writes to the app log, tolerating a door built without a server (the
+// doorTimeout fixtures hold nothing else).
+func (d *breakGlassDoor) logf(format string, args ...any) {
+	if d.srv == nil || d.srv.logger == nil {
+		return
+	}
+	d.srv.logger.Printf(format, args...)
 }
 
 func (d *breakGlassDoor) now() time.Time {
@@ -476,15 +578,55 @@ func (d *breakGlassDoor) setCookie(w http.ResponseWriter, value string, age int)
 
 func (d *breakGlassDoor) clearCookie(w http.ResponseWriter) { d.setCookie(w, "", -1) }
 
-func (d *breakGlassDoor) removeLocked(sess *bgSession) {
+// Why a session went away. The vocabulary is fixed and small so the audit
+// detail stays bounded (contract §6.3).
+const (
+	bgRemovalLogout   = "logout"
+	bgRemovalExpired  = "expired"
+	bgRemovalEvicted  = "evicted"
+	bgRemovalLifetime = "absolute lifetime reached"
+	bgRemovalIdle     = "idle timeout"
+	bgRemovalPassword = "the break-glass password changed"
+)
+
+// removeLocked deletes one session and returns the reason the caller must audit
+// once it has released the lock. It returns "" when there was nothing to remove.
+//
+// EVERY removal is audited with its reason (Astra r1 #13). Three of them used to
+// be silent — the shared /api/logout, and the expiry and capacity eviction
+// inside issue — so an emergency session could simply stop existing with no
+// trace of when or why, which is the one question the trail exists to answer.
+// The write happens after the unlock because the auditor's WriteSync can block
+// on a durable writer, and the session map must not be held across that.
+func (d *breakGlassDoor) removeLocked(sess *bgSession, reason string) string {
 	if sess == nil {
-		return
+		return ""
 	}
 	delete(d.sessions, sess.id)
 	if sess.order != nil {
 		d.order.Remove(sess.order)
 		sess.order = nil
 	}
+	return reason
+}
+
+// auditRemoval writes the one line a removal earns. The expiry reasons are
+// denials — a request was refused because of them — while a logout or an
+// eviction is ordinary lifecycle.
+func (d *breakGlassDoor) auditRemoval(r *http.Request, reason string) {
+	if reason == "" {
+		return
+	}
+	result, code := "ok", ""
+	switch reason {
+	case bgRemovalLifetime, bgRemovalIdle, bgRemovalPassword, bgRemovalExpired:
+		result, code = "denied", "session_expired"
+	}
+	ip := ""
+	if r != nil {
+		ip = peerHost(r)
+	}
+	d.audit(r, "breakglass-session", result, code, fmt.Sprintf("door=local ip=%s session destroyed: %s", ip, reason))
 }
 
 // --- login and logout --------------------------------------------------------
@@ -559,11 +701,11 @@ func (d *breakGlassDoor) login(w http.ResponseWriter, r *http.Request) {
 		// Not a credential verdict, so it must not advance the lockout ladder
 		// (round-1 P2-7): five malformed bodies would otherwise reach the
 		// 1800 s cap and lock the operator out with no password ever tried.
-		d.fail(ctx, w, r, start, ip, "malformed body", false)
+		d.fail(ctx, w, r, start, ip, "malformed body", nil)
 		return
 	}
 	if len(req.Password) > breakglass.MaxPasswordBytes {
-		d.fail(ctx, w, r, start, ip, "oversized password", false)
+		d.fail(ctx, w, r, start, ip, "oversized password", nil)
 		return
 	}
 
@@ -575,27 +717,40 @@ func (d *breakGlassDoor) login(w http.ResponseWriter, r *http.Request) {
 	// Released on every return path, including the context ending under us.
 	defer release()
 
-	locked, retry, left := d.gate.Locked()
-	if left {
-		// Exactly one "lockout left" milestone per lockout: the call that
-		// observes the expiry is the one that clears it.
-		d.audit(r, "breakglass-lockout", "ok", "", fmt.Sprintf("door=local ip=%s lockout ended", ip))
-	}
-	if locked {
-		// The body never reveals whether the password offered was right.
-		d.reject(ctx, w, r, start, http.StatusTooManyRequests, "locked_out", "Too many failed attempts. Try again later.", retry, fmt.Sprintf("locked, %ds remaining", int(retry.Seconds())))
-		return
-	}
-
-	cred, credErr := d.cred.get()
-	if credErr != nil {
-		d.srv.logger.Printf("break-glass: the credential could not be read: %v", credErr)
-	}
-	var verifyErr error
-	if err := d.gate.Verify(ctx, func() error {
+	// The lockout verdict, the compare and the outcome are ONE serialised step
+	// inside the gate (Astra r1 #7). Reading the verdict before queueing and
+	// committing the outcome after releasing let four queued attempts act on the
+	// same stale answer: they skipped rungs of the ladder, and a correct
+	// password queued behind the failure that entered a lockout was accepted
+	// during that lockout. The credential is read inside the turn too, so a
+	// locked source costs this process no file I/O at all.
+	var cred config.Local
+	var credErr, verifyErr error
+	verdict, err := d.gate.Verify(ctx, ip, func() breakglass.Outcome {
+		cred, credErr = d.cred.get()
+		if credErr != nil {
+			// Our failure, not the caller's: fail closed, but never let an
+			// unreadable config file walk anyone up the ladder.
+			return breakglass.OutcomeNeutral
+		}
 		verifyErr = breakglass.Verify(cred.Hash, req.Password)
-		return nil
-	}); err != nil {
+		switch {
+		case verifyErr == nil:
+			return breakglass.OutcomeSucceeded
+		case errors.Is(verifyErr, breakglass.ErrNoPassword):
+			// "No password configured" deliberately does not advance the ladder
+			// (round-2 P2-2): after `break-glass disable` on a running daemon
+			// the listener stays bound, so a peer could walk five attempts up to
+			// the 1800 s cap and then be refused by a lockout at the exact
+			// moment the operator was trying to get back in. The answer and the
+			// latency are identical either way, so nothing is disclosed.
+			return breakglass.OutcomeNeutral
+		default:
+			// A wrong password is the ONLY thing that advances the ladder.
+			return breakglass.OutcomeFailed
+		}
+	})
+	if err != nil {
 		// Never verified: the caller waited behind other verifications until the
 		// door's deadline, or went away. Answering "that password was not
 		// accepted" would be a lie about a password nothing ever looked at — and
@@ -605,32 +760,33 @@ func (d *breakGlassDoor) login(w http.ResponseWriter, r *http.Request) {
 		d.reject(ctx, w, r, start, http.StatusTooManyRequests, "rate_limited", "The emergency door is busy. Try again in a moment.", 2*time.Second, "queue wait expired before verification")
 		return
 	}
+	if verdict.Left {
+		// Exactly one "lockout left" milestone per lockout: the turn that
+		// observes the expiry is the one that cleared it.
+		d.audit(r, "breakglass-lockout", "ok", "", fmt.Sprintf("door=local ip=%s source lockout ended", ip))
+	}
+	if verdict.Locked {
+		// The body never reveals whether the password offered was right.
+		d.reject(ctx, w, r, start, http.StatusTooManyRequests, "locked_out", "Too many failed attempts. Try again later.", verdict.RetryAfter, fmt.Sprintf("source locked, %ds remaining", int(verdict.RetryAfter.Seconds())))
+		return
+	}
 	if credErr != nil {
-		// Our failure, not the caller's: fail closed, but do not let an
-		// unreadable config file walk the operator up the lockout ladder.
-		d.fail(ctx, w, r, start, ip, "credential unreadable", false)
+		d.logf("break-glass: the credential could not be read: %v", credErr)
+		d.fail(ctx, w, r, start, ip, "credential unreadable", nil)
 		return
 	}
 	if verifyErr != nil {
-		// A wrong password is the ONLY thing that advances the ladder.
-		//
-		// "No password configured" deliberately does not (round-2 P2-2): after
-		// `break-glass disable` on a running daemon the listener stays bound,
-		// so any LAN host could walk five attempts up to the 1800 s cap — and
-		// the operator's fresh set-password would then be refused by a lockout
-		// they never caused, at the exact moment they were trying to get back
-		// in. The answer and the latency are identical either way, so nothing
-		// is disclosed by the distinction.
-		cause, advance := "wrong password", true
+		// Only the wrong-password verdict carries the ladder report; "no
+		// password configured" is a refusal like any other and is throttled.
+		cause, reported := "wrong password", &verdict
 		if errors.Is(verifyErr, breakglass.ErrNoPassword) {
-			cause, advance = "no password configured", false
+			cause, reported = "no password configured", nil
 		}
-		d.fail(ctx, w, r, start, ip, cause, advance)
+		d.fail(ctx, w, r, start, ip, cause, reported)
 		return
 	}
 
-	d.gate.Succeeded()
-	sess, err := d.issue(cred)
+	sess, err := d.issue(r, cred)
 	if err != nil {
 		d.audit(r, "breakglass-login", "error", "internal", fmt.Sprintf("door=local ip=%s %v", ip, err))
 		writeError(w, http.StatusServiceUnavailable, "session_store_full", "Emergency sessions are full. Try again shortly.", "", r.URL.Path, "")
@@ -717,15 +873,17 @@ func (d *breakGlassDoor) logout(w http.ResponseWriter, r *http.Request) {
 		writeError(w, statusCode("permission"), "permission", "The request could not be verified. Refresh and try again.", "", r.URL.Path, "")
 		return
 	}
-	d.removeLocked(sess)
+	note := d.removeLocked(sess, bgRemovalLogout)
 	d.mu.Unlock()
-	d.audit(r, "breakglass-session", "ok", "", fmt.Sprintf("door=local ip=%s session destroyed", peerHost(r)))
+	d.auditRemoval(r, note)
 	d.clearCookie(w)
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// issue creates a session, evicting the oldest when the cap is reached.
-func (d *breakGlassDoor) issue(cred config.Local) (*bgSession, error) {
+// issue creates a session, evicting the oldest when the cap is reached. Every
+// session it removes on the way is audited with its reason, after the lock is
+// released (Astra r1 #13).
+func (d *breakGlassDoor) issue(r *http.Request, cred config.Local) (*bgSession, error) {
 	now := d.now()
 	sess := &bgSession{
 		id: rand.Text(), csrf: rand.Text(), issued: now, seen: now, updated: cred.Updated,
@@ -734,8 +892,10 @@ func (d *breakGlassDoor) issue(cred config.Local) (*bgSession, error) {
 		// resolvable by idmap: it exists to be legible in the audit trail.
 		who: backend.Principal{User: "break-glass", UID: 0, GID: 0, Groups: []int{0}, Root: true},
 	}
+	// Collected under the lock, emitted after it: an audit write can block on a
+	// durable writer, and the session map must not be held across one.
+	var removed []string
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	if d.sessions == nil {
 		d.sessions = make(map[string]*bgSession)
 	}
@@ -743,27 +903,41 @@ func (d *breakGlassDoor) issue(cred config.Local) (*bgSession, error) {
 	// operator the one they are about to need.
 	for _, old := range d.sessions {
 		if !now.Before(old.issued.Add(bgLifetime)) || !now.Before(old.seen.Add(bgIdle)) {
-			d.removeLocked(old)
+			removed = append(removed, d.removeLocked(old, bgRemovalExpired))
 		}
 	}
+	full := false
 	for len(d.sessions) >= bgMaxSessions {
 		front := d.order.Front()
 		if front == nil {
-			return nil, errors.New("the break-glass session store is full")
+			full = true
+			break
 		}
-		d.removeLocked(front.Value.(*bgSession))
+		removed = append(removed, d.removeLocked(front.Value.(*bgSession), bgRemovalEvicted))
 	}
-	sess.order = d.order.PushBack(sess)
-	d.sessions[sess.id] = sess
+	if !full {
+		sess.order = d.order.PushBack(sess)
+		d.sessions[sess.id] = sess
+	}
+	d.mu.Unlock()
+	for _, reason := range removed {
+		d.auditRemoval(r, reason)
+	}
+	if full {
+		return nil, errors.New("the break-glass session store is full")
+	}
 	return sess, nil
 }
 
 // destroy removes one session by id; it is what the shared /api/logout route
-// calls for a break-glass session.
-func (d *breakGlassDoor) destroy(id string) {
+// calls for a break-glass session. It audits the removal, which that route did
+// not (Astra r1 #13): only /api/breakglass/logout ever did, so an operator who
+// signed out through the shared route left no record of it at all.
+func (d *breakGlassDoor) destroy(r *http.Request, id string) {
 	d.mu.Lock()
-	d.removeLocked(d.sessions[id])
+	note := d.removeLocked(d.sessions[id], bgRemovalLogout)
 	d.mu.Unlock()
+	d.auditRemoval(r, note)
 }
 
 // doorTimeout is how long a login or logout request may take: the floor, or the
@@ -793,25 +967,26 @@ func (d *breakGlassDoor) Sessions() int {
 // status, one minimum latency, whatever the cause. The cause is recorded (a
 // forced milestone) and never disclosed.
 //
-// advance says whether this was a CREDENTIAL VERDICT — a password was offered
-// and the stored hash rejected it. Only those walk the lockout ladder. A
-// malformed body, an oversized field, a request abandoned while queued or a
-// config file we could not read are our problem or a broken client's, and
-// letting five of them reach the 1800 s cap would hand any LAN host a way to
-// shut the emergency door without ever guessing a password (round-1 P2-7).
-// Every path keeps the uniform body, the uniform latency and the per-IP bucket
-// charge it has already paid.
-func (d *breakGlassDoor) fail(ctx context.Context, w http.ResponseWriter, r *http.Request, start time.Time, ip, cause string, advance bool) {
+// verdict is non-nil when this attempt took a verification turn — a password
+// was offered and the turn reached a conclusion about it. The ladder has
+// already been walked (or not) inside that turn (Astra r1 #7); what is left
+// here is reporting it. A nil verdict is a refusal that never reached a
+// credential at all: a malformed body, an oversized field, a config file we
+// could not read. Those are our problem or a broken client's, and letting five
+// of them reach the 1800 s cap would hand a peer a way to shut its own
+// emergency door without ever guessing a password (round-1 P2-7). Every path
+// keeps the uniform body, the uniform latency and the per-IP bucket charge it
+// has already paid.
+func (d *breakGlassDoor) fail(ctx context.Context, w http.ResponseWriter, r *http.Request, start time.Time, ip, cause string, verdict *breakglass.Verdict) {
 	detail := fmt.Sprintf("door=local ip=%s %s", ip, cause)
-	if advance {
-		_, retry, entered := d.gate.Failed()
-		detail = fmt.Sprintf("%s, %d consecutive", detail, d.gate.Failures())
+	if verdict != nil {
+		detail = fmt.Sprintf("%s, %d consecutive", detail, verdict.Failures)
 		// The denial is recorded BEFORE the response is written (contract
 		// §16.5): an attacker who disconnects on seeing the status must not be
 		// able to discard the record of the attempt.
 		d.audit(r, "breakglass-login", "denied", "auth_failed", detail)
-		if entered {
-			d.audit(r, "breakglass-lockout", "denied", "locked_out", fmt.Sprintf("door=local ip=%s lockout %d failures, %ds", ip, d.gate.Failures(), int(retry.Seconds())))
+		if verdict.Entered {
+			d.audit(r, "breakglass-lockout", "denied", "locked_out", fmt.Sprintf("door=local ip=%s source lockout: %d failures, %ds", ip, verdict.Failures, int(verdict.RetryAfter.Seconds())))
 		}
 	} else {
 		// Recorded, but throttled the same way a refusal is: a client looping on
@@ -859,9 +1034,35 @@ type refusalState struct {
 }
 
 // noteRefusal writes at most one audit line per source per refusalWindow and
-// counts the rest. The tracking table is bounded exactly as the source bucket
-// is: a spray from forged sources can neither grow memory nor buy extra lines.
+// counts the rest, in the door's own event shape.
 func (d *breakGlassDoor) noteRefusal(r *http.Request, ip, op, code, detail string) {
+	d.noteRefusalEvent(r, ip, detail, func(detail string) {
+		d.audit(r, op, "denied", code, detail)
+	})
+}
+
+// noteUnauthenticated is the same throttle over a SESSIONLESS denial (Astra r1
+// #3). It cannot reuse d.audit: that event names the break-glass account as a
+// root administrator actor, and a request that never authenticated has no
+// actor at all. The listener's door is what is known, and that is exactly what
+// auditUnauthenticated already records.
+func (d *breakGlassDoor) noteUnauthenticated(r *http.Request) {
+	if d == nil || d.srv == nil {
+		return
+	}
+	ip := peerHost(r)
+	d.noteRefusalEvent(r, ip, "no valid session on a mutation route", func(detail string) {
+		d.srv.auditUnauthenticated(r, "unauthorized", detail)
+	})
+}
+
+// noteRefusalEvent is the throttle itself: at most one line per source per
+// refusalWindow, the rest counted and carried into the next one. The tracking
+// table is bounded exactly as the source bucket is, so a spray from many
+// sources can neither grow memory nor buy extra lines. write builds the line —
+// a login refusal and a sessionless mutation denial are different events and
+// must not be made to look alike.
+func (d *breakGlassDoor) noteRefusalEvent(r *http.Request, ip, detail string, write func(detail string)) {
 	now := d.now()
 	d.mu.Lock()
 	if d.refusals == nil {
@@ -921,7 +1122,7 @@ func (d *breakGlassDoor) noteRefusal(r *http.Request, ip, op, code, detail strin
 	if carried > 0 {
 		detail = fmt.Sprintf("%s (%d further refusals suppressed in the previous window)", detail, carried)
 	}
-	d.audit(r, op, "denied", code, detail)
+	write(detail)
 }
 
 // flushRefusals writes the one summary line a source earns when it comes back

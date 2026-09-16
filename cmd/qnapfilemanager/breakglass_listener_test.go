@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -154,6 +155,58 @@ func TestBreakGlassListenerTimeoutsAndProtocols(t *testing.T) {
 	}
 }
 
+// Astra r1 #2: NextProtos alone does not decline HTTP/2. ServeTLS APPENDS "h2"
+// to it while HTTP/2 is still enabled on the server, so a client offering only
+// h2 negotiated it — and the previous test asserted the CONFIG rather than a
+// handshake, which is exactly how that went unnoticed. This one dials.
+func TestTheBreakGlassListenerRefusesHTTP2OnTheWire(t *testing.T) {
+	hash, err := breakglass.Hash("a long enough password", breakglass.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, _, _, _ := armFixture(t, func(c *config.Config) {
+		c.Auth.Local = config.Local{Hash: hash, Cost: breakglass.MinCost, Updated: "2026-09-13T12:00:00Z"}
+	})
+	srv.bgAddr = "127.0.0.1:0"
+	httpSrv, ln, err := srv.listenBreakGlass()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A handler is not needed: ALPN is settled during the handshake.
+	httpSrv.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})
+	go func() { _ = httpSrv.ServeTLS(ln, "", "") }()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = httpSrv.Shutdown(ctx)
+	})
+	addr := ln.Addr().String()
+
+	// A client offering ONLY h2 must not come away speaking it. Either the
+	// handshake fails outright (no_application_protocol) or it succeeds with no
+	// protocol negotiated; what must never happen is "h2".
+	conn, err := tls.Dial("tcp", addr, &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h2"}})
+	if err == nil {
+		got := conn.ConnectionState().NegotiatedProtocol
+		conn.Close()
+		if got == "h2" {
+			t.Fatalf("the listener negotiated HTTP/2; every streaming, admission and deadline argument in M2-C was reasoned over HTTP/1.1")
+		}
+	} else if !strings.Contains(err.Error(), "no application protocol") && !strings.Contains(err.Error(), "alert") {
+		t.Fatalf("the h2-only dial failed for an unexpected reason: %v", err)
+	}
+
+	// And http/1.1 still works, because refusing h2 must not refuse everything.
+	ok, err := tls.Dial("tcp", addr, &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"http/1.1"}})
+	if err != nil {
+		t.Fatalf("an http/1.1 client could not reach the emergency door: %v", err)
+	}
+	defer ok.Close()
+	if got := ok.ConnectionState().NegotiatedProtocol; got != "http/1.1" {
+		t.Fatalf("negotiated %q, want http/1.1", got)
+	}
+}
+
 // -dev never opens a LAN port (contract §15): the address is FORCED to
 // loopback, not merely validated, so a development run may ask for the
 // production default and simply not get it.
@@ -188,6 +241,44 @@ func TestDevForcesTheBreakGlassAddressToLoopback(t *testing.T) {
 				t.Fatalf("-dev left the break-glass address at %q, want %q", got.Web.BreakGlass.Addr, c.want)
 			}
 		})
+	}
+}
+
+// Astra r1 #9: an explicitly configured key location that is not root's alone
+// stops the listener binding, and says why. The daemon still starts — the main
+// listener and the QTS door are unaffected — because a daemon that refuses to
+// start at all is a worse outcome than one whose emergency door is off.
+func TestAWritableKeyDirectoryStopsTheListenerBinding(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("directory ownership and POSIX modes are a Linux question (contract §15)")
+	}
+	loose := filepath.Join(t.TempDir(), "loose")
+	if err := os.Mkdir(loose, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(loose, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	hash, err := breakglass.Hash("a long enough password", breakglass.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, _, _, logged := armFixture(t, func(c *config.Config) {
+		c.Auth.Local = config.Local{Hash: hash, Cost: breakglass.MinCost, Updated: "2026-09-13T12:00:00Z"}
+		c.Web.BreakGlass.KeyFile = filepath.Join(loose, "breakglass-key.pem")
+		c.Web.BreakGlass.CertFile = filepath.Join(loose, "breakglass-cert.pem")
+	})
+	if srv.bgHandler != nil || srv.bgCert != nil || srv.bgAddr != "" {
+		t.Fatalf("the listener armed over a world-writable key directory: %+v", srv)
+	}
+	out := logged.String()
+	if !strings.Contains(out, "will not bind") || !strings.Contains(out, "writable") {
+		t.Fatalf("the log must say why the door is off:\n%s", out)
+	}
+	// Nothing was generated into it either: a key written there is a key
+	// somebody else can replace.
+	if _, err := os.Stat(filepath.Join(loose, "breakglass-key.pem")); err == nil {
+		t.Fatal("a key was generated into a world-writable directory")
 	}
 }
 
@@ -260,6 +351,69 @@ func TestTheListenerBindsWhenAPasswordAppears(t *testing.T) {
 	if srv.bgPending {
 		t.Fatal("the daemon is still waiting for a password it already found")
 	}
+}
+
+// Astra r1 #5: the late-bind path re-reads the config FROM DISK, so start-up's
+// forcing has to run again. Without it, a -dev daemon that binds late — which is
+// the documented first run, where the password is set after the daemon is
+// already up — took the file's own 0.0.0.0 default and opened a LAN port on a
+// development box, which contract §15 says never happens.
+func TestTheLateBindPathReappliesTheDevLoopbackForcing(t *testing.T) {
+	srv, _, configPath, _ := armFixture(t, func(c *config.Config) {
+		c.Web.BreakGlass.Addr = "0.0.0.0:8771" // the production default, on disk
+	})
+	srv.dev = true
+	old := breakGlassWatchInterval
+	breakGlassWatchInterval = 5 * time.Millisecond
+	t.Cleanup(func() { breakGlassWatchInterval = old })
+
+	// The arm seam reports the address the watcher decided to arm with, without
+	// binding anything.
+	armed := make(chan string, 1)
+	realArm := armBreakGlassFn
+	t.Cleanup(func() { armBreakGlassFn = realArm })
+	armBreakGlassFn = func(s *server, f *web.Server, cfg config.Config, path string, lg *log.Logger) error {
+		select {
+		case armed <- cfg.Web.BreakGlass.Addr:
+		default:
+		}
+		// Nothing is generated or bound: the address is the whole assertion.
+		return nil
+	}
+
+	hash, err := breakglass.Hash("a long enough password", breakglass.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := config.Update(configPath, false, func(c *config.Config) error {
+		c.Auth.Local.Hash = hash
+		c.Auth.Local.Cost = breakglass.MinCost
+		c.Auth.Local.Updated = "2026-09-14T09:00:00Z"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	frontend := web.New(srv.cfg, nil, nil, nil, nil, nil, "test", srv.logger, nil, nil, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		srv.watchForCredential(ctx, frontend, configPath, func(*http.Server, net.Listener) {
+			t.Error("nothing should bind: the arm seam left bgHandler nil")
+		})
+	}()
+	select {
+	case addr := <-armed:
+		if addr != "127.0.0.1:8771" {
+			t.Fatalf("the late bind armed %q; a -dev run must never open a LAN port", addr)
+		}
+	case <-ctx.Done():
+		t.Fatal("the watcher never armed")
+	}
+	cancel()
+	<-done
 }
 
 // The watcher stops with the daemon rather than outliving it.

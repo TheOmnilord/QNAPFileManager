@@ -16,7 +16,8 @@
 //   capability (uid/gid arithmetic, perm.capsFor)
 //                        a PREDICTION — INV-2
 //   guard      (protected path class)
-//                        certain, and the server's own words
+//                        certain, and the server's own words — and it is asked
+//                        only of the MUTATING actions (Astra r1 #6)
 //
 // The contract ranks the causes in that order for REPORTING, and separately
 // settles (§7.2) that a control whose only reason is `capability` stays
@@ -126,7 +127,14 @@ export function reasonsFor(action, ctx = {}) {
   ? capsSentence(ctx.session, ctx.entry, ctx.caps)
   : spec.capability && ctx.entry ? capsSentence(ctx.session, ctx.entry, null) : '';
  if (caps) out.push({cause: 'capability', sentence: caps});
- if (ctx.guard?.denied) out.push({cause: 'guard', sentence: ctx.guard.reason || GUARD_SENTENCE});
+ // The guard cause applies to MUTATING actions only (Astra r1 #6). A guard
+ // denial is a refusal to CHANGE a protected region, never a refusal to look at
+ // one: applying it to every row of the table disabled View, Download,
+ // Properties and Search under /etc — taking away exactly the repair operations
+ // an administrator opens this app to perform. Reads are the server's own call:
+ // it answers 403 protected itself where it must (browse.go guardRead), and a
+ // UI that greys the button first only hides that verdict behind a guess.
+ if (spec.mutating && ctx.guard?.denied) out.push({cause: 'guard', sentence: ctx.guard.reason || GUARD_SENTENCE});
  return out;
 }
 

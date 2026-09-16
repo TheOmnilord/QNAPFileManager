@@ -134,6 +134,22 @@ test('Rename targets the selected entry, not a focused-but-unselected one (round
  assert.equal(get('#btnRename').disabled,true,'Rename disabled: it must not target the focused-but-unselected row');
 });
 
+// The reads are what an administrator came for. Under /etc — which browse.go
+// classes 'protected' lexically, along with /usr, /var and /root — View,
+// Download, Properties and Search were all greyed out, because the display class
+// was being fed into the reason table as a guard denial and the guard cause was
+// applied to every action (Astra r1 #6).
+test('a protected folder does not grey out the READ actions', () => {
+ const rows=setup(3);
+ update({session:{family:'test',canWrite:true},dirClass:'protected'});
+ rows[1].listeners.click({}); // one plain file selected and focused
+ refreshToolbar();
+ for (const id of ['#btnDownload','#btnView','#btnProps']) {
+  assert.equal(get(id).disabled,false,`${id} must stay usable inside a protected region`);
+ }
+ update({dirClass:''});
+});
+
 test('an empty folder offers New folder only where the table allows it (round 2, finding 2)', () => {
  setup(0);
  update({session:{family:'test',canWrite:true},dirClass:''});
@@ -141,15 +157,19 @@ test('an empty folder offers New folder only where the table allows it (round 2,
  assert.equal(normal.state,'folder-empty');
  assert.deepEqual(normal.action,{id:'btnMkdir',label:'New folder'});
  assert.equal(get('#listEmptyAction').hidden,false);
- // A protected folder is a guard denial: the offer is withdrawn rather than
- // forwarding to a button the server would answer 403 to.
+ // The display class is NOT a guard verdict (Astra r1 #6). browse.go's `class`
+ // is lexical — "Display hints only", covering everything under /etc, /usr,
+ // /var and /root — and reading it as a denial took New folder away from an
+ // administrator standing in the directory they signed in to repair. The badge
+ // and the path notice still say "protected"; the offer stands, and the server
+ // refuses in its own words if it must.
  update({dirClass:'protected'});
  const guarded = paintEmpty();
  assert.equal(guarded.state,'folder-empty');
- assert.equal(guarded.action,null);
- assert.equal(get('#listEmptyAction').hidden,true);
- assert.equal(get('#listEmptyText').textContent,'This folder is empty.','the sentence is unchanged; only the offer goes');
- // 'warn' is not a denial — the server still decides there.
+ assert.deepEqual(guarded.action,{id:'btnMkdir',label:'New folder'});
+ assert.equal(get('#listEmptyAction').hidden,false);
+ assert.equal(get('#listEmptyText').textContent,'This folder is empty.','the sentence is unchanged either way');
+ // 'warn' is not a denial either — the server still decides there.
  update({dirClass:'warn'});
  assert.deepEqual(paintEmpty().action,{id:'btnMkdir',label:'New folder'});
  // Read-only withdraws it too, through the same table.

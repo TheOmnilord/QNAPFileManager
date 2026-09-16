@@ -450,6 +450,158 @@ func TestSetPasswordPreparesTheCertificate(t *testing.T) {
 	}
 }
 
+// Astra r1 #16: set-password must never be the thing that RENEWS a certificate.
+// It called Ensure, which regenerates inside the 30-day window — so an operator
+// setting a password on a unit whose certificate happened to be expiring got a
+// new fingerprint printed, with instructions to compare it in the browser,
+// while the running daemon went on serving the old pair. They then compare two
+// different fingerprints and conclude, by every rule the documentation gave
+// them, that they are being intercepted.
+func TestSetPasswordDoesNotRenewAnExpiringCertificate(t *testing.T) {
+	p := newConfig(t)
+	certFile, keyFile := config.Default().BreakGlassFiles(p)
+	// A certificate that expires tomorrow: deep inside the renewal window.
+	expiring, err := breakglass.Regenerate(certFile, keyFile, time.Now().Add(-breakglass.Validity+24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, stdout, stderr := run(t, "a long enough password\n", "set-password", "-config", p, "-cost", "10", "-stdin")
+	if code != 0 {
+		t.Fatalf("set-password = %d\n%s\n%s", code, stdout, stderr)
+	}
+	loaded, err := breakglass.Load(certFile, keyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Fingerprint != expiring.Fingerprint {
+		t.Fatalf("set-password renewed the certificate: %s -> %s", expiring.Fingerprint, loaded.Fingerprint)
+	}
+	if !strings.Contains(stdout, "sha256:"+expiring.Fingerprint) {
+		t.Fatalf("set-password printed a fingerprint the daemon is not serving:\n%s", stdout)
+	}
+
+	// A TORN pair is still repaired: that is what makes the door openable again
+	// after a crash between the two renames, and it is not a renewal.
+	if err := os.Remove(keyFile); err != nil {
+		t.Fatal(err)
+	}
+	if code, out, errOut := run(t, "a long enough password\n", "set-password", "-config", p, "-cost", "10", "-stdin"); code != 0 {
+		t.Fatalf("set-password = %d\n%s\n%s", code, out, errOut)
+	}
+	repaired, err := breakglass.Load(certFile, keyFile)
+	if err != nil {
+		t.Fatalf("a torn pair was not repaired: %v", err)
+	}
+	if repaired.Fingerprint == expiring.Fingerprint {
+		t.Fatal("a missing key did not produce a new pair")
+	}
+
+	// Renewal stays with `cert -regenerate`, and its output says the running
+	// daemon keeps serving the old pair until it restarts.
+	_, regen, _ := run(t, "", "cert", "-config", p, "-regenerate")
+	if !strings.Contains(regen, "restart") || !strings.Contains(strings.ToLower(regen), "old") {
+		t.Fatalf("`cert -regenerate` must say the running app serves the OLD pair until restarted:\n%s", regen)
+	}
+}
+
+// --- Astra r1 #14: the CLI finds the config the daemon actually reads --------
+
+// The hard-coded /share/CACHEDEV1_DATA path is right on exactly one kind of
+// unit. On QuTS hero, or anywhere App Center installed to another volume, it
+// names a file that does not exist — so `status` reports "no password" while the
+// listener is armed, and `disable` cannot revoke anything. The service script
+// reads Install_Path out of qpkg.conf with getcfg; so does this.
+func TestDefaultConfigPathComesFromQpkgConf(t *testing.T) {
+	dir := t.TempDir()
+	conf := filepath.Join(dir, "qpkg.conf")
+	install := filepath.Join(dir, "Volume2", ".qpkg", "QNAPFileManager")
+	body := "[global]\nEnable = TRUE\n\n[GitBackup]\nInstall_Path = /share/CACHEDEV1_DATA/.qpkg/GitBackup\n\n" +
+		"[QNAPFileManager]\n# a comment\nEnable = TRUE\nInstall_Path = \"" + filepath.ToSlash(install) + "\"\n"
+	if err := os.WriteFile(conf, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := qpkgConfPath
+	qpkgConfPath = conf
+	t.Cleanup(func() { qpkgConfPath = old })
+
+	path, source := defaultConfigPath()
+	want := filepath.Join(install, "config", "config.json")
+	if path != want {
+		t.Fatalf("defaultConfigPath = %q, want %q", path, want)
+	}
+	if source != "qpkg.conf" {
+		t.Fatalf("source = %q, want qpkg.conf", source)
+	}
+	// The section is what selects the value: another QPKG's Install_Path must
+	// never be picked up.
+	if strings.Contains(path, "GitBackup") {
+		t.Fatalf("the wrong section was read: %q", path)
+	}
+	// And `status` says where it looked, so an operator can see it is acting on
+	// the file the daemon reads.
+	if err := os.MkdirAll(filepath.Join(install, "config"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.Save(want, config.Default()); err != nil {
+		t.Fatal(err)
+	}
+	code, stdout, stderr := run(t, "", "status")
+	if code != 0 {
+		t.Fatalf("status = %d\n%s\n%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, want) || !strings.Contains(stdout, "from qpkg.conf") {
+		t.Fatalf("status did not say which config it read:\n%s", stdout)
+	}
+}
+
+// With no qpkg.conf — a sideloaded tree, or a unit whose App Center registry is
+// part of what is broken — the executable's own installation tree answers, and
+// only when the file is really there.
+func TestDefaultConfigPathFallsBackToTheInstallationTree(t *testing.T) {
+	old := qpkgConfPath
+	qpkgConfPath = filepath.Join(t.TempDir(), "absent.conf")
+	t.Cleanup(func() { qpkgConfPath = old })
+
+	exe, err := os.Executable()
+	if err != nil {
+		t.Skip("the test binary's own path is not available")
+	}
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+	// <the test binary's directory>/config/config.json is the "(a) sibling"
+	// form; the grandparent form is the installed <install>/bin/ layout.
+	cfgDir := filepath.Join(filepath.Dir(exe), "config")
+	if err := os.MkdirAll(cfgDir, 0o700); err != nil {
+		t.Skip("the test binary's directory is not writable: " + err.Error())
+	}
+	candidate := filepath.Join(cfgDir, "config.json")
+	if _, err := os.Stat(candidate); err == nil {
+		t.Skip("something already occupies " + candidate)
+	}
+	if err := config.Save(candidate, config.Default()); err != nil {
+		t.Skip("the test binary's directory is not writable: " + err.Error())
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(cfgDir) })
+
+	path, source := defaultConfigPath()
+	if path != candidate {
+		t.Fatalf("defaultConfigPath = %q, want the executable's own tree %q", path, candidate)
+	}
+	if source != "the installation tree" {
+		t.Fatalf("source = %q", source)
+	}
+
+	// With nothing there either, the historical default is what is left — and
+	// it is named as such rather than pretended to be discovered.
+	if err := os.RemoveAll(cfgDir); err != nil {
+		t.Fatal(err)
+	}
+	if path, source := defaultConfigPath(); path != legacyConfigPath || source != "the default location" {
+		t.Fatalf("the last resort = %q (from %s), want %q", path, source, legacyConfigPath)
+	}
+}
+
 // --- round-2 P3-6: the CLI can read a -dev configuration ---------------------
 
 func TestCLIAcceptsADevConfigurationOnlyWithTheFlag(t *testing.T) {

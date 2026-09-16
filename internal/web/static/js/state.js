@@ -23,11 +23,15 @@ const listeners = new Set();
 // has no payload of its own, and it is what decides which sign-in is shown:
 // the QTS notice must never appear on the emergency listener (M4 contract §2).
 //
-// dirClass is the guard's classification of the CURRENT folder — 'protected',
-// 'warn' or '' — as the listing reported it. It is the `guard` cause of the
-// reason table (M4 contract §7.1): inside a protected region nothing may be
-// created, and an empty state that offered "New folder" there would be offering
-// a button the server answers 403 to (round 2, finding 2).
+// dirClass is the listing's DISPLAY class of the CURRENT folder — 'protected',
+// 'warn' or '' — a lexical hint from browse.go, not the guard's verdict. It
+// drives the badge and the path notice only; it is NOT the `guard` cause of the
+// reason table (Astra r1 #6: treating it as one disabled View, Download and
+// Properties under /etc, exactly where an administrator repairs things). The
+// empty state's "New folder" offer therefore stands there too, and the guard's
+// own 403 — path-free, from the server — is the answer when it refuses; round 2,
+// finding 2 (offering a button that 403s) is accepted for this class because
+// the alternative hid a working control from the one user it exists for.
 //
 // listError is why the CURRENT folder has no rows, or null. An empty list and a
 // list the kernel refused must never look the same (M4 contract §8.1), and the

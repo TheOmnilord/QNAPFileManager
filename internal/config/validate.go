@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 // ErrInvalid wraps every validation failure so a caller can tell a bad config
@@ -82,6 +84,25 @@ func (c Config) ValidateDev(dev bool) error {
 	}
 	if c.Auth.Local.Cost != 0 && (c.Auth.Local.Cost < MinLocalCost || c.Auth.Local.Cost > MaxLocalCost) {
 		add("auth.local.cost %d is outside %d-%d (0 means %d)", c.Auth.Local.Cost, MinLocalCost, MaxLocalCost, DefaultLocalCost)
+	}
+	// The HASH itself, not only the cost key beside it (Astra r1 #10). The cost
+	// that matters is the one EMBEDDED in the hash — that is what bcrypt will
+	// actually run — and nothing checked it. `hash: " "` armed a listener no
+	// password could ever pass (§2.5's "no hash, no bind" reads it as present),
+	// and an embedded cost of 31 would run for minutes per attempt on a NAS
+	// core, from an unauthenticated caller, which is the denial of service
+	// §4.2's ceiling exists to prevent.
+	if strings.TrimSpace(c.Auth.Local.Hash) != "" {
+		cost, err := bcrypt.Cost([]byte(c.Auth.Local.Hash))
+		switch {
+		case err != nil:
+			// Never echoed: this is the credential. What it is not is enough.
+			add("auth.local.hash is not a bcrypt hash (%v); it is written only by `qnapfilemanager break-glass set-password`", err)
+		case cost < MinLocalCost || cost > MaxLocalCost:
+			add("auth.local.hash carries bcrypt cost %d, outside %d-%d", cost, MinLocalCost, MaxLocalCost)
+		}
+	} else if c.Auth.Local.Hash != "" {
+		add("auth.local.hash is whitespace; use `qnapfilemanager break-glass disable` to clear it")
 	}
 	if c.Auth.Local.Updated != "" {
 		if _, err := time.Parse(time.RFC3339, c.Auth.Local.Updated); err != nil {

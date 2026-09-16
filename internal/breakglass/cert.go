@@ -79,6 +79,26 @@ var ErrPairMismatch = errors.New("breakglass: the certificate and key on disk ar
 // two renames; the lock is what stops two live writers producing that state in
 // the first place.
 func Ensure(certFile, keyFile string, now time.Time) (Cert, error) {
+	return ensure(certFile, keyFile, now, true)
+}
+
+// EnsureUsable generates a pair only when there is not a usable one already:
+// absent, unreadable, or torn between the two renames. A certificate inside its
+// renewal window is left exactly where it is.
+//
+// It exists for `break-glass set-password` (Astra r1 #16). That command called
+// Ensure, which renews — so an operator setting a password on a unit whose
+// certificate happened to be 20 days from expiry got a NEW fingerprint printed
+// with the instruction to compare it in the browser, while the running daemon
+// went on serving the old pair. The operator then compares two different
+// fingerprints and concludes, correctly by every rule the documentation gave
+// them, that they are being intercepted. Renewal belongs to the daemon's own
+// start-up and to `cert -regenerate`, both of which say a restart is involved.
+func EnsureUsable(certFile, keyFile string, now time.Time) (Cert, error) {
+	return ensure(certFile, keyFile, now, false)
+}
+
+func ensure(certFile, keyFile string, now time.Time, renew bool) (Cert, error) {
 	if certFile == "" || keyFile == "" {
 		return Cert{}, fmt.Errorf("breakglass: certificate paths are empty")
 	}
@@ -95,7 +115,7 @@ func Ensure(certFile, keyFile string, now time.Time) (Cert, error) {
 		reason = "mismatched"
 	case err != nil:
 		reason = "unreadable"
-	case !now.Add(RenewWithin).Before(loaded.NotAfter):
+	case renew && !now.Add(RenewWithin).Before(loaded.NotAfter):
 		reason = "expiring"
 	default:
 		return loaded, nil

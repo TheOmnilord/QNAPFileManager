@@ -9,8 +9,12 @@ import assert from 'node:assert/strict';
 import {test} from 'node:test';
 import {readFileSync} from 'node:fs';
 // A document double, so syncOverflow — the DOM half — can be exercised too.
+// `trace` records focus and click in the ORDER they happened, which is the whole
+// of finding #18: the click must not be dispatched before focus has somewhere
+// visible to land.
+const trace = [];
 class Node {
- constructor() { this.attrs = {}; this.children = []; this.textContent = ''; this.disabled = false; this.title = ''; this.hidden = false; this.classes = new Set(); this.listeners = {}; this.clicks = 0;
+ constructor(id = '') { this.id = id; this.attrs = {}; this.children = []; this.textContent = ''; this.disabled = false; this.title = ''; this.hidden = false; this.classes = new Set(); this.listeners = {}; this.clicks = 0; this.focuses = 0;
   this.classList = {toggle: (n, on) => on ? this.classes.add(n) : this.classes.delete(n), add: n => this.classes.add(n), remove: n => this.classes.delete(n), contains: n => this.classes.has(n)};
  }
  setAttribute(k, v) { this.attrs[k] = String(v); }
@@ -21,11 +25,11 @@ class Node {
  querySelector() { return null; }
  querySelectorAll() { return []; }
  contains() { return false; }
- click() { this.clicks++; }
- focus() {}
+ click() { this.clicks++; trace.push(`click ${this.id}`); }
+ focus() { this.focuses++; trace.push(`focus ${this.id}`); }
 }
 const nodes = new Map();
-const $ = sel => { if (!nodes.has(sel)) nodes.set(sel, new Node()); return nodes.get(sel); };
+const $ = sel => { if (!nodes.has(sel)) nodes.set(sel, new Node(sel)); return nodes.get(sel); };
 globalThis.document = {querySelector: $, createElement: () => new Node(), addEventListener() {}, activeElement: null};
 globalThis.window = {addEventListener() {}, innerWidth: 0};
 
@@ -166,6 +170,31 @@ test('a button with no description gives its menu item none to copy', () => {
  assert.ok(item);
  assert.equal(item.attrs['aria-describedby'], undefined, 'never a dangling describedby');
  assert.equal(item.textContent, 'Trash');
+});
+
+// Finding #18: below 768 px, More → New folder closed the menu — hiding the menu
+// item that had focus — and then clicked the toolbar button, which is
+// `display:none` at this width. openDialog records document.activeElement as the
+// control to return focus to, so the dialog's return target was something
+// invisible. The ⋯ button is the visible control the user pressed, and focus goes
+// there BEFORE the click, so it is what is recorded and what focus comes back to.
+test('a menu item hands focus to the ⋯ button before it presses the hidden one', () => {
+ window.innerWidth = 375;
+ const mkdir = $('#btnMkdir');
+ mkdir.textContent = 'New folder'; mkdir.disabled = false;
+ syncOverflow();
+ const more = $('#btnMore'), menu = $('#moreMenu');
+ menu.hidden = false;
+ const item = menu.children.find(child => child.attrs['data-for'] === 'btnMkdir');
+ assert.ok(item);
+ trace.length = 0;
+ const clicks = mkdir.clicks;
+ item.listeners.click();
+ assert.equal(menu.hidden, true, 'the menu still closes');
+ assert.equal(mkdir.clicks, clicks + 1, 'and the real button is still the one pressed');
+ assert.deepEqual(trace, ['focus #btnMore', 'click #btnMkdir'],
+  'focus must land on the visible ⋯ button before the dialog records its opener');
+ assert.ok(more.focuses > 0);
 });
 
 test('above the rung the menu is emptied and the ⋯ button goes away', () => {

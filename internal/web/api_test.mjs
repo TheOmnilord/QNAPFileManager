@@ -38,6 +38,39 @@ test('QTS unavailable shows a transient notice without clearing authenticated st
  assert.equal(get('#signin h2').textContent,'QTS temporarily unavailable');
 });
 
+// An answer with no body is not a failure (Astra r1 #1). The break-glass login
+// route is the one that answers 204, but the rule is stated here, over api()
+// itself, because it is api() that has to hold it: response.json() throws on an
+// empty body, and that throw was being reported as "Request failed (204)".
+test('an empty body is null on 2xx and still a failure on a refusal', async t => {
+ t.after(() => update({session:null}));
+ update({session:null});
+ const answers=[
+  ['204 with no body at all',new Response(null,{status:204}),null],
+  ['200 with a zero-length body',new Response('',{status:200}),null],
+  ['200 with whitespace, which is not JSON either',new Response('\n',{status:200}),null],
+ ];
+ for (const [what,response,want] of answers) {
+  t.mock.method(globalThis,'fetch',async () => response.clone());
+  assert.equal(await api('api/breakglass/login',{},{method:'POST'}),want,what);
+ }
+ // A failing status with nothing to quote still fails, with its status.
+ t.mock.method(globalThis,'fetch',async () => new Response(null,{status:502}));
+ await assert.rejects(api('api/fs/list'),err => {
+  assert.equal(err.message,'Request failed (502)');
+  assert.equal(err.status,502);
+  assert.equal(err.network,false,'a proxy answering 502 is not a "cannot reach the service"');
+  return true;
+ });
+ // …and a 2xx body that is not JSON at all is still the proxy case it was.
+ t.mock.method(globalThis,'fetch',async () => new Response('<html>gateway</html>',{status:200}));
+ await assert.rejects(api('api/fs/list'),err => {
+  assert.equal(err.message,'Request failed (200)');
+  assert.equal(err.network,true);
+  return true;
+ });
+});
+
 test('QTS outage bootstrap retries the same SID and honors Retry-After', async t => {
  update({session:null});
  const calls=[],delays=[];

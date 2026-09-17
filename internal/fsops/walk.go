@@ -389,7 +389,7 @@ func (w *walker) visit(ctx context.Context, it WalkItem, open dirOpener) error {
 			// is a per-item warning like any other, and the visitor is simply not
 			// told — which leaves a caller that needed the identity without one,
 			// exactly as it should.
-			if fi, serr := d.stat(); serr == nil {
+			if fi, serr := openedInfo(d); serr == nil {
 				if oerr := w.v.Opened(it, fi); oerr != nil {
 					// The visitor refused this object, before any of its entries
 					// was read. Nothing below it is visited and the walk ends.
@@ -642,6 +642,29 @@ func (w *walker) directory(ctx context.Context, parentDir *dirRef, it WalkItem, 
 	return verr
 }
 
+// openedInfo is the reading the Opened hook is handed: the fstat of the
+// descriptor that is about to be enumerated, with that descriptor's BIRTH TIME
+// attached where the filesystem records one (Astra r10 #1).
+//
+// The birth time has to be taken HERE, because here is the only place it can be
+// taken from the object rather than from a name. The hook's caller keeps the
+// reading and asks about it later — the recursive chmod compares it against the
+// directory it re-opens in post-order, after the walk has closed this descriptor
+// and after enumeration has released its own — and device and inode alone are a
+// NUMBER, which an allocator is free to hand back to the next object created at
+// that name. A stat carrying the creation time is the same reading with the one
+// fact nothing can forge in it.
+//
+// It costs one statx per directory OPENED, not per entry, and only where a
+// visitor asked for the hook at all.
+func openedInfo(d *dirRef) (os.FileInfo, error) {
+	fi, err := d.stat()
+	if err != nil {
+		return nil, err
+	}
+	return infoWithBirthTime(d.f, fi), nil
+}
+
 // openChild opens one child directory and decides, from that descriptor alone,
 // whether it is a mount boundary the walk may not cross (F4). It returns either
 // an open dirRef to descend into, or boundary = true with nothing open.
@@ -659,8 +682,7 @@ func (w *walker) openChild(parentDir *dirRef, name, childPath, parentOS string, 
 	// recursive delete may not, so the child is visited, warned about and left.
 	if w.mutating() && unidentifiedMount(childID, parentID) {
 		child.close()
-		return nil, false, fmt.Errorf("the kernel would not name the mount %q is on, so a mutating walk left it alone: %w",
-			childPath, fsx.ErrProtected)
+		return nil, false, unnamedMountRefusal(childPath)
 	}
 	if !w.isMountPoint(childPath, childID, parentID) {
 		return child, false, nil
@@ -838,6 +860,15 @@ type mountIdentity struct {
 // applied: that is the dev box, not the kernel (INV-2).
 func unidentifiedMount(child, parent mountIdentity) bool {
 	return kernelMountIDs && (!child.hasMnt || !parent.hasMnt)
+}
+
+// unnamedMountRefusal is the one sentence B4 produces, wherever it is applied.
+// The recursive mode job applies the same rule to a LEAF it is about to change
+// (mode_job.go, Astra r10 #2), and a rule stated in two sentences is two rules a
+// year from now.
+func unnamedMountRefusal(apiPath string) error {
+	return fmt.Errorf("the kernel would not name the mount %q is on, so a mutating walk left it alone: %w",
+		apiPath, fsx.ErrProtected)
 }
 
 // differsFrom reports whether two descriptors are on different mounts. An

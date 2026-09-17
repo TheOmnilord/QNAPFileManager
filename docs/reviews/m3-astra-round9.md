@@ -20,6 +20,7 @@ Adversarial review: 1 finding, contract wording.
 
 Astra's statement of round 10: settle and test consequence validation before the first mutation, or record it.
 Judgement: recorded — closing the pre-scan window would mean the worker re-grading `aclmode` itself, which is the
-daemon's table and INV-1's boundary; the window is the same minute §17.3 accepts, and round 10 is verification.
+daemon's table and INV-1's boundary. *Corrected in round 10:* the windows are cumulative — the TTL bounds freshness
+at lookup and the pre-scan adds its own length before the first mutation — not "the same minute"; §17.16 says so.
 
 Unique findings this round: 1. Rejected: none.

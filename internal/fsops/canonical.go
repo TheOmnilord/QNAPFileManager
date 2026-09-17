@@ -161,14 +161,75 @@ func objectIDOf(f *os.File, fi os.FileInfo) objectID {
 		}
 		return id
 	}
+	id.btime, id.hasBtime = birthTimeFrom(f)
+	return id
+}
+
+// birthTimeFrom reads the creation time of an object through a descriptor that
+// is still OPEN on it, which is the only moment the fact can be read about the
+// object rather than about whatever its name means afterwards.
+//
+// Every failure — no statx, no creation time on this filesystem, a descriptor
+// the runtime will not lend — is the same answer: there is nothing to compare,
+// so the comparison degrades to device and inode (INV-2).
+func birthTimeFrom(f *os.File) (int64, bool) {
+	if f == nil {
+		return 0, false
+	}
 	rc, err := f.SyscallConn()
 	if err != nil {
-		return id
+		return 0, false
 	}
-	_ = rc.Control(func(fd uintptr) {
-		id.btime, id.hasBtime = birthTimeOf(int(fd))
-	})
-	return id
+	var (
+		btime int64
+		ok    bool
+	)
+	if cerr := rc.Control(func(fd uintptr) {
+		btime, ok = birthTimeOf(int(fd))
+	}); cerr != nil {
+		return 0, false
+	}
+	return btime, ok
+}
+
+// datedInfo is a stat with the birth time of the descriptor it was taken through
+// carried beside it, so that an identity taken from the FileInfo ALONE is still
+// the strong kind (Astra r10 #1).
+//
+// It embeds the original, so Sys() — and with it every uid, gid, nlink, device
+// and inode this package reads — is the reading the kernel made and not a copy
+// of it.
+type datedInfo struct {
+	os.FileInfo
+	btime int64
+}
+
+// birthTime satisfies btimeCarrier, the interface objectIDOf asks a FileInfo for
+// when there is no descriptor left to ask.
+func (d datedInfo) birthTime() (int64, bool) { return d.btime, true }
+
+// infoWithBirthTime attaches the birth time of a HELD descriptor to the stat
+// taken of it, for a caller that will hold on to the reading after the
+// descriptor is gone.
+//
+// Where there is no birth time to attach — off Linux, a kernel without statx, a
+// filesystem that keeps no creation time — the stat is handed back exactly as it
+// came, so nothing is wrapped that would not be stronger for it and the
+// comparison stays device and inode.
+func infoWithBirthTime(f *os.File, fi os.FileInfo) os.FileInfo {
+	if f == nil || fi == nil {
+		return fi
+	}
+	if c, ok := fi.(btimeCarrier); ok {
+		if _, has := c.birthTime(); has {
+			return fi
+		}
+	}
+	btime, ok := birthTimeFrom(f)
+	if !ok {
+		return fi
+	}
+	return datedInfo{FileInfo: fi, btime: btime}
 }
 
 // same reports whether two recorded identities describe one object.

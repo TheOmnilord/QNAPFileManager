@@ -502,12 +502,14 @@ in-app drag-and-drop and the trash janitor stay deferred.
 16. **What the token does not re-grade (Astra rounds 7–9).** The dispatch callback rebuilds the ACL verdict when
     a queued job takes its slot and refuses to dispatch if the digest differs from the one redeemed (round 8 #4)
     — so a job that waited an hour behind the slots is not dispatched on an hour-old sentence. What that
-    re-grade proves is bounded three ways, and none is a guarantee (round 9): it compares the **cached** facts,
-    so an `aclmode` changed inside §17.3's minute passes unseen; it runs at callback admission, and the job's
-    own pre-scan lies between that and the first mutation, a window nothing re-checks; and a walk already
-    mutating is the kernel's. The sync chmod's `Expect` proves identity and ACL *state* on the held leaf, not
-    the `aclmode`, so its window is the same minute. The pathname chown fallback where `/proc` is absent keeps
-    the check/use window §2.3 already accepts.
+    re-grade proves is bounded three ways, and none is a guarantee (rounds 9–10): it compares the **cached**
+    facts, so an `aclmode` changed inside §17.3's minute passes unseen; it runs at callback admission, and the
+    job's own pre-scan lies between that and the first mutation, a window nothing re-checks and whose length is
+    the pre-scan's, not the TTL's — the two windows are **cumulative** (cache `passthrough` at t=0, `discard` at
+    t=1, admit at t=59, a 30 s pre-scan: the first mutation lands at t=89 on the t=0 sentence); and a walk
+    already mutating is the kernel's. The sync chmod's `Expect` proves identity and ACL *state* on the held leaf,
+    not the `aclmode`, so its `aclmode` window is the TTL's. The pathname chown fallback where `/proc` is absent
+    keeps the check/use window §2.3 already accepts.
 17. **An orphaned size walk has no lifetime bound (Astra round 8 #5** — correcting what round 7 wrote**).** A
     measurement whose 202 the page never received, or whose tab was closed before a cancel could be sent, runs to
     completion, explicit cancellation, worker failure or shutdown, holding one of the four metadata slots while

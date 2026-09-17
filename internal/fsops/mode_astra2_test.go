@@ -28,35 +28,49 @@ import (
 // st_dev comparison calls that pair "the same filesystem and carry on", which is
 // exactly the entry a recursive chmod had been changing on somebody else's
 // share.
+//
+// Astra r10 #2 added the fail-closed half the directory walker has had since B4:
+// a pair the kernel would not name is refused rather than compared by device,
+// because a same-device bind mount is precisely what that comparison cannot see.
 func TestLeafCrossingPolicy(t *testing.T) {
 	here := mountIdentity{mnt: 7, hasMnt: true, dev: 100, hasDev: true}
 	bind := mountIdentity{mnt: 9, hasMnt: true, dev: 100, hasDev: true}
 	elsewhere := mountIdentity{mnt: 9, hasMnt: true, dev: 200, hasDev: true}
 	unnamed := mountIdentity{}
 
+	// Where the kernel names mounts, a pair it would not name is B4's refusal;
+	// where it names none at all (off Linux, walk_other.go) there is no boundary
+	// to be found and the entry stays. Both are stated as one expression rather
+	// than as a Linux-only case, because the rule is the platform's and the test
+	// is the arithmetic's (Astra r10 #2).
+	unnamedIs := leafStays
+	if kernelMountIDs {
+		unnamedIs = leafUnnamedMount
+	}
+
 	cases := []struct {
 		name          string
 		parent, child mountIdentity
 		cross         bool
 		domain        bool
-		want          bool
+		want          leafVerdict
 		asked         bool
 	}{
 		{
 			name:   "an entry on the parent's own mount is not a crossing",
 			parent: here, child: here, cross: false,
-			want: false, asked: false,
+			want: leafStays, asked: false,
 		},
 		{
 			// The finding itself. Same device, and it is still another mount.
 			name:   "a bind-mounted file is a crossing the device comparison could not see",
 			parent: here, child: bind, cross: false,
-			want: true, asked: false,
+			want: leafCrosses, asked: false,
 		},
 		{
 			name:   "with crossing on, the storage domain decides",
 			parent: here, child: bind, cross: true, domain: true,
-			want: false, asked: true,
+			want: leafStays, asked: true,
 		},
 		{
 			// The other half of the finding: crossMounts:true used to skip the
@@ -64,21 +78,45 @@ func TestLeafCrossingPolicy(t *testing.T) {
 			// at all — a USB disk, another pool, a network share.
 			name:   "with crossing on, another storage domain is still refused",
 			parent: here, child: elsewhere, cross: true, domain: false,
-			want: true, asked: true,
+			want: leafCrosses, asked: true,
+		},
+		{
+			// Astra r10 #2. Two descriptors with a device and no mount id is
+			// exactly what a same-device bind mount looks like to st_dev, and the
+			// old decision answered "not a crossing" and changed the file. The
+			// directory walker has refused that descent since B4.
+			name:   "a leaf whose mount the kernel would not name is refused, not compared by device",
+			parent: mountIdentity{dev: 100, hasDev: true}, child: mountIdentity{dev: 100, hasDev: true},
+			cross: false,
+			want:  unnamedIs, asked: false,
+		},
+		{
+			// One side is enough: the comparison needs both to mean anything.
+			name:   "a named parent and an unnamed leaf is still unproved",
+			parent: here, child: mountIdentity{dev: 100, hasDev: true}, cross: false,
+			want: unnamedIs, asked: false,
+		},
+		{
+			// Asking to include mounted sub-folders is not a way past the rule,
+			// and the mount table is never consulted about a mount nobody named.
+			name:   "with crossing on, an unnamed leaf is refused without asking the table",
+			parent: here, child: mountIdentity{dev: 100, hasDev: true}, cross: true, domain: true,
+			want: unnamedIs, asked: false,
 		},
 		{
 			// The degradation, stated: no mount ids and no devices on either
-			// side is not a boundary, because inventing one out of missing data
-			// would skip every entry on a dev box (INV-2).
+			// side is not a boundary where the platform has no mount ids to give,
+			// because inventing one out of missing data would skip every entry on
+			// a dev box (INV-2).
 			name:   "an unanswerable comparison is not a crossing",
 			parent: unnamed, child: unnamed, cross: false,
-			want: false, asked: false,
+			want: unnamedIs, asked: false,
 		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			asked := false
-			got := crossesLeafMount(c.parent, c.child, c.cross, func(p, ch mountIdentity) bool {
+			got := leafMountVerdict(c.parent, c.child, c.cross, func(p, ch mountIdentity) bool {
 				asked = true
 				if p != c.parent || ch != c.child {
 					t.Fatalf("the domain question was asked about %v/%v, not %v/%v", p, ch, c.parent, c.child)
@@ -86,7 +124,7 @@ func TestLeafCrossingPolicy(t *testing.T) {
 				return c.domain
 			})
 			if got != c.want {
-				t.Fatalf("crossesLeafMount = %v, want %v", got, c.want)
+				t.Fatalf("leafMountVerdict = %v, want %v", got, c.want)
 			}
 			if asked != c.asked {
 				t.Fatalf("the mount table was consulted = %v, want %v", asked, c.asked)

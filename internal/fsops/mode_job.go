@@ -353,6 +353,20 @@ func (j *modeJob) one(ctx context.Context, p string) error {
 // any of its entries is read. It never refuses anything: the hook exists here
 // only so that Post can prove the directory it is about to change is the one
 // that was descended into (finding 7).
+//
+// info is the fstat of the enumeration's own descriptor and it carries that
+// descriptor's BIRTH TIME where the filesystem records one (openedInfo, walk.go,
+// Astra r10 #1). It has to arrive already carrying it, because by the time this
+// identity is asked about there is no descriptor left to ask: the walk closes
+// the directory before Post, and the enumeration released its own the moment the
+// entry was handled. Device and inode alone are a number the allocator may hand
+// straight back, so an empty directory removed and recreated in that gap — until
+// the number repeats, which the client controls the length of — was accepted as
+// the object that had been traversed and took the post-order chmod or chown.
+//
+// Where the filesystem records no creation time the comparison stays device and
+// inode, because there is nothing else to compare: that is the residual round 4
+// (#7) already states, and this hook does not pretend otherwise.
 func (j *modeJob) opened(it WalkItem, info os.FileInfo) error {
 	j.setTraversed(it.Depth, objectIDOf(nil, info))
 	return nil
@@ -456,11 +470,11 @@ func (j *modeJob) unopened(it WalkItem, err error) {
 			it.Path, fsx.ErrChanged))
 		return
 	}
-	if j.crossesMount(it, ref) {
+	if v := j.leafMount(it, ref); v != leafStays {
 		// The crossing decision the walk would have made from the descriptor it
-		// never got (r2 #4). A directory it may not enter is also one it may not
-		// change.
-		j.refuse(it.Path, crossingRefusal(it.Path))
+		// never got (r2 #4), fail-closed half included (r10 #2). A directory it
+		// may not enter is also one it may not change.
+		j.refuse(it.Path, leafRefusal(it.Path, v))
 		return
 	}
 	j.emit.warnErr(it.Path, fmt.Errorf(
@@ -563,19 +577,44 @@ func (j *modeJob) applyEntry(it WalkItem) {
 				it.Path, fsx.ErrChanged))
 			return
 		}
-	} else if j.crossesMount(it, ref) {
+	} else if v := j.leafMount(it, ref); v != leafStays {
 		// A regular file can be a bind mount of its own, and the walker's
 		// WalkItem.Mount only ever marks directories — so a file outside the
 		// tree was changed under crossMounts:false, and its nlink stays 1, so
 		// the hardlink rule did not catch it either (finding 19, adversarial).
-		// The same crossing policy is applied here, with the same sentence.
-		j.refuse(it.Path, crossingRefusal(it.Path))
+		// The same crossing policy is applied here, with the same sentences: the
+		// crossing one, and B4's for a mount the kernel would not name (r10 #2).
+		j.refuse(it.Path, leafRefusal(it.Path, v))
 		return
 	}
 	j.applyRef(it.Path, it.parent, it.Name, ref, false)
 }
 
-// crossesMount reports whether a held entry is a crossing this job may not make.
+// leafVerdict is what the crossing rule says about one leaf the walk is standing
+// on: it stays, or it is refused as a crossing, or it is refused because the
+// kernel would not say which mount it is on.
+//
+// Three answers rather than a bool because the two refusals are different
+// sentences, and because the second one is a rule the leaf path did not have at
+// all (Astra r10 #2).
+type leafVerdict int
+
+const (
+	leafStays leafVerdict = iota
+	leafCrosses
+	leafUnnamedMount
+)
+
+// leafIdentityFor reads a held leaf's mount identity. It is a variable for the
+// same reason identityFor is (walk.go): the kernel that refuses to name a mount
+// is a kernel before 3.15 or one without /proc, and neither is something a test
+// can produce — mounting anything needs root and a mount namespace, and removing
+// the kernel's answer needs a different kernel. The CI root and ZFS jobs
+// exercise the real measurement.
+var leafIdentityFor = itemIdentityOf
+
+// leafMount reports what this job may do with a held entry that is not a
+// directory, and with a directory the walk could not open for itself.
 //
 // It costs one statx per entry, which is the price of seeing a bind mount at
 // all: st_dev cannot, and a recursive chmod that changes files on another share
@@ -594,29 +633,59 @@ func (j *modeJob) applyEntry(it WalkItem) {
 // the held descriptor against the mount id of the directory it was enumerated
 // from (mountIdentity.differsFrom), and, when they differ, the same crossing
 // policy the walk applies to a child directory.
-func (j *modeJob) crossesMount(it WalkItem, ref *itemRef) bool {
-	return crossesLeafMount(j.identityOfParent(it.parent), itemIdentityOf(ref), j.cross,
+func (j *modeJob) leafMount(it WalkItem, ref *itemRef) leafVerdict {
+	return leafMountVerdict(j.identityOfParent(it.parent), leafIdentityFor(ref), j.cross,
 		func(parentID, childID mountIdentity) bool { return j.mayCrossToLeaf(it, parentID, childID) })
 }
 
-// crossesLeafMount is the decision itself, with nothing in it that needs a
+// leafMountVerdict is the decision itself, with nothing in it that needs a
 // filesystem: two mount identities, the job's CrossMounts, and the storage-domain
 // question asked only where it matters. It is separated out because mounting
 // anything needs root and a mount namespace, and the arithmetic is the half a
 // test can state exactly.
 //
-// An unanswerable comparison is "not a crossing" — differsFrom's own rule, and
-// the degradation the walk has always accepted (INV-2, and off Linux there are
-// no mount ids at all): inventing a boundary out of missing data would skip
-// every entry on a dev box.
-func crossesLeafMount(parentID, childID mountIdentity, cross bool, may func(parentID, childID mountIdentity) bool) bool {
+// The fail-closed rule is asked FIRST, and it is the half this decision did not
+// have (Astra r10 #2). Where the kernel names mounts and would not name one of
+// these two, the only comparison left is st_dev — and a same-device bind mount
+// answers "not a crossing", which is precisely the boundary B4 exists for. The
+// directory walker has always refused to descend there (openChild); the leaf
+// path accepted it, so a regular file bind-mounted into the tree from outside it
+// was changed under crossMounts:false, with nlink 1 so that the hardlink rule
+// did not catch it either. One rule, both shapes, and B4's own sentence for it
+// (unnamedMountRefusal).
+//
+// The rule is stated here without the walker's "is this walk mutating?" question
+// because there is nothing else this decision serves: every walk that reaches it
+// is a recursive chmod or chown, which carries ProtectWrite — the very thing that
+// makes the walker's own half of the rule apply. A measurement never asks.
+//
+// An unanswerable comparison where there are no kernel mount ids AT ALL is still
+// "not a crossing" — differsFrom's own rule, and the degradation the walk has
+// always accepted off Linux (INV-2): inventing a boundary out of missing data
+// would skip every entry on a dev box.
+func leafMountVerdict(parentID, childID mountIdentity, cross bool, may func(parentID, childID mountIdentity) bool) leafVerdict {
+	if unidentifiedMount(childID, parentID) {
+		return leafUnnamedMount
+	}
 	if !childID.differsFrom(parentID) {
-		return false
+		return leafStays
 	}
 	if !cross {
-		return true
+		return leafCrosses
 	}
-	return !may(parentID, childID)
+	if !may(parentID, childID) {
+		return leafCrosses
+	}
+	return leafStays
+}
+
+// leafRefusal is the sentence one refused leaf produces: the crossing sentence
+// for a mount that was named, and B4's for one that was not.
+func leafRefusal(apiPath string, v leafVerdict) error {
+	if v == leafUnnamedMount {
+		return unnamedMountRefusal(apiPath)
+	}
+	return crossingRefusal(apiPath)
 }
 
 // mayCrossToLeaf is walker.mayCrossInto's question for a leaf: the job was asked

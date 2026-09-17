@@ -214,13 +214,17 @@ func TestTheStoredHashMustBeABcryptHash(t *testing.T) {
 		{"$2y$ likewise", "$2y$" + real10[4:], true},
 		{"$2x$ is the broken variant", "$2x$" + real10[4:], false},
 		{"a standard-base64 character bcrypt never writes", real10[:59] + "+", false},
-		// Astra r3 #4: the last character of each half carries only the tail of
-		// a byte, and base64 writes the spare bits as zero. Both of these are in
-		// the alphabet, are the right length and have a valid header — and no
-		// password can ever match them, which is a door that arms and then
-		// refuses the operator who just set the password.
+		// Astra r3 #4: the last character of the checksum carries only the tail
+		// of a byte, and base64 writes the spare bits as zero. This one is in the
+		// alphabet, is the right length and has a valid header — and no password
+		// can ever match it, which is a door that arms and then refuses the
+		// operator who just set the password.
 		{"a checksum whose last character sets bits bcrypt never writes", real10[:59] + "A", false},
-		{"a salt whose last character sets bits bcrypt never writes", real10[:28] + "B" + real10[29:], false},
+		// Astra r4 #4: the SALT's tail is the same arithmetic and the opposite
+		// verdict. bcrypt throws the padding bits away on decode and re-encodes
+		// the spelling it was given, so a non-canonical salt tail verifies — and
+		// refusing it would stop a daemon that had been serving that hash.
+		{"a salt whose last character sets spare bits verifies anyway", real10[:28] + "B" + real10[29:], true},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			cfg := Default()
@@ -254,6 +258,43 @@ func TestRealHashesAreNeverRefusedForTheirSpareBits(t *testing.T) {
 		if err := cfg.Validate(); err != nil {
 			t.Fatalf("a real bcrypt hash was refused: %v", err)
 		}
+	}
+}
+
+// Astra r4 #4: the salt tail is not a rule bcrypt enforces, and the proof is
+// bcrypt itself. A hash whose 22nd salt character has its low bit flipped is
+// exactly the value the round-3 mask refused — and the library still verifies
+// the original password against it, because the decode discards the padding bits
+// and the comparison re-encodes the salt spelling it was handed. So validation
+// must accept it: this check runs on every load, and refusing a credential that
+// works would lock an operator out of their own emergency door at the first
+// restart after an upgrade, which is the precise opposite of what it is for.
+func TestASaltTailBcryptItselfAcceptsIsNotRefused(t *testing.T) {
+	const password = "a long enough password"
+	h, err := bcrypt.GenerateFromPassword([]byte(password), MinLocalCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The 22nd salt character is hash[28]; flipping the low bit of its 6-bit
+	// value moves it within bcrypt's own alphabet, so nothing else about the
+	// shape changes.
+	v := strings.IndexByte(bcryptSalt64, h[28])
+	if v < 0 {
+		t.Fatalf("a real hash carries a salt character outside the alphabet at offset 28")
+	}
+	flipped := string(h[:28]) + string(bcryptSalt64[v^1]) + string(h[29:])
+	if flipped == string(h) {
+		t.Fatal("the flip changed nothing")
+	}
+	// bcrypt's verdict first: if the library refused this too, the finding would
+	// be wrong and the mask would have been right.
+	if err := bcrypt.CompareHashAndPassword([]byte(flipped), []byte(password)); err != nil {
+		t.Fatalf("bcrypt refused the flipped-salt hash, so it is not a valid credential after all: %v", err)
+	}
+	cfg := Default()
+	cfg.Auth.Local.Hash = flipped
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("validation refused a hash bcrypt verifies: %v", err)
 	}
 }
 

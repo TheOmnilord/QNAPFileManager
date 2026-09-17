@@ -219,19 +219,25 @@ func checkBcryptShape(hash string) error {
 			return fmt.Errorf("carries a character at offset %d that is not in bcrypt's base64 alphabet", i)
 		}
 	}
-	// The two characters whose low bits bcrypt never sets (Astra r3 #4).
+	// The last character of the checksum, whose low two bits bcrypt never sets
+	// (Astra r3 #4).
 	//
-	// The salt is 22 characters standing for 16 bytes and the checksum 31 for
-	// 23, so each ends on a character that carries only the tail of a byte —
-	// four spare bits at the end of the salt, two at the end of the checksum —
-	// and base64 writes the spare ones as zero. A hash whose last character is
-	// "A" passes every check above and is still a hash bcrypt did not write, so
-	// no password on earth matches it: the listener arms, the operator types the
-	// password they just set, and the door refuses them. That is the exact
-	// failure this whole check exists to catch before the door is needed.
-	if b64Value(hash[28])&0x0f != 0 {
-		return fmt.Errorf("carries a salt whose last character sets four bits bcrypt never writes, so no password can match it")
-	}
+	// The checksum is 31 characters standing for 23 bytes, so it ends on a
+	// character carrying only the tail of a byte — two spare bits — and base64
+	// writes the spare ones as zero. A hash whose last character is "A" passes
+	// every check above and is still a hash bcrypt did not write, so no password
+	// on earth matches it: the listener arms, the operator types the password
+	// they just set, and the door refuses them. That is the exact failure this
+	// whole check exists to catch before the door is needed.
+	//
+	// The SALT's tail is deliberately NOT checked (Astra r4 #4). It has four
+	// spare bits and the same arithmetic, but bcrypt does not compare salts: the
+	// decode throws the padding bits away, and the verification re-encodes the
+	// salt spelling it was GIVEN, so a hash whose salt tail is non-canonical
+	// verifies perfectly well. Refusing it would reject a credential that works —
+	// and this check runs on every load, so it would stop a daemon that had been
+	// serving that hash for months the first time it was restarted after an
+	// upgrade. A structural check may only refuse what genuinely cannot work.
 	if b64Value(hash[59])&0x03 != 0 {
 		return fmt.Errorf("carries a checksum whose last character sets two bits bcrypt never writes, so no password can match it")
 	}
@@ -239,9 +245,9 @@ func checkBcryptShape(hash string) error {
 }
 
 // b64Value is one character's 6-bit value in bcrypt's alphabet, which is what
-// the two masks above are asking about. Every character is known to be in the
+// the mask above is asking about. Every character is known to be in the
 // alphabet by the time this runs, so the not-found -1 cannot reach here — and
-// it would fail both masks anyway, which is the safe direction.
+// it would fail the mask anyway, which is the safe direction.
 func b64Value(c byte) int { return strings.IndexByte(bcryptSalt64, c) }
 
 // checkAddr accepts anything net.Listen would: "host:port", ":port",

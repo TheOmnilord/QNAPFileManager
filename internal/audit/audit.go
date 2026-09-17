@@ -147,6 +147,10 @@ type Logger struct {
 	// the admitted durable writers so Close can join them before closing the file.
 	syncSem chan struct{}
 	syncWG  sync.WaitGroup
+	// syncWaiting counts the WriteSync calls queued for a slot right now — the
+	// state a wedged sink produces, and the one a test in another package has to
+	// be able to observe rather than sleep past (Astra r4 #3). Atomic.
+	syncWaiting int64
 
 	// drainMu is held by the drain goroutine around each file write. Tests
 	// hold it to freeze the drain and prove Write drops instead of blocking.
@@ -229,6 +233,11 @@ func (l *Logger) Write(ev Event) {
 // that must not proceed without a durable record — a mutation's intent line, a
 // safety-setting milestone — treats it, and any other WriteSync error, as a hard
 // failure and refuses the operation (adv 1).
+//
+// It does NOT mean the event was not written: the timeout may have expired
+// while the event was already with a worker that goes on to fsync it. A caller
+// that needs to know which happened — one that cleared the state the line stands
+// for — uses WriteSyncInFlight (Astra r4 #2) rather than guessing from the error.
 var ErrSyncTimeout = errors.New("audit: durable write timed out")
 
 // ErrCloseTimeout is returned by Close when the drain and admitted durable
@@ -253,6 +262,28 @@ var ErrCloseTimeout = errors.New("audit: close timed out draining the sink")
 // returns os.ErrClosed. The write runs under drainMu, serialised with the drain
 // goroutine so the two never interleave on the file.
 func (l *Logger) WriteSync(ctx context.Context, ev Event) error {
+	_, err := l.WriteSyncInFlight(ctx, ev)
+	return err
+}
+
+// WriteSyncInFlight is WriteSync with the one extra bit of truth a caller that
+// CLEARS STATE in order to write a line needs (Astra r4 #2).
+//
+// An error from WriteSync does not mean the event was not written. Two of them —
+// a cancelled context and ErrSyncTimeout — are returned by a call that has
+// already handed the event to a worker goroutine, and that worker owns its
+// semaphore slot until its write and fsync finish, which they very often do a
+// moment later. The caller merely stopped waiting. A caller that treats every
+// error as "nothing was recorded" and puts its counters back therefore reports
+// the same burst a second time when the first line lands after all.
+//
+// inFlight is true exactly in that case: the event is with a worker and may yet
+// reach the sink, so it must not be written again. It is false for every
+// definite outcome — the write succeeded, or the write itself failed, or the
+// call never got past admission at all (a closed logger, a context already done,
+// the admission timeout with every writer slot held). On inFlight false with a
+// non-nil error, nothing was written and nothing will be.
+func (l *Logger) WriteSyncInFlight(ctx context.Context, ev Event) (inFlight bool, err error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -260,7 +291,7 @@ func (l *Logger) WriteSync(ctx context.Context, ev Event) error {
 	l.mu.RLock()
 	if l.closed {
 		l.mu.RUnlock()
-		return os.ErrClosed
+		return false, os.ErrClosed
 	}
 	// Register as an in-flight durable writer while still holding the read lock,
 	// so Close (which takes the write lock, sets closed, then Waits) cannot begin
@@ -273,17 +304,25 @@ func (l *Logger) WriteSync(ctx context.Context, ev Event) error {
 
 	// Bounded admission. A slot is held by the worker below until its write
 	// finishes, so at most syncWriters durable writes exist at once.
+	//
+	// Nothing here started a worker, so every exit is a definite non-admission:
+	// the event was not written and cannot be (Astra r4 #2).
+	atomic.AddInt64(&l.syncWaiting, 1)
 	select {
 	case l.syncSem <- struct{}{}:
+		atomic.AddInt64(&l.syncWaiting, -1)
 	case <-ctx.Done():
+		atomic.AddInt64(&l.syncWaiting, -1)
 		l.syncWG.Done()
-		return ctx.Err()
+		return false, ctx.Err()
 	case <-l.done:
+		atomic.AddInt64(&l.syncWaiting, -1)
 		l.syncWG.Done()
-		return os.ErrClosed
+		return false, os.ErrClosed
 	case <-timer.C:
+		atomic.AddInt64(&l.syncWaiting, -1)
 		l.syncWG.Done()
-		return ErrSyncTimeout
+		return false, ErrSyncTimeout
 	}
 
 	res := make(chan error, 1)
@@ -305,13 +344,16 @@ func (l *Logger) WriteSync(ctx context.Context, ev Event) error {
 
 	select {
 	case err := <-res:
-		return err
+		// The worker finished and said what happened, so the outcome is known
+		// either way and nothing is left in flight.
+		return false, err
 	case <-ctx.Done():
 		// The write goroutine keeps its slot until it finishes (so a stuck write
 		// is not abandoned back into the pool); the caller simply stops waiting.
-		return ctx.Err()
+		// The event is still with that worker — in flight, not lost.
+		return true, ctx.Err()
 	case <-timer.C:
-		return ErrSyncTimeout
+		return true, ErrSyncTimeout
 	}
 }
 

@@ -561,7 +561,12 @@ certificate and a running daemon binds the listener when a credential appears, s
     inside the 30-day window — *run `break-glass cert -regenerate`* — so the fingerprint an operator was told to
     compare changes only by their own act or by expiry. An expired or torn pair is unusable and is regenerated,
     with the new fingerprint logged. A stored hash must be a complete bcrypt encoding — 60 bytes, `$2a$`/`$2b$`/
-    `$2y$`, cost in range, 53 base64 characters — not merely a parsable header (round 2 #4).
+    `$2y$`, cost in range, 53 base64 characters, and a checksum tail whose two spare bits are zero — not merely a
+    parsable header (round 2 #4, round 3 #4). The salt tail's spare bits are **not** checked (round 4 #4): bcrypt
+    discards them on decode and verifies such a hash anyway, so refusing it would only lock out a working
+    credential after an upgrade. A pair `set-password` or `cert` replaced while the daemon was running is printed
+    as the *next* fingerprint with the restart the daemon needs (round 3 #1) — the one case where the door cannot
+    be repaired without App Center, and it is stated rather than hidden.
 14. **Sessionless denials on 8771 are throttled like refusals** (#3), so a flood of forged mutations shows as one
     line per source per window plus a summary, not as one line per packet — the operator sees that it happened and
     how often, not each packet.

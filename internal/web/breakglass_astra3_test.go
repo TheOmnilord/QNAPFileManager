@@ -78,13 +78,37 @@ func TestAFlushSummarySurvivesTheReturningPeerHangingUp(t *testing.T) {
 	}
 	now = now.Add(2 * refusalWindow)
 
+	// Admission is SATURATED before the cancelled request arrives (Astra r4 #3).
+	// With a writer slot free this test proved nothing: the summary's write and
+	// the peer's cancellation are two ready cases of one select inside WriteSync,
+	// Go picks either, and a run that picked the slot wrote the line whether the
+	// context was detached or not — so reverting the fix failed the test only
+	// sometimes, which is the same as not testing it. With every slot held the
+	// write has to WAIT, and a request-scoped context is then certain to take the
+	// cancellation exit instead. The slots are released only once the summary is
+	// observably queued behind them.
+	releaseSlots := s.auditor.HoldSyncSlots()
+	defer releaseSlots()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() { done <- bgLoginWithContext(t, s, source, ctx) }()
+	// flushRefusals is the first thing the login handler does that writes, so the
+	// one call queued for a slot is the summary and nothing else. A request that
+	// finished without ever queuing is the failing case and is not waited out:
+	// it means the write took an exit instead of the wait, which is precisely
+	// what a request-scoped context makes it do.
+	bgWaitFor(t, "the flush summary to queue for a writer slot", func() bool {
+		return s.auditor.SyncWaiting() == 1 || len(done) == 1
+	})
+	releaseSlots()
+
 	// What the door answers a peer that is already gone is not the point and is
 	// allowed to be the rate answer: the verification queue observes the request
 	// context, so a cancelled one never reaches the credential. The SUMMARY is
 	// the point, and it is written before any of that.
-	if w := bgLoginWithContext(t, s, source, ctx); w.Code != http.StatusNoContent && w.Code != http.StatusTooManyRequests {
+	if w := <-done; w.Code != http.StatusNoContent && w.Code != http.StatusTooManyRequests {
 		t.Fatalf("the returning login = %d %s", w.Code, w.Body)
 	}
 

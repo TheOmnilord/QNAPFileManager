@@ -1113,11 +1113,19 @@ func (s refusalShape) summary() refusalEvent {
 // knows how each shape is recorded, so a new caller cannot reach for d.audit and
 // silently give a sessionless event the door's root-administrator actor.
 //
-// It reports whether the line was ADMITTED (Astra r3 #2). An aggregate line
+// It reports the durable write's verdict (Astra r3 #2). An aggregate line
 // stands for refusals whose counters are cleared when it is written, so a
 // caller that clears them without knowing whether the write landed has thrown
 // the burst away; the two aggregates below ask.
-func (d *breakGlassDoor) writeRefusal(r *http.Request, ev refusalEvent, detail string) error {
+//
+// inFlight is the second half of that verdict (Astra r4 #2). An error alone
+// does not say the line was lost: a cancelled context or a timeout can be
+// returned by a call whose event is already with a durable writer that goes on
+// to fsync it. Putting the counters back on THAT error reports the same burst
+// twice — a flood that shrinks and a flood that doubles are both lies about the
+// same number. So a caller restores only when inFlight is false, which is the
+// one case where nothing was written and nothing will be.
+func (d *breakGlassDoor) writeRefusal(r *http.Request, ev refusalEvent, detail string) (inFlight bool, err error) {
 	if ev.shape == refusalSessionless {
 		// The sessionless line names no actor: the listener's door and the path
 		// are the whole of what is known, and the request is where both come
@@ -1125,7 +1133,7 @@ func (d *breakGlassDoor) writeRefusal(r *http.Request, ev refusalEvent, detail s
 		// than written in the other shape. Nothing reaches it that way today:
 		// both callers of this shape are on a request goroutine.
 		if d.srv == nil || r == nil {
-			return nil
+			return false, nil
 		}
 		return d.srv.auditSessionlessRefusal(r, ev.code, detail)
 	}
@@ -1144,11 +1152,11 @@ func (d *breakGlassDoor) writeRefusal(r *http.Request, ev refusalEvent, detail s
 // while the four durable-writer slots are busy would take the whole summary
 // with it. WriteSync's own writeSyncTimeout still bounds the wait, so dropping
 // the cancellation cannot block a request goroutine for longer than that.
-func (s *Server) auditSessionlessRefusal(r *http.Request, code, detail string) error {
+func (s *Server) auditSessionlessRefusal(r *http.Request, code, detail string) (bool, error) {
 	if s.auditor == nil {
-		return nil
+		return false, nil
 	}
-	return s.auditor.WriteSync(context.WithoutCancel(r.Context()), audit.Event{
+	return s.auditor.WriteSyncInFlight(context.WithoutCancel(r.Context()), audit.Event{
 		IP:             ClientIP(r),
 		Door:           doorOf(r),
 		Op:             "auth",
@@ -1164,6 +1172,23 @@ func (s *Server) auditSessionlessRefusal(r *http.Request, code, detail string) e
 type refusalState struct {
 	opened     time.Time
 	suppressed int
+	// claimed is how many suppressed refusals have been taken out of the count
+	// above by a flush that is writing their summary right now, and whose write
+	// has not yet come back (Astra r4 #1).
+	//
+	// The count has to leave suppressed — that is what stops a second returning
+	// request from writing the same summary again — but for as long as the write
+	// is in flight this entry is the ONLY place the burst still exists. An entry
+	// with a claim on it is therefore never deleted, by any path: not by the next
+	// login from this source finding suppressed at zero, not by another source's
+	// pruning sweep. If the write is then refused there is somewhere to put the
+	// burst back; without the claim the rollback found nothing and a flood went
+	// unreported.
+	//
+	// It is a count, not a flag, because a second flush may legitimately claim a
+	// second burst before the first resolves: each resolution takes back only
+	// what it claimed.
+	claimed int
 	// shape is what the SUMMARY for this window will be written as (Astra r2 #6).
 	// It starts as the shape that opened the window and only ever moves towards
 	// refusalSessionless: a window that counted even one sessionless denial must
@@ -1231,7 +1256,14 @@ func (d *breakGlassDoor) noteRefusalEvent(r *http.Request, ip, detail string, ev
 		// back and collect it — but no longer: a summary nobody returned for is
 		// stale news, and holding it would let abandoned entries fill the table
 		// and silence the reporting for every NEW source.
-		if age >= refusalWindow && (old.suppressed == 0 || age >= 2*refusalWindow) {
+		//
+		// A CLAIMED entry is not dead weight at either age (Astra r4 #1): a flush
+		// is holding that burst outside the count while its write is in flight,
+		// and pruning the entry from under it would leave the rollback with
+		// nowhere to put the burst back. The claim resolves in bounded time —
+		// WriteSync's own timeout — and the resolution deletes the entry itself
+		// when nothing is left on it.
+		if old.claimed == 0 && age >= refusalWindow && (old.suppressed == 0 || age >= 2*refusalWindow) {
 			delete(d.refusals, key)
 		}
 	}
@@ -1258,14 +1290,19 @@ func (d *breakGlassDoor) noteRefusalEvent(r *http.Request, ip, detail string, ev
 		}
 		d.mu.Unlock()
 		if report {
-			if err := d.writeRefusal(r, ev.shape.summary(),
-				fmt.Sprintf("door=local %d refusals from untracked sources; the %d-source table is full", dropped, breakglass.MaxSources)); err != nil {
+			inFlight, err := d.writeRefusal(r, ev.shape.summary(),
+				fmt.Sprintf("door=local %d refusals from untracked sources; the %d-source table is full", dropped, breakglass.MaxSources))
+			if err != nil && !inFlight {
 				// The count was cleared for a line that never landed, so it goes
 				// back (Astra r3 #2): the next refusal from an untracked source
 				// reports the whole burst instead of restarting from one, and the
 				// rate stamp is put back as it was so that next refusal may report
 				// at all. Whatever arrived in the meantime is added to, not
 				// overwritten.
+				//
+				// Only when the write is definitely lost (Astra r4 #2). A line
+				// still with a durable writer will land, and restoring behind it
+				// would report the same burst in the next line as well.
 				d.mu.Lock()
 				d.dropped[ev.shape] += dropped
 				d.droppedAt[ev.shape] = was
@@ -1295,13 +1332,15 @@ func (d *breakGlassDoor) noteRefusalEvent(r *http.Request, ip, detail string, ev
 			line = refusalSessionless.summary()
 		}
 	}
-	if err := d.writeRefusal(r, line, detail); err != nil && carried > 0 {
+	inFlight, err := d.writeRefusal(r, line, detail)
+	if err != nil && !inFlight && carried > 0 {
 		// The same rule as the two aggregates (Astra r3 #2): this line carried a
 		// closed window's count, and the count was zeroed to write it. A write
 		// that was not admitted puts it back on the window that is now open, so
-		// the next line for this source reports it rather than losing it. The
-		// shape only ever moves towards sessionless, exactly as it does when a
-		// refusal is suppressed.
+		// the next line for this source reports it rather than losing it. A write
+		// still in flight is not put back (Astra r4 #2) — it is going to land.
+		// The shape only ever moves towards sessionless, exactly as it does when
+		// a refusal is suppressed.
 		d.mu.Lock()
 		if current := d.refusals[ip]; current != nil && current.opened.Equal(now) {
 			current.suppressed += carried
@@ -1331,17 +1370,24 @@ func (d *breakGlassDoor) flushRefusals(r *http.Request, ip string) {
 	}
 	suppressed, shape, opened := state.suppressed, state.shape, state.opened
 	if suppressed == 0 {
-		// Nothing to report, so the closed window is simply forgotten.
-		delete(d.refusals, ip)
+		// Nothing to report, so the closed window is simply forgotten — unless
+		// another flush is holding a claim on it (Astra r4 #1). This is the path
+		// that used to delete the entry out from under an in-flight summary: the
+		// claim had already taken the count out of suppressed, so a second login
+		// from the same source arrived, saw nothing pending, and threw away the
+		// one record of a burst that was still being written.
+		if state.claimed == 0 {
+			delete(d.refusals, ip)
+		}
 		d.mu.Unlock()
 		return
 	}
-	// The count is CLAIMED here and the entry kept until the write is admitted
-	// (Astra r3 #2). Claiming it under the lock is what stops two returning
-	// requests from writing the same summary twice; keeping the entry is what
-	// stops a summary from being thrown away by a write that never landed,
+	// The count is CLAIMED here and the entry kept until the write resolves
+	// (Astra r3 #2, Astra r4 #1). Claiming it under the lock is what stops two
+	// returning requests from writing the same summary twice; recording the claim
+	// ON the entry is what keeps the entry alive while the write is in flight,
 	// because the state is the only place the burst still exists.
-	state.suppressed = 0
+	state.suppressed, state.claimed = 0, state.claimed+suppressed
 	d.mu.Unlock()
 	// In the shape of what the window COUNTED, not of the login that happens to
 	// be collecting it (Astra r2 #6). Only a login reaches this function, so
@@ -1349,34 +1395,45 @@ func (d *breakGlassDoor) flushRefusals(r *http.Request, ip string) {
 	// root-administrator actor — including the flush of a window that held
 	// nothing but sessionless mutation denials from a host that had not
 	// authenticated and was not trying to.
-	err := d.writeRefusal(r, shape.summary(),
+	inFlight, err := d.writeRefusal(r, shape.summary(),
 		fmt.Sprintf("door=local ip=%s %d further refusals suppressed; the source is inside its budget again", ip, suppressed))
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	current := d.refusals[ip]
 	if current == nil {
-		// Pruned while the write was in flight. A summary that landed is done,
-		// and one that did not is stale news by the time anything could collect
-		// it — re-inserting an entry here would spend a slot in a table this
-		// source no longer holds one in.
+		// Nothing holds a claimed entry open except a bug: every deletion path
+		// checks the claim (Astra r4 #1). If one somehow got past, the burst is
+		// gone either way and there is nothing useful to re-insert — a fresh
+		// entry here would spend a slot in a table this source no longer holds
+		// one in, on news nobody will come back for.
 		return
 	}
-	if err != nil {
-		// Put the burst back and let the next return collect it. Whatever the
-		// source did in the meantime is added to, never overwritten, and the
-		// shape moves only towards sessionless, exactly as it does when a refusal
-		// is suppressed.
+	// The claim is resolved either way: it is no longer in flight.
+	current.claimed -= suppressed
+	if current.claimed < 0 {
+		current.claimed = 0
+	}
+	if err != nil && !inFlight {
+		// Definitely not written (Astra r4 #2). Put the burst back and let the
+		// next return collect it. Whatever the source did in the meantime is
+		// added to, never overwritten, and the shape moves only towards
+		// sessionless, exactly as it does when a refusal is suppressed.
+		//
+		// A write that FAILED but is still in flight is left alone: that line is
+		// with a durable writer and will land, and putting the count back would
+		// have the next summary report the same burst a second time.
 		current.suppressed += suppressed
 		if shape == refusalSessionless {
 			current.shape = refusalSessionless
 		}
 		return
 	}
-	// Admitted. The entry goes only if it is still the window that was flushed
-	// and nothing has been counted against it since: a refusal that arrived while
-	// the summary was being written has a window of its own to be reported in,
-	// and deleting it here would hand the source a fresh unthrottled line.
-	if current.suppressed == 0 && current.opened.Equal(opened) {
+	// Written, or on its way. The entry goes only if it is still the window that
+	// was flushed, nothing has been counted against it since, and no other flush
+	// is holding a claim: a refusal that arrived while the summary was being
+	// written has a window of its own to be reported in, and deleting it here
+	// would hand the source a fresh unthrottled line.
+	if current.suppressed == 0 && current.claimed == 0 && current.opened.Equal(opened) {
 		delete(d.refusals, ip)
 	}
 }
@@ -1387,18 +1444,20 @@ func (d *breakGlassDoor) flushRefusals(r *http.Request, ip string) {
 // operator asking "who got in when Apache was down" must not have to
 // reconstruct it from the JSON lines.
 //
-// It returns the durable write's verdict. Almost every caller ignores it — the
-// line is a record, not a gate — but the aggregate refusal lines do not, because
-// they clear the counters they stand for (Astra r3 #2).
-func (d *breakGlassDoor) audit(r *http.Request, op, result, code, detail string) error {
+// It returns the durable write's verdict, and whether a failed one is still in
+// flight (Astra r4 #2). Almost every caller ignores both — the line is a record,
+// not a gate — but the aggregate refusal lines do not, because they clear the
+// counters they stand for (Astra r3 #2) and must neither lose a burst nor
+// report it twice.
+func (d *breakGlassDoor) audit(r *http.Request, op, result, code, detail string) (bool, error) {
 	if d.srv == nil || d.srv.auditor == nil {
-		return nil
+		return false, nil
 	}
 	ctx, ip := context.Background(), ""
 	if r != nil {
 		ctx, ip = context.WithoutCancel(r.Context()), peerHost(r)
 	}
-	return d.srv.auditor.WriteSync(ctx, audit.Event{
+	return d.srv.auditor.WriteSyncInFlight(ctx, audit.Event{
 		Actor: "break-glass", UID: 0, Admin: true, Root: true,
 		IP: ip, Door: audit.DoorLocal, Op: op, Phase: "result",
 		Result: result, Code: code, Detail: detail, ForceMilestone: true,

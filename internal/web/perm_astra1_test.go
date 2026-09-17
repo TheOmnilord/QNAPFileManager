@@ -515,7 +515,7 @@ func TestCappedScanIsRememberedAndNotRescanned(t *testing.T) {
 func TestCappedOutcomeSurvivesTheLedger(t *testing.T) {
 	s, _, _ := permFixture(t)
 	spec := perm.ModeSpec{Mask: 0o777, Value: 0o755}
-	parts := permTokenParts(tokenKindJob, "chmod", spec, perm.ModeSpec{}, -1, -1, true, false, []string{"/data/tree"})
+	parts := permTokenParts(tokenKindJob, "chmod", spec, perm.ModeSpec{}, -1, -1, true, false, aclVerdict{}, []string{"/data/tree"})
 	token, _ := s.guard.Issue("chmod", guard.Summary{Files: 0, Capped: true}, parts, true)
 	got, ok := s.peekScan(token, "chmod", parts)
 	if !ok || got != -1 {

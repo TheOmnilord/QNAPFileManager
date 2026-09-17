@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -187,30 +188,49 @@ func (p *Platform) probeExpiredLocked(mountPoint string) bool {
 }
 
 // capsLocked is what a LOOKUP may state about a mount point, which is not always
-// what the table holds (Astra r5 #2). Expiry used to do nothing but add the row
-// to the next background pass's work, so every For/ForLiteral in between kept
-// answering with the fact that had just been declared too old to trust — and the
-// pass can be delayed indefinitely: another pass is already running (single
+// what the table holds (Astra r5 #2, r6 #2). Expiry used to do nothing but add
+// the row to the next background pass's work, so every For/ForLiteral in between
+// kept answering with the fact that had just been declared too old to trust — and
+// the pass can be delayed indefinitely: another pass is already running (single
 // flight), the sixteen-per-pass bound put this row behind others, or its own `zfs
 // get` is blocked on a wedged pool. The minute residual 3 promises would then be
 // as long as the queue.
 //
-// So the mutable fact is masked at the point it is read: an expired ZFSAclmode is
-// reported as "" — unknown, which §7 reads as discard and grades L2 — until a
-// re-probe publishes a value. It is a promise of pessimism, not of freshness,
-// which is the only promise a cache can keep.
+// So the probed facts are masked at the point they are read. Past the bound this
+// mount point states no aclmode, no ACL backend and no xattr name at all — "" for
+// each, which §7 reads as discard for the aclmode and as the unknown-storage floor
+// for the backend — until a re-probe publishes. It is a promise of pessimism, not
+// of freshness, which is the only promise a cache can keep.
 //
-// The ACL BACKEND is deliberately left alone. It is a property of the filesystem
-// driver rather than of a dataset's configuration, nothing short of a remount can
-// change it (and a remount moves the incarnation, which drops the facts outright),
-// and masking it would move every expired mount onto the unprobed-storage rung —
-// the same L2, reached by throwing away a fact that is still true. The aclmode is
-// the destructive one and it is the one that is masked.
+// Round 5 masked the aclmode ALONE, and gave a reason for leaving the backend: it
+// is a property of the filesystem driver rather than of a dataset's configuration,
+// so nothing short of a remount can change it, and a remount moves the incarnation
+// and drops the cached facts outright. The first half of that is true and the
+// second half was not (Astra r6 #2). sameMountRow did not compare the mount
+// OPTIONS, so `mount -o remount,acl` on an ext4 filesystem mounted `noacl` changed
+// no field the rule looked at: the incarnation stood, the `none` probed under
+// `noacl` was carried across every refresh, and a chmod over that mount was graded
+// as touching no ACL at all — the POSIX mask notice omitted rather than merely
+// delayed, and omitted for the life of the mount. sameMountRow compares the
+// options now, so that remount advances the incarnation; and the backend is masked
+// here as well, because a cache whose freshness has run out has nothing to say
+// about EITHER fact, and the rung an unprobed storage mount already lands on is
+// exactly the honest one for a mount whose answer has aged out.
+//
+// A mount point that was never probed has no timestamp and so reads as expired
+// here too. That costs nothing: its probed fields are empty already, which is what
+// the callers were reading anyway.
+//
+// Only LOOKUPS are masked. The table keeps the value — the pass needs it to know
+// what it is replacing, and Diag reports it beside a stale flag, because "the
+// daemon probed none and then stopped trusting it" and "the daemon never got an
+// answer" are different faults with the same masked spelling.
 func (p *Platform) capsLocked(mountPoint string) FSCaps {
 	c := p.caps[mountPoint]
-	if c.ZFSAclmode != "" && p.probeExpiredLocked(mountPoint) {
-		c.ZFSAclmode = ""
+	if !p.probeExpiredLocked(mountPoint) {
+		return c
 	}
+	c.ACLBackend, c.ACLXattr, c.ZFSAclmode = "", "", ""
 	return c
 }
 
@@ -681,10 +701,29 @@ func visibleRows(mounts []Mount) map[string]Mount {
 // lives; the device numbers, source, type and in-filesystem root are compared
 // as well, so a table from a kernel that does not keep IDs stable still has to
 // describe the same filesystem for an answer to be kept.
+//
+// The OPTIONS are part of that identity (Astra r6 #2). A remount changes what the
+// filesystem DOES without changing what it is: `mount -o remount,acl` over an ext4
+// mounted `noacl` keeps the mount ID, the device, the source, the type and the
+// in-filesystem root, and changes the one thing the probe went to find — the
+// filesystem answers system.posix_acl_access afterwards and refused it before.
+// Without the options in the comparison that row was "the same mount", so the
+// incarnation stood, the probed `none` was carried forward by setMounts, and the
+// mount was never re-probed at all: a chmod over it was silently graded as
+// touching no ACL.
+//
+// Both option strings are compared, the per-mount one (field 6) and the
+// per-superblock one (field 11), because `acl` is a superblock option on ext4
+// while `ro` is a per-mount one, and neither list alone covers a remount. They are
+// compared in the order the kernel wrote them rather than as sets: the kernel is
+// consistent about that order for a given mount state, and a difference we cannot
+// explain is worth one lgetxattr to resolve. A row that differs is simply a new
+// incarnation, which is the ordinary "re-probe this" path and not an error.
 func sameMountRow(a, b Mount) bool {
 	return a.ID == b.ID && a.Major == b.Major && a.Minor == b.Minor &&
 		a.Root == b.Root && a.MountPoint == b.MountPoint &&
-		a.FSType == b.FSType && a.Source == b.Source
+		a.FSType == b.FSType && a.Source == b.Source &&
+		slices.Equal(a.Options, b.Options) && slices.Equal(a.SuperOptions, b.SuperOptions)
 }
 
 func (p *Platform) maybeRefresh() {
@@ -1075,12 +1114,14 @@ func (p *Platform) ZFSAclmode(dataset string) string {
 // Diag summarises the platform for /api/diag, so that a wrong answer in the
 // field is diagnosable without SSH.
 //
-// The per-mount aclmode here is the CACHED one, unmasked, beside a flag saying
-// whether a lookup would still state it (Astra r5 #2). Masking it would hide the
-// one thing a field report needs — "the daemon probed passthrough and then stopped
-// trusting it" and "the daemon never got an answer" are different faults with the
-// same masked spelling — and reporting it without the flag would have the
-// diagnostic contradict the dialog.
+// The per-mount probed facts here are the CACHED ones, unmasked, beside flags
+// saying whether a lookup would still state them (Astra r5 #2, r6 #2). Masking
+// them would hide the one thing a field report needs — "the daemon probed
+// passthrough and then stopped trusting it" and "the daemon never got an answer"
+// are different faults with the same masked spelling — and reporting them without
+// the flags would have the diagnostic contradict the dialog. There are two flags
+// because the backend expires with the aclmode now and the two can be cached
+// independently: a ZFS row can hold a backend and no aclmode at all.
 func (p *Platform) Diag() map[string]any {
 	p.maybeRefresh()
 	roots := p.VolumeRoots()
@@ -1091,6 +1132,7 @@ func (p *Platform) Diag() map[string]any {
 	acl := make(map[string]string, len(p.caps))
 	for _, m := range p.mounts {
 		c := p.caps[m.MountPoint]
+		stale := p.probeExpiredLocked(m.MountPoint)
 		mounts = append(mounts, map[string]any{
 			"mountPoint": m.MountPoint,
 			"fsType":     m.FSType,
@@ -1106,7 +1148,11 @@ func (p *Platform) Diag() map[string]any {
 			"zfsAclmode": c.ZFSAclmode,
 			// True once the cached answer is past its freshness bound: every lookup
 			// is reporting the aclmode as unknown until the next pass publishes.
-			"zfsAclmodeStale": c.ZFSAclmode != "" && p.probeExpiredLocked(m.MountPoint),
+			"zfsAclmodeStale": c.ZFSAclmode != "" && stale,
+			// The same for the backend, which expires with it (Astra r6 #2). A true
+			// here is why a chmod dialog over a probed mount is asking for a typed
+			// phrase: the lookup is reporting no backend at all.
+			"aclBackendStale": c.ACLBackend != "" && stale,
 		})
 		if c.Storage {
 			acl[m.MountPoint] = c.ACLBackend

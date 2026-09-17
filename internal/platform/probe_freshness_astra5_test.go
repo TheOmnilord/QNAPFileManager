@@ -116,8 +116,14 @@ func TestAnExpiredAclmodeIsUnknownUntilTheReprobePublishes(t *testing.T) {
 	if c.ZFSAclmode != "" {
 		t.Fatalf("aclmode %q while the re-probe is blocked: the expired answer is still being stated", c.ZFSAclmode)
 	}
-	if c.ACLBackend != ACLNFS4 {
-		t.Fatalf("backend %q: the backend is not the destructive fact and is not masked with it", c.ACLBackend)
+	// The BACKEND is masked with it, which round 5 deliberately did not do and
+	// round 6 overturned (Astra r6 #2). The exemption rested on "only a remount
+	// changes a backend, and a remount advances the incarnation"; sameMountRow did
+	// not compare the mount options, so a remount that changed only those did
+	// neither, and the stale backend was stated for the life of the mount. An
+	// expired probe now states neither of its two facts.
+	if c.ACLBackend != "" {
+		t.Fatalf("backend %q past the bound: an expired probe has nothing to say about either fact", c.ACLBackend)
 	}
 	// For and MountByLiteralPath are the same lookup by another spelling, and one
 	// caller may not be told what another is no longer allowed to state.

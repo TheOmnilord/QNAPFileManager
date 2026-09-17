@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -279,13 +280,21 @@ func slashPath(p string) string { return strings.ReplaceAll(p, `\`, "/") }
 // it to the ladder. The discarding datasets are collapsed into ONE L2 sentence
 // that names them (bounded), rather than one sentence per dataset, so a pool
 // with forty of them still produces a dialog somebody reads.
-func (s *Server) chmodJobLadder(ladder *permLadder, targets []string, cross bool) {
+//
+// It RETURNS the folded verdict, which is what the confirmation token binds
+// (Astra r6 #3). The crossing rungs are in it exactly as the root's own is: a
+// child dataset whose aclmode goes from `passthrough` to `discard` between the
+// challenge and the re-post is precisely the case the collapsed sentence exists
+// for, and a token minted before it may not be spent after it.
+func (s *Server) chmodJobLadder(ladder *permLadder, targets []string, cross bool) aclVerdict {
+	var acl aclVerdict
 	var discarding []string
 	seen := map[string]bool{}
 	unreadableMode := false
 	for _, p := range targets {
 		for _, f := range s.ladderFacts(p, cross) {
 			grade, notice, discards := chmodACLNotice(f)
+			acl.fold(f, grade, discards)
 			if !discards {
 				ladder.add(grade, notice)
 				continue
@@ -301,7 +310,7 @@ func (s *Server) chmodJobLadder(ladder *permLadder, targets []string, cross bool
 		}
 	}
 	if len(discarding) == 0 {
-		return
+		return acl
 	}
 	sort.Strings(discarding)
 	sentence := fmt.Sprintf(aclDiscardJobFmt, datasetList(discarding))
@@ -309,6 +318,7 @@ func (s *Server) chmodJobLadder(ladder *permLadder, targets []string, cross bool
 		sentence += aclUnknownModeSuffix
 	}
 	ladder.add(gradeTyped, sentence)
+	return acl
 }
 
 // entryACLFacts is mountFacts plus the entry's own ACL state, asked of the
@@ -749,10 +759,89 @@ func (l *permLadder) scaleNotice(scanned int64) {
 
 // --- confirmation-token parts (contract §7) ----------------------------------
 
+// aclVerdict is what the ACL half of a ladder DECIDED, in the three terms the
+// decision is actually made in: the grade the ACL rungs contributed, whether the
+// ladder judged that an ACL would be DESTROYED, and the aclmode rungs its
+// sentences were built on.
+//
+// It exists because a confirmation token outlives the facts it was minted from
+// (Astra r6 #3). A token lives sixty seconds and a probed fact is trusted for a
+// minute of its own, so the two windows overlap by construction: probe
+// `passthrough` at t=0, `zfs set aclmode=discard`, take an L1 token at t=59 for the
+// sentence promising the other entries are kept, re-post it at t=61. The
+// redemption does re-grade — every route rebuilds its ladder before
+// authorizeGraded — and by then the expired aclmode reads unknown and the grade is
+// the L2 typed phrase; but the descriptor bound the op, the mode bits and the
+// roots and nothing whatever about the ACL, so the earlier token verified and the
+// change was dispatched on a dialog the user was never shown.
+//
+// So the verdict travels INSIDE the token. The redemption rebuilds the parts from
+// the facts it has just re-read, and a verdict that has moved makes the presented
+// token fail to verify — which is not an error: authorizeGraded answers an invalid
+// token with a fresh 409 carrying the CURRENT sentence and grade, which is exactly
+// the dialog the new facts call for. The grade still travels BESIDE the token in
+// that envelope, for the client to render; what goes inside is what the token is
+// only valid for.
+//
+// Three terms rather than the sentence itself: the grade is what the dialog is,
+// the discard flag is what the change does to the ACL (and an audit milestone of
+// its own, §11), and the aclmode is what tells two L1 sentences apart —
+// `passthrough` says the other entries are kept and `groupmask` says they are
+// reduced to the group bits of the new mode, which are not interchangeable
+// promises and would otherwise both redeem as "grade 1, no discard".
+type aclVerdict struct {
+	grade    int
+	discards bool
+	// modes is the sorted, de-duplicated set of aclmode rungs the ACL sentences
+	// were built on. A job ladder folds many datasets into one sentence, so this is
+	// a set rather than a value; it is bounded by the number of spellings an
+	// aclmode has (four, plus aclModeUnknownRung), never by the size of the pool.
+	modes []string
+}
+
+// aclModeUnknownRung spells "the aclmode could not be read" in the descriptor.
+// Empty would collide with "this ladder had no ACL rung at all", and the two are
+// different things: the first is the pessimistic reading that carries the L2
+// unknown-aclmode suffix, the second is a chown, whose ladder never asks.
+const aclModeUnknownRung = "?"
+
+// fold takes one fact's ACL rung into the verdict. A rung that said nothing —
+// grade none and no discard — contributes no mode, because there was no sentence
+// for an aclmode to have been built on, and folding one in would make the token
+// sensitive to a fact nobody was told.
+func (v *aclVerdict) fold(f aclFacts, grade int, discards bool) {
+	if grade > v.grade {
+		v.grade = grade
+	}
+	if discards {
+		v.discards = true
+	}
+	if grade == gradeNone && !discards {
+		return
+	}
+	rung := f.aclmode
+	if rung == "" {
+		rung = aclModeUnknownRung
+	}
+	if slices.Contains(v.modes, rung) {
+		return
+	}
+	v.modes = append(v.modes, rung)
+	sort.Strings(v.modes)
+}
+
+// part is the verdict as the token's descriptor spells it.
+func (v aclVerdict) part() string {
+	return "acl=" + strconv.Itoa(v.grade) + "/" + strconv.FormatBool(v.discards) + "/" + strings.Join(v.modes, "+")
+}
+
 // permTokenParts is the ordered, structured descriptor every M3 confirmation
 // token binds, in the exact order the contract fixes:
 //
-//	op, mask, value, dirs, uid, gid, recursive, cross, then the sorted resolved roots.
+//	op, mask, value, dirs, uid, gid, recursive, cross, acl, then the sorted resolved roots.
+//
+// The acl part is the ladder's ACL verdict at issue time (Astra r6 #3); it sits
+// before the roots because the roots are the one variable-length tail.
 //
 // Ordered (not a sorted multiset), so a token issued for 0755 cannot be redeemed
 // for 4755 and one issued non-recursively cannot be redeemed recursively. Only
@@ -767,7 +856,7 @@ func (l *permLadder) scaleNotice(scanned int64) {
 // ACL state, while a job cannot and reads the mount pessimistically. Without the
 // separation a client could take the sync route's L1 confirmation and spend it
 // on the job route, which would have demanded a typed phrase.
-func permTokenParts(kind, op string, files, dirs perm.ModeSpec, uid, gid int, recursive, cross bool, roots []string) []string {
+func permTokenParts(kind, op string, files, dirs perm.ModeSpec, uid, gid int, recursive, cross bool, acl aclVerdict, roots []string) []string {
 	parts := []string{
 		"kind=" + kind,
 		"op=" + op,
@@ -778,6 +867,7 @@ func permTokenParts(kind, op string, files, dirs perm.ModeSpec, uid, gid int, re
 		"gid=" + strconv.Itoa(gid),
 		"recursive=" + strconv.FormatBool(recursive),
 		"cross=" + strconv.FormatBool(cross),
+		acl.part(),
 	}
 	sorted := append([]string(nil), roots...)
 	sort.Strings(sorted)
@@ -956,6 +1046,12 @@ func (s *Server) chmod(w http.ResponseWriter, r *http.Request, sess *session) {
 	grade, notice, discards := chmodACLNotice(facts)
 	ladder.add(grade, notice)
 	ladder.discards = discards
+	// What the ACL half decided, for the token to bind (Astra r6 #3): the facts
+	// behind this rung expire on their own clock and a token lives sixty seconds,
+	// so a redemption that re-grades differently must not be able to spend the
+	// confirmation the earlier grade was given.
+	var acl aclVerdict
+	acl.fold(facts, grade, discards)
 	if spec.Mask&spec.Value&perm.Setuid != 0 && !s.normalClass(p, guardPath, target) {
 		ladder.add(gradeTyped, setuidOutsideNormalNotice)
 	}
@@ -964,7 +1060,7 @@ func (s *Server) chmod(w http.ResponseWriter, r *http.Request, sess *session) {
 	// without follow cannot be redeemed with it: the two name different objects,
 	// and for a non-symlink — where they are the same spelling — follow changes
 	// nothing at all.
-	parts := permTokenParts(tokenKindSync, "chmod", spec, perm.ModeSpec{}, -1, -1, false, false, []string{target})
+	parts := permTokenParts(tokenKindSync, "chmod", spec, perm.ModeSpec{}, -1, -1, false, false, acl, []string{target})
 	extra := ladder.grade > gradeNone || body.Confirm != ""
 	if !s.authorizeGraded(w, r, sess, verdict, extra, m, p, parts, true, body.Confirm, summary, ladder.grade) {
 		return
@@ -1103,7 +1199,9 @@ func (s *Server) chown(w http.ResponseWriter, r *http.Request, sess *session) {
 	// group-executable file, and neither can be kept (contract §7).
 	ladder.add(gradeConfirm, chownClearsNotice)
 	summary := guard.Summary{Files: 1, Warnings: ladder.warnings}
-	parts := permTokenParts(tokenKindSync, "chown", perm.ModeSpec{}, perm.ModeSpec{}, uid, gid, false, false, []string{guardPath})
+	// The zero verdict: a chown's ladder asks the mount table nothing about ACLs,
+	// so there is no ACL consequence for the token to be bound to (Astra r6 #3).
+	parts := permTokenParts(tokenKindSync, "chown", perm.ModeSpec{}, perm.ModeSpec{}, uid, gid, false, false, aclVerdict{}, []string{guardPath})
 	if !s.authorizeGraded(w, r, sess, verdict, true, m, p, parts, true, body.Confirm, summary, ladder.grade) {
 		return
 	}
@@ -1355,6 +1453,10 @@ func (s *Server) submitPermJob(w http.ResponseWriter, r *http.Request, sess *ses
 	if len(containReasons) > 0 {
 		ladder.add(gradeTyped, containReasons...)
 	}
+	// The ACL verdict the token binds (Astra r6 #3). A chown leaves it zero: its
+	// ladder never reads an aclmode, so there is nothing about an ACL for a stale
+	// confirmation to be stale about.
+	var acl aclVerdict
 	if pj.op == "chown" {
 		ladder.add(gradeConfirm, chownClearsNotice)
 	} else {
@@ -1368,7 +1470,7 @@ func (s *Server) submitPermJob(w http.ResponseWriter, r *http.Request, sess *ses
 		// Crossing is inert without recursion: a non-recursive job never descends,
 		// so grading it on child datasets would promote a two-folder multi-select to
 		// L2 — and to a milestone — over ACLs it will not touch (round-5 nit 1).
-		s.chmodJobLadder(&ladder, targets, pj.cross && pj.recursive)
+		acl = s.chmodJobLadder(&ladder, targets, pj.cross && pj.recursive)
 		if (pj.files.Mask&pj.files.Value&perm.Setuid != 0 || pj.dirs.Mask&pj.dirs.Value&perm.Setuid != 0) &&
 			!s.normalClass(allSpellings...) {
 			ladder.add(gradeTyped, setuidOutsideNormalNotice)
@@ -1376,7 +1478,7 @@ func (s *Server) submitPermJob(w http.ResponseWriter, r *http.Request, sess *ses
 	}
 	// The token binds the spellings the work LANDS on, so a token issued for one
 	// link's target cannot be redeemed once that link points somewhere else.
-	parts := permTokenParts(tokenKindJob, pj.op, pj.files, pj.dirs, pj.uid, pj.gid, pj.recursive, pj.cross, targets)
+	parts := permTokenParts(tokenKindJob, pj.op, pj.files, pj.dirs, pj.uid, pj.gid, pj.recursive, pj.cross, acl, targets)
 	// The scale rung takes the MEASURED count, the same bounded scan delete and
 	// size use, run through the user's own worker (§7, §13).
 	//

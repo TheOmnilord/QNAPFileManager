@@ -482,13 +482,18 @@ test('a claim made before the id exists does not outlive a submission the server
  assert.deepEqual(cancelled, [], 'and nothing is cancelled by guesswork');
 });
 
-// --- and the claim is one SESSION's (Astra r5 #6) -----------------------------
+// --- and the claim is one USER's (Astra r5 #6, Astra r6 #1) -------------------
 //
 // The register is module-level, so it survives the sign-in it was filled under.
 // Alice's cancel goes unacknowledged and the claim stands; the page is then taken
 // over by the administrator Bob, whose first dialog swept the register and resent
 // Alice's cancel with Bob's token and Bob's credentials — which jobCancel allows,
 // because an administrator may cancel another user's job.
+//
+// What scopes the claim is the OWNERSHIP EPOCH, not the session generation. The
+// generation moves whenever the session object is replaced — a read-only toggle,
+// the minute poll — and none of those mean Alice has gone away; keying the claim
+// on it meant her own refresh disowned her running measurement (Astra r6 #1).
 
 const stubborn = cancelled => ({
  report: () => {},
@@ -533,8 +538,49 @@ test('a claim made in the CURRENT session is still retried by the next dialog to
  assert.deepEqual(cancelled, ['s1'], 'the cancel was attempted');
  assert.equal(permissions.jobId, 's1', 'same session: the other dialog still names the walk');
  await permissions.stop();                                     // Stop in the dialog that never sent it
- assert.deepEqual(cancelled, ['s1', 's1'], 'and retries it — the generation rule costs nothing here');
+ assert.deepEqual(cancelled, ['s1', 's1'], 'and retries it — the ownership rule costs nothing here');
  assert.equal(properties.jobId, 's1', 'still unacknowledged, still named');
+});
+
+// A REFRESH is not a change of user, and Alice's session is refreshed for
+// reasons that have nothing to do with her: settings.js re-reads it after a
+// read-only toggle, app.js re-reads it every minute. Round 5 scoped the claim by
+// the session generation, which moves on each of those — so a toggle arriving
+// while her measurement ran made jobId null, and Stop and the close event let go
+// of the walk without ever sending a cancel (Astra r6 #1).
+test('a same-user session refresh does not disown a running measurement (Astra r6 #1)', async t => {
+ resetSizeJobs();
+ const posts = [], cancelled = [];
+ mockFetch(t, posts);
+ update({session: {user: 'alice', uid: 1000, readOnly: false}});
+ const properties = createSizeRunner(stubborn(cancelled));
+ properties.start([dir('/share/CACHEDEV1_DATA/_IMAGES')]);
+ await new Promise(resolve => setTimeout(resolve, 0));
+ update({session: {user: 'alice', uid: 1000, readOnly: true}});   // the read-only toggle, in another tab
+ assert.equal(properties.jobId, 's1', 'her own walk, still hers to stop');
+ await properties.stop();                                         // the dialog's close event
+ assert.deepEqual(cancelled, ['s1'], 'and the cancel really goes out');
+ assert.equal(properties.jobId, 's1', 'unacknowledged, so it stays named for the next retry');
+ update({session: {user: 'alice', uid: 1000, csrf: 'rotated'}});   // the minute poll, with a rotated token
+ assert.equal(properties.jobId, 's1', 'a rotated token is not a new person either');
+ await properties.stop();
+ assert.deepEqual(cancelled, ['s1', 's1'], 'so Stop retries it');
+});
+
+test('signing out drops the claim rather than carrying it (Astra r6 #1)', async t => {
+ resetSizeJobs();
+ const posts = [], cancelled = [];
+ mockFetch(t, posts);
+ update({session: {user: 'alice', uid: 1000}});
+ const properties = createSizeRunner(stubborn(cancelled));
+ properties.start([dir('/share/CACHEDEV1_DATA/_IMAGES')]);
+ await new Promise(resolve => setTimeout(resolve, 0));
+ await properties.stop();
+ assert.deepEqual(cancelled, ['s1'], 'the cancel was attempted');
+ update({session: null});                                         // sign-out, or the 401 that api.js publishes
+ assert.equal(properties.jobId, null, 'there is nobody here with standing to ask again');
+ await properties.stop();
+ assert.deepEqual(cancelled, ['s1'], 'and nothing is resent');
 });
 
 test('a measurement that could not be submitted is not cached as an answer', async t => {

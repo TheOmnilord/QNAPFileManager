@@ -37,7 +37,11 @@ const listeners = new Set();
 // list the kernel refused must never look the same (M4 contract §8.1), and the
 // only place that difference is known is the failed request — so it is kept
 // rather than reported once and thrown away.
-export const state = {session:null,sessionGeneration:0,path:'/share',pathB64:'',sort:'name',desc:false,hidden:false,total:0,pages:new Map(),selection:new Set(),exclude:false,focus:0,anchor:0,filter:'',generation:0,loading:false,clipboard:null,searchResults:null,pendingReveal:null,searchJob:null,listError:null,listener:'',dirClass:''};
+//
+// ownerEpoch is WHOSE page this is, and it changes only when that answer does:
+// a sign-out, or a different user. See update() below for why it is not
+// sessionGeneration.
+export const state = {session:null,sessionGeneration:0,ownerEpoch:0,path:'/share',pathB64:'',sort:'name',desc:false,hidden:false,total:0,pages:new Map(),selection:new Set(),exclude:false,focus:0,anchor:0,filter:'',generation:0,loading:false,clipboard:null,searchResults:null,pendingReveal:null,searchJob:null,listError:null,listener:'',dirClass:''};
 // Capture before awaiting: even signing back in as the same user invalidates old work.
 export function sessionGuard() { const generation=state.sessionGeneration; return () => generation===state.sessionGeneration; }
 
@@ -84,8 +88,28 @@ export function sessionTransition(before,after) {
  if (!before) return 'refresh';
  return sameSession(before,after) ? 'refresh' : 'switch';
 }
+// update() bumps two counters on a session install, and they answer different
+// questions.
+//
+// sessionGeneration is "is this still the same session OBJECT", which every
+// short operation asks through sessionGuard, and it moves on EVERY install —
+// the read-only toggle, the minute poll, a rotated token.
+//
+// ownerEpoch is "is this still the same person's page", and it moves only on a
+// sign-out or a change of user, which is exactly what sessionTransition already
+// tells a refresh from. It exists because long-lived OWNERSHIP was being scoped
+// by the generation: props.js's unacknowledged size-job cancels are one user's
+// walks to stop, and keying them on the generation meant a same-user refresh
+// mid-measurement dropped the claim without ever sending the cancel, so Stop
+// named no job and the du walked on (Astra r6 #1). A refresh changes nothing
+// about who is asking, so it must not end a claim; a switch or a sign-out ends
+// every claim there is.
 export function update(patch) {
- if (Object.hasOwn(patch,'session')) state.sessionGeneration++;
+ if (Object.hasOwn(patch,'session')) {
+  state.sessionGeneration++;
+  // Read before the assign, while state.session is still the outgoing one.
+  if (sessionTransition(state.session,patch.session) !== 'refresh') state.ownerEpoch++;
+ }
  Object.assign(state,patch);
  for (const fn of listeners) fn(state);
 }

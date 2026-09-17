@@ -113,11 +113,20 @@ const claimed = entry => !!entry && !!entry.cancelPending && !entry.cancelled;
 // because an administrator may cancel another user's job, so nothing downstream
 // would have refused it.
 //
-// So the generation the claim was made under is written on the shared entry
-// alongside the claim itself, and the retry is keyed on it rather than on any
-// cross-module wiring: a claim from a session that is no longer the current one
-// is DROPPED — not retried, and not left in the register either.
-const thisSession = generation => generation === state.sessionGeneration;
+// So the OWNER the claim was made under is written on the shared entry alongside
+// the claim itself, and the retry is keyed on it rather than on any cross-module
+// wiring: a claim from a session that is no longer this user's is DROPPED — not
+// retried, and not left in the register either.
+//
+// The owner is `state.ownerEpoch`, not `state.sessionGeneration`. The generation
+// moves on every session INSTALL, same-user refreshes included — settings.js
+// re-reads the session after a read-only toggle, app.js re-reads it every minute
+// — so scoping the claim by it made a refresh arriving mid-measurement look like
+// somebody else's page: jobId went null and Stop and the close event dropped
+// ownership without sending the cancel, while the du walked on (Astra r6 #1).
+// The epoch moves only on a sign-out or a change of user, which is the question
+// actually being asked here: is this still the person who asked for the stop?
+const thisOwner = epoch => epoch === state.ownerEpoch;
 
 // dropClaim ends a claim without sending anything. Either the service answered,
 // or there is nobody left on this side with standing to ask.
@@ -127,7 +136,7 @@ const dropClaim = entry => { if (entry) { entry.cancelPending = false; pendingCa
 // action sweeps with it, so a sign-out or a user switch needs nothing wired to
 // it; it is exported so the session-transition path may say so explicitly.
 export function dropForeignClaims() {
- for (const entry of [...pendingCancels]) if (!thisSession(entry.cancelGeneration)) dropClaim(entry);
+ for (const entry of [...pendingCancels]) if (!thisOwner(entry.cancelEpoch)) dropClaim(entry);
 }
 
 // resetSizeJobs drops every shared measurement, and the pending cancels with
@@ -185,14 +194,16 @@ export function createSizeRunner({report = () => {},track = trackJob,cancel = ca
   // — signed out, or replaced on this page by another user — this side has no
   // standing to stop it and no business trying with somebody else's credentials,
   // so the claim ends here rather than being carried (Astra r5 #6).
-  if (!thisSession(entry.generation)) { dropClaim(entry); return undefined; }
+  // A refresh of the same user's session is not that, and must not end it
+  // (Astra r6 #1) — it is still her walk, and she is still here to stop it.
+  if (!thisOwner(entry.ownerEpoch)) { dropClaim(entry); return undefined; }
   // Asking is what makes the UI responsible for the stopping, and it stays
   // responsible until the service answers (Astra r3 #3). The claim is the
   // MEASUREMENT's, not the asking runner's, so every dialog that shares the walk
   // can retry it — including the one that let go of it last (Astra r4 #3) — but
   // only while the session that made it is still the current one (Astra r5 #6).
   entry.cancelPending = true;
-  entry.cancelGeneration = state.sessionGeneration;
+  entry.cancelEpoch = state.ownerEpoch;
   pendingCancels.add(entry);
   // No id yet: the 202 is still in flight, and the submitting closure sends the
   // cancel the moment the id lands. The claim above is what carries the walk's
@@ -277,15 +288,16 @@ export function createSizeRunner({report = () => {},track = trackJob,cancel = ca
   // Stop, close or Recount that let go of it, because letting go of the hold is
   // not the same as having stopped the walk (Astra r3 #3).
   get jobId() {
-   if (needsStop(held) && thisSession(held.generation)) return held.id;
+   if (needsStop(held) && thisOwner(held.ownerEpoch)) return held.id;
    // A request still ON THE WIRE is being attended to, and this side has nothing
    // to do about that walk until it answers. One that came BACK unacknowledged
    // is the one still waiting for another attempt, and it keeps its name until
    // it gets one (Astra r3 #3) — whichever dialog sent it, because the claim is
    // the measurement's (Astra r4 #3). A claim from a session that has ended names
-   // nothing here: this user is not the one who asked (Astra r5 #6).
+   // nothing here: this user is not the one who asked (Astra r5 #6). A session
+   // merely REFRESHED is the same user, and her walk keeps its name (Astra r6 #1).
    for (const entry of pendingCancels) {
-    if (claimed(entry) && thisSession(entry.cancelGeneration) && !entry.cancelling && needsStop(entry)) return entry.id;
+    if (claimed(entry) && thisOwner(entry.cancelEpoch) && !entry.cancelling && needsStop(entry)) return entry.id;
    }
    return null;
   },
@@ -311,10 +323,11 @@ export function createSizeRunner({report = () => {},track = trackJob,cancel = ca
     entry = null;
    }
    if (!entry) {
-    // `generation` is the session this walk was submitted in: the only session
-    // that may ask for it to be stopped (Astra r5 #6).
+    // `ownerEpoch` is WHOSE walk this is: the only user who may ask for it to be
+    // stopped (Astra r5 #6). It survives her session being refreshed under it,
+    // which the generation did not (Astra r6 #1).
     entry = {key,id:null,holders:0,job:null,finishedAt:0,abandoned:false,failed:false,cancelled:false,cancelling:null,
-     cancelPending:false,generation:state.sessionGeneration,cancelGeneration:-1};
+     cancelPending:false,ownerEpoch:state.ownerEpoch,cancelEpoch:-1};
     entry.promise = (async () => {
      const res = await api('api/jobs/size',{},{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify(sizeRequest(entries,{crossMounts}))});

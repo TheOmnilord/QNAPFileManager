@@ -196,7 +196,11 @@ when `zfs get` is unavailable (identity plan §4.4 is explicit — never guess).
 route and vice versa): `kind=sync|job`, `op=chmod|chown`,
 `mask=<octal>`, `value=<octal>`, `dirs=<octal>/<octal>`, `uid=<n>`, `gid=<n>`, `recursive=<bool>`, `cross=<bool>`,
 then the sorted resolved roots — so a token issued for 0755 cannot be redeemed for 4755, and one issued
-non-recursively cannot be redeemed recursively.
+non-recursively cannot be redeemed recursively. *Amended, Astra round 6 (#3):* an `acl=<grade>/<discards>/<aclmode>`
+part carries the ACL verdict the sentence was built on, so a token issued for the L1 "other entries are kept"
+sentence cannot be redeemed once the facts have aged into the L2 rung — the redemption re-grades, the parts differ,
+and the user is challenged again with the sentence that is now true. A token's lifetime is bounded by the facts it
+was issued on, not only by the clock.
 
 ## 8. Properties
 
@@ -437,7 +441,9 @@ in-app drag-and-drop and the trash janitor stay deferred.
    the mutable probe facts age out and the single-flight pass re-probes them, so the ladder can under-warn for at
    most that minute — *round 5 (#2, #3):* and not a second longer, because an expired `aclmode` is **masked** as
    unknown at lookup until the re-probe publishes, and the pass takes never-probed rows first, then the oldest,
-   with a cursor across passes so a slow pool cannot starve its trailing datasets. Unknown is already treated as `discard`, which covers the far more likely failure (the `zfs`
+   with a cursor across passes so a slow pool cannot starve its trailing datasets. *Round 6 (#2):* the expired
+   **backend** is masked the same way (the unknown-storage floor), and the row identity includes the mount options,
+   so an ext4 share remounted `noacl` → `acl` is a new incarnation rather than a cached `none`. Unknown is already treated as `discard`, which covers the far more likely failure (the `zfs`
    binary not being callable at all).
 4. **"Trivial" is our heuristic.** A mis-classified trivial NFSv4 ACL under-warns. Parse failures fail towards the
    pessimistic side, which is the half that matters.

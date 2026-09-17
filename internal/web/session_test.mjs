@@ -24,6 +24,25 @@ test('session guards survive navigation but invalidate on every session assignme
  assert.equal(reconnected(),false);
 });
 
+// The ownership epoch answers a different question from the generation: not
+// "is this the same session object" but "is this still the same person's page".
+// Long-lived ownership — props.js's unacknowledged size-job cancels — is scoped
+// by it, because scoping by the generation meant a same-user refresh disowned a
+// measurement the user was still watching (Astra r6 #1).
+test('the ownership epoch moves on a sign-out or a change of user, never on a refresh', () => {
+ update({session:{user:'alice',uid:1000,readOnly:false}});
+ const mine=state.ownerEpoch,generation=state.sessionGeneration;
+ update({session:{user:'alice',uid:1000,readOnly:true}});   // the read-only toggle
+ assert.equal(state.ownerEpoch,mine,'a refresh is the same person');
+ update({session:{user:'alice',uid:1000,csrf:'rotated'}});  // the minute poll
+ assert.equal(state.ownerEpoch,mine);
+ assert.equal(state.sessionGeneration,generation+2,'while the generation moved on each of those');
+ update({session:{user:'alice',uid:1001}});                 // the same name, a different uid
+ assert.equal(state.ownerEpoch,mine+1,'a switch is somebody else');
+ update({session:null});
+ assert.equal(state.ownerEpoch,mine+2,'and a sign-out is nobody');
+});
+
 test('delayed success and failure cannot publish after expiry and reauthentication', async () => {
  for (const reject of [false,true]) {
   update({session:{user:'alice'}});

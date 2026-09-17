@@ -200,7 +200,11 @@ non-recursively cannot be redeemed recursively. *Amended, Astra round 6 (#3):* a
 part carries the ACL verdict the sentence was built on, so a token issued for the L1 "other entries are kept"
 sentence cannot be redeemed once the facts have aged into the L2 rung — the redemption re-grades, the parts differ,
 and the user is challenged again with the sentence that is now true. A token's lifetime is bounded by the facts it
-was issued on, not only by the clock.
+was issued on, not only by the clock. *Round 7 (#1, #2):* the part is a **digest of the per-dataset consequences**
+(dataset → rung, sorted), not the deduplicated set of modes — with root `passthrough`, child A `discard`, child B
+`passthrough`, the set `discard+passthrough` did not change when B flipped, and the old token would have
+destroyed B's ACL without the warning naming B. And the client presents a *second* challenge in turn: a verdict
+that changes while the dialog is open (expiry, a background probe) is a new sentence to acknowledge, not an error.
 
 ## 8. Properties
 
@@ -481,6 +485,18 @@ in-app drag-and-drop and the trash janitor stay deferred.
     device (a regular-file bind mount) is a crossing under `crossMounts:false` and is skipped like a directory
     crossing. The recursive root is re-`fstat`ed before its own mode is built, so a special bit cleared elsewhere
     during the walk is not reinstated from a stale snapshot.
+14. **A benign refresh re-challenges (Astra round 7).** An `aclmode` that was unknown when the challenge was issued
+    and known by redemption changes the token's consequence part, so the user is asked again even though the new
+    sentence is milder. That is the conservative side, and it is bounded by the probe TTL.
+15. **Claim ownership follows the session the page observed (Astra round 7).** Pending size-job cancels are scoped
+    by an owner epoch that moves on an observed sign-out or change of user; a same-user re-login the page never
+    saw keeps the previous claims — the same person, the same walks, and nothing a different user could reach.
+    A measurement's polling and completion follow the same epoch, so a same-user refresh mid-walk neither
+    cancels nor orphans it.
+16. **What the token does not re-grade (Astra round 7).** A job already running is not re-graded when the ACL
+    facts change under it — the token bound its start, and a walk in progress is the kernel's. A size job whose
+    202 the page never received, or whose tab was closed, is reaped by the server's job lifetime, not by a dialog.
+    The pathname chown fallback where `/proc` is absent keeps the check/use window §2.3 already accepts.
 
 **To confirm on hardware first (both units):** that `zfs get -Hp -o value aclmode` is callable at all as root on
 hero and what it returns for an ordinary share — the entire L2 promotion hangs on it, and an empty answer means every

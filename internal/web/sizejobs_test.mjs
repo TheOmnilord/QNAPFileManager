@@ -29,7 +29,7 @@ globalThis.window = {addEventListener() {}};
 globalThis.matchMedia = () => ({matches: false});
 globalThis.location = {hash: ''};
 
-const {cancelJob, trackJob} = await import('./static/js/jobs.js');
+const {awaitJob, cancelJob, trackJob} = await import('./static/js/jobs.js');
 const {update} = await import('./static/js/state.js');
 const {
  SIZE_REUSE_MS, createSizeRunner, resetSizeJobs, sizeJobKey, sizeJobUsable,
@@ -581,6 +581,79 @@ test('signing out drops the claim rather than carrying it (Astra r6 #1)', async 
  assert.equal(properties.jobId, null, 'there is nobody here with standing to ask again');
  await properties.stop();
  assert.deepEqual(cancelled, ['s1'], 'and nothing is resent');
+});
+
+// --- the WAIT is owned by the same person as the claim (Astra r7 #3) ----------
+//
+// The claims moved to the ownership epoch in round 6; the poll did not, and the
+// two then disagreed about whose walk it was. awaitJob uses sessionGuard, so a
+// same-user refresh arriving during a GET /api/jobs/<id> made it answer null —
+// which start() reads as "the measurement did not answer", so abandon() cancels
+// the walk under a dialog that is still open, and start()'s own guard then
+// suppresses the failure report it just caused. One cancel, no terminal report,
+// "Measuring…" for ever (Astra r7 #3, reproduced with the real awaitJob).
+//
+// These two tests therefore use the REAL awaitJob, only hurried: the option
+// props.js passes it is the whole of the fix, and a stub would not carry it.
+const hurried = (id, options) => awaitJob(id, {...options, delay: 1, tries: 400});
+
+// jobFetch answers the size POST once and then the single-job GET, with the
+// state `live` decides — so a test can hold a measurement open for as long as it
+// needs and let it finish on the next poll.
+const jobFetch = (t, live, id = 's1') => t.mock.method(globalThis, 'fetch', async url => {
+ if (String(url).endsWith('api/jobs/size')) return new Response(JSON.stringify({job: {id, state: 'queued'}}), {status: 202});
+ const job = live() ? {id, state: 'running'} : {id, state: 'done', result: {bytes: 2048, files: 3, dirs: 2}};
+ return new Response(JSON.stringify({job}), {status: 200});
+});
+
+test('a same-user refresh during the poll neither cancels the walk nor loses its answer (Astra r7 #3)', async t => {
+ resetSizeJobs();
+ const cancelled = [], reports = [];
+ let walking = true;
+ jobFetch(t, () => walking);
+ update({session: {user: 'alice', uid: 1000, readOnly: false}});
+ const runner = createSizeRunner({
+  report: r => reports.push(r), track: () => {},
+  cancel: async id => { cancelled.push(id); return true; },
+  poll: hurried,
+ });
+ const measuring = runner.start([dir('/share/CACHEDEV1_DATA/_IMAGES')]);
+ await new Promise(resolve => setTimeout(resolve, 20));            // several polls in
+ update({session: {user: 'alice', uid: 1000, readOnly: true}});    // the toggle, in another tab
+ await new Promise(resolve => setTimeout(resolve, 20));
+ assert.deepEqual(cancelled, [], 'a refresh is not a reason to stop measuring');
+ assert.equal(runner.jobId, 's1', 'and the walk is still hers to stop');
+ assert.equal(reports.at(-1).state, 'running', 'the dialog is still honestly measuring');
+ walking = false;                                                  // the du finishes
+ const job = await measuring;
+ assert.equal(job?.state, 'done');
+ assert.equal(reports.at(-1).state, 'done', 'and the answer really arrives');
+ assert.equal(reports.at(-1).result.bytes, 2048);
+ assert.equal(runner.jobId, null, 'a finished measurement has nothing left to stop');
+});
+
+// A switch is the other half of the same rule: the page is somebody else's now,
+// so the wait is given up, nothing is reported into the new user's dialog — and
+// nothing is cancelled either, because the walk is Alice's and this page now
+// holds Bob's credentials (Astra r5 #6). The measurement is dropped from the
+// shared cache rather than left as an answer Bob could attach to.
+test('a user switch during the poll abandons the measurement and reports nothing (Astra r7 #3)', async t => {
+ resetSizeJobs();
+ const cancelled = [], reports = [];
+ jobFetch(t, () => true);                                          // the du never finishes
+ update({session: {user: 'alice', uid: 1000}});
+ const runner = createSizeRunner({
+  report: r => reports.push(r), track: () => {},
+  cancel: async id => { cancelled.push(id); return true; },
+  poll: hurried,
+ });
+ const measuring = runner.start([dir('/share/CACHEDEV1_DATA/_IMAGES')]);
+ await new Promise(resolve => setTimeout(resolve, 20));
+ update({session: {user: 'administrator', uid: 0}});               // Bob takes the page over
+ assert.equal(await measuring, null, 'the wait is given up');
+ assert.equal(reports.at(-1).state, 'running', 'and nothing is reported into Bob’s page');
+ assert.equal(runner.jobId, null, 'Alice’s walk is not Bob’s to name');
+ assert.deepEqual(cancelled, [], 'nor to cancel with Bob’s credentials (Astra r5 #6)');
 });
 
 test('a measurement that could not be submitted is not cached as an answer', async t => {

@@ -282,24 +282,42 @@ func TestAChownConfirmationIsUnaffected(t *testing.T) {
 // produced no sentence contributes no aclmode, because there was nothing for one
 // to have been built on — otherwise a tmpfs under a job's root would put a "?" in
 // the descriptor and make the token sensitive to a mount nobody was told about.
+//
+// Rewritten for round 7 (#1): the third term is a digest of the per-dataset
+// table, not the joined set of modes, so the assertions are about what the part
+// DISTINGUISHES rather than about its spelling.
 func TestTheACLVerdictRecordsOnlyRungsThatWereStated(t *testing.T) {
 	var v aclVerdict
 	if got := v.part(); got != "acl=0/false/" {
 		t.Fatalf("the zero verdict is %q, want an empty one", got)
 	}
-	v.fold(aclFacts{aclmode: "passthrough"}, gradeNone, false)
+	v.fold(aclFacts{dataset: "zpool1/a", aclmode: "passthrough"}, gradeNone, false)
 	if got := v.part(); got != "acl=0/false/" {
 		t.Fatalf("part %q: a rung that stated nothing must contribute nothing", got)
 	}
-	v.fold(aclFacts{aclmode: "passthrough"}, gradeConfirm, false)
-	if got := v.part(); got != "acl=1/false/passthrough" {
-		t.Fatalf("part %q, want the stated L1 rung", got)
+	v.fold(aclFacts{dataset: "zpool1/a", aclmode: "passthrough"}, gradeConfirm, false)
+	stated := v.part()
+	if !strings.HasPrefix(stated, "acl=1/false/") || len(stated) != len("acl=1/false/")+32 {
+		t.Fatalf("part %q, want the stated L1 grade over a digest", stated)
 	}
-	// A second dataset saying the same thing is the same rung; an unreadable
-	// aclmode is its own, because it is what carries the L2 suffix.
-	v.fold(aclFacts{aclmode: "passthrough"}, gradeConfirm, false)
-	v.fold(aclFacts{aclmode: ""}, gradeTyped, true)
-	if got := v.part(); got != "acl=2/true/?+passthrough" {
-		t.Fatalf("part %q, want the worst grade, the discard flag and both rungs, sorted", got)
+	// The same dataset saying the same thing again is the same consequence and
+	// leaves the digest alone; another dataset, with an unreadable aclmode of its
+	// own, is a second row and the worst grade.
+	v.fold(aclFacts{dataset: "zpool1/a", aclmode: "passthrough"}, gradeConfirm, false)
+	if got := v.part(); got != stated {
+		t.Fatalf("part %q, want it unchanged at %q: a repeated fact is not a new consequence", got, stated)
+	}
+	v.fold(aclFacts{dataset: "zpool1/b", aclmode: ""}, gradeTyped, true)
+	worst := v.part()
+	if !strings.HasPrefix(worst, "acl=2/true/") {
+		t.Fatalf("part %q, want the worst grade and the discard flag", worst)
+	}
+	// And the same two rungs on OTHER datasets are a different verdict, which is
+	// the whole of round 7 #1: the modes are the pair `?`+`passthrough` either way.
+	var swapped aclVerdict
+	swapped.fold(aclFacts{dataset: "zpool1/a", aclmode: ""}, gradeTyped, true)
+	swapped.fold(aclFacts{dataset: "zpool1/b", aclmode: "passthrough"}, gradeConfirm, false)
+	if swapped.part() == worst {
+		t.Fatal("two datasets that swapped rungs must not share a descriptor")
 	}
 }

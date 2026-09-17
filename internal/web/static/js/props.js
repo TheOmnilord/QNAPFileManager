@@ -1,6 +1,6 @@
 import {api} from './api.js';
 import {$,el,error,announce,openDialog,pathArgs} from './dom.js';
-import {state,sessionGuard} from './state.js';
+import {state,sessionGuard,ownerGuard} from './state.js';
 import {isDirectory,isSymlink} from './badges.js';
 import {trackJob,awaitJob,cancelJob,formatBytes} from './jobs.js';
 import {aclBadge,octal,parseOctal,symbolic} from './perm.js';
@@ -313,7 +313,16 @@ export function createSizeRunner({report = () => {},track = trackJob,cancel = ca
   },
   async start(entries,{crossMounts = false} = {}) {
    runner.stop();
-   const ticket = run,valid = sessionGuard();
+   // The measurement is held to its OWNER, not to the session object it was
+   // started under. A du over a multi-terabyte share runs for minutes, and the
+   // session is replaced under it for reasons that are not the user going away:
+   // a read-only toggle in another tab, the minute poll, a rotated token. With
+   // sessionGuard here (and inside the poll) such a refresh made the wait answer
+   // null, which cancelled the walk under a dialog that was still open — and
+   // then suppressed the failure report it had just caused, so the dialog said
+   // "Measuring…" for ever over a measurement nobody was making (Astra r7 #3).
+   // A switch or a sign-out still ends it: that is what the epoch moves on.
+   const ticket = run,valid = ownerGuard();
    const key = sizeJobKey(entries,{crossMounts});
    report({state:'running',text:'Measuring…',result:null});
    pruneSizeJobs();
@@ -342,13 +351,16 @@ export function createSizeRunner({report = () => {},track = trackJob,cancel = ca
      // throw the Operations drawer over the dialog they are reading.
      track(res.job,{quiet:true});
      // A poll that answers null has NOT seen a terminal state: awaitJob ran out
-     // of tries, or the session changed under it. Storing that as the answer set
+     // of tries, or the OWNER changed under it — the same epoch the claims use,
+     // so a refresh keeps polling and a switch gives up (Astra r7 #3), and the
+     // wait and the cancel can no longer disagree about whose walk this is.
+     // Storing that as the answer set
      // finishedAt and put the entry out of cancelling reach, so the walk carried
      // on with nobody able to stop it; a thrown fetch error lost it the same way
      // (round 1, finding 14). Either way the job is cancelled by the id the
      // entry still holds, and the failure is what this measurement reports.
      let job;
-     try { job = await poll(entry.id); }
+     try { job = await poll(entry.id,{guard:ownerGuard}); }
      catch(err) { abandon(entry); throw err; }
      if (!job) { abandon(entry); throw new Error('The measurement did not answer, and it was stopped. Press Recount to measure again.'); }
      entry.job = job; entry.finishedAt = Date.now();

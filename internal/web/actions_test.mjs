@@ -1,7 +1,7 @@
 // Run with: node --test internal/web/actions_test.mjs
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
-import {runMutation, actionMessage, onNewFolderError, deleteGrade, trashOutcome, undoRestore, PERMANENT_WARNING} from './static/js/actions.js';
+import {runMutation, CONFIRM_CHALLENGES, actionMessage, onNewFolderError, deleteGrade, trashOutcome, undoRestore, PERMANENT_WARNING} from './static/js/actions.js';
 import {update} from './static/js/state.js';
 
 test('runMutation drives the server confirmation-token flow', async t => {
@@ -31,6 +31,74 @@ test('runMutation returns null when the confirmation is declined', async t => {
  const res=await runMutation('api/fs/delete',{path:'/x'},async () => false);
  assert.equal(res,null);
  assert.equal(posts,1); // no second POST after a decline
+});
+
+// The verdict can change while the dialog is open — a probe expires, a
+// background probe lands — and the server then answers the redemption with a
+// SECOND confirm_required carrying the sentence that is now true (§7, Astra r6
+// #3). The client used to present only the first, so the L2 sentence about the
+// ACL arrived as a bare error (Astra r7 #2).
+test('runMutation presents a second challenge in turn rather than throwing it', async t => {
+ t.after(() => update({session:null}));
+ const bodies=[];
+ t.mock.method(globalThis,'fetch',async (url,opts) => {
+  bodies.push(JSON.parse(opts.body));
+  if (bodies.length===1) {
+   return new Response(JSON.stringify({error:{code:'confirm_required',message:'The ACL itself survives; named entries may lose effective access.'},confirm:{token:'L1',grade:1,summary:{warnings:['group bits become the mask']}}}),{status:409});
+  }
+  if (bodies.length===2) {
+   return new Response(JSON.stringify({error:{code:'confirm_required',message:'The ACL on tank/share will be destroyed and cannot be restored from this app.'},confirm:{token:'L2',grade:2,summary:{warnings:['aclmode is discard']}}}),{status:409});
+  }
+  return new Response(JSON.stringify({ok:true}),{status:200});
+ });
+ const shown=[];
+ const res=await runMutation('api/perm/chmod',{path:'/share/x',mask:'0777'},async (confirm,message) => {
+  shown.push({grade:confirm.grade,message});
+  return true;
+ });
+ assert.deepEqual(res,{ok:true});
+ assert.equal(shown.length,2);
+ assert.equal(shown[0].grade,1);
+ assert.match(shown[0].message,/named entries may lose effective access/);
+ assert.equal(shown[1].grade,2);                     // the CURRENT grade, so the dialog asks for the phrase
+ assert.match(shown[1].message,/will be destroyed/); // and the CURRENT sentence, not the first one
+ assert.equal(bodies.length,3);
+ assert.equal(bodies[1].confirm,'L1');
+ assert.equal(bodies[2].confirm,'L2');               // each token redeemed once, in order
+ assert.equal(bodies[2].mask,'0777');                // on the identical original body
+});
+
+test('runMutation stops at a cancelled second challenge with no third POST', async t => {
+ t.after(() => update({session:null}));
+ let posts=0;
+ t.mock.method(globalThis,'fetch',async () => {
+  posts++;
+  return new Response(JSON.stringify({error:{code:'confirm_required',message:`challenge ${posts}`},confirm:{token:`T${posts}`}}),{status:409});
+ });
+ let asked=0;
+ const res=await runMutation('api/perm/chmod',{path:'/share/x'},async () => { asked++; return asked===1; });
+ assert.equal(res,null);
+ assert.equal(asked,2);
+ assert.equal(posts,2); // the cancelled second question sends nothing
+});
+
+test('runMutation gives up at the challenge bound, reporting the last sentence', async t => {
+ t.after(() => update({session:null}));
+ let posts=0;
+ t.mock.method(globalThis,'fetch',async () => {
+  posts++;
+  return new Response(JSON.stringify({error:{code:'confirm_required',message:`sentence ${posts}`},confirm:{token:`T${posts}`}}),{status:409});
+ });
+ const shown=[];
+ await assert.rejects(
+  runMutation('api/perm/chown',{path:'/share/x'},async (confirm,message) => { shown.push(message); return true; }),
+  err => {
+   assert.equal(err.code,'confirm_required');
+   assert.equal(err.message,`sentence ${CONFIRM_CHALLENGES}`); // the latest words, not the first
+   return true;
+  });
+ assert.equal(posts,CONFIRM_CHALLENGES);      // no further POST once the bound is reached
+ assert.equal(shown.length,CONFIRM_CHALLENGES-1);
 });
 
 test('runMutation rethrows a non-confirmable error', async t => {

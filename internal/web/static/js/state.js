@@ -45,6 +45,15 @@ export const state = {session:null,sessionGeneration:0,ownerEpoch:0,path:'/share
 // Capture before awaiting: even signing back in as the same user invalidates old work.
 export function sessionGuard() { const generation=state.sessionGeneration; return () => generation===state.sessionGeneration; }
 
+// ownerGuard is the same question asked of the OWNER rather than of the session
+// object: is this still the person whose work this is? It is what LONG-LIVED
+// local work asks — props.js's size measurement polls for minutes — because
+// sessionGuard would answer no to a read-only toggle or the minute poll, and
+// answering no there cancelled a measurement whose dialog was still open and
+// then suppressed the failure it had caused, leaving "Measuring…" on screen
+// (Astra r7 #3). Short operations keep sessionGuard: see the note above.
+export function ownerGuard() { const epoch=state.ownerEpoch; return () => epoch===state.ownerEpoch; }
+
 // sameSession says whether a session is still the SAME USER's session, as
 // distinct from being the same session OBJECT — which is what sessionGuard
 // asks, and what every short operation should keep asking.

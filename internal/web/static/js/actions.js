@@ -12,21 +12,50 @@ function post(endpoint,body) {
  return api(endpoint,{},{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
 }
 
+// CONFIRM_CHALLENGES is how many confirmation challenges one mutation may draw
+// before the client stops asking. Counted over challenges RECEIVED, so the last
+// one is reported rather than asked about: two are answered and re-posted, and
+// a third means the verdict is not settling.
+export const CONFIRM_CHALLENGES=3;
+
 // runMutation posts body to endpoint and drives the server confirmation-token
 // flow. On a 409 confirm_required it calls ask(confirm,message); if that
 // resolves truthy it re-posts the identical body plus the token, otherwise it
 // returns null (cancelled). This helper is pure (no DOM) so it can be unit
 // tested with a mocked api.
+//
+// A token is bound to the VERDICT it was issued on (M3 contract §7, Astra r6
+// #3): the facts can age — a probe expires, a background probe lands — while
+// the dialog is open, and the redemption then re-grades, finds different parts
+// and answers a SECOND confirm_required carrying the sentence that is now true.
+// That is the server's fail-closed binding working, not a failure. Presenting
+// only the first challenge turned the second into a thrown error: the
+// Permissions dialog reported the bare "This change needs confirmation" and the
+// user never saw the L2 sentence about the ACL that had, in the meantime,
+// become the truth (Astra r7 #2).
+//
+// So each challenge is presented in its turn — a fresh dialog with the CURRENT
+// sentence and grade, which is what promotes the second question to a typed
+// phrase when the rung rose — and only an acknowledged one is re-posted. A
+// cancelled dialog at any step ends it with no further POST, and the exchange is
+// bounded: a verdict that will not settle is reported in its own latest words
+// rather than asked about forever.
 export async function runMutation(endpoint,body,ask) {
- try {
-  return await post(endpoint,body);
- } catch(err) {
-  if (err.code==='confirm_required' && err.confirm?.token) {
-   const approved=await ask(err.confirm,err.message);
-   if (!approved) return null;
-   return await post(endpoint,{...body,confirm:err.confirm.token});
+ let sent=body;
+ for (let challenge=1;;challenge++) {
+  let pending;
+  try {
+   return await post(endpoint,sent);
+  } catch(err) {
+   if (err.code!=='confirm_required' || !err.confirm?.token) throw err;
+   pending=err;
   }
-  throw err;
+  // The bound, reached: the last sentence IS the answer, and it is the sentence
+  // the server sent last — never an older one, and never a generic one.
+  if (challenge>=CONFIRM_CHALLENGES) throw pending;
+  const approved=await ask(pending.confirm,pending.message);
+  if (!approved) return null;
+  sent={...body,confirm:pending.confirm.token};
  }
 }
 

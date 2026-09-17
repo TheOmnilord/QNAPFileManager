@@ -2,6 +2,8 @@ package web
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -167,6 +169,17 @@ func (f aclFacts) key() string {
 		return "dataset:" + f.dataset
 	}
 	return "mount:" + f.mount
+}
+
+// verdictKey names the dataset a CONSEQUENCE lands on, for the token's digest
+// (Astra r7 #1). It is key() plus the other candidate a mount disagreement
+// leaves in play: the L2 sentence names both, so a change to either is a change
+// to what the user was told, and the token may not outlive it.
+func (f aclFacts) verdictKey() string {
+	if f.altDataset == "" {
+		return f.key()
+	}
+	return f.key() + "\x00alt:" + f.altDataset
 }
 
 // datasetNames spells every dataset an L2 sentence about this path has to name.
@@ -789,14 +802,37 @@ func (l *permLadder) scaleNotice(scanned int64) {
 // `passthrough` says the other entries are kept and `groupmask` says they are
 // reduced to the group bits of the new mode, which are not interchangeable
 // promises and would otherwise both redeem as "grade 1, no discard".
+//
+// The third term is per DATASET, not a set of modes (Astra r7 #1). A set loses
+// which dataset said what, and a crossing job's ladder reaches many: with the
+// root on `passthrough`, child A on `discard` and child B on `passthrough`, the
+// set is `discard+passthrough` — and it is still `discard+passthrough` after B
+// flips to `discard`, because A was already contributing that spelling. The old
+// token then verified and the chmod destroyed B's ACL, on an L2 sentence that
+// named A alone. So what the token binds is the TABLE: every dataset with the
+// rung it stated, which moves whenever any one of them does.
 type aclVerdict struct {
 	grade    int
 	discards bool
-	// modes is the sorted, de-duplicated set of aclmode rungs the ACL sentences
-	// were built on. A job ladder folds many datasets into one sentence, so this is
-	// a set rather than a value; it is bounded by the number of spellings an
-	// aclmode has (four, plus aclModeUnknownRung), never by the size of the pool.
-	modes []string
+	// per is the de-duplicated set of per-dataset consequences. It is bounded by
+	// the number of datasets a crossing walk reaches, which is why part() spells it
+	// as a digest rather than inline: a pool with forty datasets would otherwise put
+	// forty names in a descriptor that travels in a header-sized token.
+	per []aclConsequence
+}
+
+// aclConsequence is what ONE dataset's ACL rung said. The key is the dataset the
+// mount table names, or the mount point when it names none, so two unnamed
+// datasets are still two; the rung is the aclmode the sentence was built on; the
+// grade and the discard flag are what that sentence WAS. All four are compared,
+// because a dataset can change its consequence without changing its aclmode —
+// a backend re-probed from `posix` to `nfs4` is the same `passthrough` under a
+// different promise.
+type aclConsequence struct {
+	key      string
+	rung     string
+	grade    int
+	discards bool
 }
 
 // aclModeUnknownRung spells "the aclmode could not be read" in the descriptor.
@@ -805,10 +841,17 @@ type aclVerdict struct {
 // unknown-aclmode suffix, the second is a chown, whose ladder never asks.
 const aclModeUnknownRung = "?"
 
-// fold takes one fact's ACL rung into the verdict. A rung that said nothing —
-// grade none and no discard — contributes no mode, because there was no sentence
-// for an aclmode to have been built on, and folding one in would make the token
-// sensitive to a fact nobody was told.
+// fold takes one fact's ACL rung into the verdict: the worst grade, the discard
+// flag, and the fact's own row in the per-dataset table (Astra r7 #1). A rung that
+// said nothing — grade none and no discard — contributes no row, because there was
+// no sentence for an aclmode to have been built on, and folding one in would make
+// the token sensitive to a fact nobody was told.
+//
+// Rows are de-duplicated on the WHOLE consequence, not on the dataset: two facts
+// that agree are one row whichever path they arrived by, and two that disagree
+// about the same dataset — which the daemon's table and the worker's can, over the
+// window the asynchronous refresh opens — are kept as two rather than silently
+// merged into whichever was folded first.
 func (v *aclVerdict) fold(f aclFacts, grade int, discards bool) {
 	if grade > v.grade {
 		v.grade = grade
@@ -823,16 +866,44 @@ func (v *aclVerdict) fold(f aclFacts, grade int, discards bool) {
 	if rung == "" {
 		rung = aclModeUnknownRung
 	}
-	if slices.Contains(v.modes, rung) {
+	c := aclConsequence{key: f.verdictKey(), rung: rung, grade: grade, discards: discards}
+	if slices.Contains(v.per, c) {
 		return
 	}
-	v.modes = append(v.modes, rung)
-	sort.Strings(v.modes)
+	v.per = append(v.per, c)
 }
 
-// part is the verdict as the token's descriptor spells it.
+// part is the verdict as the token's descriptor spells it: the folded grade, the
+// discard flag, and a digest of the per-dataset table (Astra r7 #1). The first
+// two are the dialog the user saw; the digest is what makes the token invalid the
+// moment any single dataset's consequence moves, including a move that leaves the
+// folded pair — and the deduplicated set of modes before it — exactly as it was.
 func (v aclVerdict) part() string {
-	return "acl=" + strconv.Itoa(v.grade) + "/" + strconv.FormatBool(v.discards) + "/" + strings.Join(v.modes, "+")
+	return "acl=" + strconv.Itoa(v.grade) + "/" + strconv.FormatBool(v.discards) + "/" + v.digest()
+}
+
+// digest hashes the per-dataset consequences, sorted so the order the ladder
+// happened to walk the mounts in cannot change it, and length-prefixed so a
+// dataset whose name contains the separator cannot be spelled to look like two.
+// Sixteen bytes of SHA-256 in hex: the token carries the descriptor in full, and
+// the table is a fingerprint rather than a list because a pool can hold dozens of
+// datasets. An EMPTY digest is a ladder that stated no ACL rung at all — a chown,
+// or a path on a filesystem with no ACL consequence — which is what the zero
+// verdict has always spelled and must keep spelling.
+func (v aclVerdict) digest() string {
+	if len(v.per) == 0 {
+		return ""
+	}
+	rows := make([]string, 0, len(v.per))
+	for _, c := range v.per {
+		rows = append(rows, c.key+"\x00"+c.rung+"\x00"+strconv.Itoa(c.grade)+"\x00"+strconv.FormatBool(c.discards))
+	}
+	sort.Strings(rows)
+	h := sha256.New()
+	for _, row := range rows {
+		fmt.Fprintf(h, "%d:%s", len(row), row)
+	}
+	return hex.EncodeToString(h.Sum(nil)[:16])
 }
 
 // permTokenParts is the ordered, structured descriptor every M3 confirmation
@@ -840,8 +911,10 @@ func (v aclVerdict) part() string {
 //
 //	op, mask, value, dirs, uid, gid, recursive, cross, acl, then the sorted resolved roots.
 //
-// The acl part is the ladder's ACL verdict at issue time (Astra r6 #3); it sits
-// before the roots because the roots are the one variable-length tail.
+// The acl part is the ladder's ACL verdict at issue time (Astra r6 #3), grade and
+// discard flag over a digest of the per-dataset consequence table (r7 #1); it sits
+// before the roots because the roots are the one variable-length tail — the digest
+// is fixed-width however many datasets a crossing walk reached.
 //
 // Ordered (not a sorted multiset), so a token issued for 0755 cannot be redeemed
 // for 4755 and one issued non-recursively cannot be redeemed recursively. Only

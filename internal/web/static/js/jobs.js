@@ -426,13 +426,28 @@ export function trackJob(job,{quiet = false} = {}) {
 // parts of a result (a search's hits), so a caller that has a result to show
 // must ask about its own job by id. search.js makes that request itself rather
 // than inheriting this one — see searchJobView there.
-export async function awaitJob(id,{tries=1200,delay=500} = {}) {
+//
+// `guard` is the validity the wait is held to, and it is a FACTORY because the
+// question is asked fresh around every request. It defaults to sessionGuard, so
+// actions.js, perms.js and everything else keep the strict meaning: abandon the
+// wait whenever the session object is replaced. props.js's size measurement
+// passes ownerGuard instead — it runs for minutes, and giving it up on a
+// same-user refresh cancelled the walk under a dialog that was still open
+// (Astra r7 #3). Nothing else may weaken it without saying why here.
+export async function awaitJob(id,{tries=1200,delay=500,guard=sessionGuard} = {}) {
+ // Captured ONCE, and asked after the request and again after the sleep. It used
+ // to be re-captured on every iteration, so only a change that landed while a
+ // request was in flight was ever noticed — and the wait spends nearly all of its
+ // time asleep between them. A change during the half-second sleep was therefore
+ // adopted as the new baseline, and the wait ran on until it had spent its tries:
+ // up to ten minutes of polling for a user who is no longer here.
+ const valid = guard();
  for (let i = 0; i < tries; i++) {
-  const valid = sessionGuard();
   const data = await api(`api/jobs/${id}`);
   if (!valid()) return null;
   if (!jobLive(data.job)) return data.job;
   await new Promise(resolve => setTimeout(resolve,delay));
+  if (!valid()) return null;
  }
  return null;
 }

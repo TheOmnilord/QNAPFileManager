@@ -374,18 +374,26 @@ func TestChmodDiffIsAWarningNotAnError(t *testing.T) {
 // binds, in the exact order the contract fixes. It is what makes a token issued
 // for 0755 unredeemable for 4755 and a non-recursive one unredeemable
 // recursively — and, since round 6, one issued for an L1 passthrough sentence
-// unredeemable once the same path grades L2 discard (Astra r6 #3).
+// unredeemable once the same path grades L2 discard (Astra r6 #3). The ACL part
+// is the folded pair over a fixed-width digest of the per-dataset table (r7 #1),
+// so it stays in one position however many datasets the ladder reached.
 func TestPermTokenPartsAreOrderedAndComplete(t *testing.T) {
+	var acl aclVerdict
+	acl.fold(aclFacts{dataset: "zpool1/a", aclmode: "discard"}, gradeTyped, true)
+	acl.fold(aclFacts{dataset: "zpool1/b", aclmode: ""}, gradeTyped, true)
+	if !strings.HasPrefix(acl.part(), "acl=2/true/") || len(acl.part()) != len("acl=2/true/")+32 {
+		t.Fatalf("acl part %q, want the folded pair over a 16-byte digest in hex", acl.part())
+	}
 	got := permTokenParts(tokenKindJob, "chmod",
 		perm.ModeSpec{Mask: 0o777, Value: 0o755},
 		perm.ModeSpec{Mask: 0o7777, Value: 0o2755},
 		-1, 100, true, true,
-		aclVerdict{grade: gradeTyped, discards: true, modes: []string{"discard", aclModeUnknownRung}},
+		acl,
 		[]string{"/b", "/a"})
 	want := []string{
 		"kind=job", "op=chmod", "mask=0777", "value=0755", "dirs=7777/2755",
 		"uid=-1", "gid=100", "recursive=true", "cross=true",
-		"acl=2/true/discard+?",
+		acl.part(),
 		"/a", "/b", // only the roots are sorted
 	}
 	if len(got) != len(want) {

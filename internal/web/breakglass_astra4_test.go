@@ -107,7 +107,19 @@ func TestAClaimedBurstIsNotDeletedWhileItsSummaryIsInFlight(t *testing.T) {
 	// The pruning path: a refusal from a different source sweeps aged entries as
 	// it opens its own window. Its own write queues behind the held slots, so it
 	// runs in a goroutine and is waited for by its effect on the table.
-	go s.bg.noteUnauthenticated(bgReturningRequest(other))
+	//
+	// The tracking entry proves the sweep has run; it says nothing about where the
+	// goroutine is AFTER it (Astra r5 #1). It is on its way into the audit write,
+	// which reads s.auditor — and the two things this test does next are to close
+	// that logger and to hand the server a different one. A goroutine reading the
+	// field while the test writes it is a data race the Linux -race job can catch
+	// and a write to the wrong logger everywhere else, so the goroutine signals and
+	// is JOINED below, before the auditor is touched at all.
+	otherDone := make(chan struct{})
+	go func() {
+		s.bg.noteUnauthenticated(bgReturningRequest(other))
+		close(otherDone)
+	}()
 	bgWaitFor(t, "the other source to be tracked", func() bool { _, _, _, ok := bgTracked(s, other); return ok })
 	if _, _, claimed, ok := bgTracked(s, source); !ok || claimed != suppressed {
 		t.Fatalf("another source's pruning deleted the claimed entry (present %v, claimed %d)", ok, claimed)
@@ -119,7 +131,11 @@ func TestAClaimedBurstIsNotDeletedWhileItsSummaryIsInFlight(t *testing.T) {
 	if err := s.auditor.Close(); err != nil {
 		t.Fatalf("closing the sink: %v", err)
 	}
+	// Both goroutines are answered by that close, and both are joined here: no
+	// goroutine this test started is still looking at s.auditor by the time the
+	// replacement below lands, and none outlives the test (Astra r5 #1).
 	<-flushed
+	<-otherDone
 	gotOpened, sup, claimed, ok := bgTracked(s, source)
 	if !ok || sup != suppressed || claimed != 0 {
 		t.Fatalf("after a refused summary the entry is (present %v, suppressed %d, claimed %d), want %d suppressed and no claim", ok, sup, claimed, suppressed)

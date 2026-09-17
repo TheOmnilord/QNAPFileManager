@@ -1140,6 +1140,21 @@ func (d *breakGlassDoor) writeRefusal(r *http.Request, ev refusalEvent, detail s
 	return d.audit(r, ev.op, "denied", ev.code, detail)
 }
 
+// bgAuditContext is the context every break-glass refusal line is written
+// under: the request's values, none of its cancellation (Astra r3 #2).
+//
+// It is a variable, and the one thing that may replace it is a test (Astra r5
+// #2). What this whole rule comes down to is a property of this context and of
+// nothing else a test can see — a cancelled request must not cancel the write —
+// and every attempt to demonstrate it from the outside races the admission
+// select inside WriteSync, which reverting the detachment then wins often enough
+// to keep the regression test green. Handing the test the context itself is
+// decisive: it is cancelled, or it is not. Production never assigns to it, and
+// the function it holds is the rule itself, so there is no second code path.
+var bgAuditContext = func(r *http.Request) context.Context {
+	return context.WithoutCancel(r.Context())
+}
+
 // auditSessionlessRefusal is auditUnauthenticated's event, written with a
 // context the peer cannot cancel (Astra r3 #2).
 //
@@ -1156,7 +1171,7 @@ func (s *Server) auditSessionlessRefusal(r *http.Request, code, detail string) (
 	if s.auditor == nil {
 		return false, nil
 	}
-	return s.auditor.WriteSyncInFlight(context.WithoutCancel(r.Context()), audit.Event{
+	return s.auditor.WriteSyncInFlight(bgAuditContext(r), audit.Event{
 		IP:             ClientIP(r),
 		Door:           doorOf(r),
 		Op:             "auth",
@@ -1455,7 +1470,7 @@ func (d *breakGlassDoor) audit(r *http.Request, op, result, code, detail string)
 	}
 	ctx, ip := context.Background(), ""
 	if r != nil {
-		ctx, ip = context.WithoutCancel(r.Context()), peerHost(r)
+		ctx, ip = bgAuditContext(r), peerHost(r)
 	}
 	return d.srv.auditor.WriteSyncInFlight(ctx, audit.Event{
 		Actor: "break-glass", UID: 0, Admin: true, Root: true,

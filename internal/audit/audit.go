@@ -114,10 +114,24 @@ type Event struct {
 	ForceMilestone bool `json:"-"`
 }
 
+// sink is the audit log's destination: an appending, rotating file that can be
+// fsynced. *logfile.Writer is the only implementation the daemon ever uses.
+//
+// It is an interface for exactly one reason (Astra r5 #3): the failure that
+// decides whether a caller may put its counters back is the fsync failing AFTER
+// a complete line has been appended, and nothing a test can do to a real file
+// produces that failure on demand. The three methods are the three the logger
+// calls; nothing else is reachable through it.
+type sink interface {
+	Write(p []byte) (int, error)
+	Sync() error
+	Close() error
+}
+
 // Logger writes audit events without blocking the caller.
 type Logger struct {
 	path  string
-	w     *logfile.Writer
+	w     sink
 	qulog bool
 
 	ch      chan Event
@@ -277,12 +291,19 @@ func (l *Logger) WriteSync(ctx context.Context, ev Event) error {
 // error as "nothing was recorded" and puts its counters back therefore reports
 // the same burst a second time when the first line lands after all.
 //
-// inFlight is true exactly in that case: the event is with a worker and may yet
-// reach the sink, so it must not be written again. It is false for every
-// definite outcome — the write succeeded, or the write itself failed, or the
-// call never got past admission at all (a closed logger, a context already done,
-// the admission timeout with every writer slot held). On inFlight false with a
-// non-nil error, nothing was written and nothing will be.
+// inFlight is true in that case — the event is with a worker and may yet reach
+// the sink, so it must not be written again — and in one more: the append
+// succeeded and the FSYNC then failed (Astra r5 #3). The line is in the file and
+// any reader will see it; only its survival of a power cut is in doubt. Treating
+// that as "nothing was written" put the burst back and reported it again in the
+// very next line, one line below the first, so it is reported here as the
+// not-definite outcome it is.
+//
+// inFlight is false for every definite outcome — the write succeeded, or the
+// write itself failed with nothing readable in the file, or the call never got
+// past admission at all (a closed logger, a context already done, the admission
+// timeout with every writer slot held). On inFlight false with a non-nil error,
+// nothing was written and nothing will be.
 func (l *Logger) WriteSyncInFlight(ctx context.Context, ev Event) (inFlight bool, err error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -325,28 +346,34 @@ func (l *Logger) WriteSyncInFlight(ctx context.Context, ev Event) (inFlight bool
 		return false, ErrSyncTimeout
 	}
 
-	res := make(chan error, 1)
+	res := make(chan syncResult, 1)
 	go func() {
 		defer l.syncWG.Done()
 		defer func() { <-l.syncSem }()
 		l.drainMu.Lock()
-		err := l.emitSync(ev)
+		appended, err := l.emitSync(ev)
 		l.drainMu.Unlock()
 		// Acknowledge durability BEFORE mirroring: the line is fsynced, so the
 		// caller may proceed. The QuLog mirror then runs best-effort, outside
 		// drainMu and off the ack path, still holding this syncSem slot so a
 		// wedged QuLog is bounded to syncWriters goroutines (standard P2).
-		res <- err
+		res <- syncResult{appended: appended, err: err}
 		if err == nil {
 			l.mirror(ev)
 		}
 	}()
 
 	select {
-	case err := <-res:
-		// The worker finished and said what happened, so the outcome is known
-		// either way and nothing is left in flight.
-		return false, err
+	case out := <-res:
+		// The worker finished and said what happened. Two outcomes are definite —
+		// it wrote the line, or it failed before anything reached the file — and
+		// one is not: an fsync that failed over a line already appended (Astra r5
+		// #3). That line IS readable, so a caller that cleared its counters to
+		// write it must not put them back and report the same thing twice; it is
+		// reported here in the same way as a write still with a worker, which is
+		// the outcome it most resembles. Only durability is unknown, and an
+		// unreadable audit log is not a thing a counter can repair.
+		return out.appended && out.err != nil, out.err
 	case <-ctx.Done():
 		// The write goroutine keeps its slot until it finishes (so a stuck write
 		// is not abandoned back into the pool); the caller simply stops waiting.
@@ -463,23 +490,40 @@ func (l *Logger) mirror(ev Event) {
 // not merely in the OS page cache (adv 1 / standard P1). It does NOT mirror to
 // QuLog: the caller acknowledges durability first and then calls mirror(ev)
 // outside drainMu (standard P2), so the 10s QuLog path never gates the ack.
-func (l *Logger) emitSync(ev Event) error {
+//
+// appended is the other half of the answer, and the reason it exists is the
+// counters (Astra r5 #3). "The fsync failed" and "nothing was written" are not
+// the same outcome: once the append has returned, the complete line is in the
+// file and any reader will see it — only its survival of a power cut is in
+// doubt. A caller that CLEARED state in order to write that line must not put
+// the state back on that error, or the burst is reported a second time by a line
+// sitting immediately below the first. So: appended is false while the EVENT
+// cannot be read back — a failed append leaves at worst a torn fragment, which
+// Tail discards as unparseable — and true from the moment the append succeeds.
+func (l *Logger) emitSync(ev Event) (appended bool, err error) {
 	b, err := json.Marshal(ev)
 	if err != nil {
-		return err
+		return false, err
 	}
 	b = append(b, '\n')
 	if _, err := l.w.Write(b); err != nil {
 		n := atomic.AddInt64(&l.writeErrors, 1)
 		l.reportWriteErr(err, n)
-		return err
+		return false, err
 	}
 	if err := l.w.Sync(); err != nil {
 		n := atomic.AddInt64(&l.writeErrors, 1)
 		l.reportWriteErr(err, n)
-		return err
+		return true, err
 	}
-	return nil
+	return true, nil
+}
+
+// syncResult is what a durable writer goroutine reports back: the error, and
+// whether the line reached the file before it (Astra r5 #3).
+type syncResult struct {
+	appended bool
+	err      error
 }
 
 // reportWriteErr surfaces a sink write failure through errLog, rate-limited to

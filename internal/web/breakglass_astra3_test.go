@@ -78,15 +78,37 @@ func TestAFlushSummarySurvivesTheReturningPeerHangingUp(t *testing.T) {
 	}
 	now = now.Add(2 * refusalWindow)
 
-	// Admission is SATURATED before the cancelled request arrives (Astra r4 #3).
-	// With a writer slot free this test proved nothing: the summary's write and
-	// the peer's cancellation are two ready cases of one select inside WriteSync,
-	// Go picks either, and a run that picked the slot wrote the line whether the
-	// context was detached or not — so reverting the fix failed the test only
-	// sometimes, which is the same as not testing it. With every slot held the
-	// write has to WAIT, and a request-scoped context is then certain to take the
-	// cancellation exit instead. The slots are released only once the summary is
-	// observably queued behind them.
+	// The property itself, asserted on the thing it is a property OF (Astra r5
+	// #2): the context the durable write receives. Everything else about this
+	// test is circumstantial — SyncWaiting counts a call that has reached the
+	// admission attempt, not one that is parked inside it, so observing a waiter
+	// does not prove the write is blocked, and a schedule exists in which
+	// releasing the slots below hands a request-scoped write its admission before
+	// it ever looks at the cancellation. Then the line lands, the test passes, and
+	// nothing has been tested. A context either carries the peer's cancellation or
+	// it does not, and that is decided here.
+	//
+	// Every refusal line the returning login writes is collected, not just the
+	// summary: they are all written under this rule, and a login answered with the
+	// rate answer writes a second one.
+	var auditCtxs []context.Context
+	originalAuditContext := bgAuditContext
+	bgAuditContext = func(r *http.Request) context.Context {
+		ctx := originalAuditContext(r)
+		auditCtxs = append(auditCtxs, ctx)
+		return ctx
+	}
+	t.Cleanup(func() { bgAuditContext = originalAuditContext })
+
+	// Admission is SATURATED before the cancelled request arrives (Astra r4 #3),
+	// which is now belt and braces over the assertion above rather than the proof
+	// itself. With a writer slot free the summary's write and the peer's
+	// cancellation are two ready cases of one select inside WriteSync and Go picks
+	// either; with every slot held the write has to WAIT, and a request-scoped
+	// context is then far likelier to take the cancellation exit and lose the
+	// line. The slots are released once the summary is observably queued behind
+	// them, so the end-to-end half of this test — the summary reaching the log —
+	// exercises the wait rather than an idle sink.
 	releaseSlots := s.auditor.HoldSyncSlots()
 	defer releaseSlots()
 
@@ -110,6 +132,19 @@ func TestAFlushSummarySurvivesTheReturningPeerHangingUp(t *testing.T) {
 	// the point, and it is written before any of that.
 	if w := <-done; w.Code != http.StatusNoContent && w.Code != http.StatusTooManyRequests {
 		t.Fatalf("the returning login = %d %s", w.Code, w.Body)
+	}
+
+	// The handler goroutine is joined, so what it appended is safe to read here.
+	if len(auditCtxs) == 0 {
+		t.Fatal("the returning login wrote no refusal line at all, so there was nothing to detach")
+	}
+	for i, c := range auditCtxs {
+		if err := c.Err(); err != nil {
+			t.Fatalf("refusal line %d of %d was written under the returning peer's own context (%v): a peer that hangs up takes the whole window's count with it", i+1, len(auditCtxs), err)
+		}
+		if c.Done() != nil {
+			t.Errorf("refusal line %d of %d was written under a context something can still cancel; the request's cancellation must not reach the sink at all", i+1, len(auditCtxs))
+		}
 	}
 
 	ev := bgEventWith(t, read(), fmt.Sprintf("%d further refusals suppressed; the source is inside its budget again", suppressed))

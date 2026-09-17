@@ -208,8 +208,13 @@ func TestADemonstratedMismatchRaisesTheFloorOverAPosixRow(t *testing.T) {
 
 // TestWorstAclmodeIsTheTableItself states the fold once, away from the fixtures:
 // "discard" and "not read" are the two that destroy, and either of them on either
-// side wins. Everything else keeps the other entries and grades L1, so two such
-// answers leave the daemon's row alone.
+// side wins.
+//
+// Amended by Astra r5 #5: two KNOWN modes that disagree are unknown as well. The
+// three non-destroying modes all grade L1 but say three different things —
+// passthrough keeps the named entries, groupmask reduces them, restricted may make
+// the kernel refuse — so picking either cache's answer states a consequence
+// nothing proved. Only an undisputed mode is stated as itself.
 func TestWorstAclmodeIsTheTableItself(t *testing.T) {
 	for _, tc := range []struct {
 		daemon, worker, want string
@@ -219,9 +224,12 @@ func TestWorstAclmodeIsTheTableItself(t *testing.T) {
 		{"passthrough", "", ""},
 		{"", "passthrough", ""},
 		{"discard", "discard", ""},
-		{"passthrough", "restricted", "passthrough"},
-		{"restricted", "groupmask", "restricted"},
+		{"passthrough", "restricted", ""},
+		{"restricted", "groupmask", ""},
+		{"passthrough", "groupmask", ""},
 		{"groupmask", "groupmask", "groupmask"},
+		{"passthrough", "passthrough", "passthrough"},
+		{"restricted", "restricted", "restricted"},
 	} {
 		if got := worstAclmode(tc.daemon, tc.worker); got != tc.want {
 			t.Fatalf("worstAclmode(%q, %q) = %q, want %q", tc.daemon, tc.worker, got, tc.want)

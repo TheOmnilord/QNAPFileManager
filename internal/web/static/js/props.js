@@ -105,6 +105,31 @@ const pendingCancels = new Set();
 // to cancel by — until an acknowledgement clears it.
 const claimed = entry => !!entry && !!entry.cancelPending && !entry.cancelled;
 
+// A claim is one SESSION's, though, and the register outlives the sign-in that
+// filled it (Astra r5 #6). Alice asks for a stop, the service does not answer, so
+// the claim stands; the page is then switched to the administrator Bob, who opens
+// Permissions — and the retry went out from BOB's runner, with Bob's CSRF token
+// and Bob's credentials, against Alice's walk. jobCancel permits exactly that,
+// because an administrator may cancel another user's job, so nothing downstream
+// would have refused it.
+//
+// So the generation the claim was made under is written on the shared entry
+// alongside the claim itself, and the retry is keyed on it rather than on any
+// cross-module wiring: a claim from a session that is no longer the current one
+// is DROPPED — not retried, and not left in the register either.
+const thisSession = generation => generation === state.sessionGeneration;
+
+// dropClaim ends a claim without sending anything. Either the service answered,
+// or there is nobody left on this side with standing to ask.
+const dropClaim = entry => { if (entry) { entry.cancelPending = false; pendingCancels.delete(entry); } };
+
+// dropForeignClaims forgets every claim a previous session made. Every runner
+// action sweeps with it, so a sign-out or a user switch needs nothing wired to
+// it; it is exported so the session-transition path may say so explicitly.
+export function dropForeignClaims() {
+ for (const entry of [...pendingCancels]) if (!thisSession(entry.cancelGeneration)) dropClaim(entry);
+}
+
 // resetSizeJobs drops every shared measurement, and the pending cancels with
 // them. Tests use it — one test's unacknowledged claim is not the next one's
 // walk — and nothing else does, because an entry ages out on its own.
@@ -148,19 +173,26 @@ export function createSizeRunner({report = () => {},track = trackJob,cancel = ca
  // UNACKNOWLEDGED clears it and leaves the entry retryable.
  function ack(entry,ok) {
   entry.cancelling = null;
-  if (ok) { entry.cancelled = true; entry.cancelPending = false; pendingCancels.delete(entry); }
+  if (ok) { entry.cancelled = true; dropClaim(entry); }
   return ok;
  }
  // sendCancel is the only place a cancel is sent, and it answers a promise for
  // whether the server acknowledged it. It never rejects: nothing that calls it
  // is in a position to handle a failure other than by keeping the id.
  function sendCancel(entry) {
-  if (entry.cancelled) { entry.cancelPending = false; pendingCancels.delete(entry); return undefined; }
+  if (entry.cancelled) { dropClaim(entry); return undefined; }
+  // The walk belongs to the session that submitted it. Once that session is gone
+  // — signed out, or replaced on this page by another user — this side has no
+  // standing to stop it and no business trying with somebody else's credentials,
+  // so the claim ends here rather than being carried (Astra r5 #6).
+  if (!thisSession(entry.generation)) { dropClaim(entry); return undefined; }
   // Asking is what makes the UI responsible for the stopping, and it stays
   // responsible until the service answers (Astra r3 #3). The claim is the
   // MEASUREMENT's, not the asking runner's, so every dialog that shares the walk
-  // can retry it — including the one that let go of it last (Astra r4 #3).
+  // can retry it — including the one that let go of it last (Astra r4 #3) — but
+  // only while the session that made it is still the current one (Astra r5 #6).
   entry.cancelPending = true;
+  entry.cancelGeneration = state.sessionGeneration;
   pendingCancels.add(entry);
   // No id yet: the 202 is still in flight, and the submitting closure sends the
   // cancel the moment the id lands. The claim above is what carries the walk's
@@ -186,6 +218,10 @@ export function createSizeRunner({report = () => {},track = trackJob,cancel = ca
  // nothing to send for it yet, and forgetting it is precisely how the walk lost
  // its name (Astra r4 #3).
  function retryStopping(skip) {
+  // Claims made in a session that has ended are dropped before anything is
+  // resent: they are not this user's walks to stop, and retrying one would send
+  // it with this user's credentials (Astra r5 #6).
+  dropForeignClaims();
   const sent = [];
   for (const entry of [...pendingCancels]) {
    // Collected: the service acknowledged it, or the walk it named reached an end
@@ -241,13 +277,16 @@ export function createSizeRunner({report = () => {},track = trackJob,cancel = ca
   // Stop, close or Recount that let go of it, because letting go of the hold is
   // not the same as having stopped the walk (Astra r3 #3).
   get jobId() {
-   if (needsStop(held)) return held.id;
+   if (needsStop(held) && thisSession(held.generation)) return held.id;
    // A request still ON THE WIRE is being attended to, and this side has nothing
    // to do about that walk until it answers. One that came BACK unacknowledged
    // is the one still waiting for another attempt, and it keeps its name until
    // it gets one (Astra r3 #3) — whichever dialog sent it, because the claim is
-   // the measurement's (Astra r4 #3).
-   for (const entry of pendingCancels) if (claimed(entry) && !entry.cancelling && needsStop(entry)) return entry.id;
+   // the measurement's (Astra r4 #3). A claim from a session that has ended names
+   // nothing here: this user is not the one who asked (Astra r5 #6).
+   for (const entry of pendingCancels) {
+    if (claimed(entry) && thisSession(entry.cancelGeneration) && !entry.cancelling && needsStop(entry)) return entry.id;
+   }
    return null;
   },
   // stop() lets go of the measurement this runner holds and, in the same breath,
@@ -272,7 +311,10 @@ export function createSizeRunner({report = () => {},track = trackJob,cancel = ca
     entry = null;
    }
    if (!entry) {
-    entry = {key,id:null,holders:0,job:null,finishedAt:0,abandoned:false,failed:false,cancelled:false,cancelling:null,cancelPending:false};
+    // `generation` is the session this walk was submitted in: the only session
+    // that may ask for it to be stopped (Astra r5 #6).
+    entry = {key,id:null,holders:0,job:null,finishedAt:0,abandoned:false,failed:false,cancelled:false,cancelling:null,
+     cancelPending:false,generation:state.sessionGeneration,cancelGeneration:-1};
     entry.promise = (async () => {
      const res = await api('api/jobs/size',{},{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify(sizeRequest(entries,{crossMounts}))});
@@ -307,7 +349,7 @@ export function createSizeRunner({report = () => {},track = trackJob,cancel = ca
      // for the rest of the session (Astra r4 #3). A poll that gave up is a
      // different failure — it has an id, and the claim on it stands.
      entry.failed = true;
-     if (!entry.id) { entry.cancelPending = false; pendingCancels.delete(entry); }
+     if (!entry.id) dropClaim(entry);
      if (sizeJobs.get(key) === entry) sizeJobs.delete(key);
     });
     sizeJobs.set(key,entry);

@@ -437,8 +437,20 @@ func (s *Server) entryACLFacts(ctx context.Context, who backend.Principal, apiPa
 	// the L1 mask notice, and the stale worker's own POSIX probe answers `none`
 	// twice — once for the grade, once for the precondition — so the ACL is
 	// destroyed without anybody being told that it existed. Unknown warns.
+	//
+	// And "unknown" here means the DESTRUCTIVE rung, not merely "something is off"
+	// (Astra r5 #1). Marking the path unplaced moves the grade onto the nfs4/unknown
+	// branch of §7's table, but that branch still reads the aclmode — and when both
+	// caches happen to say `passthrough`, worstAclmode has nothing to disagree about
+	// and the dialog is the L1 sentence that promises the other entries are kept.
+	// Neither cache describes the mount the worker's descriptor is actually on, which
+	// is the whole content of a demonstrated mismatch, so their agreement proves
+	// nothing about it: the aclmode is discarded with the rest of the row and the
+	// grade is the L2 typed phrase with the suffix that says why, naming both
+	// candidate datasets.
 	if elsewhere {
 		f.unknown = true
+		f.aclmode = ""
 	}
 
 	// The unknown-storage floor comes next. A storage mount whose backend this
@@ -539,12 +551,27 @@ func aclBackendRank(name string) int {
 // either of them on either side means the change may destroy an ACL, and the
 // only honest way to say so while the dataset itself is in doubt is the UNKNOWN
 // aclmode — the L2 discard rung with the "could not be read" suffix, naming both
-// candidates. The remaining modes (passthrough, groupmask, restricted) all keep
-// the other entries and all grade L1, so when both sides name one of those the
-// daemon's row is kept and the grade is unchanged.
+// candidates.
+//
+// The remaining three are not interchangeable with one another either, and the
+// round-4 rule quietly assumed they were (Astra r5 #5). They do all grade L1, but
+// an L1 dialog is a SENTENCE, and the three sentences describe three different
+// outcomes: passthrough keeps the named entries, groupmask silently reduces them
+// to the mode's group bits, restricted may make the kernel refuse the change
+// outright. A daemon caching `passthrough` beside a worker that refreshed after
+// `zfs set aclmode=groupmask` would promise that the named entries survive while
+// the kernel reduces them. There is no ordering to fall back on — "restricted may
+// refuse" is not more or less severe than "groupmask reduces", it is a different
+// thing — so two KNOWN modes that disagree are also the unknown aclmode: neither
+// cache is proved, and the only statement covering both is the pessimistic one.
+// When the two name the SAME mode there is nothing in dispute and that mode is
+// what the ladder says, which is the ordinary path for every agreeing lookup.
 func worstAclmode(daemon, worker string) string {
 	if aclmodeDestroys(daemon) || aclmodeDestroys(worker) {
 		return "" // unknown: the L2 rung, with the suffix that says why
+	}
+	if daemon != worker {
+		return "" // two known modes, two different promises, neither one proved
 	}
 	return daemon
 }

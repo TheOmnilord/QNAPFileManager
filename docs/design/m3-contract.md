@@ -227,7 +227,9 @@ non-recursively cannot be redeemed recursively.
    and that answer is unverified. *Round 4 (#1, #4, #5):* agreement decides only whether the worker's **state** is
    believed; its `aclmode` and dataset can never make the grade less severe than the daemon's — the rung is the
    worst of both observations, agreement or not, because either side may hold the older table — and a
-   demonstrated mismatch is the unknown floor (L2) whatever backend the daemon's row claims.
+   demonstrated mismatch is the unknown floor (L2) whatever backend the daemon's row claims. *Round 5 (#1):* "the
+   unknown floor" means the **destructive rung** — on a mismatch the `aclmode` is treated as unknown (`discard`)
+   even when both caches say `passthrough`, because neither cache describes the mount the descriptor is on.
 4. **Size reuses the existing size job.** Opening the dialog on a directory submits `POST /api/jobs/size` for that
    one path, polls `/api/jobs` as every job is polled, and `POST /api/jobs/{id}/cancel` when the dialog closes or
    Stop is pressed; Recount resubmits. No new job kind, no new route, no second size implementation. `#pImpact` in
@@ -433,7 +435,9 @@ in-app drag-and-drop and the trash janitor stay deferred.
 3. **`aclmode` is read once, at mount-table build time** — *narrowed, Astra round 4 (#6): re-read within 60 s.* A
    `zfs set aclmode=discard` afterwards, or a field-identical remount between two refreshes, is invisible until
    the mutable probe facts age out and the single-flight pass re-probes them, so the ladder can under-warn for at
-   most that minute. Unknown is already treated as `discard`, which covers the far more likely failure (the `zfs`
+   most that minute — *round 5 (#2, #3):* and not a second longer, because an expired `aclmode` is **masked** as
+   unknown at lookup until the re-probe publishes, and the pass takes never-probed rows first, then the oldest,
+   with a cursor across passes so a slow pool cannot starve its trailing datasets. Unknown is already treated as `discard`, which covers the far more likely failure (the `zfs`
    binary not being callable at all).
 4. **"Trivial" is our heuristic.** A mis-classified trivial NFSv4 ACL under-warns. Parse failures fail towards the
    pessimistic side, which is the half that matters.

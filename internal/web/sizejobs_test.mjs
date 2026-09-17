@@ -30,6 +30,7 @@ globalThis.matchMedia = () => ({matches: false});
 globalThis.location = {hash: ''};
 
 const {cancelJob, trackJob} = await import('./static/js/jobs.js');
+const {update} = await import('./static/js/state.js');
 const {
  SIZE_REUSE_MS, createSizeRunner, resetSizeJobs, sizeJobKey, sizeJobUsable,
 } = await import('./static/js/props.js');
@@ -479,6 +480,61 @@ test('a claim made before the id exists does not outlive a submission the server
  await permissions.stop();
  await properties.stop();
  assert.deepEqual(cancelled, [], 'and nothing is cancelled by guesswork');
+});
+
+// --- and the claim is one SESSION's (Astra r5 #6) -----------------------------
+//
+// The register is module-level, so it survives the sign-in it was filled under.
+// Alice's cancel goes unacknowledged and the claim stands; the page is then taken
+// over by the administrator Bob, whose first dialog swept the register and resent
+// Alice's cancel with Bob's token and Bob's credentials — which jobCancel allows,
+// because an administrator may cancel another user's job.
+
+const stubborn = cancelled => ({
+ report: () => {},
+ track: () => {},
+ cancel: async id => { cancelled.push(id); return false; },    // the wire is down: the claim stands
+ poll: () => new Promise(() => {}),                            // the walk is still going
+});
+
+test('a claim made in one session is not retried after the page is switched to another user (Astra r5 #6)', async t => {
+ resetSizeJobs();
+ const posts = [], cancelled = [];
+ mockFetch(t, posts, () => (posts.length > 1 ? 's2' : 's1'));
+ update({session: {user: 'alice', uid: 1000}});                // Alice is signed in
+ const alice = createSizeRunner(stubborn(cancelled));
+ alice.start([dir('/share/CACHEDEV1_DATA/_IMAGES')]);
+ await new Promise(resolve => setTimeout(resolve, 0));
+ await alice.stop();                                           // the dialog's close event
+ assert.deepEqual(cancelled, ['s1'], 'the cancel was attempted');
+ assert.equal(alice.jobId, 's1', 'unacknowledged, and still hers to retry while she is signed in');
+ update({session: {user: 'administrator', uid: 0}});           // Bob takes the page over
+ const bob = createSizeRunner(stubborn(cancelled));
+ assert.equal(bob.jobId, null, 'Alice’s walk is not Bob’s to name');
+ assert.equal(alice.jobId, null, 'nor is it named by the runner that asked, in somebody else’s session');
+ await bob.stop();                                             // Bob opens Permissions and closes it
+ assert.deepEqual(cancelled, ['s1'], 'and nothing is resent with Bob’s credentials');
+ bob.start([dir('/share/Public')]);                            // Recount, on Bob's own folder
+ await new Promise(resolve => setTimeout(resolve, 0));
+ await bob.stop();
+ assert.deepEqual(cancelled, ['s1', 's2'], 'Bob stops his own walk, and only his own');
+ assert.equal(bob.jobId, 's2', 'which is unacknowledged, so it stays his to retry');
+});
+
+test('a claim made in the CURRENT session is still retried by the next dialog to act (Astra r5 #6)', async t => {
+ resetSizeJobs();
+ const posts = [], cancelled = [];
+ mockFetch(t, posts);
+ update({session: {user: 'alice', uid: 1000}});
+ const properties = createSizeRunner(stubborn(cancelled)), permissions = createSizeRunner(stubborn(cancelled));
+ properties.start([dir('/share/CACHEDEV1_DATA/_IMAGES')]);
+ await new Promise(resolve => setTimeout(resolve, 0));
+ await properties.stop();
+ assert.deepEqual(cancelled, ['s1'], 'the cancel was attempted');
+ assert.equal(permissions.jobId, 's1', 'same session: the other dialog still names the walk');
+ await permissions.stop();                                     // Stop in the dialog that never sent it
+ assert.deepEqual(cancelled, ['s1', 's1'], 'and retries it — the generation rule costs nothing here');
+ assert.equal(properties.jobId, 's1', 'still unacknowledged, still named');
 });
 
 test('a measurement that could not be submitted is not cached as an answer', async t => {

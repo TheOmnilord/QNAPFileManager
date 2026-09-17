@@ -210,9 +210,19 @@ func parentOnly(t *testing.T, r fsx.Root, dirAPI string) *dirRef {
 // so the number could not be recycled, the loop always gave up and the test
 // always skipped — including when the birth-time capture it exists to protect
 // was deleted. So the parent alone is held; the filesystem is asked about birth
-// times up front and independently; the enumeration is asked to PROVE it carried
-// one, which is the fact a regression removes; and the allocator declining to
-// recycle is now a failure that names the numbers, not a skip.
+// times up front and independently; and the enumeration is asked to PROVE it
+// carried one, which is the fact a regression removes.
+//
+// That proof is made BEFORE anything is swapped, and it is what makes the rest
+// of the test safe to skip (Astra r5 #4). Round 4 turned an allocator that would
+// not hand the number back into a failure, on the reasoning that a filesystem
+// recording birth times can stage the case. It cannot: whether a freed inode is
+// reissued within any number of tries is allocation policy — ZFS and every
+// delayed-allocation filesystem are entitled to answer with a rising sequence
+// forever — and a red ZFS job would be saying nothing about this code. So the
+// hard assertions stand where a regression lands (no birth time from the
+// enumeration, or a descriptor retained instead), and only the half that needs
+// a recycled number is skipped, naming the numbers the allocator did answer.
 func TestUnopenedFallbackRefusesARecycledInode(t *testing.T) {
 	base := tempDir(t)
 	mkdir(t, base, "tree/nested")
@@ -256,12 +266,18 @@ func TestUnopenedFallbackRefusesARecycledInode(t *testing.T) {
 	}
 
 	// The swap: removed and recreated at the same name until the allocator hands
-	// the number back, which is the case the birth time exists for.
+	// the number back, which is the case the birth time exists for. Everything
+	// above this line has already run, so a regression of the birth-time capture
+	// has already failed on every filesystem, recycling or not (Astra r5 #4).
 	const attempts = 64
 	var (
 		seen        []uint64
 		replacement objectID
 	)
+	// Registered before the loop rather than after it: each pass leaves the
+	// directory at 0000, and a t.Fatal inside the loop must not leave it that way
+	// for the fixture's own removal.
+	t.Cleanup(func() { _ = os.Chmod(nested, 0o755) })
 	for i := 0; i < attempts && !replacement.have; i++ {
 		if err := os.Remove(nested); err != nil {
 			t.Fatal(err)
@@ -282,13 +298,14 @@ func TestUnopenedFallbackRefusesARecycledInode(t *testing.T) {
 			replacement = id
 		}
 	}
-	t.Cleanup(func() { _ = os.Chmod(nested, 0o755) })
 	if !replacement.have {
-		// Not a skip: this filesystem records birth times, so the case is one it
-		// can stage, and the numbers say what happened instead — a monotonic
-		// allocator answers with a rising sequence, a converging one repeats a
-		// single number that is not the original.
-		t.Fatalf("inode %d was never handed back in %d removes and recreates (the allocator answered %v): the recycled-inode case could not be staged on a filesystem that does record birth times",
+		// The allocator's answer, not the code's: a monotonic one answers with a
+		// rising sequence, a converging one repeats a single number that is not
+		// the original. Either way this filesystem will not stage the collision,
+		// and the sequence is printed so a reader can tell which it was (Astra
+		// r5 #4).
+		t.Skipf("inode %d was never handed back in %d removes and recreates (the allocator answered %v): "+
+			"the assertion that needs a recycled inode could not be staged on this filesystem",
 			first.key.ino, attempts, seen[:min(len(seen), 8)])
 	}
 	if !replacement.hasBtime || replacement.btime == first.btime {

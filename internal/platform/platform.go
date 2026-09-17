@@ -126,6 +126,14 @@ type Platform struct {
 	// running. It is the single-flight latch AND the way a test waits for the
 	// pass it started: the channel is closed after the results are published.
 	probeDone chan struct{}
+	// probeCursor is the mount point the last pass stopped on, and the next pass
+	// resumes after it (Astra r5 #3). Ordering the pending set by age is most of
+	// the fairness, but not all of it: a row whose answer is DROPPED at publication
+	// time — the mount was replaced while its `zfs get` ran — keeps its old
+	// timestamp, stays the oldest, and would be re-selected by every pass while the
+	// rows behind it are never reached. The cursor is what makes consecutive passes
+	// walk the table rather than re-walk its head.
+	probeCursor string
 
 	getxattr XattrProbe
 	run      CommandRunner
@@ -176,6 +184,34 @@ func (p *Platform) probeExpiredLocked(mountPoint string) bool {
 		return true
 	}
 	return time.Since(at) > p.probeTTL
+}
+
+// capsLocked is what a LOOKUP may state about a mount point, which is not always
+// what the table holds (Astra r5 #2). Expiry used to do nothing but add the row
+// to the next background pass's work, so every For/ForLiteral in between kept
+// answering with the fact that had just been declared too old to trust — and the
+// pass can be delayed indefinitely: another pass is already running (single
+// flight), the sixteen-per-pass bound put this row behind others, or its own `zfs
+// get` is blocked on a wedged pool. The minute residual 3 promises would then be
+// as long as the queue.
+//
+// So the mutable fact is masked at the point it is read: an expired ZFSAclmode is
+// reported as "" — unknown, which §7 reads as discard and grades L2 — until a
+// re-probe publishes a value. It is a promise of pessimism, not of freshness,
+// which is the only promise a cache can keep.
+//
+// The ACL BACKEND is deliberately left alone. It is a property of the filesystem
+// driver rather than of a dataset's configuration, nothing short of a remount can
+// change it (and a remount moves the incarnation, which drops the facts outright),
+// and masking it would move every expired mount onto the unprobed-storage rung —
+// the same L2, reached by throwing away a fact that is still true. The aclmode is
+// the destructive one and it is the one that is masked.
+func (p *Platform) capsLocked(mountPoint string) FSCaps {
+	c := p.caps[mountPoint]
+	if c.ZFSAclmode != "" && p.probeExpiredLocked(mountPoint) {
+		c.ZFSAclmode = ""
+	}
+	return c
 }
 
 // SetXattrProbe replaces the extended-attribute probe used by ACLBackendFor.
@@ -430,10 +466,28 @@ const maxProbesPerRefresh = 16
 // table did not change. It is the body of the background pass and it holds no
 // lock across the syscalls.
 func (p *Platform) probeMissing() {
-	for _, t := range p.pendingProbes() {
+	pending := p.pendingProbes()
+	if len(pending) == 0 {
+		return
+	}
+	// Where this pass stopped, recorded BEFORE the syscalls rather than after them
+	// (Astra r5 #3): a pass that is killed half way through — the process is
+	// stopping, a `zfs get` hangs until its timeout and the daemon exits first —
+	// must not leave the next one starting at the same head again.
+	p.setProbeCursor(pending[len(pending)-1].mount.MountPoint)
+	for _, t := range pending {
 		backend, xattr, aclmode := p.probeOne(t.mount)
 		p.publishProbe(t, backend, xattr, aclmode, false)
 	}
+}
+
+// setProbeCursor records the mount point a pass ended on. It is separate from the
+// selection because the selection is also what kickProbe asks "is there anything
+// to do at all", and that question may not move the queue.
+func (p *Platform) setProbeCursor(mountPoint string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.probeCursor = mountPoint
 }
 
 // probeOne asks the kernel about one mount. It holds no lock: an lgetxattr and a
@@ -469,9 +523,29 @@ func (p *Platform) pendingProbes() []probeTarget {
 	return p.pendingProbesLocked()
 }
 
+// pendingProbesLocked chooses the batch, and the ORDER it chooses in is the whole
+// of Astra r5 #3. Taking the first sixteen rows of p.mounts was a fair rule only
+// while the pending set was "what appeared since the last refresh". Once expiry
+// feeds the same queue (r4 #6) the set is refilled from the head of the table on
+// its own: with more storage mounts than one pass can take, and probes slow enough
+// that a pass costs more than the freshness bound — sixteen `zfs get` calls
+// against a busy pool is seconds, and a wedged one is 3 s each — the head rows are
+// expired again by the time the pass ends, are selected again by the next pass,
+// and the tail of the table is never probed at all. A dataset at the tail then
+// keeps an empty backend (pessimistic, but never resolved) or an aclmode that ages
+// without limit, which is precisely the promise residual 3 makes.
+//
+// So the pending set is ordered by what has waited longest: never probed first —
+// an unprobed storage mount has no answer at all, and it is the one a fresh mount
+// leaves behind — then by probedAt, oldest first, with the mount point breaking
+// ties so the order is total and a test can state it. The cursor then resumes each
+// tier after the row the last pass stopped on, so a row that cannot be re-dated
+// (its publication keeps being dropped) cannot pin a pass to the head of the queue
+// either. The per-pass bound is unchanged: fairness is about which sixteen, not
+// about how many.
 func (p *Platform) pendingProbesLocked() []probeTarget {
 	visible := visibleRows(p.mounts)
-	var pending []probeTarget
+	var fresh, aged []probeTarget // never probed, and probed but expired
 	seen := make(map[string]bool, len(visible))
 	for _, row := range p.mounts {
 		mp := row.MountPoint
@@ -486,12 +560,56 @@ func (p *Platform) pendingProbesLocked() []probeTarget {
 		if c, ok := p.caps[mp]; ok && c.ACLBackend != "" && !p.probeExpiredLocked(mp) {
 			continue // probed recently enough, and the answer is cached
 		}
-		pending = append(pending, probeTarget{mount: m, inc: p.incarnation[mp]})
-		if len(pending) >= maxProbesPerRefresh {
-			break
+		t := probeTarget{mount: m, inc: p.incarnation[mp]}
+		if _, probed := p.probedAt[mp]; probed {
+			aged = append(aged, t)
+		} else {
+			fresh = append(fresh, t)
 		}
 	}
+	sort.Slice(fresh, func(i, j int) bool { return fresh[i].mount.MountPoint < fresh[j].mount.MountPoint })
+	sort.Slice(aged, func(i, j int) bool {
+		ai, aj := p.probedAt[aged[i].mount.MountPoint], p.probedAt[aged[j].mount.MountPoint]
+		if !ai.Equal(aj) {
+			return ai.Before(aj)
+		}
+		return aged[i].mount.MountPoint < aged[j].mount.MountPoint
+	})
+
+	pending := resumeAfter(fresh, p.probeCursor, maxProbesPerRefresh)
+	if len(pending) < maxProbesPerRefresh {
+		pending = append(pending, resumeAfter(aged, p.probeCursor, maxProbesPerRefresh-len(pending))...)
+	}
 	return pending
+}
+
+// resumeAfter takes up to n entries from an ordered tier, starting after the row
+// the cursor names and wrapping round to the front (Astra r5 #3). The cursor is
+// one string for both tiers and names at most one row in one of them, so a tier it
+// does not name is taken from its own head — which is what makes a never-probed
+// row that appears at the tail of the table the first thing the next pass takes,
+// whatever the cursor was left pointing at.
+func resumeAfter(tier []probeTarget, cursor string, n int) []probeTarget {
+	if len(tier) == 0 || n <= 0 {
+		return nil
+	}
+	start := 0
+	if cursor != "" {
+		for i, t := range tier {
+			if t.mount.MountPoint == cursor {
+				start = i + 1
+				break
+			}
+		}
+	}
+	if n > len(tier) {
+		n = len(tier)
+	}
+	out := make([]probeTarget, 0, n)
+	for i := 0; i < n; i++ {
+		out = append(out, tier[(start+i)%len(tier)])
+	}
+	return out
 }
 
 // publishProbe stores one probe's answer, if the mount it describes is still
@@ -619,7 +737,7 @@ func (p *Platform) For(osPath string) FSCaps {
 	defer p.mu.RUnlock()
 	for _, mp := range p.order {
 		if pathHasPrefix(clean, mp) {
-			return p.caps[mp]
+			return p.capsLocked(mp)
 		}
 	}
 	return FSCaps{}
@@ -644,7 +762,7 @@ func (p *Platform) ForLiteral(osPath string) (FSCaps, bool) {
 	defer p.mu.RUnlock()
 	for _, mp := range p.order {
 		if pathHasPrefix(key, mp) {
-			return p.caps[mp], true
+			return p.capsLocked(mp), true
 		}
 	}
 	return FSCaps{}, false
@@ -679,8 +797,12 @@ func (p *Platform) MountByLiteralPath(osPath string) (FSCaps, bool) {
 	p.maybeRefresh()
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	c, ok := p.caps[key]
-	return c, ok
+	if _, ok := p.caps[key]; !ok {
+		return FSCaps{}, false
+	}
+	// The same expiry mask every other lookup applies (Astra r5 #2): one caller
+	// must not be told an aclmode another is no longer allowed to state.
+	return p.capsLocked(key), true
 }
 
 // MountForLiteral is MountFor without the normalisation, the companion of
@@ -952,6 +1074,13 @@ func (p *Platform) ZFSAclmode(dataset string) string {
 
 // Diag summarises the platform for /api/diag, so that a wrong answer in the
 // field is diagnosable without SSH.
+//
+// The per-mount aclmode here is the CACHED one, unmasked, beside a flag saying
+// whether a lookup would still state it (Astra r5 #2). Masking it would hide the
+// one thing a field report needs — "the daemon probed passthrough and then stopped
+// trusting it" and "the daemon never got an answer" are different faults with the
+// same masked spelling — and reporting it without the flag would have the
+// diagnostic contradict the dialog.
 func (p *Platform) Diag() map[string]any {
 	p.maybeRefresh()
 	roots := p.VolumeRoots()
@@ -975,6 +1104,9 @@ func (p *Platform) Diag() map[string]any {
 			"aclBackend": c.ACLBackend,
 			"aclXattr":   c.ACLXattr,
 			"zfsAclmode": c.ZFSAclmode,
+			// True once the cached answer is past its freshness bound: every lookup
+			// is reporting the aclmode as unknown until the next pass publishes.
+			"zfsAclmodeStale": c.ZFSAclmode != "" && p.probeExpiredLocked(m.MountPoint),
 		})
 		if c.Storage {
 			acl[m.MountPoint] = c.ACLBackend

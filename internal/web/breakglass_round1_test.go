@@ -255,7 +255,7 @@ func TestSlowLoginBodiesDoNotHoldAdmissionSlots(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewUnstartedServer(s.BreakGlassHandler())
+	srv := httptest.NewUnstartedServer(bgOverTheLAN(s.BreakGlassHandler()))
 	srv.TLS = &tls.Config{MinVersion: tls.VersionTLS12, NextProtos: []string{"http/1.1"}, Certificates: []tls.Certificate{*cert.TLS}}
 	// ReadHeaderTimeout only, exactly as production configures it: if the body
 	// read were unbounded and taken after admission, this test would hang until

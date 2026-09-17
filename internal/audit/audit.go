@@ -35,6 +35,18 @@ const maxBytes = 8 << 20
 // shallow enough that a wedged drain cannot hold much memory.
 const bufferDepth = 1024
 
+// mirrorDepth is how many milestones may be waiting for QuLog before the mirror
+// starts skipping them (Astra r7 #1).
+//
+// It is deliberately much shallower than bufferDepth, because the two queues
+// hold different things. The file is the RECORD and must absorb a burst; the
+// QuLog mirror is a notification, it costs an exec of log_tool that can take ten
+// seconds, and a mirror that is a thousand events behind is not notifying anyone
+// of anything. A skipped mirror is counted (MilestoneDrops) and the line is on
+// disk regardless, so what deepening this queue would buy is latency, not
+// evidence.
+const mirrorDepth = 64
+
 // dropReportInterval bounds how often the "N audit events dropped" notice is
 // written, so a sustained overflow does not itself flood the log.
 const dropReportInterval = 5 * time.Second
@@ -112,6 +124,22 @@ type Event struct {
 	// ForceMilestone marks an event a milestone regardless of the automatic
 	// classification (isMilestone). It is a decision flag, never serialised.
 	ForceMilestone bool `json:"-"`
+
+	// Quiet is the opposite decision, and it beats the other two (Astra r7 #1).
+	// The line is written to the file exactly as any other, and it is never
+	// mirrored to QuLog — not by the automatic classification, not by
+	// ForceMilestone.
+	//
+	// It exists because the automatic classification makes every denial a
+	// milestone, and one class of denial is produced by whoever is on the LAN
+	// rather than by anyone who authenticated: the break-glass door's sessionless
+	// refusal lines, their summaries and its overflow reports. Each of those used
+	// to buy an exec of log_tool, so 256 sources refusing once a minute against a
+	// QuLog that answers in ten seconds was a queue nobody could drain. A forged
+	// request must not be able to spend the mirror, and this is how the writer of
+	// such a line says so. Like the flag above it, it is a decision, never
+	// serialised.
+	Quiet bool `json:"-"`
 }
 
 // sink is the audit log's destination: an appending, rotating file that can be
@@ -147,6 +175,16 @@ type Logger struct {
 	// logFn mirrors a milestone to QuLog. It is a field so tests can replace
 	// it and avoid exec'ing /sbin/log_tool.
 	logFn func(qnap.Severity, string) error
+
+	// mirrorCh and mirrorDone are the QuLog mirror's own bounded worker (Astra r7
+	// #1). Every path that used to call logFn inline now offers the event here
+	// and moves on: the drain writes the next line without waiting for an exec
+	// that qnap.Log allows ten seconds, and a durable writer gives its slot back
+	// at once. A full queue means QuLog is further behind than the notification
+	// is worth, so the mirror for that event is skipped and counted rather than
+	// blocking anybody.
+	mirrorCh   chan Event
+	mirrorDone chan struct{}
 
 	// errLog reports a sink failure somewhere other than the failing file
 	// itself (writing the failure to the same file would only fail again). It
@@ -189,12 +227,14 @@ func Open(path string, qulog bool) (*Logger, error) {
 		return nil, err
 	}
 	l := &Logger{
-		path:    path,
-		w:       w,
-		qulog:   qulog,
-		ch:      make(chan Event, bufferDepth),
-		done:    make(chan struct{}),
-		syncSem: make(chan struct{}, syncWriters),
+		path:       path,
+		w:          w,
+		qulog:      qulog,
+		ch:         make(chan Event, bufferDepth),
+		done:       make(chan struct{}),
+		mirrorCh:   make(chan Event, mirrorDepth),
+		mirrorDone: make(chan struct{}),
+		syncSem:    make(chan struct{}, syncWriters),
 		logFn: func(sev qnap.Severity, msg string) error {
 			return qnap.Log(context.Background(), sev, msg)
 		},
@@ -202,6 +242,7 @@ func Open(path string, qulog bool) (*Logger, error) {
 		closeTimeout: closeDrainTimeout,
 	}
 	go l.drain()
+	go l.mirrorLoop()
 	return l, nil
 }
 
@@ -383,9 +424,10 @@ func (l *Logger) WriteSyncInFlight(ctx context.Context, ev Event) (inFlight bool
 		appended, err := l.emitSync(ev)
 		l.drainMu.Unlock()
 		// Acknowledge durability BEFORE mirroring: the line is fsynced, so the
-		// caller may proceed. The QuLog mirror then runs best-effort, outside
-		// drainMu and off the ack path, still holding this syncSem slot so a
-		// wedged QuLog is bounded to syncWriters goroutines (standard P2).
+		// caller may proceed. Handing the event to the mirror worker is then a
+		// channel send that either fits or does not (Astra r7 #1), so this slot is
+		// given back at the speed of the fsync rather than at the speed of QuLog —
+		// a wedged log_tool no longer holds a durable writer at all.
 		res <- syncResult{appended: appended, err: err}
 		if err == nil {
 			l.mirror(ev)
@@ -422,7 +464,9 @@ func (l *Logger) Dropped() int64 { return atomic.LoadInt64(&l.dropped) }
 func (l *Logger) WriteErrors() int64 { return atomic.LoadInt64(&l.writeErrors) }
 
 // MilestoneDrops returns how many milestone events could not be mirrored to
-// QuLog. The audit line still lands in the file; only the QuLog mirror was lost.
+// QuLog: log_tool refused them, or the mirror's own bounded queue was full and
+// the event was skipped rather than made to wait (Astra r7 #1). The audit line
+// still lands in the file; only the QuLog mirror was lost.
 func (l *Logger) MilestoneDrops() int64 { return atomic.LoadInt64(&l.milestoneDrops) }
 
 // Close stops the drain, flushing every queued event, and closes the file. The
@@ -453,15 +497,33 @@ func (l *Logger) Close() error {
 		l.syncWG.Wait()
 		close(drained)
 	}()
+	deadline := time.Now().Add(timeout)
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	select {
 	case <-drained:
-		return l.w.Close()
 	case <-timer.C:
 		l.errLog("close timed out draining the audit sink; some events may be unflushed and the file is left open")
 		return ErrCloseTimeout
 	}
+	// Every sender is finished — the drain returned and the durable writers were
+	// joined — so the mirror queue can be closed and its worker joined too (Astra
+	// r7 #1). The wait shares the SAME deadline rather than starting a fresh one:
+	// shutdown is bounded by closeTimeout in total, not by it twice.
+	close(l.mirrorCh)
+	mirrorTimer := time.NewTimer(time.Until(deadline))
+	defer mirrorTimer.Stop()
+	select {
+	case <-l.mirrorDone:
+	case <-mirrorTimer.C:
+		// The worker is inside log_tool and nothing can hurry it. It never touches
+		// the sink, though, so the file is closed anyway: leaving it open to wait
+		// on QuLog would be the mirror gating the record all over again.
+		l.errLog("close timed out waiting for the QuLog mirror; the last milestones may not be mirrored")
+		_ = l.w.Close()
+		return ErrCloseTimeout
+	}
+	return l.w.Close()
 }
 
 func (l *Logger) drain() {
@@ -471,8 +533,10 @@ func (l *Logger) drain() {
 		l.emit(ev)
 		l.reportDropped(false)
 		l.drainMu.Unlock()
-		// Mirror outside drainMu so a slow QuLog cannot hold the sink lock and
-		// stall the drain of the next event (standard P2).
+		// Offered to the mirror's own worker, which is what keeps a slow QuLog off
+		// this goroutine entirely (Astra r7 #1). Outside drainMu as before, and now
+		// also outside the ten seconds log_tool may take, so the next line is
+		// written at the speed of the file.
 		l.mirror(ev)
 	}
 	// Final pass: record any drops that accumulated after the last notice.
@@ -497,19 +561,47 @@ func (l *Logger) emit(ev Event) {
 	}
 }
 
-// mirror best-effort-copies a milestone to QuLog. It is deliberately called
-// OUTSIDE drainMu and, on the durable path, AFTER the caller has been told the
-// write is persisted (standard P2): qnap.Log blocks up to 10s, and that latency
-// must never hold the sink lock, stall the async drain, or turn a successfully
-// fsynced intent into a false ErrSyncTimeout. A dropped mirror is counted and
-// surfaced (adv 10); the audit line itself is already on disk regardless.
+// mirror OFFERS a milestone to QuLog and returns immediately. It never calls
+// log_tool itself (Astra r7 #1).
+//
+// Calling it outside drainMu was not enough. The drain is a single goroutine, so
+// an inline exec that qnap.Log allows ten seconds to answer held up the NEXT
+// event just as surely as the lock would have: a few hundred denials a minute —
+// which is what a handful of LAN sources produce without trying — put the file
+// hours behind the events it records and then overflowed the buffer, dropping
+// the results of real work. So the mirror has its own worker and its own bounded
+// queue: the caller hands the event over or, when QuLog is too far behind for the
+// notification to mean anything, does not, and counts that.
+//
+// A skipped mirror is counted and surfaced exactly as a failed one is (adv 10);
+// the audit line itself is on disk either way, which is what makes skipping the
+// right answer rather than a loss.
 func (l *Logger) mirror(ev Event) {
 	if !l.qulog || l.logFn == nil || !isMilestone(ev) {
 		return
 	}
-	if err := l.logFn(severity(ev), message(ev)); err != nil {
+	select {
+	case l.mirrorCh <- ev:
+	default:
 		n := atomic.AddInt64(&l.milestoneDrops, 1)
-		l.errLog(fmt.Sprintf("milestone not mirrored to QuLog (%d total): %v", n, err))
+		l.errLog(fmt.Sprintf("milestone not mirrored to QuLog (%d total): the mirror queue is full", n))
+	}
+}
+
+// mirrorLoop is the one goroutine that ever execs log_tool. Nothing it does can
+// reach the sink, the drain or a durable writer, so however long QuLog takes,
+// the only thing that falls behind is QuLog.
+func (l *Logger) mirrorLoop() {
+	defer close(l.mirrorDone)
+	for ev := range l.mirrorCh {
+		fn := l.logFn
+		if fn == nil {
+			continue
+		}
+		if err := fn(severity(ev), message(ev)); err != nil {
+			n := atomic.AddInt64(&l.milestoneDrops, 1)
+			l.errLog(fmt.Sprintf("milestone not mirrored to QuLog (%d total): %v", n, err))
+		}
 	}
 }
 
@@ -639,6 +731,12 @@ func (l *Logger) Tail(n int) ([]Event, error) {
 // toggles, any denial, big deletes, chowns and writes under /etc/config
 // qualify — plus anything the caller forces.
 func isMilestone(ev Event) bool {
+	// The explicit refusal first, so it beats the force flag as well as the
+	// automatic classification (Astra r7 #1). A caller that has said this line is
+	// not for QuLog has said the last word on it.
+	if ev.Quiet {
+		return false
+	}
 	if ev.ForceMilestone {
 		return true
 	}

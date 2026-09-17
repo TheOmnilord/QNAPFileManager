@@ -159,6 +159,10 @@ The session you get belongs to the **address you signed in from**: presented fro
 refusal is audited, which is what keeps a browser that also talks to QTS on 443 from handing your emergency session to
 whatever answers there. If your address changes — a new lease, a different machine, a VPN — sign in again.
 
+**Reach the door directly, from another machine on the LAN — never through an SSH tunnel or a local port forward.** A
+login that arrives from the NAS itself is refused outright, because a relay makes every browser look like loopback and
+the address the session is pinned to is then one that every other service on the NAS shares.
+
 Five wrong passwords lock the account for 60 seconds, doubling to a 30-minute cap; a restart of the app clears the
 lockout. A locked account is told so — the answer is `429 locked_out` with a `Retry-After`, deliberately, because leaving
 an operator to guess at a door that will not open for half an hour is worse than admitting the lockout. Attempts,

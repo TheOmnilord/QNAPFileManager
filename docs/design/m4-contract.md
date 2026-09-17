@@ -583,7 +583,20 @@ certificate and a running daemon binds the listener when a credential appears, s
     the NAS hostname at another port receives the root-session cookie. The door therefore refuses the cookie from
     any other peer address (audited as a sessionless denial), which turns a replay from the NAS itself, or from
     another machine, into a 401. An operator whose address changes mid-session signs in again; on a LAN that is
-    rare and cheap.
+    rare and cheap. *Round 7:* the pin does **not** close the replay issue, it narrows it. A NAS-local relay or an
+    SSH tunnel would have pinned the session to loopback — where every sibling service on the NAS lives — so the
+    door refuses to issue a session to a loopback peer at all (answered like a wrong password, audited, not a
+    ladder step): the emergency door is reached directly from another machine on the LAN. What remains is two
+    machines behind one observed address (NAT, a proxy on the segment): a replay from the operator's own address
+    is not caught, and that is the residual. An origin-isolated credential would close it and is out of scope for
+    v1.0. The per-source lockout is likewise a bound on carelessness, not on an adversary with many addresses
+    (IPv6 aliases on one host, LRU eviction of the locked source): §18.12's serialised bcrypt is the bound there.
+18. **Queued lines are not in event order** (round 7). Sessionless denials and their summaries take the
+    asynchronous path, so they can land in the file after later durable lines; the `T` stamp is the order, the
+    file position is not. They are not mirrored to QuLog, and the mirror runs on its own bounded worker, so a slow
+    `log_tool` stalls neither the file nor the operator.
+19. **A pruned summary whose queue write is refused is lost** (round 7). The entry is gone by then; `Dropped()`
+    counts it, and the per-source line that opened the window is already on disk.
 
 **To confirm on hardware first (both units):** that **8771 is free** and QuFirewall does not block it — the whole
 feature is inert otherwise, and `netstat -tlnp` before the first release is the check; that the listener **does not

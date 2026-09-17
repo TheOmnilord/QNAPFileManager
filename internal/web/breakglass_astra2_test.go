@@ -301,7 +301,7 @@ func bgShortenReadDeadlines(t *testing.T, within time.Duration) {
 // TLS listener.
 func bgSocketServer(t *testing.T, s *Server) *httptest.Server {
 	t.Helper()
-	srv := httptest.NewUnstartedServer(s.BreakGlassHandler())
+	srv := httptest.NewUnstartedServer(bgOverTheLAN(s.BreakGlassHandler()))
 	// HTTP/1 only: contract §13.5, and the Connection: close the wrapper relies
 	// on has no meaning in HTTP/2.
 	srv.EnableHTTP2 = false

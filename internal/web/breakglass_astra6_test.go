@@ -162,13 +162,19 @@ func TestRepeatedReplaysAreThrottledLikeEveryOtherRefusal(t *testing.T) {
 }
 
 // The pin compares addresses, not the notation an address happens to arrive in.
-// ::1 and 0:0:0:0:0:0:0:1 are one host; so are 192.0.2.10 and the IPv4-mapped
-// form a dual-stack listener reports for the same IPv4 peer. Getting this wrong
-// locks the operator out of their own emergency session over punctuation.
+// 2001:db8::1 and its fully written-out form are one host; so are 192.0.2.10 and
+// the IPv4-mapped form a dual-stack listener reports for the same IPv4 peer.
+// Getting this wrong locks the operator out of their own emergency session over
+// punctuation.
+//
+// The spelled-out pair used to be ::1 against 0:0:0:0:0:0:0:1, which is no
+// longer a case the door has: it refuses a loopback peer outright (Astra r7 #6).
+// The documentation IPv6 range makes the same point about notation without
+// testing an address that can never sign in.
 func TestThePinAgreesAcrossAddressSpellings(t *testing.T) {
 	for _, tc := range []struct{ name, signIn, again string }{
-		{"the loopback spelled out", "::1", "0:0:0:0:0:0:0:1"},
-		{"the loopback abbreviated", "0:0:0:0:0:0:0:1", "::1"},
+		{"an IPv6 peer abbreviated", "2001:db8::1", "2001:0db8:0000:0000:0000:0000:0000:0001"},
+		{"and spelled out", "2001:0db8:0000:0000:0000:0000:0000:0001", "2001:db8::1"},
 		{"an IPv4 peer mapped into IPv6", "192.0.2.10", "::ffff:192.0.2.10"},
 		{"and back again", "::ffff:192.0.2.10", "192.0.2.10"},
 	} {
@@ -237,14 +243,20 @@ func TestSessionlessDenialsDoNotSpendTheDurableWriters(t *testing.T) {
 			if ev.IP == source && ev.Op == "auth" && ev.Result == "denied" {
 				found = true
 				assertSessionlessShape(t, ev)
-				if ev.ForceMilestone {
-					t.Errorf("the denial from %s is still a forced milestone", source)
-				}
 			}
 		}
 		if !found {
 			t.Errorf("the denial from %s reached no audit line at all", source)
 		}
+	}
+	// The forced-milestone flag is asserted on the CONSTRUCTED event, not on one
+	// read back from the file (Astra r7 #5). It is `json:"-"`: every event that
+	// comes back through Tail has it false, whatever was written, so the
+	// assertion this test used to make against the file could not fail and proved
+	// nothing at all.
+	line := sessionlessRefusalEvent(httptest.NewRequest("POST", "/api/fs/mkdir", nil), "unauthorized", "no valid session on a mutation route")
+	if line.ForceMilestone {
+		t.Error("a sessionless denial is still constructed as a forced milestone")
 	}
 }
 

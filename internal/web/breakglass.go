@@ -521,7 +521,7 @@ func (s *Server) breakGlassAuth(w http.ResponseWriter, r *http.Request) (*sessio
 		}
 		return nil, false
 	}
-	sess := s.bg.resolve(w, r)
+	sess, accounted := s.bg.resolve(w, r)
 	if sess == nil {
 		// api/session is the one API answer an unauthenticated page may read, on
 		// this listener exactly as on the other: it is what tells the sign-in
@@ -530,7 +530,15 @@ func (s *Server) breakGlassAuth(w http.ResponseWriter, r *http.Request) (*sessio
 			s.sessionInfo(w, r, nil)
 			return nil, false
 		}
-		if !safeMethod(r.Method) && isMutationRoute(r.URL.Path) {
+		if !accounted && !safeMethod(r.Method) && isMutationRoute(r.URL.Path) {
+			// Once, not twice (Astra r7 #2). resolve accounts for the refusals it
+			// makes itself — a cookie presented from another address is counted and
+			// audited there — and says so, because this line and that one are the
+			// same refusal of the same request. Counting it again here made a
+			// replayed POST cost two suppressed refusals apiece, so five of them
+			// reported nine, which is a lie about a number whose whole purpose is to
+			// tell an operator how hard they are being hit.
+			//
 			// Through the bounded refusal accounting, not straight to
 			// auditUnauthenticated (Astra r1 #3). On the MAIN listener that call
 			// is fine: it sits behind the QTS proxy and a caller must already be
@@ -592,14 +600,43 @@ func canonicalHost(host string) string {
 // is, as far as this door is concerned, nobody.
 const bgPeerMismatch = "session_peer_mismatch"
 
+// bgLoopbackPeer reports whether the request came from the machine itself
+// (Astra r7 #6).
+//
+// The peer pin cannot see through a relay, and the relay that matters is a local
+// one: any unprivileged process on the NAS may listen on a high port and forward
+// to 127.0.0.1:8771, and an SSH tunnel does the same thing with no code at all.
+// The browser's login then arrives from loopback, the session is pinned to
+// loopback — and every other HTTPS service on the NAS hostname, which receives
+// the host-scoped cookie, is also at loopback as far as this door can tell. The
+// pin would be satisfied by exactly the replay it exists to stop.
+//
+// So loopback is not a peer this door deals with. It is a LAN door: the operator
+// is at another machine, because the reason they are using it is that the NAS is
+// not well. Refusing loopback costs that operator nothing and takes the relay
+// away.
+func bgLoopbackPeer(r *http.Request) bool {
+	// The zone is cut off exactly as canonicalHost cuts it: "::1%lo0" is the same
+	// host as "::1", and net.ParseIP does not take the suffix.
+	addr, _, _ := strings.Cut(peerHost(r), "%")
+	ip := net.ParseIP(addr)
+	return ip != nil && ip.IsLoopback()
+}
+
 // resolve maps the cookie to a live session, applying the peer pin, the idle
 // timeout, the absolute lifetime and the credential-stamp eviction. It returns
 // nil when the request is unauthenticated, having already destroyed anything
 // stale.
-func (d *breakGlassDoor) resolve(w http.ResponseWriter, r *http.Request) *session {
+//
+// accounted is the second half of that answer (Astra r7 #2): true when resolve
+// has already counted and audited this refusal through the bounded refusal
+// table, so the caller must not count the same request a second time in its own
+// shape. It is false for every nil that was simply not a session — no cookie, an
+// unknown one, an expired one — because those are the caller's to account for.
+func (d *breakGlassDoor) resolve(w http.ResponseWriter, r *http.Request) (*session, bool) {
 	c, err := r.Cookie(bgCookie)
 	if err != nil || c.Value == "" {
-		return nil
+		return nil, false
 	}
 	// The stamp is read before the lock so a wedged config read cannot be held
 	// across the session map.
@@ -611,7 +648,7 @@ func (d *breakGlassDoor) resolve(w http.ResponseWriter, r *http.Request) *sessio
 	if sess == nil {
 		d.mu.Unlock()
 		d.clearCookie(w)
-		return nil
+		return nil, false
 	}
 	// The pin, before anything else this function does (Astra r6 #1). A request
 	// from another address is not this session's and gets nothing from it: not
@@ -625,10 +662,18 @@ func (d *breakGlassDoor) resolve(w http.ResponseWriter, r *http.Request) *sessio
 	// is cleared: the cookie is host-scoped, so a Set-Cookie written to whoever
 	// replayed it would, in the browser case this is about, delete the operator's
 	// own cookie from their own browser.
-	if bgPeer(r) != sess.peer {
+	//
+	// A loopback peer is a mismatch too, whatever the session says (Astra r7 #6).
+	// No session is ever issued to loopback any more, so this can only be a
+	// session pinned to a LAN address being presented from the NAS itself — but it
+	// is written as its own condition rather than left to the comparison, because
+	// the rule is about the relay, not about which address happens to be stored.
+	if bgLoopbackPeer(r) || bgPeer(r) != sess.peer {
 		d.mu.Unlock()
 		d.notePeerMismatch(r)
-		return nil
+		// Counted and audited HERE, so the caller does not do it again in the
+		// sessionless shape (Astra r7 #2).
+		return nil, true
 	}
 	reason := ""
 	switch {
@@ -644,13 +689,13 @@ func (d *breakGlassDoor) resolve(w http.ResponseWriter, r *http.Request) *sessio
 		d.mu.Unlock()
 		d.clearCookie(w)
 		d.auditRemoval(r, note)
-		return nil
+		return nil, false
 	}
 	sess.seen = now
 	snap := sess.snapshot()
 	d.mu.Unlock()
 	d.setCookie(w, sess.id, int(bgIdle.Seconds()))
-	return snap
+	return snap, false
 }
 
 // logf writes to the app log, tolerating a door built without a server (the
@@ -785,6 +830,19 @@ func (d *breakGlassDoor) login(w http.ResponseWriter, r *http.Request) {
 	// not from the other two locks.
 	if !validOrigin(r) {
 		d.reject(ctx, w, r, start, http.StatusForbidden, "permission", "The request could not be verified.", 0, "origin check failed")
+		return
+	}
+	// No session is ever issued to the machine itself (Astra r7 #6). A login that
+	// arrives from loopback came through a relay — a forwarder some unprivileged
+	// process on the NAS put in front of 8771, or an SSH tunnel — and a session
+	// pinned to loopback is a session every sibling service on the NAS can replay,
+	// because the host-scoped cookie reaches them and they are at loopback too.
+	// The answer is the uniform one: same body, same floor, same bucket charge,
+	// and no rung of the lockout ladder, because nothing here is a verdict about a
+	// password and an operator must not be able to lock their own door by
+	// tunnelling to it five times.
+	if bgLoopbackPeer(r) {
+		d.fail(ctx, w, r, start, ip, "loopback peer", nil)
 		return
 	}
 	// A source that is inside its budget again gets its suppressed refusals
@@ -967,12 +1025,23 @@ func (d *breakGlassDoor) logout(w http.ResponseWriter, r *http.Request) {
 	}
 	d.mu.Lock()
 	sess := d.sessions[c.Value]
+	// The pin FIRST, and on its own (Astra r7 #3). Folding it into the condition
+	// below answered a replay from another address with the same 403 as a missing
+	// token and recorded nothing at all — so the one event the pin exists to make
+	// visible, a root session cookie turning up somewhere else, was silent on the
+	// single route that reaches a live session without going through resolve. It
+	// goes through the same bounded mismatch path as every other replay, and the
+	// session SURVIVES: signing the operator out is precisely what a replayed
+	// logout is for.
+	if sess != nil && (bgLoopbackPeer(r) || bgPeer(r) != sess.peer) {
+		d.mu.Unlock()
+		d.notePeerMismatch(r)
+		writeError(w, statusCode("permission"), "permission", "The request could not be verified. Refresh and try again.", "", r.URL.Path, "")
+		return
+	}
 	// Only a caller holding the session's own CSRF token may destroy it, the
-	// same rule every other unsafe request follows — and only from the address
-	// the session belongs to (Astra r6 #1). Destroying a session is a mutation
-	// like any other, so this route obeys the pin too rather than being the one
-	// place a replayed cookie can still reach a live session.
-	if sess == nil || !validCSRF(r, sess.csrf) || bgPeer(r) != sess.peer {
+	// same rule every other unsafe request follows.
+	if sess == nil || !validCSRF(r, sess.csrf) {
 		d.mu.Unlock()
 		// No cookie is written on this path: an unverifiable request changes
 		// nothing at all, including the browser's state.
@@ -1212,8 +1281,9 @@ func (d *breakGlassDoor) writeRefusal(r *http.Request, ev refusalEvent, detail s
 	return d.audit(r, ev.op, "denied", ev.code, detail)
 }
 
-// queueRefusal is writeRefusal for a line that must not wait for anything: the
-// same two shapes, both on the async path (Astra r6 #4).
+// queuePrunedRefusal is writeRefusal for the one line that must not wait for
+// anything and is not about the request that triggers it: the summary a swept
+// window owes (Astra r6 #4, Astra r7 #4).
 //
 // The pruning sweep is its only caller, and the sweep is the reason it exists.
 // It runs inside another source's refusal, it can find a whole table's worth of
@@ -1222,20 +1292,31 @@ func (d *breakGlassDoor) writeRefusal(r *http.Request, ev refusalEvent, detail s
 // sources that stopped talking minutes ago — the same amplifier #2 closed on the
 // sessionless line itself, re-opened one level up. The verdict is a single bool
 // because the async path has no in-flight state to tell apart.
-func (d *breakGlassDoor) queueRefusal(r *http.Request, ev refusalEvent, detail string) bool {
+//
+// Every identifying field comes from the PRUNED WINDOW, and no http.Request is
+// passed in at all (Astra r7 #4). That is not tidiness: with the request in
+// hand, the two constructors read its address and its route, and the resulting
+// line said that source B had made these refusals on the path B happened to be
+// asking for — while the detail text, alone, named A. An operator filtering the
+// trail by address gets a count attributed to the wrong host, which is worse
+// than no line.
+func (d *breakGlassDoor) queuePrunedRefusal(p prunedWindow, detail string) bool {
 	if d.srv == nil || d.srv.auditor == nil {
 		return false
 	}
-	if ev.shape == refusalSessionless {
-		if r == nil {
-			return false
-		}
-		return d.srv.auditor.WriteQueued(sessionlessRefusalEvent(r, ev.code, detail))
+	if p.ev.shape == refusalSessionless {
+		// No path. The window counted refusals across whatever routes the source
+		// tried, so any single route would be a guess, and the one route this
+		// summary certainly has nothing to do with is the one the triggering
+		// request asked for.
+		return d.srv.auditor.WriteQueued(sessionlessRefusalLine(p.ip, audit.DoorLocal, "", p.ev.code, detail))
 	}
 	// The door's own shape, minus the forced milestone: a summary of refusals is
 	// a rate report about a source that has gone away, not a use of the door.
 	// Result "denied" still puts it in front of QuLog on its own merits.
-	return d.srv.auditor.WriteQueued(bgDoorEvent(r, ev.op, "denied", ev.code, detail))
+	ev := bgDoorEvent(nil, p.ev.op, "denied", p.ev.code, detail)
+	ev.IP = p.ip
+	return d.srv.auditor.WriteQueued(ev)
 }
 
 // bgAuditContext is the context every break-glass refusal line is written
@@ -1259,27 +1340,47 @@ var bgAuditContext = func(r *http.Request) context.Context {
 // an inFlight of false, is the whole verdict.
 var errRefusalNotQueued = errors.New("the refusal line was not queued")
 
-// sessionlessRefusalEvent is the event a denial with nobody behind it is
-// recorded as. The shape is the one routes_mutate.go's auditUnauthenticated
-// writes, and assertSessionlessShape in breakglass_astra2_test.go pins both to
-// it: no actor, the LISTENER's door, the path, Op "auth".
-func sessionlessRefusalEvent(r *http.Request, code, detail string) audit.Event {
+// sessionlessRefusalLine is the event a denial with nobody behind it is recorded
+// as, built from the identity of WHOEVER IT IS ABOUT rather than from a request
+// (Astra r7 #4).
+//
+// Taking the fields one at a time is the whole point. A per-source line is about
+// the request that is being refused, so it is built from that request. A pruned
+// window's summary is about a source that stopped talking minutes ago and is
+// written on the goroutine of some unrelated request, so building it from that
+// request put the wrong address in the IP field and the wrong route in the path,
+// and left the truth in the detail text where no filter looks.
+//
+// The shape is the one routes_mutate.go's auditUnauthenticated writes, and
+// assertSessionlessShape in breakglass_astra2_test.go pins both to it: no actor,
+// the LISTENER's door, Op "auth".
+func sessionlessRefusalLine(ip, door, path, code, detail string) audit.Event {
 	return audit.Event{
-		IP:     ClientIP(r),
-		Door:   doorOf(r),
+		IP:     ip,
+		Door:   door,
 		Op:     "auth",
-		Path:   r.URL.Path,
+		Path:   path,
 		Phase:  "result",
 		Result: "denied",
 		Code:   code,
 		Detail: detail,
 		// NOT a forced milestone (Astra r6 #2). §6.2's "a milestone on every use"
 		// is about uses of the DOOR, and a forged mutation from a host that never
-		// authenticated is not one. The line is still classified on its own merits
-		// — every denial is — so QuLog still hears about it; what it no longer does
-		// is demand a durable writer and a synchronous QuLog call per line.
+		// authenticated is not one.
 		ForceMilestone: false,
+		// And not mirrored to QuLog at all (Astra r7 #1). Leaving the automatic
+		// classification to make a milestone of it — every denial is one — meant a
+		// line anybody on the LAN can produce still bought an exec of log_tool, and
+		// that exec was the thing standing between the audit file and the next
+		// event. The line is written and kept; QuLog is for uses of the door.
+		Quiet: true,
 	}
+}
+
+// sessionlessRefusalEvent is that line for the request in front of us: the peer
+// that sent it, this listener's door, the route it aimed at.
+func sessionlessRefusalEvent(r *http.Request, code, detail string) audit.Event {
+	return sessionlessRefusalLine(ClientIP(r), doorOf(r), r.URL.Path, code, detail)
 }
 
 // auditSessionlessRefusal writes that event on the ASYNCHRONOUS path (Astra r6
@@ -1481,7 +1582,7 @@ func (d *breakGlassDoor) noteRefusalEvent(r *http.Request, ip, detail string, ev
 			d.droppedAt[ev.shape], d.dropped[ev.shape] = now, 0
 		}
 		d.mu.Unlock()
-		d.emitPruned(r, pruned)
+		d.emitPruned(pruned)
 		if report {
 			inFlight, err := d.writeRefusal(r, ev.shape.summary(),
 				fmt.Sprintf("door=local %d refusals from untracked sources; the %d-source table is full", dropped, breakglass.MaxSources))
@@ -1513,7 +1614,7 @@ func (d *breakGlassDoor) noteRefusalEvent(r *http.Request, ip, detail string, ev
 	}
 	state.opened, state.suppressed, state.shape = now, 0, ev.shape
 	d.mu.Unlock()
-	d.emitPruned(r, pruned)
+	d.emitPruned(pruned)
 	line := ev
 	if carried > 0 {
 		detail = fmt.Sprintf("%s (%d further refusals suppressed in the previous window)", detail, carried)
@@ -1564,9 +1665,9 @@ type prunedWindow struct {
 // talking long ago, and re-inserting a window nobody will return to would spend
 // a slot in a bounded table on news that would only be swept again. The
 // auditor's own drop counter is what reports that the log lost lines.
-func (d *breakGlassDoor) emitPruned(r *http.Request, pruned []prunedWindow) {
+func (d *breakGlassDoor) emitPruned(pruned []prunedWindow) {
 	for _, p := range pruned {
-		d.queueRefusal(r, p.ev, fmt.Sprintf(
+		d.queuePrunedRefusal(p, fmt.Sprintf(
 			"door=local ip=%s %d further refusals suppressed; the window aged out before the source came back", p.ip, p.count))
 	}
 }

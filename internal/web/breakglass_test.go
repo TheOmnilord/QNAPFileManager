@@ -682,7 +682,7 @@ func TestBreakGlassOverRealTLS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewUnstartedServer(s.BreakGlassHandler())
+	srv := httptest.NewUnstartedServer(bgOverTheLAN(s.BreakGlassHandler()))
 	srv.TLS = &tls.Config{
 		MinVersion:   tls.VersionTLS12,
 		NextProtos:   []string{"http/1.1"}, // HTTP/2 declined on purpose (§13.5)

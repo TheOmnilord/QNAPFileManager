@@ -127,6 +127,11 @@ func TestWorkerFactsAreTakenWhenTheMountMatches(t *testing.T) {
 // reading of a different filesystem — neither the state nor the aclmode, which
 // between them are the difference between "this is fine" and "this DESTROYS the
 // ACL".
+//
+// Amended by Astra r4 #1: the daemon's row is not simply KEPT either, because the
+// disagreement says only that nobody can name the mount. The grade is the worst of
+// the two readings, which here is still the L2 discard rung — now with the
+// unknown-aclmode suffix, and naming both candidates (perm_astra4_test.go).
 func TestWorkerFactsFromAnotherMountAreNotFoldedIn(t *testing.T) {
 	s, b, _ := permFixture(t)
 	s.platform = heroPlatform(t, "discard")
@@ -144,8 +149,11 @@ func TestWorkerFactsFromAnotherMountAreNotFoldedIn(t *testing.T) {
 	if facts.state != fsx.ACLUnknown {
 		t.Fatalf("state %q: a reading taken on another mount was graded as this object's", facts.state)
 	}
-	if facts.aclmode != "discard" || facts.dataset == "zpool1/somewhere_else" {
-		t.Fatalf("facts %+v, want the daemon's own row for this dataset", facts)
+	if facts.dataset == "zpool1/somewhere_else" {
+		t.Fatalf("facts %+v: the worker's dataset replaced the daemon's own row", facts)
+	}
+	if facts.aclmode != "" {
+		t.Fatalf("aclmode %q: a contradicted row is not a row anyone can state an aclmode from (r4 #1)", facts.aclmode)
 	}
 	if grade, _, discards := chmodACLNotice(facts); grade != gradeTyped || !discards {
 		t.Fatalf("grade %d discards %v, want the discard warning kept", grade, discards)

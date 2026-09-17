@@ -125,6 +125,22 @@ type WalkItem struct {
 	// traversal to anything outside this package, and the callers that need a
 	// descriptor live here.
 	parent *dirRef
+
+	// held is the enumeration's OWN descriptor on this item, kept open, and it
+	// is set in one case only: a directory whose filesystem records no birth
+	// time (lstatUnprovenHeld, Astra r4 #7).
+	//
+	// Everywhere else an identity settles what a second lookup of the name
+	// reached — device, inode and the creation time nothing can forge. Where
+	// there is no creation time to read, the only remaining proof is not to look
+	// the name up twice at all, so the walk holds what it described and the
+	// Unopened fallback acts on that object rather than on whatever answers to
+	// the name by then.
+	//
+	// The WALK owns it: it is closed as soon as this item has been handled,
+	// descended into or not, so at most one is outstanding per level. A visitor
+	// must use it and must not close it.
+	held *os.File
 }
 
 // isDir reports whether the item is a directory, without following anything.
@@ -439,7 +455,7 @@ func (w *walker) children(ctx context.Context, d *dirRef, parent WalkItem) error
 				w.warn(childPath, err)
 				continue
 			}
-			fi, err := d.lstat(name)
+			fi, held, err := d.lstatHeld(name)
 			if err != nil {
 				// Unlinked between getdents and the stat: an ordinary race in a
 				// live directory, and there is nothing left to report on.
@@ -456,15 +472,26 @@ func (w *walker) children(ctx context.Context, d *dirRef, parent WalkItem) error
 				Depth:  parent.Depth + 1,
 				remove: func(isDir bool) error { return d.unlink(name, isDir) },
 				parent: d,
+				held:   held,
 			}
 			if !fi.IsDir() {
+				// held is nil for anything that is not a directory, so there is
+				// nothing to release here.
 				if err := w.visit(ctx, it, nil); err != nil {
 					return err
 				}
 				continue
 			}
-			if err := w.directory(ctx, d, it, parentOS, parentID); err != nil {
-				return err
+			derr := w.directory(ctx, d, it, parentOS, parentID)
+			if held != nil {
+				// Released the moment this entry is finished with — descended
+				// into, refused, or handed to the fallback — which is what keeps
+				// the outstanding count to one per level rather than one per
+				// entry (Astra r4 #7).
+				_ = held.Close()
+			}
+			if derr != nil {
+				return derr
 			}
 		}
 		if errors.Is(readErr, io.EOF) {

@@ -389,6 +389,98 @@ test('Recount retries the cancel it could not send, and still measures again', a
  assert.equal(runner.jobId, null);
 });
 
+// --- the claim belongs to the MEASUREMENT, not to the runner (Astra r4 #3) ----
+//
+// Properties and Permissions ask about the same folder, so one walk has two
+// holders. Close the first, close the second while the 202 is STILL in flight,
+// and the stop the last holder asked for has no id to name yet: the cancel goes
+// out later, from the closure that posted the job — the first dialog's runner.
+// A runner-local set of pending cancels was therefore the SUBMITTER's, and the
+// dialog that let go last reported no job id at all: its Stop and its Recount
+// sent nothing while the du walked on.
+
+test('a cancel claimed while the 202 was in flight is retried by whichever dialog acts next (Astra r4 #3)', async t => {
+ resetSizeJobs();
+ const posts = [], cancelled = [];
+ let acknowledge = false;                         // the wire is down to begin with
+ let land;                                        // the 202 waits here until we let it land
+ const submitted = new Promise(resolve => { land = resolve; });
+ const make = () => createSizeRunner({
+  report: () => {},
+  track: () => {},
+  cancel: async id => { cancelled.push(id); return acknowledge; },
+  poll: () => new Promise(() => {}),              // the walk is still going
+ });
+ t.mock.method(globalThis, 'fetch', async (url, options) => {
+  posts.push({url: String(url), body: options?.body ? JSON.parse(options.body) : null});
+  await submitted;
+  return new Response(JSON.stringify({job: {id: 's1', state: 'queued'}}), {status: 202});
+ });
+ const properties = make(), permissions = make();
+ const a = properties.start([dir('/share/CACHEDEV1_DATA/_IMAGES')]);
+ await new Promise(resolve => setTimeout(resolve, 0));
+ const b = permissions.start([dir('/share/CACHEDEV1_DATA/_IMAGES')]);
+ await new Promise(resolve => setTimeout(resolve, 0));
+ assert.equal(posts.length, 1, 'Properties and Permissions measure the same folder once');
+ await properties.stop();                         // Properties closes first
+ assert.deepEqual(cancelled, [], 'the other dialog is still waiting for this walk');
+ await permissions.stop();                        // and now the last holder lets go
+ assert.deepEqual(cancelled, [], 'nothing to cancel yet: the 202 has not landed');
+ land();
+ await new Promise(resolve => setTimeout(resolve, 0));
+ assert.deepEqual(cancelled, ['s1'], 'the submitting closure sends it the moment the id arrives');
+ assert.equal(await a, null);
+ assert.equal(await b, null);
+ assert.equal(permissions.jobId, 's1', 'unacknowledged: the dialog that let go LAST still names the walk');
+ assert.equal(properties.jobId, 's1', 'and so does the one whose closure sent the request');
+ await permissions.stop();                        // Stop in the dialog that never sent the first cancel
+ assert.deepEqual(cancelled, ['s1', 's1'], 'and it retries — one attempt per user action');
+ acknowledge = true;                              // the service is back
+ await permissions.stop();
+ assert.deepEqual(cancelled, ['s1', 's1', 's1']);
+ assert.equal(permissions.jobId, null, 'acknowledged at last: there is nothing left to stop');
+ assert.equal(properties.jobId, null, 'and one acknowledgement clears the walk for BOTH dialogs');
+ await properties.stop();
+ await permissions.stop();
+ assert.deepEqual(cancelled, ['s1', 's1', 's1'], 'neither dialog sends a fourth');
+});
+
+test('a claim made before the id exists does not outlive a submission the server refused (Astra r4 #3)', async t => {
+ // The other end of the same gap: both dialogs let go while the POST is in
+ // flight, and the POST comes back 403. There is no walk on the server, so the
+ // claim ends there rather than being carried — and cancelled — for the rest of
+ // the session by every Stop the user presses afterwards.
+ resetSizeJobs();
+ const cancelled = [];
+ let refuse;
+ const answered = new Promise(resolve => { refuse = resolve; });
+ const make = () => createSizeRunner({
+  report: () => {},
+  track: () => {},
+  cancel: async id => { cancelled.push(id); return false; },
+  poll: () => new Promise(() => {}),
+ });
+ t.mock.method(globalThis, 'fetch', async () => {
+  await answered;
+  return new Response(JSON.stringify({error: {code: 'protected', message: 'no'}}), {status: 403});
+ });
+ const properties = make(), permissions = make();
+ const a = properties.start([dir('/etc')]);
+ await new Promise(resolve => setTimeout(resolve, 0));
+ const b = permissions.start([dir('/etc')]);
+ await new Promise(resolve => setTimeout(resolve, 0));
+ await properties.stop();
+ await permissions.stop();
+ refuse();
+ assert.equal(await a, null);
+ assert.equal(await b, null);
+ assert.equal(permissions.jobId, null, 'the server never took the job, so there is no walk to name');
+ assert.equal(properties.jobId, null);
+ await permissions.stop();
+ await properties.stop();
+ assert.deepEqual(cancelled, [], 'and nothing is cancelled by guesswork');
+});
+
 test('a measurement that could not be submitted is not cached as an answer', async t => {
  resetSizeJobs();
  const {runner, reports} = harness();

@@ -91,6 +91,16 @@ func (ref *itemRef) restat() {}
 // every caller falls back to addressing the entry by name through os.Root.
 func refFD(ref *itemRef) *os.File { return nil }
 
+// heldRef has nothing to present off Linux. The walk retains no enumeration
+// descriptor here — there is no O_PATH to retain — so WalkItem.held is always
+// nil and nothing ever calls this; it exists so the fallback that consults it
+// compiles on one platform and behaves on the other (INV-2, the usual
+// degradation).
+func heldRef(f *os.File) (*itemRef, error) {
+	_ = f
+	return nil, os.ErrInvalid
+}
+
 // itemRefIn off Linux is statAt of the entry beneath an already-held directory.
 // There is no openat to address it relative to a descriptor, so the name is
 // joined onto the directory's own jail-relative path and os.Root resolves it —

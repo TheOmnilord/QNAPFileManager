@@ -77,13 +77,43 @@ export function sizeJobUsable(entry,now = Date.now(),window = SIZE_REUSE_MS) {
  return now - entry.finishedAt <= window;
 }
 
-// resetSizeJobs drops every shared measurement. Tests use it; nothing else
-// needs to, because an entry ages out on its own.
-export function resetSizeJobs() { sizeJobs.clear(); }
+// `pendingCancels` is every measurement the UI has ASKED the service to stop and
+// that the service has not acknowledged stopping.
+//
+// It is the whole of Astra r3 #3: Stop dropped its reference to the entry before
+// the cancel was sent, and abandon drops the entry from the shared cache, so when
+// the RETRY cancel failed too nothing on this side still named the walk — jobId
+// went null and a second Stop sent nothing while the du carried on. Ownership of
+// an unacknowledged cancel therefore survives Stop, the close event and Recount:
+// jobId keeps naming it, and each of those user actions retries it exactly once —
+// never a loop — until the service answers.
+//
+// The register is MODULE-level, not one runner's, because the walk is shared
+// (Astra r4 #3). Properties and Permissions hold one measurement whose 202 is
+// still in flight; the last dialog to close asks for a stop that has no id to
+// name yet, and the cancel finally goes out from the closure that POSTED the job
+// — the FIRST dialog's runner. With a set per runner that was the only one that
+// then named the walk, so the dialog the user was still looking at reported no
+// job at all and its Stop and Recount sent nothing. The claim is written on the
+// shared entry as well (`cancelPending`), so an entry that has left `sizeJobs`
+// still carries it, and only an acknowledgement clears it.
+const pendingCancels = new Set();
+
+// claimed is the shared question every runner asks: has this measurement been
+// asked to stop without the service saying it has? True from the moment a stop
+// is asked for — including while the 202 is still in flight and there is no id
+// to cancel by — until an acknowledgement clears it.
+const claimed = entry => !!entry && !!entry.cancelPending && !entry.cancelled;
+
+// resetSizeJobs drops every shared measurement, and the pending cancels with
+// them. Tests use it — one test's unacknowledged claim is not the next one's
+// walk — and nothing else does, because an entry ages out on its own.
+export function resetSizeJobs() { sizeJobs.clear(); pendingCancels.clear(); }
 
 // pruneSizeJobs collects measurements nobody holds and nobody may reuse. A
 // session that walks a thousand folders would otherwise keep a thousand stale
-// answers alive for the sake of a ten-second window.
+// answers alive for the sake of a ten-second window. An unacknowledged cancel is
+// not lost by this: the claim lives in `pendingCancels`, which is not this map.
 export const SIZE_JOB_CAP = 32;
 export function pruneSizeJobs(now = Date.now()) {
  if (sizeJobs.size <= SIZE_JOB_CAP) return;
@@ -105,16 +135,9 @@ export function pruneSizeJobs(now = Date.now()) {
 // cannot be overtaken by the first.
 export function createSizeRunner({report = () => {},track = trackJob,cancel = cancelJob,poll = awaitJob} = {}) {
  let held = null,run = 0;
- // `stopping` is the measurements this runner has ASKED the service to stop and
- // that the service has not acknowledged stopping. It is the whole of Astra r3
- // #3: Stop dropped its reference to the entry before the cancel was sent, and
- // abandon drops the entry from the shared cache, so when the RETRY cancel
- // failed too nothing on this side still named the walk — jobId went null and a
- // second Stop sent nothing while the du carried on. Ownership of an
- // unacknowledged cancel therefore survives Stop, the close event and Recount:
- // jobId keeps naming it, and each of those user actions retries it exactly
- // once — never a loop — until the service answers.
- const stopping = new Set();
+ // The cancels this runner is waiting to have acknowledged are not its own:
+ // they are in `pendingCancels`, above, because the measurement is shared.
+ //
  // `cancelled` is ACKNOWLEDGED, never merely requested, and the distinction is
  // the whole of Astra r2 #9. The entry used to be marked cancelled before the
  // cancel was sent — so when the poll had given up because the connection was
@@ -125,17 +148,25 @@ export function createSizeRunner({report = () => {},track = trackJob,cancel = ca
  // UNACKNOWLEDGED clears it and leaves the entry retryable.
  function ack(entry,ok) {
   entry.cancelling = null;
-  if (ok) { entry.cancelled = true; stopping.delete(entry); }
+  if (ok) { entry.cancelled = true; entry.cancelPending = false; pendingCancels.delete(entry); }
   return ok;
  }
  // sendCancel is the only place a cancel is sent, and it answers a promise for
  // whether the server acknowledged it. It never rejects: nothing that calls it
  // is in a position to handle a failure other than by keeping the id.
  function sendCancel(entry) {
-  if (!entry.id || entry.cancelled) { stopping.delete(entry); return undefined; }
-  // Asking is what makes this runner responsible for the stopping, and it stays
-  // responsible until the service answers (Astra r3 #3).
-  stopping.add(entry);
+  if (entry.cancelled) { entry.cancelPending = false; pendingCancels.delete(entry); return undefined; }
+  // Asking is what makes the UI responsible for the stopping, and it stays
+  // responsible until the service answers (Astra r3 #3). The claim is the
+  // MEASUREMENT's, not the asking runner's, so every dialog that shares the walk
+  // can retry it — including the one that let go of it last (Astra r4 #3).
+  entry.cancelPending = true;
+  pendingCancels.add(entry);
+  // No id yet: the 202 is still in flight, and the submitting closure sends the
+  // cancel the moment the id lands. The claim above is what carries the walk's
+  // name across that gap — it used to be dropped here, and with it the only
+  // record that anybody had asked (Astra r4 #3).
+  if (!entry.id) return undefined;
   if (entry.cancelling) return entry.cancelling;
   // cancel() is called synchronously — Stop and the close event are asserted to
   // have cancelled by the time they return.
@@ -150,11 +181,17 @@ export function createSizeRunner({report = () => {},track = trackJob,cancel = ca
  // starting a second — so a connection that stays down costs one request per
  // Stop, close or Recount and never a busy loop. `skip` is the entry this action
  // has just cancelled on its own account.
+ //
+ // A claim whose 202 has not landed is KEPT rather than collected: there is
+ // nothing to send for it yet, and forgetting it is precisely how the walk lost
+ // its name (Astra r4 #3).
  function retryStopping(skip) {
   const sent = [];
-  for (const entry of [...stopping]) {
+  for (const entry of [...pendingCancels]) {
+   // Collected: the service acknowledged it, or the walk it named reached an end
+   // of its own. A claim with no id yet has named nothing and is neither.
+   if (!claimed(entry) || (entry.id && !needsStop(entry))) { pendingCancels.delete(entry); continue; }
    if (entry === skip) continue;
-   if (!needsStop(entry)) { stopping.delete(entry); continue; }
    const pending = sendCancel(entry);
    if (pending) sent.push(pending);
   }
@@ -208,8 +245,9 @@ export function createSizeRunner({report = () => {},track = trackJob,cancel = ca
    // A request still ON THE WIRE is being attended to, and this side has nothing
    // to do about that walk until it answers. One that came BACK unacknowledged
    // is the one still waiting for another attempt, and it keeps its name until
-   // it gets one (Astra r3 #3).
-   for (const entry of stopping) if (!entry.cancelling && needsStop(entry)) return entry.id;
+   // it gets one (Astra r3 #3) — whichever dialog sent it, because the claim is
+   // the measurement's (Astra r4 #3).
+   for (const entry of pendingCancels) if (claimed(entry) && !entry.cancelling && needsStop(entry)) return entry.id;
    return null;
   },
   // stop() lets go of the measurement this runner holds and, in the same breath,
@@ -234,13 +272,16 @@ export function createSizeRunner({report = () => {},track = trackJob,cancel = ca
     entry = null;
    }
    if (!entry) {
-    entry = {key,id:null,holders:0,job:null,finishedAt:0,abandoned:false,failed:false,cancelled:false,cancelling:null};
+    entry = {key,id:null,holders:0,job:null,finishedAt:0,abandoned:false,failed:false,cancelled:false,cancelling:null,cancelPending:false};
     entry.promise = (async () => {
      const res = await api('api/jobs/size',{},{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify(sizeRequest(entries,{crossMounts}))});
      entry.id = res.job?.id ?? null;
      // Abandoned while the 202 was in flight: the job exists on the server and
      // nobody is waiting for it, so it is cancelled rather than left to walk.
+     // This closure belongs to whichever runner submitted, which is not
+     // necessarily the dialog that let go last — so the claim it makes here is
+     // the shared entry's, and every holder can retry it (Astra r4 #3).
      if (entry.abandoned) { sendCancel(entry); return null; }
      // quiet: a measurement the user did not ask for as an operation must not
      // throw the Operations drawer over the dialog they are reading.
@@ -260,8 +301,13 @@ export function createSizeRunner({report = () => {},track = trackJob,cancel = ca
     })();
     entry.promise.catch(() => {
      // A measurement that could not even be submitted is not an answer to
-     // attach to; the next dialog asks again.
+     // attach to; the next dialog asks again. It is not a walk either: a stop
+     // asked for while the POST was in flight named a job the server never
+     // acknowledged having, so that claim ends here rather than being carried
+     // for the rest of the session (Astra r4 #3). A poll that gave up is a
+     // different failure — it has an id, and the claim on it stands.
      entry.failed = true;
+     if (!entry.id) { entry.cancelPending = false; pendingCancels.delete(entry); }
      if (sizeJobs.get(key) === entry) sizeJobs.delete(key);
     });
     sizeJobs.set(key,entry);

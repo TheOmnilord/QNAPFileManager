@@ -527,6 +527,52 @@ func readDirInfos(f *os.File, n int, showHidden bool) ([]dirEntryInfo, error) {
 // listing never compares its entries to anything and must not pay a statx for
 // fifty thousand of them.
 func lstatIn(dirfd int, name string, wantBtime bool) (fs.FileInfo, error) {
+	fi, fd, err := lstatOpened(dirfd, name, wantBtime)
+	if err != nil {
+		return nil, err
+	}
+	syscall.Close(fd)
+	return fi, nil
+}
+
+// lstatUnprovenHeld is lstatIn for the WALK's own enumeration, and it differs in
+// one case: a directory whose filesystem records no birth time keeps the O_PATH
+// descriptor this stat was taken through, and the caller gets it (Astra r4 #7).
+//
+// The reason is what the enumeration is FOR. A directory the walk then fails to
+// open is handed to the Unopened fallback, which has to decide whether the thing
+// it is about to change is the thing the walk described. With a birth time in
+// the reading, re-opening the name and comparing identities settles that. Without
+// one — an old kernel with no statx, a filesystem that keeps no creation time —
+// the comparison is device and inode alone, and an inode number freed with its
+// object may be handed straight back, so "the same" was a number rather than an
+// object and the fallback silently degraded to no protection at all.
+//
+// A retained descriptor is the same fact stated in the way the kernel enforces:
+// the fallback acts on the very inode that was enumerated, with no second lookup
+// for anything to slip into. It costs one descriptor while that entry is being
+// handled, for directories only, and the walk closes it as soon as it is done —
+// so the outstanding count is bounded by the depth, not by the width.
+//
+// held is nil whenever it is not needed (a file, a symlink, a birth time that
+// was read), and the caller closes it when it is not.
+func lstatUnprovenHeld(dirfd int, name string) (fs.FileInfo, *os.File, error) {
+	fi, fd, err := lstatOpened(dirfd, name, true)
+	if err != nil {
+		return nil, nil, err
+	}
+	if fi.hasBtime || fi.st.Mode&syscall.S_IFMT != syscall.S_IFDIR {
+		syscall.Close(fd)
+		return fi, nil, nil
+	}
+	return fi, os.NewFile(uintptr(fd), name), nil
+}
+
+// lstatOpened is the openat-and-fstat both of the above are made of. It hands
+// back the descriptor it stat'ed through, still open, and whoever called it
+// decides whether to keep it or close it — which is the only way the decision
+// can be made from the READING, as lstatUnprovenHeld's has to be.
+func lstatOpened(dirfd int, name string, wantBtime bool) (*statFileInfo, int, error) {
 	var (
 		fd   int
 		serr error
@@ -538,17 +584,30 @@ func lstatIn(dirfd int, name string, wantBtime bool) (fs.FileInfo, error) {
 		}
 	}
 	if serr != nil {
-		return nil, &fs.PathError{Op: "openat", Path: name, Err: serr}
+		return nil, -1, &fs.PathError{Op: "openat", Path: name, Err: serr}
 	}
-	defer syscall.Close(fd)
 	fi := &statFileInfo{name: name}
 	if err := syscall.Fstat(fd, &fi.st); err != nil {
-		return nil, &fs.PathError{Op: "fstat", Path: name, Err: err}
+		syscall.Close(fd)
+		return nil, -1, &fs.PathError{Op: "fstat", Path: name, Err: err}
 	}
 	if wantBtime && fi.st.Mode&syscall.S_IFMT == syscall.S_IFDIR {
 		fi.btime, fi.hasBtime = birthTimeOf(fd)
 	}
-	return fi, nil
+	return fi, fd, nil
+}
+
+// heldRef presents a descriptor the walk RETAINED (WalkItem.held) as the
+// itemRef every held-object helper in this package takes, re-stating it through
+// that same descriptor so the reading is the object's current one.
+//
+// It does not take ownership: the walk closes what the walk opened.
+func heldRef(f *os.File) (*itemRef, error) {
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	return &itemRef{f: f, fi: fi}, nil
 }
 
 // statFileInfo is an fs.FileInfo over a raw syscall.Stat_t.

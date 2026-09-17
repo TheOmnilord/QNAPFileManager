@@ -55,6 +55,24 @@ const refreshInterval = 5 * time.Second
 // zfsTimeout bounds the `zfs get` probe.
 const zfsTimeout = 3 * time.Second
 
+// defaultProbeTTL is how long a PROBED fact about a mount is trusted before the
+// background pass asks again (Astra r4 #6). The incarnation rule catches a mount
+// that was replaced between two refreshes, but it is built on the mountinfo row,
+// and two of the things the probe goes to find are not in the row at all: `zfs
+// set aclmode=discard` changes a live dataset without touching a single field,
+// and a remount that completes entirely between two five-second refreshes repeats
+// every field it had. Either way the cached answer is field-identical, kept
+// forever, and wrong — and the one it is most likely to be wrong about is the
+// aclmode, which is the difference between "the mode is set" and "the ACL is
+// destroyed". So a probed fact expires: it is re-probed by the same single-flight
+// background pass and published under the same incarnation rule, which bounds how
+// stale a chmod dialog can be to a minute (contract residual 3, amended).
+//
+// A minute, not five seconds: the pass costs an lgetxattr and a `zfs get` per
+// storage mount, and re-running that every refresh would put a pool's worth of
+// helper processes on the request path for a fact that changes about never.
+const defaultProbeTTL = 60 * time.Second
+
 // Errors returned by the injectable xattr probe. The real Linux probe maps
 // errno values onto these so that tests can simulate them on any OS.
 var (
@@ -96,6 +114,14 @@ type Platform struct {
 	// field the row has while its aclmode changes underneath.
 	incarnation map[string]uint64
 	nextInc     uint64
+	// probedAt records when each mount point's probed facts were last LEARNED,
+	// which is what expires them (Astra r4 #6). It is carried across a refresh
+	// exactly as the facts themselves are — only for a mount point whose
+	// incarnation survived — so a new mount is never born with an old timestamp.
+	probedAt map[string]time.Time
+	// probeTTL is defaultProbeTTL, per instance so that a test can shorten it
+	// without racing every other test in the package.
+	probeTTL time.Duration
 	// probeDone is the in-flight background probe pass, or nil when none is
 	// running. It is the single-flight latch AND the way a test waits for the
 	// pass it started: the channel is closed after the results are published.
@@ -124,9 +150,32 @@ func newPlatform() *Platform {
 		Family:      FamilyUnknown,
 		caps:        map[string]FSCaps{},
 		incarnation: map[string]uint64{},
+		probedAt:    map[string]time.Time{},
+		probeTTL:    defaultProbeTTL,
 		getxattr:    newXattrProbe,
 		run:         newCommandRunner,
 	}
+}
+
+// setProbeTTL shortens (or lengthens) how long this table's probed facts are
+// trusted. It is the test seam for the freshness bound; production uses the
+// default the constructor sets.
+func (p *Platform) setProbeTTL(d time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.probeTTL = d
+}
+
+// probeExpiredLocked reports whether the probed facts at a mount point are older
+// than the freshness bound, and so due to be asked again (Astra r4 #6). A mount
+// point with no timestamp has never been probed, which the callers recognise by
+// the empty backend instead.
+func (p *Platform) probeExpiredLocked(mountPoint string) bool {
+	at, ok := p.probedAt[mountPoint]
+	if !ok {
+		return true
+	}
+	return time.Since(at) > p.probeTTL
 }
 
 // SetXattrProbe replaces the extended-attribute probe used by ACLBackendFor.
@@ -177,6 +226,7 @@ func (p *Platform) setMounts(mounts []Mount) {
 	previous := visibleRows(p.mounts)
 	current := visibleRows(mounts)
 	incarnation := make(map[string]uint64, len(caps))
+	probedAt := make(map[string]time.Time, len(caps))
 	for mp, c := range caps {
 		// The same mount still at that point keeps its incarnation, and with it
 		// whatever was probed for it; anything else is a NEW incarnation, whose
@@ -196,10 +246,17 @@ func (p *Platform) setMounts(mounts []Mount) {
 		c.ACLXattr = old.ACLXattr
 		c.ZFSAclmode = old.ZFSAclmode
 		caps[mp] = c
+		// The facts carry their AGE with them (Astra r4 #6). Re-dating them here
+		// would make a table that refreshes every five seconds refresh the answer's
+		// freshness too, and nothing would ever expire.
+		if at, ok := p.probedAt[mp]; ok {
+			probedAt[mp] = at
+		}
 	}
 	p.mounts = mounts
 	p.caps = caps
 	p.incarnation = incarnation
+	p.probedAt = probedAt
 	p.order = order
 	p.read = time.Now()
 }
@@ -426,8 +483,8 @@ func (p *Platform) pendingProbesLocked() []probeTarget {
 		if !IsStorageFS(m.FSType) {
 			continue
 		}
-		if c, ok := p.caps[mp]; ok && c.ACLBackend != "" {
-			continue // already probed, and the answer is cached
+		if c, ok := p.caps[mp]; ok && c.ACLBackend != "" && !p.probeExpiredLocked(mp) {
+			continue // probed recently enough, and the answer is cached
 		}
 		pending = append(pending, probeTarget{mount: m, inc: p.incarnation[mp]})
 		if len(pending) >= maxProbesPerRefresh {
@@ -470,13 +527,22 @@ func (p *Platform) publishProbe(t probeTarget, backend, xattr, aclmode string, o
 		return
 	}
 	c, ok := p.caps[m.MountPoint]
-	if !ok || (!overwrite && c.ACLBackend != "") {
+	if !ok {
+		return
+	}
+	// The background pass fills a gap — or replaces an answer that has passed its
+	// freshness bound, which is the same pass doing the same work for the same
+	// reason (Astra r4 #6). What it may not do is overwrite a fresh answer with
+	// another one, because two passes racing on the same mount point would then
+	// publish in whichever order they happened to finish.
+	if !overwrite && c.ACLBackend != "" && !p.probeExpiredLocked(m.MountPoint) {
 		return
 	}
 	c.ACLBackend = backend
 	c.ACLXattr = xattr
 	c.ZFSAclmode = aclmode
 	p.caps[m.MountPoint] = c
+	p.probedAt[m.MountPoint] = time.Now()
 }
 
 // visibleRows indexes a mount table by mount point, keeping the row the kernel

@@ -50,6 +50,14 @@ func (d *dirRef) lstat(name string) (os.FileInfo, error) {
 	return statAt(d.j, relJoin(d.rel, name))
 }
 
+// lstatHeld retains nothing off Linux: there is no O_PATH handle to keep, so the
+// walk hands the fallback the same FileInfo it always did and the fallback
+// re-opens the name, which is what this platform can do (INV-2).
+func (d *dirRef) lstatHeld(name string) (os.FileInfo, *os.File, error) {
+	fi, err := d.lstat(name)
+	return fi, nil, err
+}
+
 // unlink removes one entry. os.Root.Remove deletes a file or an empty
 // directory, refuses a non-empty one with ENOTEMPTY and removes a symlink as
 // the link, so the isDir hint the Linux path needs to choose AT_REMOVEDIR is

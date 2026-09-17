@@ -157,6 +157,44 @@ func TestEmptyExpectationRefusalNamesTheUngradedACL(t *testing.T) {
 	}
 }
 
+// recordsBirthTime answers the one question this filesystem has to answer before
+// a recycled inode is worth staging at all: does it keep a creation time?
+//
+// It is asked of a directory that already exists — the fixture's own root,
+// through a descriptor held while the statx is made — so no object is created
+// to ask it, and the answer is the filesystem's rather than one object's. A
+// false here means STATX_BTIME is genuinely absent (an old kernel without
+// statx, or a filesystem that does not keep the fact) and not that the test
+// failed to look (Astra r4 #2).
+func recordsBirthTime(t *testing.T, dir string) bool {
+	t.Helper()
+	f, err := os.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return objectIDOf(f, fi).hasBtime
+}
+
+// parentOnly opens a directory the way the walk holds it and NOTHING inside it.
+//
+// heldIn is the wrong helper for an object that has to be removed: it also opens
+// the entry, and an open descriptor — O_PATH included — pins the inode for as
+// long as it lives, so the number is never freed and never handed back.
+func parentOnly(t *testing.T, r fsx.Root, dirAPI string) *dirRef {
+	t.Helper()
+	d, _, err := canonicalDir(r, dirAPI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.close() })
+	return d
+}
+
 // TestUnopenedFallbackRefusesARecycledInode is Astra r3 #9.
 //
 // The fallback for a directory the walk could not enumerate re-opens the name
@@ -167,35 +205,64 @@ func TestEmptyExpectationRefusalNamesTheUngradedACL(t *testing.T) {
 // cannot be listed, removed and recreated at the same name between the two
 // lookups, therefore passed `same` and received the change.
 //
-// Inode reuse is the allocator's choice and no test can compel it, so the loop
-// below asks for it and says so when the kernel declines. Nor does every
-// filesystem record a birth time: a tmpfs does not, and on one the protection
-// this test is about does not exist to be tested (INV-2 — the kernel decides).
+// The first version of this test proved none of that, and Astra r4 #2 is why:
+// it held the CHILD open across the remove and recreate, which pins the inode,
+// so the number could not be recycled, the loop always gave up and the test
+// always skipped — including when the birth-time capture it exists to protect
+// was deleted. So the parent alone is held; the filesystem is asked about birth
+// times up front and independently; the enumeration is asked to PROVE it carried
+// one, which is the fact a regression removes; and the allocator declining to
+// recycle is now a failure that names the numbers, not a skip.
 func TestUnopenedFallbackRefusesARecycledInode(t *testing.T) {
 	base := tempDir(t)
 	mkdir(t, base, "tree/nested")
 	nested := filepath.Join(base, "tree/nested")
 	r := newRoot(t, base)
 
-	parent, _ := heldIn(t, r, "/tree", "nested")
+	// Nothing below can be told apart on a filesystem that keeps no creation
+	// time, and on one the protection does not exist to be tested (INV-2 — the
+	// kernel decides). That is the only skip left here, and it is decided before
+	// anything is staged.
+	if !recordsBirthTime(t, base) {
+		t.Skipf("%s reports no STATX_BTIME, so a recycled inode cannot be told apart on it at all", base)
+	}
 
-	// What the walk's own enumeration recorded, through the walk's own lstat.
-	enumerated, err := parent.lstat("nested")
+	parent := parentOnly(t, r, "/tree")
+
+	// What the walk's own enumeration recorded, through the walk's own lstat —
+	// the very call the walker makes, so that what is asserted below is what the
+	// walker will be holding.
+	enumerated, held, err := parent.lstatHeld("nested")
 	if err != nil {
 		t.Fatal(err)
 	}
-	firstKey, ok := inodeOf(enumerated)
-	if !ok {
+	if held != nil {
+		// A birth time is available here, so the walk has an identity that
+		// survives the object and needs to retain nothing (Astra r4 #7).
+		_ = held.Close()
+		t.Fatal("the enumeration retained a descriptor although this filesystem dates its objects")
+	}
+	first := objectIDOf(nil, enumerated)
+	if !first.have {
 		t.Fatal("the fixture reports no inode number at all")
 	}
-	if id := objectIDOf(nil, enumerated); !id.hasBtime {
-		t.Skipf("%s records no birth time, so a recycled inode cannot be told apart here", base)
+	if !first.hasBtime {
+		// The regression this test exists for, caught before the swap: the
+		// identity the fallback compares is device and inode alone again, and on
+		// a filesystem that does record birth times there is no honest reason
+		// for the walk's lstat not to carry one.
+		t.Fatalf("the walk's lstat of \"nested\" carried no birth time although %s records them: "+
+			"the fallback's identity is device and inode alone, which a recycled number satisfies", base)
 	}
 
 	// The swap: removed and recreated at the same name until the allocator hands
 	// the number back, which is the case the birth time exists for.
-	recycled := false
-	for i := 0; i < 64 && !recycled; i++ {
+	const attempts = 64
+	var (
+		seen        []uint64
+		replacement objectID
+	)
+	for i := 0; i < attempts && !replacement.have; i++ {
 		if err := os.Remove(nested); err != nil {
 			t.Fatal(err)
 		}
@@ -206,14 +273,31 @@ func TestUnopenedFallbackRefusesARecycledInode(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if k, ok := inodeOf(again); ok && k == firstKey {
-			recycled = true
+		id := objectIDOf(nil, again)
+		if !id.have {
+			t.Fatal("the replacement reports no inode number at all")
+		}
+		seen = append(seen, id.key.ino)
+		if id.key == first.key {
+			replacement = id
 		}
 	}
-	if !recycled {
-		t.Skip("the allocator never handed the inode number back, so the case could not be staged")
-	}
 	t.Cleanup(func() { _ = os.Chmod(nested, 0o755) })
+	if !replacement.have {
+		// Not a skip: this filesystem records birth times, so the case is one it
+		// can stage, and the numbers say what happened instead — a monotonic
+		// allocator answers with a rising sequence, a converging one repeats a
+		// single number that is not the original.
+		t.Fatalf("inode %d was never handed back in %d removes and recreates (the allocator answered %v): the recycled-inode case could not be staged on a filesystem that does record birth times",
+			first.key.ino, attempts, seen[:min(len(seen), 8)])
+	}
+	if !replacement.hasBtime || replacement.btime == first.btime {
+		// The other half of the proof. A birth time the replacement does not
+		// carry, or one too coarse to differ across a remove and a recreate,
+		// would make the refusal below an accident of something else.
+		t.Fatalf("the replacement at inode %d reports birth time %d (recorded: %v) against the original's %d: the two objects are not distinguishable by it",
+			replacement.key.ino, replacement.btime, replacement.hasBtime, first.btime)
+	}
 
 	var log jobLog
 	j := &modeJob{

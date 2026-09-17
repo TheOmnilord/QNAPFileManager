@@ -132,6 +132,13 @@ type aclFacts struct {
 	backend string // platform.ACLPosix | platform.ACLNFS4 | platform.ACLNone | ""
 	aclmode string // "discard"|"groupmask"|"passthrough"|"restricted"|"" (unknown)
 	dataset string // Mount.Source, for the L2 sentence
+	// altDataset is the OTHER dataset a mount disagreement leaves in play (Astra
+	// r4 #1). When the daemon's table and the worker's name different mounts for
+	// one object, neither name is known to be the right one, and an L2 sentence
+	// that spells only the daemon's would tell the user the change lands on a
+	// dataset it may well not land on. Empty whenever the two sides agree, which
+	// is every path a permissions JOB grades: only entryACLFacts has two sides.
+	altDataset string
 	// mount is the mount point the facts came from. It is not displayed; it is
 	// what tells two datasets apart when the table names neither, so a crossing
 	// fold counts them as two rather than collapsing them into one (round-5).
@@ -159,6 +166,18 @@ func (f aclFacts) key() string {
 		return "dataset:" + f.dataset
 	}
 	return "mount:" + f.mount
+}
+
+// datasetNames spells every dataset an L2 sentence about this path has to name.
+// Normally that is the one the mount table places it on; after a mount
+// disagreement it is both candidates, because the honest sentence is the one
+// that covers whichever of the two tables turns out to be the current one
+// (Astra r4 #1). datasetList does the counting and the bounding.
+func (f aclFacts) datasetNames() []string {
+	if f.altDataset == "" {
+		return []string{f.dataset}
+	}
+	return []string{f.dataset, f.altDataset}
 }
 
 // mountFacts fills the mount-table half of aclFacts. Nothing branches on QTS vs
@@ -316,6 +335,13 @@ func (s *Server) chmodJobLadder(ladder *permLadder, targets []string, cross bool
 // appeared, and a reading taken on the enclosing share is a reading of another
 // filesystem: it is carried as an observation and kept out of the grade.
 //
+// A disagreement discredits BOTH tables, not just the worker's (Astra r4 #1).
+// Either process can be the one holding the stale row — the daemon's refresh is
+// asynchronous, and a worker's platform can equally well have refreshed first —
+// so "the worker is elsewhere, keep the daemon's row" quietly grades a fresh
+// discard dataset with its stale passthrough parent's reassurance. Where the two
+// name different mounts the grade is the worst of the two readings instead.
+//
 // The second return is the PRECONDITION the caller sends with the change
 // (contract §8.1 as amended): the state the worker OBSERVED and the identity of
 // the object it read it from, so the worker refuses `changed` if either moved
@@ -350,6 +376,13 @@ func (s *Server) entryACLFacts(ctx context.Context, who backend.Principal, apiPa
 	if observed == "" {
 		observed = resp.Entry.ACL
 	}
+	// The identity travels exactly as Props reported it, zero included (Astra r2
+	// #6). Off Linux there is no inode to report and the zero value is the honest
+	// answer; the worker, seeing no inode on either side, proves the state alone.
+	// Suppressing the expectation on that account would drop the ACL half with it,
+	// and inventing an identity would be a proof of nothing. It is built here, once,
+	// because it is the raw reading and none of the grading below may touch it.
+	expect := &wproto.ACLExpect{State: observed, Identity: resp.Identity}
 	// Which MOUNT the two halves are talking about, before anything they say
 	// about it (Astra r3 #8). A worker is a long-lived process with a mount table
 	// of its own, and the daemon's refresh is asynchronous by design (r2 #7), so
@@ -361,27 +394,69 @@ func (s *Server) entryACLFacts(ctx context.Context, who backend.Principal, apiPa
 	// at. The identical wrong answer satisfies the precondition afterwards, so the
 	// chmod goes through and the ACL is what pays for it.
 	agrees, haveRow := s.workerMountAgrees(apiPath, resp)
-	// A worker that named a mount the daemon's row contradicts is describing
-	// another filesystem. What it read ON that filesystem — the state, the aclmode,
-	// the dataset name — says nothing about this path and is not folded in; the
-	// BACKEND still is, because the rank rule only ever moves that half towards the
-	// pessimistic side and the worker may genuinely hold the fresher table.
 	elsewhere := haveRow && resp.FS.Mount != "" && !agrees
 
-	// The unknown-storage floor comes first of all. A storage mount whose backend
-	// this daemon has not probed, and a path its table cannot place, both grade L2
+	// The aclmode half is folded pessimistically FIRST, and it is folded whether or
+	// not the two sides agree about the mount (Astra r4 #1 and #4). Two different
+	// facts are in play and only one of them is ever checked: `resp.Identity.Mount`
+	// comes from the inode the worker has just opened, while `resp.ACL.Aclmode`
+	// comes from its own cached platform row. Substitute one dataset for another at
+	// the same mount point — unmount `pool/a` (passthrough), mount `pool/b`
+	// (discard) there, let the daemon refresh and the worker not — and the agreement
+	// check passes on the fresh identity while the aclmode arriving with it is a's.
+	// The reverse staleness is the same story from the other end: a discard dataset
+	// mounted beneath a passthrough parent, the worker's platform refreshed first,
+	// and round 3's rule threw the worker's real `discard` away as "elsewhere" and
+	// kept the daemon's stale `passthrough` — L1, a promise that the other entries
+	// survive, and an unchanged re-reading that satisfies the precondition after.
+	//
+	// So the rule is not "whose row wins" at all. The worker's aclmode may never
+	// make the grade LESS severe than the daemon's, and the daemon's row is no more
+	// trustworthy than the worker's once the two contradict each other: the ladder
+	// states the worst of the two, in both directions. What the agreement check
+	// still decides — all it decides — is whether the worker's per-object STATE may
+	// be believed.
+	f.aclmode = worstAclmode(f.aclmode, resp.ACL.Aclmode)
+	if resp.ACL.Dataset != "" {
+		switch {
+		case f.dataset == "":
+			// The daemon's table named none; the worker's name is the only one.
+			f.dataset = resp.ACL.Dataset
+		case resp.ACL.Dataset != f.dataset:
+			// Two candidates and no way to tell which one the chmod lands on, so the
+			// sentence names both rather than reassuring about the wrong one.
+			f.altDataset = resp.ACL.Dataset
+		}
+	}
+
+	// A DEMONSTRATED mismatch — the worker's descriptor is on a mount the daemon's
+	// row for this path is not — leaves the path exactly where one the table cannot
+	// place at all is, whatever backend the daemon's stale row happens to carry
+	// (Astra r4 #5). An NFSv4 dataset under aclmode=discard mounted beneath a cached
+	// POSIX parent otherwise grades on that parent: posix plus an unknown state is
+	// the L1 mask notice, and the stale worker's own POSIX probe answers `none`
+	// twice — once for the grade, once for the precondition — so the ACL is
+	// destroyed without anybody being told that it existed. Unknown warns.
+	if elsewhere {
+		f.unknown = true
+	}
+
+	// The unknown-storage floor comes next. A storage mount whose backend this
+	// daemon has not probed, and a path its table cannot place, both grade L2
 	// (§7, round-1 finding 1) precisely because nobody has looked; and a row nobody
 	// has looked at is a row a worker's claim cannot be checked against. So while
 	// the floor is up the worker's reading of this object is carried on the wire as
 	// an observation and kept out of the grade entirely — the pessimistic reading
 	// is the only honest one, and it lasts until the daemon's own probe lands.
 	if f.unknown || (f.storage && f.backend == "") {
-		return f, &wproto.ACLExpect{State: observed, Identity: resp.Identity}
+		return f, expect
 	}
 
-	// The backend first: whether the worker's reading is trusted at all decides
-	// whether its state may be taken INTO THE GRADE.
-	trusted := !elsewhere
+	// Past the floor the two sides agree about the mount, so the worker's own
+	// reading may be taken into the grade. The backend decides whether it may: a
+	// reading made under an ACL model this object does not use says nothing about
+	// it, and the rank rule is what tells the two apart.
+	trusted := true
 	if resp.ACL.Backend != "" {
 		if aclBackendRank(resp.ACL.Backend) >= aclBackendRank(f.backend) {
 			f.backend = resp.ACL.Backend
@@ -392,20 +467,13 @@ func (s *Server) entryACLFacts(ctx context.Context, who backend.Principal, apiPa
 	if trusted && observed != "" {
 		f.state = observed
 	}
-	if !elsewhere {
-		if resp.ACL.Aclmode != "" {
-			f.aclmode = resp.ACL.Aclmode
-		}
-		if resp.ACL.Dataset != "" {
-			f.dataset = resp.ACL.Dataset
-		}
-	}
-	// The identity travels exactly as Props reported it, zero included (Astra r2
-	// #6). Off Linux there is no inode to report and the zero value is the honest
-	// answer; the worker, seeing no inode on either side, proves the state alone.
-	// Suppressing the expectation on that account would drop the ACL half with
-	// it, and inventing an identity would be a proof of nothing.
-	return f, &wproto.ACLExpect{State: observed, Identity: resp.Identity}
+	// The STATE needs no fold of its own anywhere above: the daemon never reads an
+	// object's ACL — only the worker holds the descriptor — so the daemon's side of
+	// it is always ACLUnknown, and a worker reading that is not believed leaves it
+	// there. Unknown is the non-trivial rung, which is the worst of the two and so
+	// exactly what the rule asks for. Underneath all of it the round-3 rule stands:
+	// worker facts never LIFT the floor.
+	return f, expect
 }
 
 // workerMountAgrees reports whether the worker's Props answer describes the same
@@ -464,6 +532,26 @@ func aclBackendRank(name string) int {
 		return 1
 	}
 }
+
+// worstAclmode folds the two sides of a mount disagreement into the aclmode the
+// ladder may safely state (Astra r4 #1). "discard" is the mode that destroys an
+// ACL and "" is the mode nobody has read, which §7 already treats as discard;
+// either of them on either side means the change may destroy an ACL, and the
+// only honest way to say so while the dataset itself is in doubt is the UNKNOWN
+// aclmode — the L2 discard rung with the "could not be read" suffix, naming both
+// candidates. The remaining modes (passthrough, groupmask, restricted) all keep
+// the other entries and all grade L1, so when both sides name one of those the
+// daemon's row is kept and the grade is unchanged.
+func worstAclmode(daemon, worker string) string {
+	if aclmodeDestroys(daemon) || aclmodeDestroys(worker) {
+		return "" // unknown: the L2 rung, with the suffix that says why
+	}
+	return daemon
+}
+
+// aclmodeDestroys is the pessimistic half of §7's table: the modes under which a
+// chmod can take the whole ACL with it, "not read" included.
+func aclmodeDestroys(mode string) bool { return mode == "" || mode == "discard" }
 
 // maxNamedDatasets bounds how many datasets an L2 sentence spells out. A
 // crossing walk can reach every dataset of a pool, and a dialog that lists forty
@@ -527,9 +615,15 @@ func datasetList(sources []string) string {
 //     suffix (finding 1). An empty backend is the answer for a dataset that was
 //     mounted after the table was probed, and reading it as "no ACLs here"
 //     silently removed the one warning that exists for destroying them.
+//
+// The unplaced rung is tested BEFORE the POSIX one (Astra r4 #5). A path nobody
+// can place is a path whose backend nobody can state either, and the daemon's
+// row for it may be the very thing that is out of date — a cached POSIX parent
+// with an NFSv4 dataset mounted underneath it. Reading the stale backend first
+// answered "the mask is rewritten" for a change that destroys an ACL.
 func chmodACLNotice(f aclFacts) (grade int, notice string, discards bool) {
 	switch {
-	case f.backend == platform.ACLPosix:
+	case f.backend == platform.ACLPosix && !f.unknown:
 		switch f.state {
 		case fsx.ACLPosix, fsx.ACLUnknown, "":
 			return gradeConfirm, aclPosixMaskNotice, false
@@ -553,7 +647,7 @@ func chmodACLNotice(f aclFacts) (grade int, notice string, discards bool) {
 			// reading is the only honest one (identity plan §4.4). An
 			// unprobed backend has no aclmode either, so it lands here with
 			// the suffix, which is what it should say.
-			sentence := fmt.Sprintf(aclDiscardFmt, datasetList([]string{f.dataset}))
+			sentence := fmt.Sprintf(aclDiscardFmt, datasetList(f.datasetNames()))
 			if f.aclmode == "" {
 				sentence += aclUnknownModeSuffix
 			}

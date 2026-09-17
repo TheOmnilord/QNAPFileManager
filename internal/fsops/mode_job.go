@@ -390,15 +390,50 @@ func (j *modeJob) unopened(it WalkItem, err error) {
 		j.fail(it.Path, err)
 		return
 	}
-	ref, rerr := itemRefIn(it.parent, it.Name)
+	var (
+		ref  *itemRef
+		rerr error
+	)
+	if it.held != nil {
+		// The walk kept its own enumeration descriptor on this directory,
+		// because the filesystem records no birth time and a second lookup of the
+		// name could therefore not be told apart from a recycled inode number
+		// (Astra r4 #7). There is no second lookup: this IS the object the walk
+		// described, and it is re-stat'ed through that descriptor so the reading
+		// below is current.
+		//
+		// It is the stronger half of the bargain and it is also the stricter one
+		// to state: the job acts on the OBJECT it reached, so a directory renamed
+		// elsewhere while the walk was in the tree is still changed here, exactly
+		// as the ordinary descent changes every directory through the descriptor
+		// it opened rather than through the name it opened it by. What it will
+		// not do is change something else, which is what the name could have
+		// become.
+		ref, rerr = heldRef(it.held)
+	} else {
+		ref, rerr = itemRefIn(it.parent, it.Name)
+	}
 	if rerr != nil {
 		// Unlinked in between, or not addressable even O_PATH. The failure worth
 		// reporting is still the one that stopped the walk.
 		j.fail(it.Path, err)
 		return
 	}
-	defer ref.close()
-	if ref.fi == nil || !ref.fi.IsDir() || !objectIDOf(refFD(ref), ref.fi).same(objectIDOf(nil, it.Info)) {
+	if it.held == nil {
+		// Only what this call opened is closed here; the retained one belongs to
+		// the walk and is closed when the walk is done with the entry.
+		defer ref.close()
+	}
+	if it.held != nil && linkCountOf(ref.fi) == 0 {
+		// The object the walk described has been removed. Changing it would
+		// change an inode on its way out and would say a folder was changed that
+		// nobody can reach — and whatever now answers to the name is a different
+		// object this job never authorized, recycled number or not.
+		j.refuse(it.Path, fmt.Errorf(
+			"%q was removed before it could be changed: %w", it.Path, fsx.ErrChanged))
+		return
+	}
+	if ref.fi == nil || !ref.fi.IsDir() || (it.held == nil && !objectIDOf(refFD(ref), ref.fi).same(objectIDOf(nil, it.Info))) {
 		// A second lookup of the name, so it is proved against the reading the
 		// enumeration made, exactly as the post-order path is proved against the
 		// reading the descent made (finding 7, r2 #2).
@@ -410,6 +445,12 @@ func (j *modeJob) unopened(it WalkItem, err error) {
 		// allocator handed the inode number back. The walk's lstat now carries a
 		// directory's birth time with it, which is what makes this comparison
 		// about the object rather than about the number (Astra r3 #9).
+		//
+		// Where there was no birth time to carry the comparison is not made at
+		// all, because there is nothing to compare: the walk retained the object
+		// instead, and it is still the object it described (Astra r4 #7). What is
+		// still asked of it is what it IS — a descriptor whose object stopped
+		// being a directory is not one either branch will act on.
 		j.refuse(it.Path, fmt.Errorf(
 			"%q is not the folder the walk reached; it was replaced before it could be changed: %w",
 			it.Path, fsx.ErrChanged))

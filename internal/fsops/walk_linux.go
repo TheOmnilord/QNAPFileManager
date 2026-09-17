@@ -91,6 +91,32 @@ func (d *dirRef) lstat(name string) (os.FileInfo, error) {
 	return fi, nil
 }
 
+// lstatHeld is lstat for the WALK's own enumeration: the same reading, plus the
+// O_PATH descriptor it was taken through where letting go of it would leave the
+// Unopened fallback with nothing but a device and an inode number to prove an
+// object by (Astra r4 #7).
+//
+// held is nil for everything except a directory on a filesystem that records no
+// birth time, and the caller closes it when it is not.
+func (d *dirRef) lstatHeld(name string) (os.FileInfo, *os.File, error) {
+	rc, err := d.f.SyscallConn()
+	if err != nil {
+		return nil, nil, err
+	}
+	var (
+		fi   fs.FileInfo
+		held *os.File
+		serr error
+	)
+	if cerr := rc.Control(func(pfd uintptr) { fi, held, serr = lstatUnprovenHeld(int(pfd), name) }); cerr != nil {
+		return nil, nil, cerr
+	}
+	if serr != nil {
+		return nil, nil, serr
+	}
+	return fi, held, nil
+}
+
 // unlink removes one entry from this directory, with AT_REMOVEDIR for a
 // directory (so a non-empty one is ENOTEMPTY rather than being recursed into by
 // the kernel) and a plain unlink otherwise, which removes a symlink as the link

@@ -209,7 +209,8 @@ bounded at three, the last sentence surfaced verbatim, and the exchange pinned t
 8 #1, #2). *Round 8 (#4):* the binding extends from submission to **dispatch**: a confirmed job that waited for a
 slot rebuilds its ACL verdict when it takes one and does not dispatch if the digest differs from the one redeemed
 — it fails as `confirm_required` ("the ACL facts changed while this was waiting; nothing was changed") and is
-audited as a denial.
+audited as a denial. That re-grade is against the cached facts and precedes the job's own pre-scan; §17.16 says
+exactly what it does and does not cover.
 
 ## 8. Properties
 
@@ -498,12 +499,15 @@ in-app drag-and-drop and the trash janitor stay deferred.
     saw keeps the previous claims — the same person, the same walks, and nothing a different user could reach.
     A measurement's polling and completion follow the same epoch, so a same-user refresh mid-walk neither
     cancels nor orphans it.
-16. **What the token does not re-grade (Astra rounds 7–8).** A job already **running** is not re-graded when the
-    ACL facts change under it — a walk in progress is the kernel's. A job still **queued** is: the dispatch
-    callback rebuilds the ACL verdict when the job takes its slot and refuses to dispatch if the digest differs
-    from the one redeemed, failing the job with "confirm it again" (round 8 #4) — the token binds the start of the
-    walk, not the submission. The pathname chown fallback where `/proc` is absent keeps the check/use window §2.3
-    already accepts.
+16. **What the token does not re-grade (Astra rounds 7–9).** The dispatch callback rebuilds the ACL verdict when
+    a queued job takes its slot and refuses to dispatch if the digest differs from the one redeemed (round 8 #4)
+    — so a job that waited an hour behind the slots is not dispatched on an hour-old sentence. What that
+    re-grade proves is bounded three ways, and none is a guarantee (round 9): it compares the **cached** facts,
+    so an `aclmode` changed inside §17.3's minute passes unseen; it runs at callback admission, and the job's
+    own pre-scan lies between that and the first mutation, a window nothing re-checks; and a walk already
+    mutating is the kernel's. The sync chmod's `Expect` proves identity and ACL *state* on the held leaf, not
+    the `aclmode`, so its window is the same minute. The pathname chown fallback where `/proc` is absent keeps
+    the check/use window §2.3 already accepts.
 17. **An orphaned size walk has no lifetime bound (Astra round 8 #5** — correcting what round 7 wrote**).** A
     measurement whose 202 the page never received, or whose tab was closed before a cancel could be sent, runs to
     completion, explicit cancellation, worker failure or shutdown, holding one of the four metadata slots while

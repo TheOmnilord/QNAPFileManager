@@ -160,8 +160,13 @@ refusal is audited, which is what keeps a browser that also talks to QTS on 443 
 whatever answers there. If your address changes — a new lease, a different machine, a VPN — sign in again.
 
 **Reach the door directly, from another machine on the LAN — never through an SSH tunnel or a local port forward.** A
-login that arrives from the NAS itself is refused outright, because a relay makes every browser look like loopback and
-the address the session is pinned to is then one that every other service on the NAS shares.
+login that arrives from the NAS itself is refused outright, and "the NAS itself" means **any address this NAS answers
+on**: loopback, and every address on every interface — including its own LAN address, which is what a forwarder running
+on the NAS (`socat`, an SSH tunnel with a bind address) would make your browser look like. A relay pins the session to
+an address every other service on the NAS shares, and the cookie is host-scoped, so the pin would be satisfied by the
+very replay it exists to stop. The refusal is worded and timed exactly like a wrong password and it does not count
+towards the lockout, so reaching the door the wrong way costs you nothing but the trip. The set of the NAS's own
+addresses is re-read about once a minute, so an address that arrives after the app started is covered too.
 
 Five wrong passwords lock the account for 60 seconds, doubling to a 30-minute cap; a restart of the app clears the
 lockout. A locked account is told so — the answer is `429 locked_out` with a `Retry-After`, deliberately, because leaving

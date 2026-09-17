@@ -59,8 +59,9 @@ func TestTheFileDrainsWhileTheMirrorIsStuck(t *testing.T) {
 	l, _ := openTest(t, true)
 	seam := newMirrorSeam()
 	l.logFn = seam.log
-	var notices int64
-	l.errLog = func(string) { atomic.AddInt64(&notices, 1) }
+	var noticeMu sync.Mutex
+	var notices []string
+	l.errLog = func(msg string) { noticeMu.Lock(); notices = append(notices, msg); noticeMu.Unlock() }
 
 	for i := 0; i < events; i++ {
 		l.Write(Event{Op: "chown", Path: fmt.Sprintf("/data/%d", i), Phase: "result", Result: "ok"})
@@ -96,19 +97,41 @@ func TestTheFileDrainsWhileTheMirrorIsStuck(t *testing.T) {
 	}
 	// And the mirrors that could not fit behind the stuck one were SKIPPED, not
 	// queued without limit: the queue is a notification path, and one that is a
-	// thousand events behind is notifying nobody. Each skip is counted and
-	// surfaced.
-	if drops := l.MilestoneDrops(); drops == 0 {
+	// thousand events behind is notifying nobody. Each skip is counted.
+	drops := l.MilestoneDrops()
+	if drops == 0 {
 		t.Error("a hundred milestones fitted behind a wedged mirror; the mirror queue is not bounded")
 	}
-	if atomic.LoadInt64(&notices) == 0 {
-		t.Error("a skipped mirror was not surfaced through errLog")
+	// Counted, and NOT written to stderr from here (Astra r8 #5). The skips
+	// happen on the drain and on the durable writers, and stderr on the NAS is an
+	// unrotated file; the notice is the worker's to write, once, when it is
+	// moving again.
+	noticeMu.Lock()
+	early := len(notices)
+	noticeMu.Unlock()
+	if early != 0 {
+		t.Errorf("%d drop notices were written while the mirror was wedged; the drain is paying for the overflow it was supposed to bound", early)
 	}
 
 	close(seam.release)
 	l.closeTimeout = 5 * time.Second
 	if err := l.Close(); err != nil {
 		t.Fatalf("Close after releasing the mirror: %v", err)
+	}
+	// One notice, carrying the whole burst — every drop happened before the
+	// release, so there is nothing for a second one to say.
+	noticeMu.Lock()
+	defer noticeMu.Unlock()
+	if len(notices) != 1 {
+		t.Fatalf("%d drop notices after the mirror came back, want exactly 1: %q", len(notices), notices)
+	}
+	if want := fmt.Sprintf("%d milestones not mirrored", drops); !strings.Contains(notices[0], want) {
+		t.Errorf("the notice is %q, want it to carry %q", notices[0], want)
+	}
+	// What the mirror did deliver is the milestones themselves, bounded by the
+	// queue: the one it was stuck inside plus at most a queueful behind it.
+	if got := len(seam.seen()); got == 0 || got > mirrorDepth+1 {
+		t.Errorf("the mirror delivered %d messages, want between 1 and %d", got, mirrorDepth+1)
 	}
 }
 

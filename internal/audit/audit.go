@@ -51,6 +51,13 @@ const mirrorDepth = 64
 // written, so a sustained overflow does not itself flood the log.
 const dropReportInterval = 5 * time.Second
 
+// mirrorNoticeInterval bounds how often the skipped-mirror notice reaches
+// stderr (Astra r8 #5). Stderr on the NAS is `logs/startup.log`, which nothing
+// rotates, so this notice is the one place a bounded overflow could still turn
+// into unbounded disk: a minute between lines keeps the fact visible and the
+// file small, and the count each line carries loses nothing.
+const mirrorNoticeInterval = time.Minute
+
 // writeSyncTimeout bounds how long WriteSync waits for a durable line to reach
 // the sink (write + fsync) before giving up and returning an error. Long enough
 // to ride out a brief rotation or a slow disk, short enough that a wedged drain
@@ -216,6 +223,15 @@ type Logger struct {
 	lastReported   int64
 	lastReportAt   time.Time
 	lastWriteErrAt time.Time // rate-limits the sink-failure notice (drain only)
+
+	// mirrorNoticed and mirrorNoticeAt rate-limit the skipped-mirror notice
+	// (Astra r8 #5). Touched only by the mirror worker, which is the only
+	// goroutine that writes that notice, so they need no lock. mirrorClock is
+	// the seam a test sets — before anything is written — to move the interval
+	// without waiting a minute.
+	mirrorNoticed  int64
+	mirrorNoticeAt time.Time
+	mirrorClock    func() time.Time
 }
 
 // Open prepares the JSON-lines audit log at path (mode 0600, rotated at 8 MiB
@@ -583,27 +599,94 @@ func (l *Logger) mirror(ev Event) {
 	select {
 	case l.mirrorCh <- ev:
 	default:
-		n := atomic.AddInt64(&l.milestoneDrops, 1)
-		l.errLog(fmt.Sprintf("milestone not mirrored to QuLog (%d total): the mirror queue is full", n))
+		// COUNTED here, reported elsewhere (Astra r8 #5). This runs on the drain
+		// goroutine and on every durable writer, and the notice it used to write
+		// went to stderr — which on the NAS is `logs/startup.log`, a file the QPKG
+		// never rotates. So the one thing the bounded queue was for, turning an
+		// overflow into a counter instead of unbounded work, was undone one line
+		// later: each skipped milestone bought a synchronous write to a file that
+		// only ever grows, on the path that is already behind. The mirror worker
+		// aggregates the count into at most one notice per minute.
+		atomic.AddInt64(&l.milestoneDrops, 1)
 	}
 }
 
 // mirrorLoop is the one goroutine that ever execs log_tool. Nothing it does can
 // reach the sink, the drain or a durable writer, so however long QuLog takes,
 // the only thing that falls behind is QuLog.
+//
+// It is also the only goroutine that writes the drop notice (Astra r8 #5), which
+// is why lastErr and the two notice fields need no lock: a burst of skipped
+// mirrors costs the drain an atomic increment each and this worker one stderr
+// line a minute, whatever the rate.
 func (l *Logger) mirrorLoop() {
 	defer close(l.mirrorDone)
-	for ev := range l.mirrorCh {
-		fn := l.logFn
-		if fn == nil {
-			continue
-		}
-		if err := fn(severity(ev), message(ev)); err != nil {
-			n := atomic.AddInt64(&l.milestoneDrops, 1)
-			l.errLog(fmt.Sprintf("milestone not mirrored to QuLog (%d total): %v", n, err))
+	// The tick is what reports a burst that ended in silence — the queue filled,
+	// the sources stopped, and nothing arrives to carry the count out. Stopping it
+	// is deferred before the drain of the queue, so the final forced notice below
+	// still runs.
+	tick := time.NewTicker(mirrorNoticeInterval)
+	defer tick.Stop()
+	var lastErr error
+	for {
+		select {
+		case ev, ok := <-l.mirrorCh:
+			if !ok {
+				// Closed: report whatever is still uncounted, regardless of the
+				// interval, so a shutdown does not swallow the last burst.
+				l.reportMirrorDrops(true, lastErr)
+				return
+			}
+			fn := l.logFn
+			if fn == nil {
+				continue
+			}
+			if err := fn(severity(ev), message(ev)); err != nil {
+				atomic.AddInt64(&l.milestoneDrops, 1)
+				lastErr = err
+			}
+			l.reportMirrorDrops(false, lastErr)
+		case <-tick.C:
+			l.reportMirrorDrops(false, lastErr)
 		}
 	}
 }
+
+// reportMirrorDrops surfaces the milestones that never reached QuLog, at most
+// one notice per mirrorNoticeInterval, each carrying the number dropped since
+// the last one (Astra r8 #5). force is used on shutdown.
+//
+// MilestoneDrops() still counts every one of them: the aggregation is about how
+// often stderr is written to, not about what is known.
+func (l *Logger) reportMirrorDrops(force bool, lastErr error) {
+	total := atomic.LoadInt64(&l.milestoneDrops)
+	if total <= l.mirrorNoticed {
+		return
+	}
+	now := time.Now()
+	if l.mirrorClock != nil {
+		now = l.mirrorClock()
+	}
+	if !force && !l.mirrorNoticeAt.IsZero() && now.Sub(l.mirrorNoticeAt) < mirrorNoticeInterval {
+		return
+	}
+	since := total - l.mirrorNoticed
+	l.mirrorNoticed, l.mirrorNoticeAt = total, now
+	msg := fmt.Sprintf("%d milestones not mirrored to QuLog (%d total)", since, total)
+	if lastErr != nil {
+		// The last failure, not one per failure: a QuLog that is refusing calls
+		// refuses them all the same way, and the notice is a summary.
+		msg += fmt.Sprintf("; the last failure was: %v", lastErr)
+	}
+	l.errLog(msg)
+}
+
+// SetQuLogMirror replaces the function the mirror worker calls, so a test in
+// another package can observe what the door offers to QuLog without exec'ing
+// /sbin/log_tool. It must be called before anything is written, which is the
+// fixture convention everywhere here: the worker reads the field, and nothing
+// else may be writing it while it does.
+func (l *Logger) SetQuLogMirror(fn func(qnap.Severity, string) error) { l.logFn = fn }
 
 // emitSync writes one event as a JSON line and fsyncs it, returning an error if
 // either the write or the fsync fails. It is the durable counterpart of emit,

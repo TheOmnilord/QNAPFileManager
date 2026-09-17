@@ -583,20 +583,36 @@ certificate and a running daemon binds the listener when a credential appears, s
     the NAS hostname at another port receives the root-session cookie. The door therefore refuses the cookie from
     any other peer address (audited as a sessionless denial), which turns a replay from the NAS itself, or from
     another machine, into a 401. An operator whose address changes mid-session signs in again; on a LAN that is
-    rare and cheap. *Round 7:* the pin does **not** close the replay issue, it narrows it. A NAS-local relay or an
-    SSH tunnel would have pinned the session to loopback — where every sibling service on the NAS lives — so the
-    door refuses to issue a session to a loopback peer at all (answered like a wrong password, audited, not a
-    ladder step): the emergency door is reached directly from another machine on the LAN. What remains is two
-    machines behind one observed address (NAT, a proxy on the segment): a replay from the operator's own address
-    is not caught, and that is the residual. An origin-isolated credential would close it and is out of scope for
-    v1.0. The per-source lockout is likewise a bound on carelessness, not on an adversary with many addresses
-    (IPv6 aliases on one host, LRU eviction of the locked source): §18.12's serialised bcrypt is the bound there.
+    rare and cheap. *Rounds 7–8:* the pin does **not** close the replay issue, it narrows it. A NAS-local relay or
+    an SSH tunnel would have pinned the session to an address **this machine** answers from — loopback, or the
+    NAS's own LAN address when the relay targets that — where every sibling service on the NAS lives; so the
+    door refuses to issue a session to any peer that is one of the NAS's own interface addresses (answered
+    exactly like a wrong password: body, floor, keep-alive; audited; not a ladder step), and treats such a peer
+    as a mismatch afterwards. The emergency door is reached directly from another machine on the LAN. What
+    remains is two machines behind one observed address (NAT, a proxy on the segment): a replay from the
+    operator's own address is not caught, and that is the residual. An origin-isolated credential would close
+    it and is out of scope for v1.0. The per-source lockout is likewise a bound on carelessness, not on an
+    adversary with many addresses (IPv6 aliases on one host, LRU eviction of the locked source): §18.12's
+    serialised bcrypt is the bound there. Two more things a sibling service on the host can do with a host-scoped
+    cookie jar (round 8): overwrite or clear the `__Host-qfm_bg` cookie and so sign the operator out — a nuisance,
+    not an entry — and nothing at all with the CSRF token, which it never receives. Under `serve -dev` the
+    listener is forced onto loopback and loopback peers are accepted; the local-peer rule is production's.
+    A replay attempt against a live session is mirrored to QuLog (throttled to one per source per window), so an
+    operator scanning the log sees it; other sessionless lines are not.
 18. **Queued lines are not in event order** (round 7). Sessionless denials and their summaries take the
     asynchronous path, so they can land in the file after later durable lines; the `T` stamp is the order, the
     file position is not. They are not mirrored to QuLog, and the mirror runs on its own bounded worker, so a slow
     `log_tool` stalls neither the file nor the operator.
-19. **A pruned summary whose queue write is refused is lost** (round 7). The entry is gone by then; `Dropped()`
-    counts it, and the per-source line that opened the window is already on disk.
+19. **The sessionless trail is best-effort** (rounds 7–8). Sessionless lines take the asynchronous path, whose
+    queue can be full: then the line that opened a source's window is refused, the refusals still accumulate, and
+    a later pruning sweep can lose their summary to the same full queue — the **whole** source-specific trail for
+    that burst can be absent, not only its summary. `Dropped()` counts what the queue refused. Likewise the QuLog
+    mirror worker's queue (64 deep) drops milestones it cannot hold, counted in `MilestoneDrops` and reported to
+    stderr at most once a minute with the count (round 8) — and because that queue is shared, login refusals
+    under attack can crowd out a genuine credential-change or lockout milestone in QuLog; the JSON-lines file
+    still has every one of them. A shutdown whose mirror is wedged past `closeTimeout` closes the file without
+    waiting for the mirror. The durable,
+    milestone path used by everything a session does — logins, lockouts, mutations — is untouched by any of this.
 
 **To confirm on hardware first (both units):** that **8771 is free** and QuFirewall does not block it — the whole
 feature is inert otherwise, and `netstat -tlnp` before the first release is the check; that the listener **does not

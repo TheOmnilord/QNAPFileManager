@@ -130,6 +130,9 @@ type breakGlassDoor struct {
 	srv  *Server
 	gate *breakglass.Gate
 	cred *localCred
+	// local is the set of addresses this machine answers on, which no session is
+	// ever issued to (Astra r8 #1). Read at arm time and refreshed on a TTL.
+	local *bgLocalAddrs
 
 	mu       sync.Mutex
 	sessions map[string]*bgSession
@@ -191,10 +194,18 @@ func (s *Server) EnableBreakGlass(configPath string) {
 	if c, err := breakglass.HashCost(live.Hash); err == nil {
 		cost = c
 	}
+	local := &bgLocalAddrs{}
+	// Read once before anything serves (Astra r8 #1). A door that armed with an
+	// unreadable interface list would treat its own LAN address as somebody else's
+	// until the first refresh, which is precisely the window a relay needs.
+	if err := local.prime(time.Now()); err != nil {
+		s.logger.Printf("break-glass: this machine's own addresses could not be read at start-up (%v); the door refuses loopback and re-reads them within the minute", err)
+	}
 	s.bg = &breakGlassDoor{
 		srv:      s,
 		gate:     &breakglass.Gate{},
 		cred:     cred,
+		local:    local,
 		sessions: make(map[string]*bgSession),
 		// One bcrypt, once, before anything serves: the door's request deadline
 		// has to be longer than its own queue can legitimately take, and on the
@@ -600,27 +611,165 @@ func canonicalHost(host string) string {
 // is, as far as this door is concerned, nobody.
 const bgPeerMismatch = "session_peer_mismatch"
 
-// bgLoopbackPeer reports whether the request came from the machine itself
-// (Astra r7 #6).
+// bgLocalPeerRefresh is how long the set of this machine's own addresses is
+// trusted before it is read again. An address is added to a NAS by DHCP, by an
+// IPv6 advertisement or by an operator's own hand, and none of those restart the
+// daemon; a minute is short enough that a new address is covered before anyone
+// could have built a relay onto it, and long enough that the enumeration is not
+// a per-request cost.
+const bgLocalPeerRefresh = time.Minute
+
+// bgLocalAddrs is the set of addresses THIS MACHINE answers on, cached behind a
+// short TTL (Astra r8 #1).
+//
+// lookup is the seam: production reads the interfaces, and a test says what the
+// machine's addresses are without having any. It is held under the same mutex as
+// the cache so a test may replace it without racing the request goroutines that
+// read it.
+type bgLocalAddrs struct {
+	mu     sync.Mutex
+	lookup func() ([]string, error)
+	set    map[string]struct{}
+	read   time.Time
+	have   bool
+}
+
+// setLookup installs the seam and drops whatever was cached, so the next lookup
+// is the test's own answer rather than the machine's.
+func (a *bgLocalAddrs) setLookup(fn func() ([]string, error)) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.lookup, a.set, a.have = fn, nil, false
+}
+
+// has reports whether ip — already canonical, as bgPeer's addresses are — is one
+// of this machine's own, refreshing the set when it has aged out.
+func (a *bgLocalAddrs) has(ip string, now time.Time) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	// A clock that went backwards (a test's, or an NTP step) refreshes rather
+	// than pinning the set until it catches up.
+	if !a.have || now.Sub(a.read) >= bgLocalPeerRefresh || now.Before(a.read) {
+		a.refreshLocked(now)
+	}
+	_, ok := a.set[ip]
+	return ok
+}
+
+// refreshLocked re-reads the interfaces. A failure KEEPS the previous answer and
+// does not retry until the next TTL: the alternative — an empty set — would open
+// the relay this whole rule closes, at the exact moment the machine is unwell,
+// which is when the emergency door is used at all. The first read is primed at
+// arm time and logged if it fails, so an operator is told rather than left to
+// infer it.
+func (a *bgLocalAddrs) refreshLocked(now time.Time) error {
+	lookup := a.lookup
+	if lookup == nil {
+		lookup = bgInterfaceAddrs
+	}
+	addrs, err := lookup()
+	a.read = now
+	if err != nil {
+		return err
+	}
+	set := make(map[string]struct{}, len(addrs)+2)
+	for _, addr := range addrs {
+		if canon := bgCanonicalIP(addr); canon != "" {
+			set[canon] = struct{}{}
+		}
+	}
+	// Loopback is always in the set, whatever the interfaces say: the rule's
+	// oldest case must not depend on an enumeration that can fail.
+	set["127.0.0.1"] = struct{}{}
+	set["::1"] = struct{}{}
+	a.set, a.have = set, true
+	return nil
+}
+
+// prime reads the set once, at arm time, so the door is never serving with an
+// empty one.
+func (a *bgLocalAddrs) prime(now time.Time) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.refreshLocked(now)
+}
+
+// bgInterfaceAddrs is the production lookup: every address assigned to every
+// interface, as a canonical IP string with the prefix length and the zone
+// dropped.
+func bgInterfaceAddrs() ([]string, error) {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(addrs))
+	for _, addr := range addrs {
+		switch v := addr.(type) {
+		case *net.IPNet:
+			out = append(out, v.IP.String())
+		case *net.IPAddr:
+			out = append(out, v.IP.String())
+		}
+	}
+	return out, nil
+}
+
+// bgCanonicalIP puts one address into the form bgPeer produces, or returns ""
+// when it is not an address at all. The zone is cut off exactly as canonicalHost
+// cuts it: "fe80::1%eth0" is the same host as "fe80::1", and net.ParseIP does not
+// take the suffix.
+func bgCanonicalIP(s string) string {
+	addr, _, _ := strings.Cut(s, "%")
+	ip := net.ParseIP(addr)
+	if ip == nil {
+		return ""
+	}
+	return ip.String()
+}
+
+// localPeer reports whether the request came from this machine (Astra r7 #6,
+// corrected by Astra r8 #1).
 //
 // The peer pin cannot see through a relay, and the relay that matters is a local
 // one: any unprivileged process on the NAS may listen on a high port and forward
-// to 127.0.0.1:8771, and an SSH tunnel does the same thing with no code at all.
-// The browser's login then arrives from loopback, the session is pinned to
-// loopback — and every other HTTPS service on the NAS hostname, which receives
-// the host-scoped cookie, is also at loopback as far as this door can tell. The
-// pin would be satisfied by exactly the replay it exists to stop.
+// to the door, and an SSH tunnel does the same thing with no code at all. The
+// browser's login then arrives from an address the NAS itself answers on, the
+// session is pinned to it — and every other HTTPS service on the NAS hostname,
+// which receives the host-scoped cookie, presents from that same address. The pin
+// would be satisfied by exactly the replay it exists to stop.
 //
-// So loopback is not a peer this door deals with. It is a LAN door: the operator
-// is at another machine, because the reason they are using it is that the NAS is
-// not well. Refusing loopback costs that operator nothing and takes the relay
-// away.
-func bgLoopbackPeer(r *http.Request) bool {
-	// The zone is cut off exactly as canonicalHost cuts it: "::1%lo0" is the same
-	// host as "::1", and net.ParseIP does not take the suffix.
+// Round 7 refused loopback, which was the wrong rule by one step: `socat
+// TCP-LISTEN:9443,fork TCP:192.168.1.10:8771` on the NAS itself makes the login
+// peer 192.168.1.10 — the NAS's OWN LAN address — and the relay is back with one
+// command. The rule is not "loopback"; it is "the peer is this machine", and
+// every address on every interface is this machine.
+//
+// So the emergency door is a LAN door: the operator is at another machine,
+// because the reason they are using it is that the NAS is not well. Refusing the
+// machine's own addresses costs that operator nothing and takes the relay away.
+func (d *breakGlassDoor) localPeer(r *http.Request) bool {
+	// The zone is cut off before the comparison, on both sides: "fe80::1%eth0" is
+	// this machine if "fe80::1" is, and a peer that named a zone must not slip
+	// past the set because of it.
 	addr, _, _ := strings.Cut(peerHost(r), "%")
 	ip := net.ParseIP(addr)
-	return ip != nil && ip.IsLoopback()
+	if ip == nil {
+		return false
+	}
+	if ip.IsLoopback() {
+		// Under `serve -dev` the listener is FORCED to loopback
+		// (forceLoopbackBreakGlass), so the production rule would refuse every
+		// login a developer can make — the door would be untestable by hand on the
+		// one configuration that exists to be tested by hand (Astra r8 #4). The
+		// relaxation is loopback's alone, and only there: a dev daemon's own LAN
+		// addresses are refused exactly as production refuses them, so the rule
+		// under test is still the rule.
+		return !d.dev
+	}
+	if d.local == nil {
+		return false
+	}
+	return d.local.has(ip.String(), d.now())
 }
 
 // resolve maps the cookie to a live session, applying the peer pin, the idle
@@ -663,12 +812,13 @@ func (d *breakGlassDoor) resolve(w http.ResponseWriter, r *http.Request) (*sessi
 	// replayed it would, in the browser case this is about, delete the operator's
 	// own cookie from their own browser.
 	//
-	// A loopback peer is a mismatch too, whatever the session says (Astra r7 #6).
-	// No session is ever issued to loopback any more, so this can only be a
-	// session pinned to a LAN address being presented from the NAS itself — but it
-	// is written as its own condition rather than left to the comparison, because
-	// the rule is about the relay, not about which address happens to be stored.
-	if bgLoopbackPeer(r) || bgPeer(r) != sess.peer {
+	// A peer that is THIS MACHINE is a mismatch too, whatever the session says
+	// (Astra r7 #6, r8 #1). No session is ever issued to one of the NAS's own
+	// addresses any more, so this can only be a session pinned to another machine
+	// being presented from the NAS itself — but it is written as its own condition
+	// rather than left to the comparison, because the rule is about the relay, not
+	// about which address happens to be stored.
+	if d.localPeer(r) || bgPeer(r) != sess.peer {
 		d.mu.Unlock()
 		d.notePeerMismatch(r)
 		// Counted and audited HERE, so the caller does not do it again in the
@@ -832,19 +982,6 @@ func (d *breakGlassDoor) login(w http.ResponseWriter, r *http.Request) {
 		d.reject(ctx, w, r, start, http.StatusForbidden, "permission", "The request could not be verified.", 0, "origin check failed")
 		return
 	}
-	// No session is ever issued to the machine itself (Astra r7 #6). A login that
-	// arrives from loopback came through a relay — a forwarder some unprivileged
-	// process on the NAS put in front of 8771, or an SSH tunnel — and a session
-	// pinned to loopback is a session every sibling service on the NAS can replay,
-	// because the host-scoped cookie reaches them and they are at loopback too.
-	// The answer is the uniform one: same body, same floor, same bucket charge,
-	// and no rung of the lockout ladder, because nothing here is a verdict about a
-	// password and an operator must not be able to lock their own door by
-	// tunnelling to it five times.
-	if bgLoopbackPeer(r) {
-		d.fail(ctx, w, r, start, ip, "loopback peer", nil)
-		return
-	}
 	// A source that is inside its budget again gets its suppressed refusals
 	// summarised once, so a burst is legible without one milestone per packet.
 	d.flushRefusals(r, ip)
@@ -857,6 +994,28 @@ func (d *breakGlassDoor) login(w http.ResponseWriter, r *http.Request) {
 	// bounds the read, and the per-IP bucket above is what bounds how many such
 	// connections one source may open per minute.
 	body, readErr := readWithDeadline(w, r, bgLoginBody, bgLoginRead)
+
+	// No session is ever issued to the machine itself (Astra r7 #6, r8 #1). A
+	// login that arrives from one of this NAS's own addresses came through a relay
+	// — a forwarder some unprivileged process put in front of 8771, or an SSH
+	// tunnel — and a session pinned to an address the NAS answers on is a session
+	// every sibling service on it can replay, because the host-scoped cookie
+	// reaches them and they present from that address too. The answer is the
+	// uniform one: same body, same floor, same bucket charge, and no rung of the
+	// lockout ladder, because nothing here is a verdict about a password and an
+	// operator must not be able to lock their own door by tunnelling to it five
+	// times.
+	//
+	// It is refused HERE, after the body has been read, and that placement is the
+	// whole of Astra r8 #2. Refused before the read, the request left a declared
+	// body unconsumed, so the outermost wrapper added `Connection: close` — and a
+	// wrong password, whose body IS read, did not. The bodies matched, the floor
+	// matched, and the connection header told a prober which of the two answers
+	// they had just been given. Same path, same headers, same socket.
+	if d.localPeer(r) {
+		d.fail(ctx, w, r, start, ip, "peer is this machine", nil)
+		return
+	}
 	var req bgLoginBodyJSON
 	if readErr != nil || json.Unmarshal(body, &req) != nil || req.Password == "" {
 		// Not a credential verdict, so it must not advance the lockout ladder
@@ -1033,7 +1192,7 @@ func (d *breakGlassDoor) logout(w http.ResponseWriter, r *http.Request) {
 	// goes through the same bounded mismatch path as every other replay, and the
 	// session SURVIVES: signing the operator out is precisely what a replayed
 	// logout is for.
-	if sess != nil && (bgLoopbackPeer(r) || bgPeer(r) != sess.peer) {
+	if sess != nil && (d.localPeer(r) || bgPeer(r) != sess.peer) {
 		d.mu.Unlock()
 		d.notePeerMismatch(r)
 		writeError(w, statusCode("permission"), "permission", "The request could not be verified. Refresh and try again.", "", r.URL.Path, "")
@@ -1373,7 +1532,16 @@ func sessionlessRefusalLine(ip, door, path, code, detail string) audit.Event {
 		// line anybody on the LAN can produce still bought an exec of log_tool, and
 		// that exec was the thing standing between the audit file and the next
 		// event. The line is written and kept; QuLog is for uses of the door.
-		Quiet: true,
+		//
+		// With ONE exception, and it is the most important line this door writes
+		// (Astra r8 #6): a peer mismatch is a live root session's cookie turning up
+		// at another address. That is not a stranger knocking, it is the emergency
+		// session being replayed, and an operator scanning QuLog for what happened
+		// to their NAS must find it there. The cost is bounded by the same throttle
+		// as the line itself — one per source per window — so the lever r7 #1 closed
+		// stays closed: a flood of cookie-less POSTs, which is what anybody on the
+		// LAN can produce for free, buys no exec at all.
+		Quiet: code != bgPeerMismatch,
 	}
 }
 

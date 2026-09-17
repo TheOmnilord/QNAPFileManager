@@ -203,7 +203,6 @@ func TestSessionlessRefusalLinesAreNeverMirroredToQuLog(t *testing.T) {
 		ev   audit.Event
 	}{
 		{"a sessionless denial", sessionlessRefusalEvent(r, "unauthorized", "no valid session on a mutation route")},
-		{"a peer mismatch", sessionlessRefusalEvent(r, bgPeerMismatch, "an emergency session cookie was presented from another address")},
 		{"a pruned window's summary", sessionlessRefusalLine("203.0.113.60", audit.DoorLocal, "", "unauthorized", "the window aged out")},
 	} {
 		if !tc.ev.Quiet {
@@ -218,6 +217,13 @@ func TestSessionlessRefusalLinesAreNeverMirroredToQuLog(t *testing.T) {
 	door := bgDoorEvent(r, "breakglass-login", "denied", "auth_failed", "door=local")
 	if door.Quiet {
 		t.Error("a refusal at the door itself is no longer mirrored to QuLog")
+	}
+	// And the peer mismatch is the exception r8 #6 carved out: it is a live root
+	// session's cookie presented from somewhere else, which is exactly what an
+	// operator scanning QuLog is scanning for. The throttle bounds it.
+	mismatch := sessionlessRefusalEvent(r, bgPeerMismatch, "an emergency session cookie was presented from another address")
+	if mismatch.Quiet {
+		t.Error("a replayed root session cookie is hidden from QuLog")
 	}
 }
 
@@ -256,7 +262,7 @@ func TestTheDoorRefusesALoopbackLogin(t *testing.T) {
 			if failures := s.BreakGlassGate().Failures(source); failures != 0 {
 				t.Errorf("a loopback login advanced the lockout ladder to %d", failures)
 			}
-			ev := bgEventWith(t, read(), "loopback peer")
+			ev := bgEventWith(t, read(), "peer is this machine")
 			assertLoginShape(t, ev)
 		})
 	}
@@ -283,6 +289,15 @@ func TestALoopbackRequestNeverRedeemsASession(t *testing.T) {
 	const operator = "192.0.2.31"
 
 	cookie := bgSignInFrom(t, s, operator)
+	// The session's own CSRF token is collected FIRST, from the address it belongs
+	// to (Astra r8 #3). The logout below used to be sent without one, so the 403 it
+	// asserted was the CSRF guard's and would have arrived with the peer rule
+	// deleted — the test passed on a door that had no rule at all. With a valid
+	// token, only the pin can refuse it.
+	_, csrf := bgSessionAnswer(t, bgRequestFrom(s, operator, "GET", "/api/session", bgWithCookie(cookie), ""))
+	if csrf == "" {
+		t.Fatal("the operator's own session handed back no CSRF token")
+	}
 	// The session is re-pinned to loopback by hand — the state a relay used to
 	// produce, and the one the door must refuse to act on however it arose.
 	s.bg.mu.Lock()
@@ -294,8 +309,26 @@ func TestALoopbackRequestNeverRedeemsASession(t *testing.T) {
 	if authenticated, csrf := bgSessionAnswer(t, bgRequestFrom(s, "127.0.0.1", "GET", "/api/session", bgWithCookie(cookie), "")); authenticated || csrf != "" {
 		t.Fatalf("a loopback request redeemed a loopback-pinned session: authenticated %v, csrf handed over %v", authenticated, csrf != "")
 	}
-	if w := bgRequestFrom(s, "127.0.0.1", "POST", bgLogoutPath, bgWithCookie(cookie), ""); w.Code != statusCode("permission") {
-		t.Fatalf("a loopback logout = %d %s, want %d", w.Code, w.Body, statusCode("permission"))
+	// resolve's refusal has already opened this source's window and written the one
+	// line it is allowed, so the logout's own refusal is isolated by counting what
+	// the throttle records across the call (Astra r8 #3). The old assertion read
+	// the file at the end and was satisfied by the /api/session line above — it
+	// said nothing whatever about this route.
+	_, before, _, tracked := bgTracked(s, "127.0.0.1")
+	if !tracked {
+		t.Fatal("the refused loopback request was not tracked, so the count below proves nothing")
+	}
+	headers := bgWithCookie(cookie)
+	headers["X-QFM-CSRF"] = csrf
+	if w := bgRequestFrom(s, "127.0.0.1", "POST", bgLogoutPath, headers, ""); w.Code != statusCode("permission") {
+		t.Fatalf("a loopback logout with a VALID token = %d %s, want %d", w.Code, w.Body, statusCode("permission"))
+	}
+	if _, after, _, _ := bgTracked(s, "127.0.0.1"); after != before+1 {
+		t.Errorf("the loopback logout added %d refusals to the window, want exactly its own 1", after-before)
+	}
+	// And it destroyed nothing: a replayed logout is for signing the operator out.
+	if n := s.bg.Sessions(); n != 1 {
+		t.Errorf("%d sessions after a refused loopback logout, want the operator's 1", n)
 	}
 	ev := bgEventWith(t, read(), "presented from another address")
 	if ev.Code != bgPeerMismatch {

@@ -155,6 +155,10 @@ at all, so the app replaces it at the next start and logs the new fingerprint as
    identity this listener has. The session you get is an administrator session, and a persistent orange banner says that
    everything you create through it will be owned by root.
 
+The session you get belongs to the **address you signed in from**: presented from anywhere else it is refused and the
+refusal is audited, which is what keeps a browser that also talks to QTS on 443 from handing your emergency session to
+whatever answers there. If your address changes — a new lease, a different machine, a VPN — sign in again.
+
 Five wrong passwords lock the account for 60 seconds, doubling to a 30-minute cap; a restart of the app clears the
 lockout. A locked account is told so — the answer is `429 locked_out` with a `Retry-After`, deliberately, because leaving
 an operator to guess at a door that will not open for half an hour is worse than admitting the lockout. Attempts,

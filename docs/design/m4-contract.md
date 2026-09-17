@@ -570,6 +570,20 @@ certificate and a running daemon binds the listener when a credential appears, s
 14. **Sessionless denials on 8771 are throttled like refusals** (#3), so a flood of forged mutations shows as one
     line per source per window plus a summary, not as one line per packet — the operator sees that it happened and
     how often, not each packet.
+16. **An ambiguous audit outcome loses a summary rather than duplicating it** (Astra rounds 4–6). A refusal
+    summary whose line was appended but whose fsync failed, or whose write timed out after admission, is treated as
+    in flight and its counters are not restored; if that line then never reached the disk, the burst is gone. The
+    other choice reported the same refusals twice, which reads as a second attack; a lost summary reads as one
+    fewer line in a log that still carries the per-source refusal itself. The durable write's own error is logged
+    either way. Sessionless denial lines and their summaries take the **asynchronous** write path and are not
+    forced milestones (round 6 #2, #4): a forged mutation is not a use of the door, and four slow QuLog calls
+    from four forged sources must not hold the slots an operator's real mutation needs.
+17. **A break-glass session is pinned to the address that logged in** (Astra round 6 #1). Browser cookies are
+    host-scoped, not port-scoped — `__Host-` prefixes do not change that — so every browser-trusted HTTPS service on
+    the NAS hostname at another port receives the root-session cookie. The door therefore refuses the cookie from
+    any other peer address (audited as a sessionless denial), which turns a replay from the NAS itself, or from
+    another machine, into a 401. An operator whose address changes mid-session signs in again; on a LAN that is
+    rare and cheap.
 
 **To confirm on hardware first (both units):** that **8771 is free** and QuFirewall does not block it — the whole
 feature is inert otherwise, and `netstat -tlnp` before the first release is the check; that the listener **does not

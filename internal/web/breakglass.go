@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -98,6 +99,15 @@ type bgSession struct {
 	who      backend.Principal
 	issued   time.Time
 	seen     time.Time
+	// peer is the address the session was issued to, canonicalised (Astra r6
+	// #1). A cookie presented from any other address is not this session's:
+	// browser cookies are scoped to the HOST, not to the port, and the __Host-
+	// prefix does not change that — it constrains what may SET the cookie, not
+	// who it is sent to. So every browser-trusted HTTPS service on the NAS
+	// hostname, QTS on 443 included, receives this root session's cookie and
+	// could replay it against 8771. Pinning turns that replay into a 401,
+	// because it arrives from the NAS's own address rather than the operator's.
+	peer string
 	// updated is the auth.local.updated stamp this session was issued under.
 	// A mismatch on any later request destroys it, which is what makes
 	// `break-glass disable` an eviction rather than a suggestion (§4.4).
@@ -543,9 +553,49 @@ func (s *Server) breakGlassAuth(w http.ResponseWriter, r *http.Request) (*sessio
 	return sess, true
 }
 
-// resolve maps the cookie to a live session, applying the idle timeout, the
-// absolute lifetime and the credential-stamp eviction. It returns nil when the
-// request is unauthenticated, having already destroyed anything stale.
+// bgPeer is the source address a break-glass session is pinned to: the REAL
+// peer, never a forwarded header (contract §6.3 — this listener is not behind a
+// proxy, so a forwarded header on it is a forgery), reduced to one spelling.
+//
+// One address has many spellings and the pin has to see through all of them
+// (Astra r6 #1): ::1 and 0:0:0:0:0:0:0:1 are the same host, and so are
+// 192.0.2.10 and ::ffff:192.0.2.10, which is how a dual-stack listener reports
+// an IPv4 peer. net.IP's own String is the canonical form of both — it prints an
+// IPv4-mapped address as the dotted quad — so a comparison over it agrees where
+// a string comparison over RemoteAddr would lock the operator out of their own
+// session on nothing but notation.
+//
+// A zone ("fe80::1%eth0") is canonicalised on the address alone and keeps its
+// zone, and anything that is not an address at all — a Unix socket, a test's
+// literal — is compared as it was given.
+func bgPeer(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	return canonicalHost(peerHost(r))
+}
+
+func canonicalHost(host string) string {
+	addr, zone, zoned := strings.Cut(host, "%")
+	ip := net.ParseIP(addr)
+	if ip == nil {
+		return host
+	}
+	if zoned {
+		return ip.String() + "%" + zone
+	}
+	return ip.String()
+}
+
+// bgPeerMismatch is the audit code for a cookie presented from an address the
+// session was not issued to. It is the sessionless vocabulary: whoever sent it
+// is, as far as this door is concerned, nobody.
+const bgPeerMismatch = "session_peer_mismatch"
+
+// resolve maps the cookie to a live session, applying the peer pin, the idle
+// timeout, the absolute lifetime and the credential-stamp eviction. It returns
+// nil when the request is unauthenticated, having already destroyed anything
+// stale.
 func (d *breakGlassDoor) resolve(w http.ResponseWriter, r *http.Request) *session {
 	c, err := r.Cookie(bgCookie)
 	if err != nil || c.Value == "" {
@@ -561,6 +611,23 @@ func (d *breakGlassDoor) resolve(w http.ResponseWriter, r *http.Request) *sessio
 	if sess == nil {
 		d.mu.Unlock()
 		d.clearCookie(w)
+		return nil
+	}
+	// The pin, before anything else this function does (Astra r6 #1). A request
+	// from another address is not this session's and gets nothing from it: not
+	// the snapshot, not the CSRF token /api/session would hand back, and not the
+	// refreshed idle window either — a replay must not keep a session alive that
+	// the operator has walked away from.
+	//
+	// And the session SURVIVES. It belongs to the peer that signed in, who is
+	// still using it; destroying it here would let anything holding a copy of the
+	// cookie sign the operator out mid-emergency. For the same reason no cookie
+	// is cleared: the cookie is host-scoped, so a Set-Cookie written to whoever
+	// replayed it would, in the browser case this is about, delete the operator's
+	// own cookie from their own browser.
+	if bgPeer(r) != sess.peer {
+		d.mu.Unlock()
+		d.notePeerMismatch(r)
 		return nil
 	}
 	reason := ""
@@ -901,8 +968,11 @@ func (d *breakGlassDoor) logout(w http.ResponseWriter, r *http.Request) {
 	d.mu.Lock()
 	sess := d.sessions[c.Value]
 	// Only a caller holding the session's own CSRF token may destroy it, the
-	// same rule every other unsafe request follows.
-	if sess == nil || !validCSRF(r, sess.csrf) {
+	// same rule every other unsafe request follows — and only from the address
+	// the session belongs to (Astra r6 #1). Destroying a session is a mutation
+	// like any other, so this route obeys the pin too rather than being the one
+	// place a replayed cookie can still reach a live session.
+	if sess == nil || !validCSRF(r, sess.csrf) || bgPeer(r) != sess.peer {
 		d.mu.Unlock()
 		// No cookie is written on this path: an unverifiable request changes
 		// nothing at all, including the browser's state.
@@ -923,6 +993,8 @@ func (d *breakGlassDoor) issue(r *http.Request, cred config.Local) (*bgSession, 
 	now := d.now()
 	sess := &bgSession{
 		id: rand.Text(), csrf: rand.Text(), issued: now, seen: now, updated: cred.Updated,
+		// The address this session belongs to, from here on (Astra r6 #1).
+		peer: bgPeer(r),
 		// Root, so it keys to the same root worker as any other admin session
 		// (backend.Principal.Key). The name is not a QTS user and is not
 		// resolvable by idmap: it exists to be legible in the audit trail.
@@ -1140,6 +1212,32 @@ func (d *breakGlassDoor) writeRefusal(r *http.Request, ev refusalEvent, detail s
 	return d.audit(r, ev.op, "denied", ev.code, detail)
 }
 
+// queueRefusal is writeRefusal for a line that must not wait for anything: the
+// same two shapes, both on the async path (Astra r6 #4).
+//
+// The pruning sweep is its only caller, and the sweep is the reason it exists.
+// It runs inside another source's refusal, it can find a whole table's worth of
+// abandoned windows at once, and each one it drops owes a summary. Writing those
+// durably would let one unlucky refusal spend every writer slot on news about
+// sources that stopped talking minutes ago — the same amplifier #2 closed on the
+// sessionless line itself, re-opened one level up. The verdict is a single bool
+// because the async path has no in-flight state to tell apart.
+func (d *breakGlassDoor) queueRefusal(r *http.Request, ev refusalEvent, detail string) bool {
+	if d.srv == nil || d.srv.auditor == nil {
+		return false
+	}
+	if ev.shape == refusalSessionless {
+		if r == nil {
+			return false
+		}
+		return d.srv.auditor.WriteQueued(sessionlessRefusalEvent(r, ev.code, detail))
+	}
+	// The door's own shape, minus the forced milestone: a summary of refusals is
+	// a rate report about a source that has gone away, not a use of the door.
+	// Result "denied" still puts it in front of QuLog on its own merits.
+	return d.srv.auditor.WriteQueued(bgDoorEvent(r, ev.op, "denied", ev.code, detail))
+}
+
 // bgAuditContext is the context every break-glass refusal line is written
 // under: the request's values, none of its cancellation (Astra r3 #2).
 //
@@ -1155,33 +1253,68 @@ var bgAuditContext = func(r *http.Request) context.Context {
 	return context.WithoutCancel(r.Context())
 }
 
-// auditSessionlessRefusal is auditUnauthenticated's event, written with a
-// context the peer cannot cancel (Astra r3 #2).
+// errRefusalNotQueued is what a refused ASYNC write reports to a caller that
+// cleared counters to make it. The async path has no in-flight state — the
+// event is on the queue or it was turned away here and now — so this error, and
+// an inFlight of false, is the whole verdict.
+var errRefusalNotQueued = errors.New("the refusal line was not queued")
+
+// sessionlessRefusalEvent is the event a denial with nobody behind it is
+// recorded as. The shape is the one routes_mutate.go's auditUnauthenticated
+// writes, and assertSessionlessShape in breakglass_astra2_test.go pins both to
+// it: no actor, the LISTENER's door, the path, Op "auth".
+func sessionlessRefusalEvent(r *http.Request, code, detail string) audit.Event {
+	return audit.Event{
+		IP:     ClientIP(r),
+		Door:   doorOf(r),
+		Op:     "auth",
+		Path:   r.URL.Path,
+		Phase:  "result",
+		Result: "denied",
+		Code:   code,
+		Detail: detail,
+		// NOT a forced milestone (Astra r6 #2). §6.2's "a milestone on every use"
+		// is about uses of the DOOR, and a forged mutation from a host that never
+		// authenticated is not one. The line is still classified on its own merits
+		// — every denial is — so QuLog still hears about it; what it no longer does
+		// is demand a durable writer and a synchronous QuLog call per line.
+		ForceMilestone: false,
+	}
+}
+
+// auditSessionlessRefusal writes that event on the ASYNCHRONOUS path (Astra r6
+// #2).
 //
-// The shape is the one routes_mutate.go's auditUnauthenticated writes, and
-// assertSessionlessShape in breakglass_astra2_test.go pins both to it: no
-// actor, the LISTENER's door, the path, Op "auth". What differs is the context.
-// A per-request denial is request-scoped on purpose — a cancelled request must
-// not go on waiting for a wedged sink — but an AGGREGATE stands for refusals
-// that are already counted and forgotten, and a returning peer that hangs up
-// while the four durable-writer slots are busy would take the whole summary
-// with it. WriteSync's own writeSyncTimeout still bounds the wait, so dropping
-// the cancellation cannot block a request goroutine for longer than that.
+// It used to be a forced milestone written with WriteSync, on a context the peer
+// could not cancel (Astra r3 #2) — and that made a denial nobody authenticated
+// for as expensive as an operator's own mutation. Four sources refused at once
+// took all four durable-writer slots, and if QuLog was slow to answer they held
+// them for as long as it took: the operator's real mkdir, on the other listener,
+// then failed its intent line on the admission timeout. A forged request must
+// not be able to spend the slots a genuine one needs, so this shape queues
+// instead, which cannot block and cannot wait.
+//
+// The cost is where the line lands in the FILE. A queued line is appended by the
+// drain while a durable one appends itself, so a denial can turn up below a
+// mutation recorded after it. Each line carries the time it was made at, which
+// is what orders the record; the file's order was only ever an approximation of
+// that, since every ordinary result line has taken this path all along.
+//
+// The context goes with it: there is nothing left for a cancellation to reach.
+// A queued event belongs to the drain, and the peer hanging up cannot take it
+// back — which is the property bgAuditContext was protecting, now held by
+// construction rather than by care.
 func (s *Server) auditSessionlessRefusal(r *http.Request, code, detail string) (bool, error) {
 	if s.auditor == nil {
 		return false, nil
 	}
-	return s.auditor.WriteSyncInFlight(bgAuditContext(r), audit.Event{
-		IP:             ClientIP(r),
-		Door:           doorOf(r),
-		Op:             "auth",
-		Path:           r.URL.Path,
-		Phase:          "result",
-		Result:         "denied",
-		Code:           code,
-		Detail:         detail,
-		ForceMilestone: true,
-	})
+	// inFlight is always false here, and that is the point: the answer is
+	// definite either way, so a caller that has to put its counters back knows
+	// immediately whether to.
+	if !s.auditor.WriteQueued(sessionlessRefusalEvent(r, code, detail)) {
+		return false, errRefusalNotQueued
+	}
+	return false, nil
 }
 
 type refusalState struct {
@@ -1233,6 +1366,31 @@ func (d *breakGlassDoor) noteUnauthenticated(r *http.Request) {
 	d.noteRefusalEvent(r, ip, "no valid session on a mutation route", refusalEvent{shape: refusalSessionless, code: "unauthorized"})
 }
 
+// notePeerMismatch records a live session cookie presented from an address the
+// session was not issued to (Astra r6 #1).
+//
+// It is the SESSIONLESS shape, and for the same reason the others are: the
+// sender proved nothing, so naming the break-glass account as a root
+// administrator actor would describe the operator as having done this. It goes
+// through the same throttle as every other refusal, because the thing it is most
+// likely to be — a browser that has been to the door and then visits QTS on 443,
+// or a page on another port fetching in a loop — repeats.
+//
+// The detail names no path and no cookie value: what it stands for is one
+// sentence, "this cookie turned up somewhere else", and the address it turned up
+// at is the throttle's own key.
+// The throttle is keyed on peerHost, the raw source, exactly as the rate bucket
+// and every other refusal are: the canonical form is what the PIN compares, and
+// a second keying convention in the same table would be one more thing to get
+// wrong for a distinction no real peer can make (one connection, one spelling).
+func (d *breakGlassDoor) notePeerMismatch(r *http.Request) {
+	if d == nil || d.srv == nil {
+		return
+	}
+	d.noteRefusalEvent(r, peerHost(r), "an emergency session cookie was presented from another address",
+		refusalEvent{shape: refusalSessionless, code: bgPeerMismatch})
+}
+
 // noteRefusalEvent is the throttle itself: at most one line per source per
 // refusalWindow, the rest counted and carried into the next one. The tracking
 // table is bounded exactly as the source bucket is, so a spray from many
@@ -1260,7 +1418,10 @@ func (d *breakGlassDoor) noteRefusalEvent(r *http.Request, ip, detail string, ev
 		return
 	}
 	// A new window. Prune what has aged out before deciding whether there is
-	// room, so a long-running daemon does not accumulate dead entries.
+	// room, so a long-running daemon does not accumulate dead entries. What the
+	// sweep drops with a count still on it is summarised first (Astra r6 #4), and
+	// those lines are written after the lock is released, like every other one.
+	var pruned []prunedWindow
 	for key, old := range d.refusals {
 		if key == ip {
 			continue
@@ -1278,7 +1439,23 @@ func (d *breakGlassDoor) noteRefusalEvent(r *http.Request, ip, detail string, ev
 		// nowhere to put the burst back. The claim resolves in bounded time —
 		// WriteSync's own timeout — and the resolution deletes the entry itself
 		// when nothing is left on it.
-		if old.claimed == 0 && age >= refusalWindow && (old.suppressed == 0 || age >= 2*refusalWindow) {
+		if old.claimed != 0 || age < refusalWindow {
+			continue
+		}
+		if old.suppressed == 0 {
+			delete(d.refusals, key)
+			continue
+		}
+		if age >= 2*refusalWindow {
+			// The count goes out with a line of its own before the entry does
+			// (Astra r6 #4). This is the one path on which a burst was simply
+			// discarded: a source that floods and then stops is never seen again,
+			// so nothing of its own ever collects the summary, and two windows
+			// later some unrelated source's refusal swept the count away. The
+			// aggregate accounting is only complete if every counted refusal is
+			// reported by someone, and for an abandoned window this is the last
+			// moment anyone can.
+			pruned = append(pruned, prunedWindow{ip: key, count: old.suppressed, ev: old.shape.summary()})
 			delete(d.refusals, key)
 		}
 	}
@@ -1304,6 +1481,7 @@ func (d *breakGlassDoor) noteRefusalEvent(r *http.Request, ip, detail string, ev
 			d.droppedAt[ev.shape], d.dropped[ev.shape] = now, 0
 		}
 		d.mu.Unlock()
+		d.emitPruned(r, pruned)
 		if report {
 			inFlight, err := d.writeRefusal(r, ev.shape.summary(),
 				fmt.Sprintf("door=local %d refusals from untracked sources; the %d-source table is full", dropped, breakglass.MaxSources))
@@ -1335,6 +1513,7 @@ func (d *breakGlassDoor) noteRefusalEvent(r *http.Request, ip, detail string, ev
 	}
 	state.opened, state.suppressed, state.shape = now, 0, ev.shape
 	d.mu.Unlock()
+	d.emitPruned(r, pruned)
 	line := ev
 	if carried > 0 {
 		detail = fmt.Sprintf("%s (%d further refusals suppressed in the previous window)", detail, carried)
@@ -1364,6 +1543,31 @@ func (d *breakGlassDoor) noteRefusalEvent(r *http.Request, ip, detail string, ev
 			}
 		}
 		d.mu.Unlock()
+	}
+}
+
+// prunedWindow is one abandoned window's last words: the source it belonged to,
+// what it had counted, and the shape that count has to be reported in (Astra r6
+// #4). It is collected under the door's lock and written outside it.
+type prunedWindow struct {
+	ip    string
+	count int
+	ev    refusalEvent
+}
+
+// emitPruned writes the summary each swept window owed. Queued, never durable:
+// the sweep can produce a table's worth of these at once, on the goroutine of a
+// request that has nothing to do with any of them.
+//
+// A line the queue refuses is simply gone, and there is deliberately nothing to
+// put it back on: the entry it belonged to has been deleted, the source stopped
+// talking long ago, and re-inserting a window nobody will return to would spend
+// a slot in a bounded table on news that would only be swept again. The
+// auditor's own drop counter is what reports that the log lost lines.
+func (d *breakGlassDoor) emitPruned(r *http.Request, pruned []prunedWindow) {
+	for _, p := range pruned {
+		d.queueRefusal(r, p.ev, fmt.Sprintf(
+			"door=local ip=%s %d further refusals suppressed; the window aged out before the source came back", p.ip, p.count))
 	}
 }
 
@@ -1468,15 +1672,31 @@ func (d *breakGlassDoor) audit(r *http.Request, op, result, code, detail string)
 	if d.srv == nil || d.srv.auditor == nil {
 		return false, nil
 	}
-	ctx, ip := context.Background(), ""
+	ctx := context.Background()
 	if r != nil {
-		ctx, ip = bgAuditContext(r), peerHost(r)
+		ctx = bgAuditContext(r)
 	}
-	return d.srv.auditor.WriteSyncInFlight(ctx, audit.Event{
+	ev := bgDoorEvent(r, op, result, code, detail)
+	ev.ForceMilestone = true
+	return d.srv.auditor.WriteSyncInFlight(ctx, ev)
+}
+
+// bgDoorEvent is the event shape of the door itself: the break-glass account as
+// the actor, this listener's door, the real peer. Shared by the durable path
+// above and the queued one (Astra r6 #4), which differ in how the line is
+// written and in nothing about what it says — except the forced milestone, which
+// the caller sets, because it is a statement about the EVENT rather than about
+// the shape.
+func bgDoorEvent(r *http.Request, op, result, code, detail string) audit.Event {
+	ip := ""
+	if r != nil {
+		ip = peerHost(r)
+	}
+	return audit.Event{
 		Actor: "break-glass", UID: 0, Admin: true, Root: true,
 		IP: ip, Door: audit.DoorLocal, Op: op, Phase: "result",
-		Result: result, Code: code, Detail: detail, ForceMilestone: true,
-	})
+		Result: result, Code: code, Detail: detail,
+	}
 }
 
 // AuditBreakGlass records a break-glass event that happens outside a request —

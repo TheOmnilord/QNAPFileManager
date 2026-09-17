@@ -64,17 +64,24 @@ func bgRefusingAuditor(t *testing.T, s *Server) {
 // written under that peer's cancellable context. A peer that hung up while the
 // four durable slots were busy took the whole window's count with it, because
 // the counters had already been cleared to write the line.
+//
+// The burst here is one of refused LOGINS (Astra r6 #2). A window of sessionless
+// denials is now summarised on the queue, where a hang-up cannot reach it at all
+// and there is no rule left to break; the door's own refusals are still written
+// durably, and for those the detachment is what stands between a peer's
+// disconnect and a lost count. Both halves of the old test survive: the line
+// under a context nothing can cancel, and the summary in the log.
 func TestAFlushSummarySurvivesTheReturningPeerHangingUp(t *testing.T) {
 	const suppressed = 4
 	s, _, _ := bgFixture(t)
-	s.pinned = nil // no impersonation, so the requests really are sessionless
+	s.pinned = nil
 	now := time.Date(2026, 9, 17, 12, 0, 0, 0, time.UTC)
 	s.BreakGlassGate().Now = func() time.Time { return now }
 	read := withAudit(t, s)
 	const source = "192.0.2.90"
 
 	for i := 0; i < suppressed+1; i++ {
-		bgSessionlessMutation(t, s, source)
+		bgRefusedLogin(t, s, source)
 	}
 	now = now.Add(2 * refusalWindow)
 
@@ -148,12 +155,14 @@ func TestAFlushSummarySurvivesTheReturningPeerHangingUp(t *testing.T) {
 	}
 
 	ev := bgEventWith(t, read(), fmt.Sprintf("%d further refusals suppressed; the source is inside its budget again", suppressed))
-	assertSessionlessShape(t, ev)
+	assertLoginShape(t, ev)
 }
 
 // The other half: a summary that was NOT admitted leaves the burst where it
 // was, so the next trigger reports it rather than reporting a flood that has
-// silently shrunk to nothing.
+// silently shrunk to nothing. It holds on both paths — a closed logger refuses a
+// durable write and a queued one alike — so this one keeps the sessionless burst
+// it always had, and now covers the async refusal (Astra r6 #2) as well.
 func TestAFlushSummaryThatWasRefusedIsNotLost(t *testing.T) {
 	const suppressed = 4
 	s, _, _ := bgFixture(t)

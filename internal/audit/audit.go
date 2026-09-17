@@ -228,17 +228,35 @@ func (l *Logger) prepare(ev Event) Event {
 // Write records ev. It never blocks: if the buffer is full the event is
 // dropped and the dropped counter incremented. A zero T is stamped now, and a
 // non-UTF-8 Path is moved to PathB64.
-func (l *Logger) Write(ev Event) {
+func (l *Logger) Write(ev Event) { _ = l.WriteQueued(ev) }
+
+// WriteQueued is Write with the one answer a caller that CLEARED SOMETHING in
+// order to write the line needs (Astra r6 #2): whether the event was taken.
+//
+// The async verdict is immediate and has only two sides, which is what makes it
+// so much simpler to account for than WriteSync's. Either the event is on the
+// queue — the drain owns it from here, and nothing the caller does can affect
+// it — or it was refused right here, because the buffer is full or the logger
+// is closed, and the caller still holds the only record of whatever the line
+// stood for. There is no third, in-flight state to weigh.
+//
+// What it does not promise is what no write path promises: a queued event can
+// still fail at the sink (a full disk, an append error), and the drain reports
+// that through WriteErrors and the app log rather than back to this caller.
+// queued means accepted for writing, not written.
+func (l *Logger) WriteQueued(ev Event) (queued bool) {
 	ev = l.prepare(ev)
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	if l.closed {
-		return
+		return false
 	}
 	select {
 	case l.ch <- ev:
+		return true
 	default:
 		atomic.AddInt64(&l.dropped, 1)
+		return false
 	}
 }
 
@@ -304,6 +322,17 @@ func (l *Logger) WriteSync(ctx context.Context, ev Event) error {
 // past admission at all (a closed logger, a context already done, the admission
 // timeout with every writer slot held). On inFlight false with a non-nil error,
 // nothing was written and nothing will be.
+//
+// In flight means the outcome is UNKNOWN, not that the line will be recorded
+// (Astra r6 #3). The worker that still holds the event may yet fail its append —
+// a full disk, an I/O error, a logger closed under it — and the appended line
+// whose fsync failed may not survive the power cut that the fsync was there to
+// answer for. Nothing comes back to the caller in either case: the drain reports
+// the failure through WriteErrors and the app log, and the caller has already
+// moved on. So a caller that cleared state to write the line is choosing, when
+// it declines to restore that state on inFlight, to LOSE the record rather than
+// risk reporting it twice (M4 contract §18.16). That is the trade this bit
+// exists to make deliberately; it is not a promise of eventual recording.
 func (l *Logger) WriteSyncInFlight(ctx context.Context, ev Event) (inFlight bool, err error) {
 	if ctx == nil {
 		ctx = context.Background()

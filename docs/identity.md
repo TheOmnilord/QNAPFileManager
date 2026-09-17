@@ -202,6 +202,10 @@ How it is set up, and the properties that follow:
   brings the listener up** without restarting the app you are in the middle of repairing.
 - **Changing or clearing the password destroys every live break-glass session**, via the `auth.local.updated` stamp each
   session carries. That is what makes `break-glass disable` an eviction rather than a suggestion.
+- **A break-glass session is pinned to the address it was issued to**: the cookie presented from any other peer is
+  unauthenticated, audited as a sessionless denial, and leaves the real session untouched. Cookies are host-scoped rather
+  than port-scoped — the `__Host-` prefix does not change that — so without the pin every browser-trusted HTTPS service
+  on the NAS hostname would receive a cookie redeeming a root session, and `api/session` would hand it the CSRF token.
 - The certificate is self-signed, **never transmitted**, and generated on the NAS when the password is set or when the
   listener first binds — whichever happens first. Its SHA-256 fingerprint is printed to the app log at every start and by
   `break-glass status`. Compare it before you type a password into a page your browser has warned about —

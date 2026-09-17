@@ -79,6 +79,26 @@ func bgRefusedLogin(t *testing.T, s *Server, source string) {
 	}
 }
 
+// bgAllAudit closes the audit log and returns EVERY line in it, not the last
+// two hundred (Astra r6 #2).
+//
+// A test that fills the 256-source table writes more lines than withAudit's tail
+// returns, and since the sessionless shape moved to the async path the tail is
+// no longer even a window on the newest lines: a queued line is appended by the
+// drain, a durable line writes itself, so a line written LATER can land in the
+// file first. Each line still carries the time it was made at, which is what
+// orders the record; the file's order is only approximately that, and a test
+// that depends on it is testing the scheduler.
+func bgAllAudit(t *testing.T, s *Server, read func() []audit.Event) []audit.Event {
+	t.Helper()
+	read() // closes the logger, which drains everything queued
+	events, err := s.auditor.Tail(8192)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return events
+}
+
 // bgEventWith returns the single audit event whose detail contains want.
 func bgEventWith(t *testing.T, events []audit.Event, want string) audit.Event {
 	t.Helper()
@@ -158,7 +178,7 @@ func TestTheFullSourceTableReportsEachFloodInItsOwnShape(t *testing.T) {
 	bgSessionlessMutation(t, s, "203.0.113.9")
 	bgRefusedLogin(t, s, "203.0.113.8")
 
-	events := read()
+	events := bgAllAudit(t, s, read)
 	full := fmt.Sprintf("the %d-source table is full", breakglass.MaxSources)
 	var sessionless, login []audit.Event
 	for _, ev := range events {

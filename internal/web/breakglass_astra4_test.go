@@ -62,10 +62,17 @@ func bgTracked(s *Server, ip string) (opened time.Time, suppressed, claimed int,
 // and another source's refusal, whose pruning of aged entries does not know or
 // care that one of them is being reported on. Either one turned the rollback of
 // a refused write into a silent loss of the whole flood.
+//
+// The burst is one of refused LOGINS (Astra r6 #2). A claim is only ever open
+// while a DURABLE write is outstanding, and the sessionless shape no longer
+// makes one: it queues, which is answered on the spot. Refusals at the door are
+// still written durably — they are uses of the door — so this is where the
+// window between claiming a count and learning its fate still exists, and it is
+// the shape the test has to use to stand inside it.
 func TestAClaimedBurstIsNotDeletedWhileItsSummaryIsInFlight(t *testing.T) {
 	const suppressed = 4
 	s, _, _ := bgFixture(t)
-	s.pinned = nil // no impersonation, so the requests really are sessionless
+	s.pinned = nil
 	now := time.Date(2026, 9, 17, 12, 0, 0, 0, time.UTC)
 	s.BreakGlassGate().Now = func() time.Time { return now }
 	withAudit(t, s)
@@ -73,7 +80,7 @@ func TestAClaimedBurstIsNotDeletedWhileItsSummaryIsInFlight(t *testing.T) {
 	const other = "192.0.2.95"
 
 	for i := 0; i < suppressed+1; i++ {
-		bgSessionlessMutation(t, s, source)
+		bgRefusedLogin(t, s, source)
 	}
 	// Two windows on, which is exactly the age at which the pruning sweep gives
 	// up on an entry with a pending summary — the harshest case for the claim.
@@ -105,16 +112,13 @@ func TestAClaimedBurstIsNotDeletedWhileItsSummaryIsInFlight(t *testing.T) {
 	}
 
 	// The pruning path: a refusal from a different source sweeps aged entries as
-	// it opens its own window. Its own write queues behind the held slots, so it
-	// runs in a goroutine and is waited for by its effect on the table.
-	//
-	// The tracking entry proves the sweep has run; it says nothing about where the
-	// goroutine is AFTER it (Astra r5 #1). It is on its way into the audit write,
-	// which reads s.auditor — and the two things this test does next are to close
-	// that logger and to hand the server a different one. A goroutine reading the
-	// field while the test writes it is a data race the Linux -race job can catch
-	// and a write to the wrong logger everywhere else, so the goroutine signals and
-	// is JOINED below, before the auditor is touched at all.
+	// it opens its own window. Its own line is queued rather than durable now
+	// (Astra r6 #2), so it no longer waits behind the held slots — but it still
+	// reads s.auditor, and the two things this test does next are to close that
+	// logger and to hand the server a different one. A goroutine reading the field
+	// while the test writes it is a data race the Linux -race job can catch and a
+	// write to the wrong logger everywhere else, so the goroutine signals and is
+	// JOINED below, before the auditor is touched at all (Astra r5 #1).
 	otherDone := make(chan struct{})
 	go func() {
 		s.bg.noteUnauthenticated(bgReturningRequest(other))
@@ -149,7 +153,7 @@ func TestAClaimedBurstIsNotDeletedWhileItsSummaryIsInFlight(t *testing.T) {
 	read := withAudit(t, s)
 	s.bg.flushRefusals(bgReturningRequest(source), source)
 	ev := bgEventWith(t, read(), fmt.Sprintf("%d further refusals suppressed; the source is inside its budget again", suppressed))
-	assertSessionlessShape(t, ev)
+	assertLoginShape(t, ev)
 	if _, _, _, ok := bgTracked(s, source); ok {
 		t.Error("the entry outlived the summary that emptied it")
 	}
@@ -161,6 +165,10 @@ func TestAClaimedBurstIsNotDeletedWhileItsSummaryIsInFlight(t *testing.T) {
 // reports the same burst a second time when the first line lands a moment later.
 // A flood that doubles is as much a lie about the number as a flood that
 // vanishes.
+//
+// Refused LOGINS again (Astra r6 #2): a timeout on a write that was admitted is
+// a state only the durable path has, and that is now the login shape's path
+// alone.
 func TestASummaryThatTimedOutInTheSinkIsNotReportedTwice(t *testing.T) {
 	if testing.Short() {
 		t.Skip("this one waits out the two-second durable-write timeout")
@@ -174,7 +182,7 @@ func TestASummaryThatTimedOutInTheSinkIsNotReportedTwice(t *testing.T) {
 	const source = "192.0.2.96"
 
 	for i := 0; i < suppressed+1; i++ {
-		bgSessionlessMutation(t, s, source)
+		bgRefusedLogin(t, s, source)
 	}
 	now = now.Add(2 * refusalWindow)
 
@@ -196,5 +204,5 @@ func TestASummaryThatTimedOutInTheSinkIsNotReportedTwice(t *testing.T) {
 	// line the first flush gave up on is the only one in the log.
 	s.bg.flushRefusals(bgReturningRequest(source), source)
 	ev := bgEventWith(t, read(), fmt.Sprintf("%d further refusals suppressed; the source is inside its budget again", suppressed))
-	assertSessionlessShape(t, ev)
+	assertLoginShape(t, ev)
 }

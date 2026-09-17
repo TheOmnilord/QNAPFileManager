@@ -145,15 +145,15 @@ func TestAKnownRemotePeerIsAnsweredFromAFreshSetWithoutWaiting(t *testing.T) {
 
 	bgSignInFrom(t, s, operator)
 	before := seam.count()
-	started := time.Now()
 	bgSignInFrom(t, s, operator)
-	waited := time.Since(started)
 	if got := seam.count() - before; got != 0 {
 		t.Errorf("a second login against a set read this instant made %d further discoveries, want 0", got)
 	}
-	if waited > bgLocalFresh/2 {
-		t.Errorf("a login that needed no read took %v; nothing here was rate-limited", waited)
-	}
+	// The discovery count is the whole assertion. The wall clock is not: a
+	// login carries its own floor and a bcrypt, and under -race on a loaded
+	// runner those alone passed the half-second this test once demanded
+	// (856 ms in CI run 35179304134) — the door had waited for nothing. What
+	// the wait would have shown is a further discovery, and there was none.
 }
 
 // The verification queue is the one part of this handler a caller can lengthen at

@@ -1,7 +1,7 @@
 // Run with: node --test internal/web/actions_test.mjs
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
-import {runMutation, CONFIRM_CHALLENGES, actionMessage, onNewFolderError, deleteGrade, trashOutcome, undoRestore, PERMANENT_WARNING} from './static/js/actions.js';
+import {runMutation, CONFIRM_CHALLENGES, NO_CHANGE_SUBMITTED, confirmQueue, actionMessage, onNewFolderError, deleteGrade, trashOutcome, undoRestore, PERMANENT_WARNING} from './static/js/actions.js';
 import {update} from './static/js/state.js';
 
 test('runMutation drives the server confirmation-token flow', async t => {
@@ -82,23 +82,103 @@ test('runMutation stops at a cancelled second challenge with no third POST', asy
  assert.equal(posts,2); // the cancelled second question sends nothing
 });
 
-test('runMutation gives up at the challenge bound, reporting the last sentence', async t => {
+// The envelope here is the PRODUCTION one: the server's `message` on a
+// confirm_required is the generic "This change needs confirmation." and the
+// sentences that say what is at stake are in confirm.summary.warnings, which is
+// where authorizeGraded puts the ACL's own words (routes_mutate.go). Round 7
+// reported "the last sentence" but read only `message`, so what actually
+// reached the dialog at the bound was the generic line and the third warning —
+// the one that had just changed the verdict — was never shown (Astra r8 #1).
+test('runMutation gives up at the challenge bound in the LATEST challenge’s warnings', async t => {
  t.after(() => update({session:null}));
+ const last=CONFIRM_CHALLENGES;
  let posts=0;
  t.mock.method(globalThis,'fetch',async () => {
   posts++;
-  return new Response(JSON.stringify({error:{code:'confirm_required',message:`sentence ${posts}`},confirm:{token:`T${posts}`}}),{status:409});
+  return new Response(JSON.stringify({
+   error:{code:'confirm_required',message:'This change needs confirmation.'},
+   confirm:{token:`T${posts}`,grade:2,summary:{warnings:[`the ACL on tank/share/${posts} would be destroyed`,`aclmode is discard (round ${posts})`]}},
+  }),{status:409});
  });
  const shown=[];
  await assert.rejects(
   runMutation('api/perm/chown',{path:'/share/x'},async (confirm,message) => { shown.push(message); return true; }),
   err => {
-   assert.equal(err.code,'confirm_required');
-   assert.equal(err.message,`sentence ${CONFIRM_CHALLENGES}`); // the latest words, not the first
+   assert.equal(err.code,'confirm_required');                                  // callers still classify it
+   assert.match(err.message,new RegExp(`tank/share/${last} would be destroyed`)); // the latest words
+   assert.match(err.message,new RegExp(`aclmode is discard \\(round ${last}\\)`)); // ALL of them, not the first alone
+   assert.doesNotMatch(err.message,new RegExp(`round ${last-1}`));             // never an older challenge's
+   assert.ok(err.message.includes(NO_CHANGE_SUBMITTED),'it says nothing was sent');
+   assert.equal(actionMessage(err),err.message);                               // and that is what the dialog prints
    return true;
   });
  assert.equal(posts,CONFIRM_CHALLENGES);      // no further POST once the bound is reached
  assert.equal(shown.length,CONFIRM_CHALLENGES-1);
+});
+
+// A challenge with no warnings at all — a warn-class path, whose message IS the
+// sentence — keeps the server's prose rather than reporting nothing.
+test('runMutation falls back to the server’s prose when a challenge carries no warnings', async t => {
+ t.after(() => update({session:null}));
+ t.mock.method(globalThis,'fetch',async () => new Response(JSON.stringify({
+  error:{code:'confirm_required',message:'This location needs confirmation.'},confirm:{token:'T'},
+ }),{status:409}));
+ await assert.rejects(
+  runMutation('api/fs/mkdir',{dir:'/etc',name:'x'},async () => true),
+  err => {
+   assert.equal(err.message,`This location needs confirmation. ${NO_CHANGE_SUBMITTED}`);
+   return true;
+  });
+});
+
+// Alice approves the first challenge and the page is taken over by Bob while
+// the redemption is in flight. The second 409 used to open a dialog whose queue
+// ticket was taken AFTER the switch — self-consistently Bob's, so nothing
+// refused it — and Alice's operation was then re-posted with Bob's CSRF
+// credentials. Reproduced as Alice, Alice, Bob (Astra r8 #2). The real
+// confirmation queue is used here, because it is precisely what does not catch
+// this.
+test('runMutation abandons the exchange when the page changes hands (Astra r8 #2)', async t => {
+ t.after(() => update({session:null}));
+ update({session:{user:'alice',uid:1000,csrf:'ALICE'}});
+ const posts=[];
+ t.mock.method(globalThis,'fetch',async (url,opts) => {
+  posts.push(opts.headers.get('X-QFM-CSRF'));
+  // Bob signs in while Alice's redemption is on the wire.
+  if (posts.length===2) update({session:{user:'administrator',uid:0,csrf:'BOB'}});
+  return new Response(JSON.stringify({
+   error:{code:'confirm_required',message:'This change needs confirmation.'},
+   confirm:{token:`T${posts.length}`,summary:{warnings:['the ACL on tank/share would be destroyed']}},
+  }),{status:409});
+ });
+ const asked=[];
+ const res=await runMutation('api/perm/chmod',{path:'/share/x',mask:'0770'},(confirm,message) =>
+  confirmQueue(() => { asked.push(message); return true; }));
+ assert.equal(res,null,'nothing was done, and the caller is told so');
+ assert.equal(asked.length,1,'Bob is never shown Alice’s question');
+ assert.deepEqual(posts,['ALICE','ALICE'],'and her operation is never re-posted with his credentials');
+});
+
+// A same-user refresh is not that, and must not abandon a change halfway
+// through its confirmation: settings.js re-reads the session after a read-only
+// toggle and app.js re-reads it every minute, and neither means anybody left.
+test('runMutation carries on across a same-user refresh (Astra r8 #2)', async t => {
+ t.after(() => update({session:null}));
+ update({session:{user:'alice',uid:1000,csrf:'ALICE'}});
+ const posts=[];
+ t.mock.method(globalThis,'fetch',async (url,opts) => {
+  posts.push(opts.headers.get('X-QFM-CSRF'));
+  if (posts.length===1) {
+   update({session:{user:'alice',uid:1000,csrf:'ROTATED'}});   // the minute poll, with a rotated token
+   return new Response(JSON.stringify({error:{code:'confirm_required',message:'m'},confirm:{token:'T1'}}),{status:409});
+  }
+  return new Response(JSON.stringify({ok:true}),{status:200});
+ });
+ let asked=0;
+ const res=await runMutation('api/fs/rename',{path:'/share/x',to:'y'},async () => { asked++; return true; });
+ assert.deepEqual(res,{ok:true});
+ assert.equal(asked,1,'she is still asked');
+ assert.deepEqual(posts,['ALICE','ROTATED'],'and her own change goes out under her refreshed session');
 });
 
 test('runMutation rethrows a non-confirmable error', async t => {

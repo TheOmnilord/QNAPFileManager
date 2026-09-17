@@ -1440,6 +1440,64 @@ func permJobTitle(verb string, paths []string) string {
 	return fmt.Sprintf("%s: %d items", verb, len(paths))
 }
 
+// aclVerdictMovedNotice is what a permissions job is failed with when the ACL
+// facts moved between the confirmation and the dispatch (Astra r8 #4). It is
+// path-free like every published job error, and it says the one thing the user
+// can act on: the sentence they acknowledged is no longer the true one, so the
+// change has to be asked for again against the facts that hold now.
+const aclVerdictMovedNotice = "The ACL facts changed while this was waiting; nothing was changed. Confirm it again."
+
+// aclVerdictNow rebuilds the ACL verdict from the facts as they stand, over the
+// same roots and with the same crossing flag the challenge folded (Astra r8 #4).
+// The ladder it fills is a throwaway: at dispatch there is nobody left to show a
+// sentence to, and what is wanted is the descriptor alone.
+//
+// A chown's verdict is the zero one at submit and here both, because its ladder
+// never asks the mount table about an ACL — so the comparison below is a constant
+// true for chown and costs it no probe.
+func (s *Server) aclVerdictNow(pj permJob, targets []string) aclVerdict {
+	if pj.op != "chmod" {
+		return aclVerdict{}
+	}
+	var ladder permLadder
+	return s.chmodJobLadder(&ladder, targets, pj.cross && pj.recursive)
+}
+
+// recheckACLVerdict is the start-of-job half of the token's ACL binding (Astra
+// r8 #4).
+//
+// Round 6 bound the ACL verdict into the confirmation token and round 7 made it
+// a per-dataset digest, so a token minted on one set of facts cannot be redeemed
+// once they have moved. But a token binds SUBMISSION, and a job does not start
+// when it is submitted: with the four metadata slots occupied it sits in the
+// queue, and `zfs set aclmode=discard` between the 202 and the dispatch happens
+// entirely before the first mutation. The queued callback re-checked the GUARD
+// (W1) and nothing else, so the ACLs were destroyed without the destructive
+// sentence ever having been shown — the one outcome the whole ladder exists to
+// prevent, and the one that cannot be undone afterwards.
+//
+// So the verdict is rebuilt here, from the same fold over the same roots, and
+// compared with the descriptor the redeemed token carried. A difference is not an
+// error in the job: it is a confirmation that no longer covers what the change
+// would now do, which is `confirm_required` — the code the HTTP layer already
+// answers a stale token with, and the one jobFinishOutcome records as a DENIAL
+// rather than a fault. Nothing is dispatched, and the audit result line the
+// completion hook writes says so.
+//
+// The guard re-check stays: the two ask different questions, and a job held while
+// read-only was switched on must still be refused on those grounds first.
+func (s *Server) recheckACLVerdict(pj permJob, targets []string, redeemed string) error {
+	now := s.aclVerdictNow(pj, targets).part()
+	if now == redeemed {
+		return nil
+	}
+	// The descriptor is a grade, a flag and a digest — no path, no dataset name —
+	// but it is diagnostic rather than something a client needs, so it goes to the
+	// server log and the published sentence stays the plain one.
+	s.logger.Printf("job acl re-check refused: confirmed %s, at dispatch %s", redeemed, now)
+	return &jobError{code: "confirm_required", msg: aclVerdictMovedNotice, err: fsx.ErrConfirmRequired}
+}
+
 func (s *Server) submitPermJob(w http.ResponseWriter, r *http.Request, sess *session, paths []string, pj permJob) {
 	who := sess.who
 	guardOp := guard.OpChmod
@@ -1591,6 +1649,11 @@ func (s *Server) submitPermJob(w http.ResponseWriter, r *http.Request, sess *ses
 	if !s.authorizeGraded(w, r, sess, verdict, extra, m, "", parts, true, pj.confirm, summary, ladder.grade) {
 		return
 	}
+	// The descriptor the token was REDEEMED with, carried to the dispatch so the
+	// queued job can tell whether the facts it was confirmed on still hold (Astra
+	// r8 #4). It is the verdict built above, which is the one authorizeGraded has
+	// just accepted a token for.
+	redeemedACL := acl.part()
 	big := permMilestone(pj.op, ladder.discards, s.normalClass(allSpellings...), pj.recursive, scanned)
 	id, err := jobs.NewID()
 	if err != nil {
@@ -1629,6 +1692,13 @@ func (s *Server) submitPermJob(w http.ResponseWriter, r *http.Request, sess *ses
 	job, err := s.jobMgr.Submit(pj.kind, pj.title, meta, func(ctx context.Context, p *jobs.Progress) (any, error) {
 		// W1: the queue may have held this job while read-only was switched on.
 		if derr := s.recheckGuard(guardCheck{op: guardOp, paths: allSpellings}); derr != nil {
+			return nil, derr
+		}
+		// Astra r8 #4: it may equally have held it while the ACL facts moved, and
+		// the token bound those facts only as they were at SUBMISSION. A verdict
+		// that has changed since is a sentence the user never acknowledged, so the
+		// job ends here rather than one mutation later.
+		if derr := s.recheckACLVerdict(pj, targets, redeemedACL); derr != nil {
 			return nil, derr
 		}
 		res, err := s.jobRunner.Job(ctx, who, wproto.JobReq{JobID: id, Kind: pj.wireKind, Body: reqBody}, s.progressSink(roots, p), s.warnSink(roots, pj.op, id, p))

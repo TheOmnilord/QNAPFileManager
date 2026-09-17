@@ -1,7 +1,7 @@
 import {api} from './api.js';
 import {$,el,error,announce,openDialog,pathArgs,toast,applyWhy} from './dom.js';
 import {whyDisabled} from './why.js';
-import {state,sessionGuard,listingActions,sessionTransition,subscribe} from './state.js';
+import {state,sessionGuard,ownerGuard,listingActions,sessionTransition,subscribe} from './state.js';
 import {loadList,focused,selectedOne,selectionEntries,extraActions} from './list.js';
 import {loadTree} from './tree.js';
 import {trackJob,awaitJob,jobLive} from './jobs.js';
@@ -17,6 +17,38 @@ function post(endpoint,body) {
 // one is reported rather than asked about: two are answered and re-posted, and
 // a third means the verdict is not settling.
 export const CONFIRM_CHALLENGES=3;
+
+// NO_CHANGE_SUBMITTED is what the bound has to say for itself. Giving up is not
+// a failure of the change — it is the client refusing to keep re-posting one —
+// and the user must be told that nothing was sent, or the sentence that arrives
+// reads like a description of what just happened to their files.
+export const NO_CHANGE_SUBMITTED='No change was submitted.';
+
+// confirmBoundError is the error a bounded exchange ends on, and its wording is
+// the whole of Astra r8 #1.
+//
+// The server's `message` on a confirm_required is the GENERIC one —
+// "This change needs confirmation." (routes_mutate.go) — because the sentences
+// that actually say what is at stake live in confirm.summary.warnings, which is
+// where authorizeGraded puts the ACL's own words. Round 7 made the bound report
+// "the last sentence", but the last MESSAGE is that generic line, and
+// actionMessage has no entry for confirm_required, so it passed it straight
+// through: the third warning — the one that had just changed the verdict, and
+// the only reason this exchange is being abandoned — was never shown.
+//
+// So the error is built from the LATEST challenge's warnings, joined the way
+// every other dialog joins them, and the message falls back to the server's
+// prose only when a challenge carried no warnings at all. The code stays
+// `confirm_required` so callers can still classify it.
+export function confirmBoundError(pending) {
+ const warnings=(pending?.confirm?.summary?.warnings||[]).filter(Boolean).map(String);
+ const said=warnings.length ? warnings.join(' · ') : (pending?.message || 'This change needs confirmation.');
+ const err=new Error(`${said} ${NO_CHANGE_SUBMITTED}`);
+ err.code='confirm_required';
+ err.status=pending?.status;
+ err.confirm=pending?.confirm;
+ return err;
+}
 
 // runMutation posts body to endpoint and drives the server confirmation-token
 // flow. On a 409 confirm_required it calls ask(confirm,message); if that
@@ -40,8 +72,27 @@ export const CONFIRM_CHALLENGES=3;
 // cancelled dialog at any step ends it with no further POST, and the exchange is
 // bounded: a verdict that will not settle is reported in its own latest words
 // rather than asked about forever.
+//
+// The exchange also belongs to ONE PERSON, and it outlives a single request: a
+// challenge is a dialog, and the page can be taken over by another user while
+// that dialog is open or while the redemption is in flight. Only the first POST
+// was ever the initiating user's in that case — the second 409 opened a dialog
+// whose ticket was taken AFTER the switch, so the confirmation queue found it
+// self-consistently valid, showed the departed user's question to whoever was
+// now at the keyboard, and re-posted her operation with HIS CSRF credentials.
+// Reproduced as Alice, Alice, Bob (Astra r8 #2).
+//
+// So the owner is captured when the mutation starts and asked again before
+// every subsequent challenge is PRESENTED and again before it is REDEEMED. A
+// change of owner ends the exchange there: no dialog, no further POST, and null
+// — which is the answer every caller already handles as "nothing was done", and
+// which their own guards reach before anything is painted. It is ownerGuard,
+// not sessionGuard: a read-only toggle or the minute poll replaces the session
+// object without anybody leaving, and abandoning a half-confirmed change over
+// that would be its own kind of surprise.
 export async function runMutation(endpoint,body,ask) {
  let sent=body;
+ const mine=ownerGuard();
  for (let challenge=1;;challenge++) {
   let pending;
   try {
@@ -50,11 +101,18 @@ export async function runMutation(endpoint,body,ask) {
    if (err.code!=='confirm_required' || !err.confirm?.token) throw err;
    pending=err;
   }
+  // Somebody else's page now: this question is not theirs to answer and this
+  // token is not theirs to spend (Astra r8 #2).
+  if (!mine()) return null;
   // The bound, reached: the last sentence IS the answer, and it is the sentence
-  // the server sent last — never an older one, and never a generic one.
-  if (challenge>=CONFIRM_CHALLENGES) throw pending;
+  // the server sent last — never an older one, and never a generic one, which
+  // is what reading only `message` left it as (Astra r8 #1).
+  if (challenge>=CONFIRM_CHALLENGES) throw confirmBoundError(pending);
   const approved=await ask(pending.confirm,pending.message);
   if (!approved) return null;
+  // Asked and answered — but the dialog was open while the world could change,
+  // and an approval is only an approval from the person who is still here.
+  if (!mine()) return null;
   sent={...body,confirm:pending.confirm.token};
  }
 }

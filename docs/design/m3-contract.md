@@ -204,7 +204,12 @@ was issued on, not only by the clock. *Round 7 (#1, #2):* the part is a **digest
 (dataset → rung, sorted), not the deduplicated set of modes — with root `passthrough`, child A `discard`, child B
 `passthrough`, the set `discard+passthrough` did not change when B flipped, and the old token would have
 destroyed B's ACL without the warning naming B. And the client presents a *second* challenge in turn: a verdict
-that changes while the dialog is open (expiry, a background probe) is a new sentence to acknowledge, not an error.
+that changes while the dialog is open (expiry, a background probe) is a new sentence to acknowledge, not an error —
+bounded at three, the last sentence surfaced verbatim, and the exchange pinned to the owner who started it (round
+8 #1, #2). *Round 8 (#4):* the binding extends from submission to **dispatch**: a confirmed job that waited for a
+slot rebuilds its ACL verdict when it takes one and does not dispatch if the digest differs from the one redeemed
+— it fails as `confirm_required` ("the ACL facts changed while this was waiting; nothing was changed") and is
+audited as a denial.
 
 ## 8. Properties
 
@@ -493,10 +498,18 @@ in-app drag-and-drop and the trash janitor stay deferred.
     saw keeps the previous claims — the same person, the same walks, and nothing a different user could reach.
     A measurement's polling and completion follow the same epoch, so a same-user refresh mid-walk neither
     cancels nor orphans it.
-16. **What the token does not re-grade (Astra round 7).** A job already running is not re-graded when the ACL
-    facts change under it — the token bound its start, and a walk in progress is the kernel's. A size job whose
-    202 the page never received, or whose tab was closed, is reaped by the server's job lifetime, not by a dialog.
-    The pathname chown fallback where `/proc` is absent keeps the check/use window §2.3 already accepts.
+16. **What the token does not re-grade (Astra rounds 7–8).** A job already **running** is not re-graded when the
+    ACL facts change under it — a walk in progress is the kernel's. A job still **queued** is: the dispatch
+    callback rebuilds the ACL verdict when the job takes its slot and refuses to dispatch if the digest differs
+    from the one redeemed, failing the job with "confirm it again" (round 8 #4) — the token binds the start of the
+    walk, not the submission. The pathname chown fallback where `/proc` is absent keeps the check/use window §2.3
+    already accepts.
+17. **An orphaned size walk has no lifetime bound (Astra round 8 #5** — correcting what round 7 wrote**).** A
+    measurement whose 202 the page never received, or whose tab was closed before a cancel could be sent, runs to
+    completion, explicit cancellation, worker failure or shutdown, holding one of the four metadata slots while
+    it does; `jobs.Manager.Reap` keeps live jobs, `runJob` has no call timeout, and the size route's scan is
+    uncapped. A reader-idle reaper (cancel a job nobody has polled for N minutes) is the v1.1 answer; the dialogs'
+    cancel-on-close, the shared measurement and the retried claims are what bound it in v1.0.
 
 **To confirm on hardware first (both units):** that `zfs get -Hp -o value aclmode` is callable at all as root on
 hero and what it returns for an ordinary share — the entire L2 promotion hangs on it, and an empty answer means every

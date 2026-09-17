@@ -597,20 +597,43 @@ test('signing out drops the claim rather than carrying it (Astra r6 #1)', async 
 // props.js passes it is the whole of the fix, and a stub would not carry it.
 const hurried = (id, options) => awaitJob(id, {...options, delay: 1, tries: 400});
 
-// jobFetch answers the size POST once and then the single-job GET, with the
-// state `live` decides — so a test can hold a measurement open for as long as it
-// needs and let it finish on the next poll.
-const jobFetch = (t, live, id = 's1') => t.mock.method(globalThis, 'fetch', async url => {
- if (String(url).endsWith('api/jobs/size')) return new Response(JSON.stringify({job: {id, state: 'queued'}}), {status: 202});
- const job = live() ? {id, state: 'running'} : {id, state: 'done', result: {bytes: 2048, files: 3, dirs: 2}};
- return new Response(JSON.stringify({job}), {status: 200});
-});
+// heldJobFetch answers the size POST at once and hands every single-job GET back
+// to the test UNANSWERED, each with its own `reply`.
+//
+// The round-7 versions of these two tests let the mock answer immediately,
+// landed the session change in the gap between two polls, waited a fixed 20 ms
+// and read the outcome. That is not the scenario — r7 #3 is a change arriving
+// DURING a GET — and the switch test was not decisive either: it accepted the
+// wait ending however it ended, spending all 400 tries included, so both tests
+// still passed against a jobs.js that ignored the guard option entirely
+// (Astra r8 #3).
+//
+// Holding the GET open makes the boundary the test's to choose: the session
+// changes while the request is genuinely in flight, and what is asserted
+// afterwards is whether ANOTHER GET goes out — the one thing "still measuring"
+// and "gave up" actually differ by.
+function heldJobFetch(t, id = 's1') {
+ const gets = [];
+ t.mock.method(globalThis, 'fetch', async url => {
+  if (String(url).endsWith('api/jobs/size')) return new Response(JSON.stringify({job: {id, state: 'queued'}}), {status: 202});
+  return new Promise(resolve => gets.push({reply: job => resolve(new Response(JSON.stringify({job}), {status: 200}))}));
+ });
+ return gets;
+}
+// turn yields to the event loop, and to the 1 ms sleeps inside the hurried poll,
+// without asserting anything about how long anything takes.
+const turn = (ms = 2) => new Promise(resolve => setTimeout(resolve, ms));
+// untilGets waits for the Nth poll to be ISSUED, and says what is missing rather
+// than hanging until the runner's timeout.
+async function untilGets(gets, n, what) {
+ for (let i = 0; i < 60 && gets.length < n; i++) await turn();
+ assert.equal(gets.length, n, what);
+}
 
 test('a same-user refresh during the poll neither cancels the walk nor loses its answer (Astra r7 #3)', async t => {
  resetSizeJobs();
  const cancelled = [], reports = [];
- let walking = true;
- jobFetch(t, () => walking);
+ const gets = heldJobFetch(t);
  update({session: {user: 'alice', uid: 1000, readOnly: false}});
  const runner = createSizeRunner({
   report: r => reports.push(r), track: () => {},
@@ -618,13 +641,14 @@ test('a same-user refresh during the poll neither cancels the walk nor loses its
   poll: hurried,
  });
  const measuring = runner.start([dir('/share/CACHEDEV1_DATA/_IMAGES')]);
- await new Promise(resolve => setTimeout(resolve, 20));            // several polls in
- update({session: {user: 'alice', uid: 1000, readOnly: true}});    // the toggle, in another tab
- await new Promise(resolve => setTimeout(resolve, 20));
+ await untilGets(gets, 1, 'the first poll is on the wire');
+ update({session: {user: 'alice', uid: 1000, readOnly: true}});    // the toggle, in another tab, while it is
+ gets[0].reply({id: 's1', state: 'running'});                      // and the du is still walking
+ await untilGets(gets, 2, 'the wait polls again rather than giving up on her');
  assert.deepEqual(cancelled, [], 'a refresh is not a reason to stop measuring');
  assert.equal(runner.jobId, 's1', 'and the walk is still hers to stop');
  assert.equal(reports.at(-1).state, 'running', 'the dialog is still honestly measuring');
- walking = false;                                                  // the du finishes
+ gets[1].reply({id: 's1', state: 'done', result: {bytes: 2048, files: 3, dirs: 2}});   // the du finishes
  const job = await measuring;
  assert.equal(job?.state, 'done');
  assert.equal(reports.at(-1).state, 'done', 'and the answer really arrives');
@@ -637,10 +661,14 @@ test('a same-user refresh during the poll neither cancels the walk nor loses its
 // nothing is cancelled either, because the walk is Alice's and this page now
 // holds Bob's credentials (Astra r5 #6). The measurement is dropped from the
 // shared cache rather than left as an answer Bob could attach to.
+//
+// Both halves are asserted here, in the order they happen: the refresh must not
+// end the wait, and the switch must end it AT ONCE — not eventually, and not by
+// running out of tries. Counting the polls is what tells those apart.
 test('a user switch during the poll abandons the measurement and reports nothing (Astra r7 #3)', async t => {
  resetSizeJobs();
  const cancelled = [], reports = [];
- jobFetch(t, () => true);                                          // the du never finishes
+ const gets = heldJobFetch(t);
  update({session: {user: 'alice', uid: 1000}});
  const runner = createSizeRunner({
   report: r => reports.push(r), track: () => {},
@@ -648,10 +676,16 @@ test('a user switch during the poll abandons the measurement and reports nothing
   poll: hurried,
  });
  const measuring = runner.start([dir('/share/CACHEDEV1_DATA/_IMAGES')]);
- await new Promise(resolve => setTimeout(resolve, 20));
- update({session: {user: 'administrator', uid: 0}});               // Bob takes the page over
+ await untilGets(gets, 1, 'the first poll is on the wire');
+ update({session: {user: 'alice', uid: 1000, readOnly: true}});    // a refresh first: her walk survives it
+ gets[0].reply({id: 's1', state: 'running'});
+ await untilGets(gets, 2, 'as it must');
+ update({session: {user: 'administrator', uid: 0}});               // Bob takes the page over, mid-GET
+ gets[1].reply({id: 's1', state: 'running'});                      // Alice's answer, arriving at Bob's page
  assert.equal(await measuring, null, 'the wait is given up');
- assert.equal(reports.at(-1).state, 'running', 'and nothing is reported into Bob’s page');
+ await turn(10);                                                   // ten times the poll's own sleep
+ assert.equal(gets.length, 2, 'and NOT ONE further poll goes out for a page that is no longer hers');
+ assert.equal(reports.at(-1).state, 'running', 'nothing is reported into Bob’s page');
  assert.equal(runner.jobId, null, 'Alice’s walk is not Bob’s to name');
  assert.deepEqual(cancelled, [], 'nor to cancel with Bob’s credentials (Astra r5 #6)');
 });

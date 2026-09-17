@@ -197,9 +197,12 @@ func (s *Server) EnableBreakGlass(configPath string) {
 	local := &bgLocalAddrs{}
 	// Read once before anything serves (Astra r8 #1). A door that armed with an
 	// unreadable interface list would treat its own LAN address as somebody else's
-	// until the first refresh, which is precisely the window a relay needs.
-	if err := local.prime(time.Now()); err != nil {
-		s.logger.Printf("break-glass: this machine's own addresses could not be read at start-up (%v); the door refuses loopback and re-reads them within the minute", err)
+	// until the first refresh, which is precisely the window a relay needs — and
+	// now refuses every login it cannot place instead (Astra r9 #1), which an
+	// operator must find in the log rather than infer from a door that will not
+	// open.
+	if note := local.prime(time.Now()); note != "" {
+		s.logger.Printf("%s", note)
 	}
 	s.bg = &breakGlassDoor{
 		srv:      s,
@@ -612,15 +615,42 @@ func canonicalHost(host string) string {
 const bgPeerMismatch = "session_peer_mismatch"
 
 // bgLocalPeerRefresh is how long the set of this machine's own addresses is
-// trusted before it is read again. An address is added to a NAS by DHCP, by an
-// IPv6 advertisement or by an operator's own hand, and none of those restart the
-// daemon; a minute is short enough that a new address is covered before anyone
-// could have built a relay onto it, and long enough that the enumeration is not
-// a per-request cost.
+// trusted by a request that is merely REDEEMING a session. An address is added
+// to a NAS by DHCP, by an IPv6 advertisement or by an operator's own hand, and
+// none of those restart the daemon; a minute is short enough that a new address
+// is covered before anyone could have built a relay onto it, and long enough
+// that the enumeration is not a per-request cost.
+//
+// A LOGIN does not use this window at all (Astra r9 #4): locality is established
+// at the moment a session is issued, by a discovery made then. See bgLocalFresh.
 const bgLocalPeerRefresh = time.Minute
 
+// bgLocalFresh is the shortest interval between two enumerations on the login
+// path (Astra r9 #4).
+//
+// The minute above was a relay window. An address that arrives after a refresh —
+// DHCP, IPv6 autoconfiguration, an operator adding one — is treated as somebody
+// else's for the rest of that minute, and a relay already listening on it carries
+// the operator's login through: automation needs seconds, not a minute. So a
+// login from a peer the cached set does not know is answered from a FRESH read,
+// and the cost of that is bounded by this interval rather than by the request
+// rate: a flood of logins from one address buys one enumeration a second, and a
+// second is far less than the time it takes to notice an address and connect.
+const bgLocalFresh = time.Second
+
+// bgLocalUnverifiable is how long the set may go without a SUCCESSFUL discovery
+// before the door stops believing it (Astra r9 #1).
+//
+// Keeping the last good answer through a failed refresh is right for a blip and
+// wrong for an outage: the set was not merely old, it was never checked against a
+// machine that has since been given addresses, and a relay built on one of those
+// is exactly what the rule exists to refuse. Five refreshes is long enough that
+// no ordinary hiccup reaches it and short enough that nobody can plan around it.
+const bgLocalUnverifiable = 5 * bgLocalPeerRefresh
+
 // bgLocalAddrs is the set of addresses THIS MACHINE answers on, cached behind a
-// short TTL (Astra r8 #1).
+// short TTL (Astra r8 #1), with the time of the last SUCCESSFUL read kept apart
+// from the time of the last attempt (Astra r9 #1).
 //
 // lookup is the seam: production reads the interfaces, and a test says what the
 // machine's addresses are without having any. It is held under the same mutex as
@@ -629,102 +659,265 @@ const bgLocalPeerRefresh = time.Minute
 type bgLocalAddrs struct {
 	mu     sync.Mutex
 	lookup func() ([]string, error)
-	set    map[string]struct{}
-	read   time.Time
-	have   bool
+	// set is keyed the way a peer is: a plain canonical IP, except for a
+	// link-local address whose interface is known, which carries its zone
+	// (Astra r9 #5).
+	set map[string]struct{}
+	// link is the zoneless form of every link-local address in the set, whatever
+	// zone it was found on. It answers the one question set cannot: a peer whose
+	// link-local address the socket reported WITHOUT a zone, which no single
+	// zoned key can be compared against.
+	link map[string]struct{}
+	// tried is when a lookup was last attempted; ok is when one last succeeded.
+	// They are different times and the difference is the whole of r9 #1: a set
+	// that has only been ATTEMPTED since the last success is a set nobody has
+	// checked against this machine.
+	tried time.Time
+	ok    time.Time
+	have  bool
+	// failing is the last attempt's error text, or "" when it succeeded; logged
+	// is the last one written to the log, so a lookup that goes on failing the
+	// same way costs one line rather than one a minute for as long as it lasts.
+	failing string
+	logged  string
 }
 
-// setLookup installs the seam and drops whatever was cached, so the next lookup
-// is the test's own answer rather than the machine's.
+// setLookup installs the seam and drops everything cached with it, including the
+// timestamps: a test's clock is not the arm-time clock, and a stamp from one
+// compared against the other is a comparison between two unrelated numbers.
 func (a *bgLocalAddrs) setLookup(fn func() ([]string, error)) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.lookup, a.set, a.have = fn, nil, false
+	a.lookup, a.set, a.link, a.have = fn, nil, nil, false
+	a.tried, a.ok = time.Time{}, time.Time{}
+	a.failing, a.logged = "", ""
 }
 
-// has reports whether ip — already canonical, as bgPeer's addresses are — is one
-// of this machine's own, refreshing the set when it has aged out.
-func (a *bgLocalAddrs) has(ip string, now time.Time) bool {
+// check answers both questions the door has about a peer: whether this address is
+// one of THIS MACHINE's, and whether the set that answer came from is believable
+// at all (Astra r9 #1). note is a line for the log, written once per distinct
+// reason, and empty when there is nothing new to say.
+//
+// atIssue marks the login path, which is held to the stricter rule (Astra r9 #4):
+// a peer the cached set does not know is looked up again, at most once per
+// bgLocalFresh, and an attempt that FAILS makes the answer unverifiable even
+// though the cache is warm — locality has to be established when the session is
+// issued, and "it was not one of ours a minute ago" is not that.
+//
+// The enumeration runs under this mutex, which is what makes the interval a real
+// bound rather than a hope: a hundred simultaneous logins take it in turn and all
+// but the first find the read already done. They are logins at an emergency door,
+// bounded to ten a minute per source before they reach this point.
+func (a *bgLocalAddrs) check(p bgPeerAddr, now time.Time, atIssue bool) (local, known bool, note string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	// A clock that went backwards (a test's, or an NTP step) refreshes rather
 	// than pinning the set until it catches up.
-	if !a.have || now.Sub(a.read) >= bgLocalPeerRefresh || now.Before(a.read) {
-		a.refreshLocked(now)
+	if !a.have || now.Sub(a.tried) >= bgLocalPeerRefresh || now.Before(a.tried) {
+		note = a.refreshLocked(now)
 	}
-	_, ok := a.set[ip]
+	local = a.hasLocked(p)
+	if atIssue && !local && (now.Sub(a.tried) >= bgLocalFresh || now.Before(a.tried)) {
+		if fresh := a.refreshLocked(now); fresh != "" {
+			note = fresh
+		}
+		local = a.hasLocked(p)
+	}
+	return local, a.knownLocked(now, atIssue), note
+}
+
+// hasLocked is the comparison itself, and the zone is the whole of it (Astra r9
+// #5). fe80::55 on the NAS's eth1 and fe80::55 on an operator's laptop, reached
+// over eth0, are two different hosts that share an address — the zone is what
+// says which — so a link-local peer is compared zone and all.
+//
+// Either side may be missing its zone, and a missing zone is not a mismatch: it
+// is an unknown, and an unknown here fails CLOSED. A link-local peer the socket
+// reported without a zone matches any interface's copy of that address, and a set
+// entry found without one matches a peer on any zone.
+func (a *bgLocalAddrs) hasLocked(p bgPeerAddr) bool {
+	if _, ok := a.set[p.key()]; ok {
+		return true
+	}
+	if p.ip == nil || !bgZoned(p.ip) {
+		return false
+	}
+	base := p.ip.String()
+	if p.zone == "" {
+		_, ok := a.link[base]
+		return ok
+	}
+	_, ok := a.set[base]
 	return ok
 }
 
-// refreshLocked re-reads the interfaces. A failure KEEPS the previous answer and
-// does not retry until the next TTL: the alternative — an empty set — would open
-// the relay this whole rule closes, at the exact moment the machine is unwell,
-// which is when the emergency door is used at all. The first read is primed at
-// arm time and logged if it fails, so an operator is told rather than left to
-// infer it.
-func (a *bgLocalAddrs) refreshLocked(now time.Time) error {
+// knownLocked reports whether the cached answer may be acted on. A set that has
+// never been read, one whose last success is older than bgLocalUnverifiable, and
+// — on the login path only — one whose last attempt failed are all the same
+// verdict: this door cannot say where the peer is, so it says nothing and refuses.
+func (a *bgLocalAddrs) knownLocked(now time.Time, atIssue bool) bool {
+	if !a.have {
+		return false
+	}
+	if atIssue && a.failing != "" {
+		return false
+	}
+	if now.Before(a.ok) {
+		// A clock that stepped backwards is not an outage; the set is as good as
+		// it was a moment ago and the next tick will re-read it anyway.
+		return true
+	}
+	return now.Sub(a.ok) < bgLocalUnverifiable
+}
+
+// refreshLocked re-reads the interfaces. A failure KEEPS the previous answer —
+// an empty set would open the relay this whole rule closes, at the exact moment
+// the machine is unwell, which is when the emergency door is used at all — but it
+// no longer keeps it FOREVER (Astra r9 #1): the success time is left where it
+// was, so a set nobody has been able to check for five refreshes stops counting
+// as an answer, and every tick and every login attempt tries again.
+func (a *bgLocalAddrs) refreshLocked(now time.Time) string {
 	lookup := a.lookup
 	if lookup == nil {
 		lookup = bgInterfaceAddrs
 	}
 	addrs, err := lookup()
-	a.read = now
+	a.tried = now
 	if err != nil {
-		return err
+		a.failing = err.Error()
+		if a.logged == a.failing {
+			return ""
+		}
+		a.logged = a.failing
+		return fmt.Sprintf("break-glass: this machine's own addresses could not be read (%v); until they can be, the door refuses every login it cannot place", err)
 	}
 	set := make(map[string]struct{}, len(addrs)+2)
+	link := make(map[string]struct{}, len(addrs))
 	for _, addr := range addrs {
-		if canon := bgCanonicalIP(addr); canon != "" {
-			set[canon] = struct{}{}
+		key, base := bgLocalKey(addr)
+		if key == "" {
+			continue
+		}
+		set[key] = struct{}{}
+		if base != "" {
+			link[base] = struct{}{}
 		}
 	}
 	// Loopback is always in the set, whatever the interfaces say: the rule's
 	// oldest case must not depend on an enumeration that can fail.
 	set["127.0.0.1"] = struct{}{}
 	set["::1"] = struct{}{}
-	a.set, a.have = set, true
-	return nil
+	a.set, a.link, a.have, a.ok = set, link, true, now
+	if a.failing == "" {
+		return ""
+	}
+	a.failing, a.logged = "", ""
+	return "break-glass: this machine's own addresses can be read again; logins are judged on the real set once more"
 }
 
 // prime reads the set once, at arm time, so the door is never serving with an
-// empty one.
-func (a *bgLocalAddrs) prime(now time.Time) error {
+// empty one. It returns the line the failure owes the log, if it failed.
+func (a *bgLocalAddrs) prime(now time.Time) string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.refreshLocked(now)
 }
 
 // bgInterfaceAddrs is the production lookup: every address assigned to every
-// interface, as a canonical IP string with the prefix length and the zone
-// dropped.
+// interface, as a canonical IP string with the prefix length dropped — and, for a
+// link-local address, with the INTERFACE'S NAME kept as the zone (Astra r9 #5),
+// because that is the only thing that distinguishes the NAS's own fe80::55 from
+// the operator's.
+//
+// It is read per interface rather than through net.InterfaceAddrs, which does not
+// say which interface an address belongs to. An error anywhere is the whole
+// lookup's error: a partial enumeration is a set with addresses missing from it,
+// and a missing address is one this door would hand a session to.
 func bgInterfaceAddrs() ([]string, error) {
-	addrs, err := net.InterfaceAddrs()
+	ifaces, err := net.Interfaces()
 	if err != nil {
 		return nil, err
 	}
-	out := make([]string, 0, len(addrs))
-	for _, addr := range addrs {
-		switch v := addr.(type) {
-		case *net.IPNet:
-			out = append(out, v.IP.String())
-		case *net.IPAddr:
-			out = append(out, v.IP.String())
+	var out []string
+	for _, iface := range ifaces {
+		addrs, err := iface.Addrs()
+		if err != nil {
+			return nil, fmt.Errorf("interface %s: %w", iface.Name, err)
+		}
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			default:
+				continue
+			}
+			if ip == nil {
+				continue
+			}
+			if bgZoned(ip) && iface.Name != "" {
+				out = append(out, ip.String()+"%"+iface.Name)
+				continue
+			}
+			out = append(out, ip.String())
 		}
 	}
 	return out, nil
 }
 
-// bgCanonicalIP puts one address into the form bgPeer produces, or returns ""
-// when it is not an address at all. The zone is cut off exactly as canonicalHost
-// cuts it: "fe80::1%eth0" is the same host as "fe80::1", and net.ParseIP does not
-// take the suffix.
-func bgCanonicalIP(s string) string {
-	addr, _, _ := strings.Cut(s, "%")
+// bgLocalKey puts one discovered address into the form the set is keyed in, and
+// returns the zoneless form alongside it when the address is link-local. key is
+// "" when the string is not an address at all.
+func bgLocalKey(s string) (key, base string) {
+	addr, zone, _ := strings.Cut(s, "%")
 	ip := net.ParseIP(addr)
 	if ip == nil {
+		return "", ""
+	}
+	if !bgZoned(ip) {
+		return ip.String(), ""
+	}
+	base = ip.String()
+	if zone == "" {
+		return base, base
+	}
+	return base + "%" + zone, base
+}
+
+// bgZoned reports whether an address is one whose zone carries meaning: an IPv6
+// link-local address is only an address together with the interface it is on.
+// Everything else — including IPv4's own 169.254/16, which has no zones — is
+// compared zonelessly, exactly as it always was.
+func bgZoned(ip net.IP) bool {
+	return ip.To4() == nil && (ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast())
+}
+
+// bgPeerAddr is one peer's address as the socket reported it: the IP, and the
+// zone if it named one.
+type bgPeerAddr struct {
+	ip   net.IP
+	zone string
+}
+
+// key is the form this peer would be found under in the set.
+func (p bgPeerAddr) key() string {
+	if p.ip == nil {
 		return ""
 	}
-	return ip.String()
+	if p.zone == "" || !bgZoned(p.ip) {
+		return p.ip.String()
+	}
+	return p.ip.String() + "%" + p.zone
+}
+
+// bgParsePeer reads the peer's address off the request. net.SplitHostPort leaves
+// the zone on the host — "[fe80::55%eth0]:40000" yields "fe80::55%eth0" — and the
+// zone is kept, because for a link-local address it is half the address.
+func bgParsePeer(r *http.Request) bgPeerAddr {
+	addr, zone, _ := strings.Cut(peerHost(r), "%")
+	return bgPeerAddr{ip: net.ParseIP(addr), zone: zone}
 }
 
 // localPeer reports whether the request came from this machine (Astra r7 #6,
@@ -747,16 +940,37 @@ func bgCanonicalIP(s string) string {
 // So the emergency door is a LAN door: the operator is at another machine,
 // because the reason they are using it is that the NAS is not well. Refusing the
 // machine's own addresses costs that operator nothing and takes the relay away.
-func (d *breakGlassDoor) localPeer(r *http.Request) bool {
-	// The zone is cut off before the comparison, on both sides: "fe80::1%eth0" is
-	// this machine if "fe80::1" is, and a peer that named a zone must not slip
-	// past the set because of it.
-	addr, _, _ := strings.Cut(peerHost(r), "%")
-	ip := net.ParseIP(addr)
-	if ip == nil {
-		return false
+//
+// The verdict has THREE values, not two (Astra r9 #1). "I do not know where this
+// peer is" is a real answer and it used to be spelled "somewhere else": a
+// discovery that had never succeeded left the set empty, and an empty set said
+// every address on the LAN — including the NAS's own — belonged to somebody else.
+// The door now refuses what it cannot place.
+type bgLocality uint8
+
+const (
+	// bgPeerElsewhere: another machine. The operator, as far as this door knows.
+	bgPeerElsewhere bgLocality = iota
+	// bgPeerThisMachine: an address this NAS answers on, so a relay.
+	bgPeerThisMachine
+	// bgPeerUnverifiable: the set could not be read, or has not been read in long
+	// enough that it no longer describes this machine.
+	bgPeerUnverifiable
+)
+
+// peerLocality places the request's peer. atIssue marks the login path, which
+// establishes locality with a fresh read rather than trusting the cached minute
+// (Astra r9 #4); redemption keeps using the cache, because a replay needs a
+// session that was issued through the relay and the fresh read at login is what
+// stops one ever being.
+func (d *breakGlassDoor) peerLocality(r *http.Request, atIssue bool) bgLocality {
+	peer := bgParsePeer(r)
+	if peer.ip == nil {
+		// A peer whose address does not parse cannot be compared to the set at
+		// all, so it is the unknown, not the operator.
+		return bgPeerUnverifiable
 	}
-	if ip.IsLoopback() {
+	if peer.ip.IsLoopback() {
 		// Under `serve -dev` the listener is FORCED to loopback
 		// (forceLoopbackBreakGlass), so the production rule would refuse every
 		// login a developer can make — the door would be untestable by hand on the
@@ -764,12 +978,30 @@ func (d *breakGlassDoor) localPeer(r *http.Request) bool {
 		// relaxation is loopback's alone, and only there: a dev daemon's own LAN
 		// addresses are refused exactly as production refuses them, so the rule
 		// under test is still the rule.
-		return !d.dev
+		//
+		// It is decided BEFORE the set is consulted, which is what keeps the dev
+		// door usable when discovery is failing too (Astra r9 #1): the dev
+		// listener is bound to loopback and nothing else, so there is no set to
+		// consult for the only peer it can ever have.
+		if d.dev {
+			return bgPeerElsewhere
+		}
+		return bgPeerThisMachine
 	}
 	if d.local == nil {
-		return false
+		return bgPeerUnverifiable
 	}
-	return d.local.has(ip.String(), d.now())
+	local, known, note := d.local.check(peer, d.now(), atIssue)
+	if note != "" {
+		d.logf("%s", note)
+	}
+	switch {
+	case local:
+		return bgPeerThisMachine
+	case !known:
+		return bgPeerUnverifiable
+	}
+	return bgPeerElsewhere
 }
 
 // resolve maps the cookie to a live session, applying the peer pin, the idle
@@ -818,7 +1050,12 @@ func (d *breakGlassDoor) resolve(w http.ResponseWriter, r *http.Request) (*sessi
 	// being presented from the NAS itself — but it is written as its own condition
 	// rather than left to the comparison, because the rule is about the relay, not
 	// about which address happens to be stored.
-	if d.localPeer(r) || bgPeer(r) != sess.peer {
+	//
+	// A peer this door cannot PLACE is a mismatch too (Astra r9 #1): with no
+	// believable set of the machine's own addresses there is no way to tell the
+	// operator's laptop from a forwarder running on the NAS, and the safe reading
+	// of an unknown is the one that hands nothing over.
+	if d.peerLocality(r, false) != bgPeerElsewhere || bgPeer(r) != sess.peer {
 		d.mu.Unlock()
 		d.notePeerMismatch(r)
 		// Counted and audited HERE, so the caller does not do it again in the
@@ -1012,8 +1249,19 @@ func (d *breakGlassDoor) login(w http.ResponseWriter, r *http.Request) {
 	// wrong password, whose body IS read, did not. The bodies matched, the floor
 	// matched, and the connection header told a prober which of the two answers
 	// they had just been given. Same path, same headers, same socket.
-	if d.localPeer(r) {
+	//
+	// The locality is established HERE, at issue time, from a discovery made now
+	// rather than from the cached minute (Astra r9 #4) — and when that discovery
+	// cannot be made the login is refused in exactly the same words (Astra r9 #1).
+	// A door that cannot say whether the peer is one of its own addresses must not
+	// issue a root session to it, and the operator is told which it was through the
+	// audit line, which is the one place the two are distinguishable.
+	switch d.peerLocality(r, true) {
+	case bgPeerThisMachine:
 		d.fail(ctx, w, r, start, ip, "peer is this machine", nil)
+		return
+	case bgPeerUnverifiable:
+		d.fail(ctx, w, r, start, ip, "local addresses unknown", nil)
 		return
 	}
 	var req bgLoginBodyJSON
@@ -1192,7 +1440,7 @@ func (d *breakGlassDoor) logout(w http.ResponseWriter, r *http.Request) {
 	// goes through the same bounded mismatch path as every other replay, and the
 	// session SURVIVES: signing the operator out is precisely what a replayed
 	// logout is for.
-	if sess != nil && (d.localPeer(r) || bgPeer(r) != sess.peer) {
+	if sess != nil && (d.peerLocality(r, false) != bgPeerElsewhere || bgPeer(r) != sess.peer) {
 		d.mu.Unlock()
 		d.notePeerMismatch(r)
 		writeError(w, statusCode("permission"), "permission", "The request could not be verified. Refresh and try again.", "", r.URL.Path, "")
@@ -1384,6 +1632,12 @@ const (
 	// refusalSessionless: an unsafe request to a mutation route arrived with no
 	// session at all.
 	refusalSessionless
+	// refusalMismatch: a LIVE session's cookie was presented from an address the
+	// session was not issued to (Astra r9 #6). It is written in the sessionless
+	// shape — the sender proved nothing — but it is not the same event, and the
+	// difference is the only one QuLog is shown: an ordinary sessionless denial is
+	// Quiet, a replayed root cookie is not.
+	refusalMismatch
 	// refusalShapes is how many there are, so the overflow counters above can be
 	// keyed by shape.
 	refusalShapes
@@ -1403,11 +1657,23 @@ type refusalEvent struct {
 // reports about a burst rather than a report of one particular refusal, so
 // neither carries the individual refusal's code.
 func (s refusalShape) summary() refusalEvent {
-	if s == refusalSessionless {
+	switch s {
+	case refusalSessionless:
 		return refusalEvent{shape: refusalSessionless, code: "unauthorized"}
+	case refusalMismatch:
+		// The one aggregate that keeps its refusal's own code (Astra r9 #6): the
+		// code is what makes the line audible in QuLog, and a summary of five
+		// replays is at least as worth hearing as the first one.
+		return refusalEvent{shape: refusalMismatch, code: bgPeerMismatch}
 	}
 	return refusalEvent{shape: refusalLogin, op: "breakglass-login", code: "rate_limited"}
 }
+
+// sessionless reports whether this shape is recorded in the actor-less line.
+// Everything but a refused login at the door is: nobody authenticated for any of
+// them, and naming the break-glass account would describe the operator as having
+// done it.
+func (s refusalShape) sessionless() bool { return s != refusalLogin }
 
 // writeRefusal writes one line in its event's own shape — the single place that
 // knows how each shape is recorded, so a new caller cannot reach for d.audit and
@@ -1426,7 +1692,7 @@ func (s refusalShape) summary() refusalEvent {
 // same number. So a caller restores only when inFlight is false, which is the
 // one case where nothing was written and nothing will be.
 func (d *breakGlassDoor) writeRefusal(r *http.Request, ev refusalEvent, detail string) (inFlight bool, err error) {
-	if ev.shape == refusalSessionless {
+	if ev.shape.sessionless() {
 		// The sessionless line names no actor: the listener's door and the path
 		// are the whole of what is known, and the request is where both come
 		// from — so a sessionless line with no request to read is dropped rather
@@ -1463,7 +1729,7 @@ func (d *breakGlassDoor) queuePrunedRefusal(p prunedWindow, detail string) bool 
 	if d.srv == nil || d.srv.auditor == nil {
 		return false
 	}
-	if p.ev.shape == refusalSessionless {
+	if p.ev.shape.sessionless() {
 		// No path. The window counted refusals across whatever routes the source
 		// tried, so any single route would be a guess, and the one route this
 		// summary certainly has nothing to do with is the one the triggering
@@ -1587,6 +1853,11 @@ func (s *Server) auditSessionlessRefusal(r *http.Request, code, detail string) (
 }
 
 type refusalState struct {
+	// ip is the address this window is ABOUT, which is not always the key it is
+	// filed under (Astra r9 #6): a mismatch is tracked separately from the same
+	// source's ordinary refusals, and every line the window writes has to name the
+	// address rather than the key.
+	ip         string
 	opened     time.Time
 	suppressed int
 	// claimed is how many suppressed refusals have been taken out of the count
@@ -1619,8 +1890,13 @@ type refusalState struct {
 // noteRefusal writes at most one audit line per source per refusalWindow and
 // counts the rest, in the door's own event shape.
 func (d *breakGlassDoor) noteRefusal(r *http.Request, ip, op, code, detail string) {
-	d.noteRefusalEvent(r, ip, detail, refusalEvent{shape: refusalLogin, op: op, code: code})
+	d.noteRefusalEvent(r, ip, ip, detail, refusalEvent{shape: refusalLogin, op: op, code: code})
 }
+
+// bgMismatchKey is the throttle key a peer mismatch from this source is counted
+// under (Astra r9 #6). The NUL is what makes it a key no peerHost can spell, so
+// the two windows can never collide however the address is written.
+func bgMismatchKey(ip string) string { return ip + "\x00mismatch" }
 
 // noteUnauthenticated is the same throttle over a SESSIONLESS denial (Astra r1
 // #3). It cannot reuse d.audit: that event names the break-glass account as a
@@ -1632,7 +1908,7 @@ func (d *breakGlassDoor) noteUnauthenticated(r *http.Request) {
 		return
 	}
 	ip := peerHost(r)
-	d.noteRefusalEvent(r, ip, "no valid session on a mutation route", refusalEvent{shape: refusalSessionless, code: "unauthorized"})
+	d.noteRefusalEvent(r, ip, ip, "no valid session on a mutation route", refusalEvent{shape: refusalSessionless, code: "unauthorized"})
 }
 
 // notePeerMismatch records a live session cookie presented from an address the
@@ -1652,12 +1928,24 @@ func (d *breakGlassDoor) noteUnauthenticated(r *http.Request) {
 // and every other refusal are: the canonical form is what the PIN compares, and
 // a second keying convention in the same table would be one more thing to get
 // wrong for a distinction no real peer can make (one connection, one spelling).
+//
+// But it is keyed on that source's OWN window, not on the one its other refusals
+// share (Astra r9 #6). Round 8 made this the one sessionless line QuLog hears,
+// and the shared window could swallow it whole: a cookie-less POST from B opens
+// B's window, the replay that follows a moment later is suppressed into the
+// generic count, and the summary that eventually reports the burst says
+// "unauthorized" and is Quiet — so neither the file nor QuLog names the replay,
+// and producing that cookie-less POST first is free for anyone on the LAN. A
+// separate key gives the mismatch its own window, its own line and its own
+// summary, and the mirror stays bounded at one per source per window because the
+// window is still one per source.
 func (d *breakGlassDoor) notePeerMismatch(r *http.Request) {
 	if d == nil || d.srv == nil {
 		return
 	}
-	d.noteRefusalEvent(r, peerHost(r), "an emergency session cookie was presented from another address",
-		refusalEvent{shape: refusalSessionless, code: bgPeerMismatch})
+	ip := peerHost(r)
+	d.noteRefusalEvent(r, bgMismatchKey(ip), ip, "an emergency session cookie was presented from another address",
+		refusalEvent{shape: refusalMismatch, code: bgPeerMismatch})
 }
 
 // noteRefusalEvent is the throttle itself: at most one line per source per
@@ -1667,13 +1955,18 @@ func (d *breakGlassDoor) notePeerMismatch(r *http.Request) {
 // SHAPE as well as its vocabulary — a login refusal and a sessionless mutation
 // denial are different events and must not be made to look alike, on the
 // per-source line or on either of the aggregates (Astra r2 #6).
-func (d *breakGlassDoor) noteRefusalEvent(r *http.Request, ip, detail string, ev refusalEvent) {
+// key is the window this refusal is counted in and ip is the address it is
+// about; they are the same string for everything except a peer mismatch, which
+// has a window of its own so that a generic refusal can never hide one (Astra r9
+// #6). The table's bound is unchanged — it is a bound on ENTRIES, and a source
+// that produces both kinds holds two.
+func (d *breakGlassDoor) noteRefusalEvent(r *http.Request, key, ip, detail string, ev refusalEvent) {
 	now := d.now()
 	d.mu.Lock()
 	if d.refusals == nil {
 		d.refusals = make(map[string]*refusalState, breakglass.MaxSources)
 	}
-	state := d.refusals[ip]
+	state := d.refusals[key]
 	if state != nil && now.Sub(state.opened) < refusalWindow {
 		state.suppressed++
 		// One sessionless denial anywhere in the window fixes the summary's
@@ -1691,8 +1984,8 @@ func (d *breakGlassDoor) noteRefusalEvent(r *http.Request, ip, detail string, ev
 	// sweep drops with a count still on it is summarised first (Astra r6 #4), and
 	// those lines are written after the lock is released, like every other one.
 	var pruned []prunedWindow
-	for key, old := range d.refusals {
-		if key == ip {
+	for other, old := range d.refusals {
+		if other == key {
 			continue
 		}
 		age := now.Sub(old.opened)
@@ -1712,7 +2005,7 @@ func (d *breakGlassDoor) noteRefusalEvent(r *http.Request, ip, detail string, ev
 			continue
 		}
 		if old.suppressed == 0 {
-			delete(d.refusals, key)
+			delete(d.refusals, other)
 			continue
 		}
 		if age >= 2*refusalWindow {
@@ -1724,8 +2017,8 @@ func (d *breakGlassDoor) noteRefusalEvent(r *http.Request, ip, detail string, ev
 			// aggregate accounting is only complete if every counted refusal is
 			// reported by someone, and for an abandoned window this is the last
 			// moment anyone can.
-			pruned = append(pruned, prunedWindow{ip: key, count: old.suppressed, ev: old.shape.summary()})
-			delete(d.refusals, key)
+			pruned = append(pruned, prunedWindow{ip: old.ip, count: old.suppressed, ev: old.shape.summary()})
+			delete(d.refusals, other)
 		}
 	}
 	if state == nil && len(d.refusals) >= breakglass.MaxSources {
@@ -1775,8 +2068,8 @@ func (d *breakGlassDoor) noteRefusalEvent(r *http.Request, ip, detail string, ev
 	}
 	carried, previous := 0, ev.shape
 	if state == nil {
-		state = &refusalState{}
-		d.refusals[ip] = state
+		state = &refusalState{ip: ip}
+		d.refusals[key] = state
 	} else {
 		carried, previous = state.suppressed, state.shape
 	}
@@ -1805,7 +2098,7 @@ func (d *breakGlassDoor) noteRefusalEvent(r *http.Request, ip, detail string, ev
 		// The shape only ever moves towards sessionless, exactly as it does when
 		// a refusal is suppressed.
 		d.mu.Lock()
-		if current := d.refusals[ip]; current != nil && current.opened.Equal(now) {
+		if current := d.refusals[key]; current != nil && current.opened.Equal(now) {
 			current.suppressed += carried
 			if previous == refusalSessionless {
 				current.shape = refusalSessionless
@@ -1840,13 +2133,26 @@ func (d *breakGlassDoor) emitPruned(pruned []prunedWindow) {
 	}
 }
 
-// flushRefusals writes the one summary line a source earns when it comes back
+// flushRefusals writes the summary lines a source earns when it comes back
 // inside its budget, so a burst that stopped is visibly over rather than simply
 // absent from the log.
+//
+// Both of the source's windows are collected (Astra r9 #6): its ordinary
+// refusals, and the mismatches it is tracked separately for. A mismatch burst
+// that was never flushed would be reported only by the pruning sweep two windows
+// later, which is a long time to wait for news that a root cookie is being
+// replayed.
 func (d *breakGlassDoor) flushRefusals(r *http.Request, ip string) {
+	d.flushRefusalWindow(r, ip, ip)
+	d.flushRefusalWindow(r, bgMismatchKey(ip), ip)
+}
+
+// flushRefusalWindow is that flush for one window: key is where it is filed, ip
+// is the address every line it writes has to name.
+func (d *breakGlassDoor) flushRefusalWindow(r *http.Request, key, ip string) {
 	now := d.now()
 	d.mu.Lock()
-	state := d.refusals[ip]
+	state := d.refusals[key]
 	// Only once the WINDOW has elapsed. Passing the per-IP bucket is not by
 	// itself recovery: an attempt can be inside the bucket and still be refused
 	// by the lockout a moment later, and flushing on every such attempt would
@@ -1865,7 +2171,7 @@ func (d *breakGlassDoor) flushRefusals(r *http.Request, ip string) {
 		// from the same source arrived, saw nothing pending, and threw away the
 		// one record of a burst that was still being written.
 		if state.claimed == 0 {
-			delete(d.refusals, ip)
+			delete(d.refusals, key)
 		}
 		d.mu.Unlock()
 		return
@@ -1887,7 +2193,7 @@ func (d *breakGlassDoor) flushRefusals(r *http.Request, ip string) {
 		fmt.Sprintf("door=local ip=%s %d further refusals suppressed; the source is inside its budget again", ip, suppressed))
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	current := d.refusals[ip]
+	current := d.refusals[key]
 	if current == nil {
 		// Nothing holds a claimed entry open except a bug: every deletion path
 		// checks the claim (Astra r4 #1). If one somehow got past, the burst is
@@ -1922,7 +2228,7 @@ func (d *breakGlassDoor) flushRefusals(r *http.Request, ip string) {
 	// written has a window of its own to be reported in, and deleting it here
 	// would hand the source a fresh unthrottled line.
 	if current.suppressed == 0 && current.claimed == 0 && current.opened.Equal(opened) {
-		delete(d.refusals, ip)
+		delete(d.refusals, key)
 	}
 }
 

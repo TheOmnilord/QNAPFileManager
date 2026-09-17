@@ -588,17 +588,27 @@ certificate and a running daemon binds the listener when a credential appears, s
     NAS's own LAN address when the relay targets that — where every sibling service on the NAS lives; so the
     door refuses to issue a session to any peer that is one of the NAS's own interface addresses (answered
     exactly like a wrong password: body, floor, keep-alive; audited; not a ladder step), and treats such a peer
-    as a mismatch afterwards. The emergency door is reached directly from another machine on the LAN. What
-    remains is two machines behind one observed address (NAT, a proxy on the segment): a replay from the
-    operator's own address is not caught, and that is the residual. An origin-isolated credential would close
+    as a mismatch afterwards. The emergency door is reached directly from another machine on the LAN. The set of
+    the NAS's own addresses is discovered at arm and re-read once a minute (round 9), and — because a relay
+    already waiting on a freshly acquired DHCP or VPN address needs seconds, not a minute — a **login** from a
+    peer the cached set does not know triggers a fresh discovery before any session is issued (at most one read
+    a second under a flood); resolution of an existing session uses the cached set, since a replay needs a
+    session that was issued through the relay and that is what the fresh read refuses. Link-local IPv6 addresses
+    keep their zone on both sides, so an operator on `fe80::…%eth0` is not mistaken for the NAS's own `fe80::…`
+    on another link. Discovery fails **closed**: with no successful read ever, or none within five refresh
+    intervals, every peer is unverifiable and the door refuses to issue or resolve a session, logging why once
+    and retrying each tick. What remains is two machines behind one observed address (NAT, a proxy on the
+    segment, an operator arriving over the NAS's own VPN address): a replay from the operator's own address is
+    not caught, and that is the residual. An origin-isolated credential would close
     it and is out of scope for v1.0. The per-source lockout is likewise a bound on carelessness, not on an
     adversary with many addresses (IPv6 aliases on one host, LRU eviction of the locked source): §18.12's
     serialised bcrypt is the bound there. Two more things a sibling service on the host can do with a host-scoped
     cookie jar (round 8): overwrite or clear the `__Host-qfm_bg` cookie and so sign the operator out — a nuisance,
     not an entry — and nothing at all with the CSRF token, which it never receives. Under `serve -dev` the
     listener is forced onto loopback and loopback peers are accepted; the local-peer rule is production's.
-    A replay attempt against a live session is mirrored to QuLog (throttled to one per source per window), so an
-    operator scanning the log sees it; other sessionless lines are not.
+    A replay attempt against a live session is mirrored to QuLog (throttled to one per source per window, in its
+    **own** window — a generic refusal from the same source cannot swallow it, round 9), so an operator scanning
+    the log sees it; other sessionless lines are not.
 18. **Queued lines are not in event order** (round 7). Sessionless denials and their summaries take the
     asynchronous path, so they can land in the file after later durable lines; the `T` stamp is the order, the
     file position is not. They are not mirrored to QuLog, and the mirror runs on its own bounded worker, so a slow

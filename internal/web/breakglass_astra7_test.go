@@ -59,8 +59,9 @@ func TestAReplayedMutationIsCountedOnce(t *testing.T) {
 	}
 
 	// The first replay opens the window and is written; the other four are
-	// suppressed behind it. Once each, so four.
-	_, suppressed, _, present := bgTracked(s, elsewhere)
+	// suppressed behind it. Once each, so four. The window is the source's
+	// MISMATCH window, which is its own since Astra r9 #6.
+	_, suppressed, _, present := bgTracked(s, bgMismatchKey(elsewhere))
 	if !present {
 		t.Fatal("the replaying source is not tracked at all")
 	}
@@ -314,7 +315,7 @@ func TestALoopbackRequestNeverRedeemsASession(t *testing.T) {
 	// the throttle records across the call (Astra r8 #3). The old assertion read
 	// the file at the end and was satisfied by the /api/session line above — it
 	// said nothing whatever about this route.
-	_, before, _, tracked := bgTracked(s, "127.0.0.1")
+	_, before, _, tracked := bgTracked(s, bgMismatchKey("127.0.0.1"))
 	if !tracked {
 		t.Fatal("the refused loopback request was not tracked, so the count below proves nothing")
 	}
@@ -323,7 +324,7 @@ func TestALoopbackRequestNeverRedeemsASession(t *testing.T) {
 	if w := bgRequestFrom(s, "127.0.0.1", "POST", bgLogoutPath, headers, ""); w.Code != statusCode("permission") {
 		t.Fatalf("a loopback logout with a VALID token = %d %s, want %d", w.Code, w.Body, statusCode("permission"))
 	}
-	if _, after, _, _ := bgTracked(s, "127.0.0.1"); after != before+1 {
+	if _, after, _, _ := bgTracked(s, bgMismatchKey("127.0.0.1")); after != before+1 {
 		t.Errorf("the loopback logout added %d refusals to the window, want exactly its own 1", after-before)
 	}
 	// And it destroyed nothing: a replayed logout is for signing the operator out.

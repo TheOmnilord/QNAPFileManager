@@ -101,7 +101,7 @@ func TestTheMachinesOwnAddressNeverRedeemsASession(t *testing.T) {
 	if authenticated, handed := bgSessionAnswer(t, bgRequestFrom(s, own, "GET", "/api/session", bgWithCookie(cookie), "")); authenticated || handed != "" {
 		t.Fatalf("a relayed request redeemed a relay-pinned session: authenticated %v, csrf handed over %v", authenticated, handed != "")
 	}
-	_, before, _, tracked := bgTracked(s, own)
+	_, before, _, tracked := bgTracked(s, bgMismatchKey(own))
 	if !tracked {
 		t.Fatal("the refused request was not tracked, so the count below proves nothing")
 	}
@@ -110,7 +110,7 @@ func TestTheMachinesOwnAddressNeverRedeemsASession(t *testing.T) {
 	if w := bgRequestFrom(s, own, "POST", bgLogoutPath, headers, ""); w.Code != statusCode("permission") {
 		t.Fatalf("a relayed logout with a VALID token = %d %s, want %d", w.Code, w.Body, statusCode("permission"))
 	}
-	if _, after, _, _ := bgTracked(s, own); after != before+1 {
+	if _, after, _, _ := bgTracked(s, bgMismatchKey(own)); after != before+1 {
 		t.Errorf("the relayed logout added %d refusals to the window, want exactly its own 1", after-before)
 	}
 	if n := s.bg.Sessions(); n != 1 {
@@ -126,6 +126,11 @@ func TestTheMachinesOwnAddressNeverRedeemsASession(t *testing.T) {
 // advertisement, an operator's own hand — so the set is re-read on a TTL. A door
 // that read its interfaces once at start-up would hand a session to a relay built
 // on an address that arrived afterwards.
+//
+// Round 9 #4 took the TTL off the login path entirely: the cached minute was
+// itself the relay window, so a login from an address the cache does not know is
+// answered from a fresh read. What the TTL still governs is REDEMPTION, and the
+// second half of this test is where that shows.
 func TestTheLocalAddressSetIsRefreshed(t *testing.T) {
 	const arrives = "192.168.1.77"
 	s, _, _ := bgFixture(t)
@@ -148,20 +153,23 @@ func TestTheLocalAddressSetIsRefreshed(t *testing.T) {
 	mu.Lock()
 	addrs = append(addrs, arrives)
 	mu.Unlock()
-	// Still inside the TTL: the set is cached, and that is the deal the TTL makes.
-	now = now.Add(bgLocalPeerRefresh / 2)
-	if w := bgRequestFrom(s, arrives, "POST", bgLoginPath,
-		map[string]string{"Content-Type": "application/json"},
-		fmt.Sprintf(`{"password":%q}`, bgTestPassword)); w.Code != http.StatusNoContent {
-		t.Fatalf("a login inside the TTL = %d %s, want the cached answer's 204", w.Code, w.Body)
-	}
-	// Past it, the door re-reads and the new address is this machine.
-	now = now.Add(bgLocalPeerRefresh)
+	// Inside the TTL, and the login is refused all the same (Astra r9 #4): the
+	// cached minute used to answer this, and a relay already listening on the
+	// address that just arrived would have carried the login through it.
+	now = now.Add(bgLocalFresh)
 	w := bgRequestFrom(s, arrives, "POST", bgLoginPath,
 		map[string]string{"Content-Type": "application/json"},
 		fmt.Sprintf(`{"password":%q}`, bgTestPassword))
 	if w.Code != http.StatusUnauthorized {
-		t.Fatalf("a login from a newly local address = %d %s, want 401 after the refresh", w.Code, w.Body)
+		t.Fatalf("a login from a newly local address = %d %s, want 401 from the fresh read", w.Code, w.Body)
+	}
+	// And the same answer once the TTL has gone by, which is the r8 rule the
+	// fresh read now front-runs rather than replaces.
+	now = now.Add(bgLocalPeerRefresh)
+	if w := bgRequestFrom(s, arrives, "POST", bgLoginPath,
+		map[string]string{"Content-Type": "application/json"},
+		fmt.Sprintf(`{"password":%q}`, bgTestPassword)); w.Code != http.StatusUnauthorized {
+		t.Fatalf("a login from a newly local address after the TTL = %d %s, want 401", w.Code, w.Body)
 	}
 	// And the session it held before the address became local is no longer
 	// redeemable from it either.

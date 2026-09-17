@@ -103,9 +103,14 @@ func TestSkippedMirrorsCostOneStderrNoticePerMinute(t *testing.T) {
 		t.Fatalf("the notice is %q, want it to carry %q", got[0], want)
 	}
 
-	// A second burst inside the same minute is counted and stays silent; a minute
-	// later it is reported, and the line carries what was dropped SINCE the last
-	// one, not the running total.
+	// A second burst inside the same minute is counted and stays SILENT — and the
+	// test has to stand inside that minute to say so (Astra r9 #3). It used to
+	// advance the clock a full interval before letting the worker move again, so
+	// the worker only ever reported on the far side of the window: deleting the
+	// interval guard from reportMirrorDrops left the test green, and the one rule
+	// it exists for was unasserted. The worker is released HERE, with more drops
+	// behind it and the clock where it was, which is exactly the moment a missing
+	// guard writes its second line.
 	const second = 7
 	l.mirror(ev) // the queue is one short of full again
 	for i := 0; i < second; i++ {
@@ -114,6 +119,28 @@ func TestSkippedMirrorsCostOneStderrNoticePerMinute(t *testing.T) {
 	if drops := l.MilestoneDrops(); drops != burst+second {
 		t.Fatalf("MilestoneDrops = %d, want %d", drops, burst+second)
 	}
+	mirror.step <- struct{}{}
+	<-mirror.entered // the worker has finished a call and reported inside the minute
+	noticeMu.Lock()
+	got = append([]string(nil), notices...)
+	noticeMu.Unlock()
+	if len(got) != 1 {
+		t.Fatalf("%d notices for a second burst inside the same minute, want the first one alone: %q", len(got), got)
+	}
+
+	// More still, also inside the minute, so what the next line reports is an
+	// accumulation across two silent bursts rather than one.
+	const third = 3
+	l.mirror(ev) // full again behind the parked worker
+	for i := 0; i < third; i++ {
+		l.mirror(ev)
+	}
+	const silent = second + third
+	if drops := l.MilestoneDrops(); drops != burst+silent {
+		t.Fatalf("MilestoneDrops = %d, want %d", drops, burst+silent)
+	}
+	// A minute later it is reported, and the line carries what was dropped SINCE
+	// the last one, not the running total.
 	clock.Store(time.Unix(0, clock.Load()).Add(mirrorNoticeInterval).UnixNano())
 	mirror.step <- struct{}{}
 	<-mirror.entered
@@ -123,7 +150,7 @@ func TestSkippedMirrorsCostOneStderrNoticePerMinute(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("%d notices after the interval elapsed, want 2: %q", len(got), got)
 	}
-	if want := fmt.Sprintf("%d milestones not mirrored to QuLog (%d total)", second, burst+second); !strings.Contains(got[1], want) {
+	if want := fmt.Sprintf("%d milestones not mirrored to QuLog (%d total)", silent, burst+silent); !strings.Contains(got[1], want) {
 		t.Errorf("the second notice is %q, want it to carry %q", got[1], want)
 	}
 
@@ -140,7 +167,7 @@ func TestSkippedMirrorsCostOneStderrNoticePerMinute(t *testing.T) {
 	if len(notices) != 2 {
 		t.Errorf("%d notices in total, want 2: %q", len(notices), notices)
 	}
-	if drops := l.MilestoneDrops(); drops != burst+second {
-		t.Errorf("MilestoneDrops = %d at the end, want %d — the counter must record every skip, however few lines report them", drops, burst+second)
+	if drops := l.MilestoneDrops(); drops != burst+silent {
+		t.Errorf("MilestoneDrops = %d at the end, want %d — the counter must record every skip, however few lines report them", drops, burst+silent)
 	}
 }

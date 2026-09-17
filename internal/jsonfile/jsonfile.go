@@ -67,7 +67,7 @@ func WriteMode(path string, v any, mode os.FileMode) error {
 	if err := os.Chmod(tmp, mode); err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, path); err != nil {
+	if err := publish(tmp, path); err != nil {
 		return err
 	}
 	// The rename itself is an entry in the directory, and durable only once

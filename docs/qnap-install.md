@@ -166,7 +166,22 @@ on the NAS (`socat`, an SSH tunnel with a bind address) would make your browser 
 an address every other service on the NAS shares, and the cookie is host-scoped, so the pin would be satisfied by the
 very replay it exists to stop. The refusal is worded and timed exactly like a wrong password and it does not count
 towards the lockout, so reaching the door the wrong way costs you nothing but the trip. The set of the NAS's own
-addresses is re-read about once a minute, so an address that arrives after the app started is covered too.
+addresses is re-read about once a minute for requests that are *using* a session, and **afresh for every login** that
+comes from an address the cached set does not know — so an address the NAS is given a moment ago, by DHCP, by an IPv6
+advertisement or by your own hand, is covered immediately rather than a minute later. That read costs the door at most
+one enumeration a second however many logins arrive.
+
+An address is matched **with its interface** when it is link-local (`fe80::…`): the NAS's `fe80::55` on its own eth1
+and your laptop's `fe80::55`, reached over your eth0, are two different machines that happen to share an address, and
+the zone is what says which. You do not have to do anything about this; it is here because a door that got it wrong
+would refuse you with no way round it short of changing your address.
+
+**If the NAS cannot read its own interfaces, the door refuses every login it cannot place** — in the same words and at
+the same speed as a wrong password, and without counting towards the lockout. The app log says so plainly ("this
+machine's own addresses could not be read"), once per distinct reason rather than once a minute, and again when they can
+be read and the door goes back to normal. It is a deliberate choice: a door that cannot tell your laptop from a
+forwarder running on the NAS must not hand out a root session to either. Loopback on a `serve -dev` daemon is the one
+exception, because that listener is bound to loopback and can have no other peer.
 
 Five wrong passwords lock the account for 60 seconds, doubling to a 30-minute cap; a restart of the app clears the
 lockout. A locked account is told so — the answer is `429 locked_out` with a `Retry-After`, deliberately, because leaving

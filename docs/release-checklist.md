@@ -95,6 +95,28 @@ unit and on the QTS unit, and work through the list. Anything that fails here st
 - [ ] Requesting 2755 on a file as a non-member owner shows exactly one sentence — the setgid one — and the audit line
       carries the diff of what the kernel actually did.
 
+From the ten Astra rounds (`docs/reviews/m3-astra-round10.md`), with disposable fixtures on **both** units:
+
+- [ ] Real owner / non-owner / administrator workers: a non-owner chmod is refused per item; member and non-member
+      chgrp; a dropped setgid and a chown-cleared special bit each appear in the diff.
+- [ ] A chmod reached through a share symlink succeeds; a symlink leaf is refused as unsupported.
+- [ ] Protected paths and read-only mode refuse exactly what the contract says, and a recursive change over an
+      ancestor of the installation is refused as naming it is.
+- [ ] The POSIX mask warning appears on a QTS folder with a named ACL entry.
+- [ ] Hero: the actual `system.nfs4_acl` bytes of a plain file classify `nfs4-trivial`, a named ACE classifies `nfs4`,
+      and both are readable as the non-root owner. Every `aclmode` value (`discard`, `groupmask`, `passthrough`,
+      `restricted`) grades the rung the contract says; an unreadable one grades L2.
+- [ ] A confirmed recursive chmod queued behind the metadata slots, with `zfs set aclmode=discard` landing while it
+      waits, fails as "confirm it again" and nothing is changed.
+- [ ] A recursive chmod over a share containing a nested dataset names the child in the L2 sentence.
+- [ ] An unreadable nested directory (`0000`) under a recursive chmod is repaired and its listing failure is warned.
+- [ ] A hardlink under an administrator's recursive chmod is skipped with a warning.
+- [ ] Cancelling a recursive job reports the partial count; the warnings and the audit lines carry it.
+- [ ] Ownership plus mode on a multi-item selection: the chmod waits for the chown job.
+- [ ] A size walk survives a same-user session refresh, is cancelled on dialog close, and is retried after a lost
+      cancel; a closed tab leaves the walk running until it completes (§17.17 — observe it in Operations).
+- [ ] A domain user's numeric ids and a hero dataset's quota-relative free space display sensibly.
+
 ### The break-glass door (M4)
 
 - [ ] `netstat -tlnp` before anything: **8771 is free**, and QuFirewall does not block it.
@@ -110,11 +132,28 @@ unit and on the QTS unit, and work through the list. Anything that fails here st
 - [ ] The fingerprint the browser shows matches the one in the app log and in `break-glass status`.
 - [ ] Signing in yields an **administrator** session whose banner says content will be root-owned, and a file created
       through it really is `root:root` (check over SSH).
-- [ ] Five wrong passwords lock the account, and QuLog Center shows milestone lines for the attempts, the lockout and the
-      successful login.
+- [ ] Five wrong passwords lock **the source they came from** — a second machine still signs in — and QuLog Center
+      shows milestone lines for the attempts, the lockout and the successful login.
 - [ ] `break-glass set-password` run while the daemon is up takes effect on the next attempt and evicts a live
-      break-glass session.
+      break-glass session; `break-glass disable` does the same.
 - [ ] The certificate warning flow in three browsers.
+
+From the ten Astra rounds (`docs/reviews/m4-astra-round10.md`):
+
+- [ ] A correct password entered in the page signs in without a manual reload (the 204 was once treated as a failure).
+- [ ] Stop Apache (`/etc/init.d/Qthttpd.sh stop`) and sign in through 8771 directly; start it again afterwards.
+- [ ] A login relayed from the NAS itself — `socat TCP-LISTEN:9443,fork TCP:<nas-lan-ip>:8771` on the NAS, then
+      `https://<nas>:9443/` — is refused with the wrong-password answer; the same from another machine's relay is not.
+- [ ] Bring a second interface or a VPN address up on the NAS and log in from it within a second: refused. Log in from
+      a LAN machine at the same moment: accepted, at most a second slower.
+- [ ] A replay of a live cookie from another machine is refused, the session survives, and QuLog shows the mismatch once
+      per minute per source; a cookie-less flood of forged mutations shows one line per source per window and does not
+      delay a real mutation on the main listener.
+- [ ] A slow QuLog (`log_tool` wrapped in a `sleep 10`) neither stalls the audit file nor the operator; the stderr notice
+      appears once a minute with a count.
+- [ ] `break-glass set-password` over an expired certificate prints the **next** fingerprint and the restart
+      instruction; the browser sees the new one only after the restart.
+- [ ] A login latency check under a job load: the door answers within its floor plus one bcrypt plus at most a second.
 
 ### Accessibility and layout (M4, manual by design — there is no npm, so no axe run)
 

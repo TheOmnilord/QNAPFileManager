@@ -591,15 +591,23 @@ certificate and a running daemon binds the listener when a credential appears, s
     as a mismatch afterwards. The emergency door is reached directly from another machine on the LAN. The set of
     the NAS's own addresses is discovered at arm and re-read once a minute (round 9), and — because a relay
     already waiting on a freshly acquired DHCP or VPN address needs seconds, not a minute — a **login** from a
-    peer the cached set does not know triggers a fresh discovery before any session is issued (at most one read
-    a second under a flood); resolution of an existing session uses the cached set, since a replay needs a
-    session that was issued through the relay and that is what the fresh read refuses. Link-local IPv6 addresses
+    peer the cached set does not know triggers a fresh discovery before any session is issued — and is **never**
+    authorised from a cached negative (round 10): under a flood the reads are one a second and an unfamiliar
+    peer waits for the next one, bounded by the request deadline, or is refused as unverifiable; the decision is
+    taken after the queued verification so the queue cannot be used to age a negative. Resolution of an existing
+    session uses the cached set, since a replay needs a session that was issued through the relay and that is
+    what the fresh read refuses. Link-local IPv6 addresses
     keep their zone on both sides, so an operator on `fe80::…%eth0` is not mistaken for the NAS's own `fe80::…`
-    on another link. Discovery fails **closed**: with no successful read ever, or none within five refresh
-    intervals, every peer is unverifiable and the door refuses to issue or resolve a session, logging why once
-    and retrying each tick. What remains is two machines behind one observed address (NAT, a proxy on the
-    segment, an operator arriving over the NAS's own VPN address): a replay from the operator's own address is
-    not caught, and that is the residual. An origin-isolated credential would close
+    on another link; a numeric zone (`%3`) and a name (`%eth0`) are the same interface, compared by index, and a
+    zone that resolves to no interface fails closed (round 10). Discovery fails **closed**: with no successful
+    read ever, or none within five refresh intervals, every peer is unverifiable and the door refuses to issue
+    or resolve a session, logging why once; the retries are **request-driven** — there is no background task, so
+    an idle door recovers on the next login that probes it, not on a tick (round 10). Two consequences are
+    stated rather than hidden: an operator whose VPN or SNAT presents them **as the NAS's own address** cannot
+    use this door at all (the correct password is refused as "this machine") and needs another route — that is
+    unavailability, not a replay risk; and what remains as the replay residual is two machines behind one
+    observed **external** address (NAT, a proxy on the segment): a replay from the operator's own address is not
+    caught. An origin-isolated credential would close
     it and is out of scope for v1.0. The per-source lockout is likewise a bound on carelessness, not on an
     adversary with many addresses (IPv6 aliases on one host, LRU eviction of the locked source): §18.12's
     serialised bcrypt is the bound there. Two more things a sibling service on the host can do with a host-scoped

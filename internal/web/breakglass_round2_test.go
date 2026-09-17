@@ -228,6 +228,13 @@ func TestADisabledPasswordCannotBeLockedOut(t *testing.T) {
 // password nothing ever looked at.
 func TestAQueuedLoginIsNotCalledWrong(t *testing.T) {
 	s, _, _ := bgFixture(t)
+	// The placement at login must be answered by a read taken after the request
+	// arrived (Astra r10 #1), and this fixture primed its set a moment ago at arm
+	// time. The door's clock is put one interval past that prime so the read this
+	// login needs is one it is allowed to make at once: the deadline under test
+	// here is the QUEUE's, and it is 150 ms — far shorter than the wait a
+	// rate-limited read would legitimately impose.
+	s.BreakGlassGate().Now = func() time.Time { return time.Now().Add(bgLocalFresh) }
 	// A deadline that has already passed by the time Verify is reached.
 	r := httptest.NewRequest("POST", bgLoginPath, strings.NewReader(fmt.Sprintf(`{"password":%q}`, bgTestPassword)))
 	r.TLS = &tls.ConnectionState{}

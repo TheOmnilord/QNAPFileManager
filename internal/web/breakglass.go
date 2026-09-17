@@ -636,6 +636,15 @@ const bgLocalPeerRefresh = time.Minute
 // and the cost of that is bounded by this interval rather than by the request
 // rate: a flood of logins from one address buys one enumeration a second, and a
 // second is far less than the time it takes to notice an address and connect.
+//
+// The interval is a WAIT, never a skip (Astra r10 #1). Rate-limiting the fresh
+// read by returning the previous answer made the interval a window of its own: a
+// peer the cached set did not know, arriving less than a second after the last
+// read, was authorised from a cached NEGATIVE — and a relay reconnects in far
+// less than a second. A login that needs a read it may not make yet waits for the
+// one it is allowed to make; the logins that arrive while it waits share that
+// read, so the bound on enumerations is unchanged and no negative is ever reused
+// across it.
 const bgLocalFresh = time.Second
 
 // bgLocalUnverifiable is how long the set may go without a SUCCESSFUL discovery
@@ -659,9 +668,19 @@ const bgLocalUnverifiable = 5 * bgLocalPeerRefresh
 type bgLocalAddrs struct {
 	mu     sync.Mutex
 	lookup func() ([]string, error)
+	// zones resolves an interface NAME to its index, and is the second seam
+	// (Astra r10 #2): a zone is compared as an index, and a test has no
+	// interfaces to name.
+	zones func(string) (int, error)
+	// reading is non-nil while one goroutine has claimed the next discovery, and
+	// is closed when that attempt ends, read or abandoned. It is what makes a
+	// flood of logins share one read instead of queueing one read each: the
+	// waiters do not hold the mutex, so nothing else the door does is blocked
+	// behind the wait (Astra r10 #1).
+	reading chan struct{}
 	// set is keyed the way a peer is: a plain canonical IP, except for a
-	// link-local address whose interface is known, which carries its zone
-	// (Astra r9 #5).
+	// link-local address whose interface is known, which carries that
+	// interface's INDEX as its zone (Astra r9 #5, r10 #2).
 	set map[string]struct{}
 	// link is the zoneless form of every link-local address in the set, whatever
 	// zone it was found on. It answers the one question set cannot: a peer whose
@@ -693,62 +712,228 @@ func (a *bgLocalAddrs) setLookup(fn func() ([]string, error)) {
 	a.failing, a.logged = "", ""
 }
 
+// setZoneLookup installs the name-to-index seam and drops the set with it: the
+// set is keyed by index, so keys built through one resolver mean nothing under
+// another.
+func (a *bgLocalAddrs) setZoneLookup(fn func(string) (int, error)) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.zones, a.set, a.link, a.have = fn, nil, nil, false
+	a.tried, a.ok = time.Time{}, time.Time{}
+	a.failing, a.logged = "", ""
+}
+
 // check answers both questions the door has about a peer: whether this address is
 // one of THIS MACHINE's, and whether the set that answer came from is believable
 // at all (Astra r9 #1). note is a line for the log, written once per distinct
 // reason, and empty when there is nothing new to say.
 //
 // atIssue marks the login path, which is held to the stricter rule (Astra r9 #4):
-// a peer the cached set does not know is looked up again, at most once per
-// bgLocalFresh, and an attempt that FAILS makes the answer unverifiable even
-// though the cache is warm — locality has to be established when the session is
-// issued, and "it was not one of ours a minute ago" is not that.
+// the answer must come from a read taken at or after `since`, and an attempt that
+// FAILS makes the answer unverifiable even though the cache is warm — locality
+// has to be established when the session is issued, and "it was not one of ours a
+// minute ago" is not that. On the redemption path `since` is the zero time and
+// the TTL above is the only bound.
 //
-// The enumeration runs under this mutex, which is what makes the interval a real
-// bound rather than a hope: a hundred simultaneous logins take it in turn and all
-// but the first find the read already done. They are logins at an emergency door,
-// bounded to ten a minute per source before they reach this point.
-func (a *bgLocalAddrs) check(p bgPeerAddr, now time.Time, atIssue bool) (local, known bool, note string) {
+// The wait, not the skip, is what bounds the enumeration (Astra r10 #1): a read
+// that the interval does not allow yet is waited for, once, by whichever caller
+// claims it, and every caller that arrives while it is outstanding takes the same
+// answer. A hundred simultaneous logins therefore still buy one read — and none
+// of them is answered from the read before their own arrival.
+func (a *bgLocalAddrs) check(ctx context.Context, p bgPeerAddr, clock func() time.Time, since time.Time, atIssue bool) (local, known bool, note string) {
+	now := clock()
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	// A clock that went backwards (a test's, or an NTP step) refreshes rather
 	// than pinning the set until it catches up.
 	if !a.have || now.Sub(a.tried) >= bgLocalPeerRefresh || now.Before(a.tried) {
 		note = a.refreshLocked(now)
 	}
-	local = a.hasLocked(p)
-	if atIssue && !local && (now.Sub(a.tried) >= bgLocalFresh || now.Before(a.tried)) {
-		if fresh := a.refreshLocked(now); fresh != "" {
+	key, base, placeable := a.peerKeyLocked(p)
+	if !placeable {
+		// A peer whose zone names no interface of this machine's cannot be
+		// compared with the set at all, and the door does not guess (Astra r10 #2).
+		a.mu.Unlock()
+		return false, false, note
+	}
+	local = a.hasLocked(key, base)
+	if local || !a.tried.Before(since) {
+		known = a.knownLocked(now, atIssue)
+		a.mu.Unlock()
+		return local, known, note
+	}
+	a.mu.Unlock()
+
+	// The set does not hold this peer and the answer predates the request, so it
+	// is not an answer about this peer at all. Read again, waiting out the
+	// interval if the interval says so.
+	if fresh, ok := a.freshen(ctx, clock, since); !ok {
+		if fresh != "" {
 			note = fresh
 		}
-		local = a.hasLocked(p)
+		// The door ran out of time before it could place the peer. That is the
+		// unverifiable answer, not the permissive one.
+		return false, false, note
+	} else if fresh != "" {
+		note = fresh
 	}
-	return local, a.knownLocked(now, atIssue), note
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.hasLocked(key, base), a.knownLocked(clock(), atIssue), note
+}
+
+// freshen makes sure the set has been read at or after `since`, waiting out the
+// rest of the interval when it must (Astra r10 #1). ok is false when the
+// request's own deadline arrived first, which is the unverifiable answer.
+//
+// The wait is deliberately NOT taken under the mutex: an unbroken stream of
+// logins would otherwise hold it for most of every second and block the
+// redemptions and the ticker behind them. One caller claims the read and the rest
+// wait on its channel, which is the same bound without the contention.
+func (a *bgLocalAddrs) freshen(ctx context.Context, clock func() time.Time, since time.Time) (note string, ok bool) {
+	for {
+		a.mu.Lock()
+		if !a.tried.Before(since) {
+			// Somebody else's read already answers this request. A FAILED attempt
+			// stamps `tried` too, and that is right: it is knownLocked, not this
+			// loop, that turns a failure into a refusal, and a door that retried
+			// here would spin a whole queue of logins against a lookup that is
+			// down.
+			a.mu.Unlock()
+			return note, true
+		}
+		if done := a.reading; done != nil {
+			a.mu.Unlock()
+			select {
+			case <-done:
+			case <-ctx.Done():
+				return note, false
+			}
+			continue
+		}
+		done := make(chan struct{})
+		a.reading = done
+		// A clock that stepped backwards would compute a wait longer than the
+		// interval itself; the interval is the cap either way.
+		delay := bgLocalFresh - clock().Sub(a.tried)
+		if delay > bgLocalFresh {
+			delay = bgLocalFresh
+		}
+		a.mu.Unlock()
+		if delay > 0 {
+			timer := time.NewTimer(delay)
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				timer.Stop()
+				// The claim is given up where it was taken, so a waiter behind
+				// this one reads rather than inheriting a promise nobody kept.
+				a.mu.Lock()
+				a.reading = nil
+				a.mu.Unlock()
+				close(done)
+				return note, false
+			}
+		}
+		a.mu.Lock()
+		if line := a.refreshLocked(clock()); line != "" {
+			note = line
+		}
+		a.reading = nil
+		a.mu.Unlock()
+		close(done)
+		return note, true
+	}
 }
 
 // hasLocked is the comparison itself, and the zone is the whole of it (Astra r9
 // #5). fe80::55 on the NAS's eth1 and fe80::55 on an operator's laptop, reached
 // over eth0, are two different hosts that share an address — the zone is what
-// says which — so a link-local peer is compared zone and all.
+// says which — so a link-local peer is compared zone and all. key and base come
+// from peerKeyLocked, which has already reduced both sides' zones to an interface
+// index (Astra r10 #2).
 //
-// Either side may be missing its zone, and a missing zone is not a mismatch: it
-// is an unknown, and an unknown here fails CLOSED. A link-local peer the socket
-// reported without a zone matches any interface's copy of that address, and a set
-// entry found without one matches a peer on any zone.
-func (a *bgLocalAddrs) hasLocked(p bgPeerAddr) bool {
-	if _, ok := a.set[p.key()]; ok {
+// base is empty for everything that is not link-local. For a link-local peer it
+// is the zoneless form, and a missing zone is not a mismatch: it is an unknown,
+// and an unknown here fails CLOSED. A peer the socket reported without a zone
+// matches any interface's copy of that address, and a set entry found without one
+// matches a peer on any zone.
+func (a *bgLocalAddrs) hasLocked(key, base string) bool {
+	if _, ok := a.set[key]; ok {
 		return true
 	}
-	if p.ip == nil || !bgZoned(p.ip) {
+	if base == "" {
 		return false
 	}
-	base := p.ip.String()
-	if p.zone == "" {
+	if key == base {
+		// The peer named no zone: any interface's copy of it is this machine.
 		_, ok := a.link[base]
 		return ok
 	}
+	// The peer named one, and an entry discovered without a zone is on every
+	// interface as far as this door can tell.
 	_, ok := a.set[base]
 	return ok
+}
+
+// peerKeyLocked puts the peer into the spelling the set is keyed in, resolving
+// its zone to an interface index (Astra r10 #2). placeable is false when the peer
+// names a zone this machine does not have.
+//
+// The zone the socket reports is a LOCAL interface — link-local traffic arrives
+// on one of this machine's own — and Go may spell it either way: a name on Linux,
+// a bare index where the name is not known. Discovery spells it the other way
+// often enough that comparing the strings is a coin toss, and the losing side of
+// that toss is the dangerous one: the NAS's own fe80:: address read as somebody
+// else's, and a session issued to a relay. Both sides are reduced to the index,
+// which is the only spelling of a zone that is not a matter of taste.
+func (a *bgLocalAddrs) peerKeyLocked(p bgPeerAddr) (key, base string, placeable bool) {
+	if p.ip == nil {
+		return "", "", false
+	}
+	if !bgZoned(p.ip) {
+		return p.ip.String(), "", true
+	}
+	base = p.ip.String()
+	if p.zone == "" {
+		return base, base, true
+	}
+	zone, known := a.zoneKeyLocked(p.zone)
+	if !known {
+		// A zone that names nothing on this machine is not a peer somewhere else;
+		// it is a peer this door cannot place, and it is refused.
+		return "", "", false
+	}
+	return base + "%" + zone, base, true
+}
+
+// zoneKeyLocked canonicalises one zone to its interface index, as decimal. A zone
+// that is already numeric is taken as the index it is; a name is resolved, and a
+// name that resolves to nothing is not known.
+func (a *bgLocalAddrs) zoneKeyLocked(zone string) (string, bool) {
+	if n, err := strconv.Atoi(zone); err == nil {
+		if n <= 0 {
+			return "", false
+		}
+		return strconv.Itoa(n), true
+	}
+	lookup := a.zones
+	if lookup == nil {
+		lookup = bgInterfaceIndex
+	}
+	n, err := lookup(zone)
+	if err != nil || n <= 0 {
+		return "", false
+	}
+	return strconv.Itoa(n), true
+}
+
+// bgInterfaceIndex is the production name-to-index resolver.
+func bgInterfaceIndex(name string) (int, error) {
+	iface, err := net.InterfaceByName(name)
+	if err != nil {
+		return 0, err
+	}
+	return iface.Index, nil
 }
 
 // knownLocked reports whether the cached answer may be acted on. A set that has
@@ -794,7 +979,7 @@ func (a *bgLocalAddrs) refreshLocked(now time.Time) string {
 	set := make(map[string]struct{}, len(addrs)+2)
 	link := make(map[string]struct{}, len(addrs))
 	for _, addr := range addrs {
-		key, base := bgLocalKey(addr)
+		key, base := a.localKeyLocked(addr)
 		if key == "" {
 			continue
 		}
@@ -825,9 +1010,13 @@ func (a *bgLocalAddrs) prime(now time.Time) string {
 
 // bgInterfaceAddrs is the production lookup: every address assigned to every
 // interface, as a canonical IP string with the prefix length dropped — and, for a
-// link-local address, with the INTERFACE'S NAME kept as the zone (Astra r9 #5),
-// because that is the only thing that distinguishes the NAS's own fe80::55 from
-// the operator's.
+// link-local address, with the INTERFACE it was found on kept as the zone (Astra
+// r9 #5), because that is the only thing that distinguishes the NAS's own
+// fe80::55 from the operator's.
+//
+// The interface is spelled as its INDEX (Astra r10 #2): net.Interfaces hands both
+// the index and the name, a socket's peer address may carry either, and the index
+// is the one both sides can always agree on.
 //
 // It is read per interface rather than through net.InterfaceAddrs, which does not
 // say which interface an address belongs to. An error anywhere is the whole
@@ -857,8 +1046,8 @@ func bgInterfaceAddrs() ([]string, error) {
 			if ip == nil {
 				continue
 			}
-			if bgZoned(ip) && iface.Name != "" {
-				out = append(out, ip.String()+"%"+iface.Name)
+			if bgZoned(ip) && iface.Index > 0 {
+				out = append(out, ip.String()+"%"+strconv.Itoa(iface.Index))
 				continue
 			}
 			out = append(out, ip.String())
@@ -867,10 +1056,15 @@ func bgInterfaceAddrs() ([]string, error) {
 	return out, nil
 }
 
-// bgLocalKey puts one discovered address into the form the set is keyed in, and
-// returns the zoneless form alongside it when the address is link-local. key is
-// "" when the string is not an address at all.
-func bgLocalKey(s string) (key, base string) {
+// localKeyLocked puts one discovered address into the form the set is keyed in,
+// and returns the zoneless form alongside it when the address is link-local. key
+// is "" when the string is not an address at all.
+//
+// A zone that cannot be resolved to an index keeps the spelling it was found
+// with (Astra r10 #2). That is the safe direction on this side: an entry nobody
+// can match is one more address counted as this machine's, and a peer arriving
+// with the same unresolvable zone is refused by peerKeyLocked in any case.
+func (a *bgLocalAddrs) localKeyLocked(s string) (key, base string) {
 	addr, zone, _ := strings.Cut(s, "%")
 	ip := net.ParseIP(addr)
 	if ip == nil {
@@ -882,6 +1076,9 @@ func bgLocalKey(s string) (key, base string) {
 	base = ip.String()
 	if zone == "" {
 		return base, base
+	}
+	if canon, known := a.zoneKeyLocked(zone); known {
+		zone = canon
 	}
 	return base + "%" + zone, base
 }
@@ -901,16 +1098,8 @@ type bgPeerAddr struct {
 	zone string
 }
 
-// key is the form this peer would be found under in the set.
-func (p bgPeerAddr) key() string {
-	if p.ip == nil {
-		return ""
-	}
-	if p.zone == "" || !bgZoned(p.ip) {
-		return p.ip.String()
-	}
-	return p.ip.String() + "%" + p.zone
-}
+// The form it is looked up under is peerKeyLocked's to decide, because turning a
+// zone into a key needs this machine's interface table (Astra r10 #2).
 
 // bgParsePeer reads the peer's address off the request. net.SplitHostPort leaves
 // the zone on the host — "[fe80::55%eth0]:40000" yields "fe80::55%eth0" — and the
@@ -958,12 +1147,24 @@ const (
 	bgPeerUnverifiable
 )
 
-// peerLocality places the request's peer. atIssue marks the login path, which
-// establishes locality with a fresh read rather than trusting the cached minute
-// (Astra r9 #4); redemption keeps using the cache, because a replay needs a
-// session that was issued through the relay and the fresh read at login is what
-// stops one ever being.
-func (d *breakGlassDoor) peerLocality(r *http.Request, atIssue bool) bgLocality {
+// peerLocality places the request's peer from the cached set, which is what a
+// request merely REDEEMING a session uses: a replay needs a session that was
+// issued through the relay, and the read at login is what stops one ever being.
+func (d *breakGlassDoor) peerLocality(r *http.Request) bgLocality {
+	return d.placePeer(r, time.Time{}, false)
+}
+
+// peerLocalityAtIssue is the login path's placement (Astra r9 #4, r10 #1). since
+// is the oldest read that may answer this request: a peer the cached set does not
+// hold is placed by a read taken at or after it, waiting for the interval if the
+// interval says so and refusing if the request's own deadline arrives first.
+func (d *breakGlassDoor) peerLocalityAtIssue(r *http.Request, since time.Time) bgLocality {
+	return d.placePeer(r, since, true)
+}
+
+// placePeer is the common body. The wait, when there is one, is bounded by the
+// request's context, which on this listener carries the door's deadline.
+func (d *breakGlassDoor) placePeer(r *http.Request, since time.Time, atIssue bool) bgLocality {
 	peer := bgParsePeer(r)
 	if peer.ip == nil {
 		// A peer whose address does not parse cannot be compared to the set at
@@ -991,7 +1192,7 @@ func (d *breakGlassDoor) peerLocality(r *http.Request, atIssue bool) bgLocality 
 	if d.local == nil {
 		return bgPeerUnverifiable
 	}
-	local, known, note := d.local.check(peer, d.now(), atIssue)
+	local, known, note := d.local.check(r.Context(), peer, d.now, since, atIssue)
 	if note != "" {
 		d.logf("%s", note)
 	}
@@ -1055,7 +1256,7 @@ func (d *breakGlassDoor) resolve(w http.ResponseWriter, r *http.Request) (*sessi
 	// believable set of the machine's own addresses there is no way to tell the
 	// operator's laptop from a forwarder running on the NAS, and the safe reading
 	// of an unknown is the one that hands nothing over.
-	if d.peerLocality(r, false) != bgPeerElsewhere || bgPeer(r) != sess.peer {
+	if d.peerLocality(r) != bgPeerElsewhere || bgPeer(r) != sess.peer {
 		d.mu.Unlock()
 		d.notePeerMismatch(r)
 		// Counted and audited HERE, so the caller does not do it again in the
@@ -1256,7 +1457,13 @@ func (d *breakGlassDoor) login(w http.ResponseWriter, r *http.Request) {
 	// A door that cannot say whether the peer is one of its own addresses must not
 	// issue a root session to it, and the operator is told which it was through the
 	// audit line, which is the one place the two are distinguishable.
-	switch d.peerLocality(r, true) {
+	//
+	// "A discovery made now" means one taken at or after THIS REQUEST ARRIVED, and
+	// a read the interval does not allow yet is waited for rather than skipped
+	// (Astra r10 #1). The wait is here, before the password has even been parsed,
+	// so it costs every login the same: an operator's correct password must not be
+	// the one that takes half a second longer.
+	switch d.peerLocalityAtIssue(r, d.now()) {
 	case bgPeerThisMachine:
 		d.fail(ctx, w, r, start, ip, "peer is this machine", nil)
 		return
@@ -1330,8 +1537,31 @@ func (d *breakGlassDoor) login(w http.ResponseWriter, r *http.Request) {
 	}
 	if verdict.Left {
 		// Exactly one "lockout left" milestone per lockout: the turn that
-		// observes the expiry is the one that cleared it.
+		// observes the expiry is the one that cleared it. It is written before the
+		// re-placement below, because a turn that returns without writing it loses
+		// the milestone for good.
 		d.audit(r, "breakglass-lockout", "ok", "", fmt.Sprintf("door=local ip=%s source lockout ended", ip))
+	}
+	// And the placement is made again on the way OUT of the queue (Astra r10 #1).
+	// The verification is the one part of this handler a caller can lengthen at
+	// will — four bcrypts deep, on an ARM NAS, is seconds — and a locality decided
+	// on the way in would be that many seconds old by the time the session is
+	// issued: acquire the address while the queue drains and the door hands the
+	// relay a session it placed before the relay existed. The answer must be no
+	// older than the interval at the moment of issue, which by definition is a read
+	// the interval already allows, so this placement never waits.
+	//
+	// It is decided BEFORE the verdict is acted on, so the latency of the second
+	// placement cannot be read as anything about the password, and it keeps the
+	// uniform refusal: same body, same floor, same bucket charge, no rung of the
+	// ladder — the ladder has already moved, or not, on the password's own merit.
+	switch d.peerLocalityAtIssue(r, d.now().Add(-bgLocalFresh)) {
+	case bgPeerThisMachine:
+		d.fail(ctx, w, r, start, ip, "peer became this machine before issue", nil)
+		return
+	case bgPeerUnverifiable:
+		d.fail(ctx, w, r, start, ip, "local addresses unverifiable at issue", nil)
+		return
 	}
 	if verdict.Locked {
 		// The body never reveals whether the password offered was right.
@@ -1440,7 +1670,7 @@ func (d *breakGlassDoor) logout(w http.ResponseWriter, r *http.Request) {
 	// goes through the same bounded mismatch path as every other replay, and the
 	// session SURVIVES: signing the operator out is precisely what a replayed
 	// logout is for.
-	if sess != nil && (d.peerLocality(r, false) != bgPeerElsewhere || bgPeer(r) != sess.peer) {
+	if sess != nil && (d.peerLocality(r) != bgPeerElsewhere || bgPeer(r) != sess.peer) {
 		d.mu.Unlock()
 		d.notePeerMismatch(r)
 		writeError(w, statusCode("permission"), "permission", "The request could not be verified. Refresh and try again.", "", r.URL.Path, "")

@@ -21,6 +21,11 @@ type bgAddressSeam struct {
 	addrs []string
 	err   error
 	calls int
+	// zones is this machine's interface table as the test says it is: a name to
+	// the index the kernel would have given it (Astra r10 #2). A test that names
+	// no interfaces has none, and a zone it does not list is a zone this machine
+	// does not have.
+	zones map[string]int
 }
 
 // bgSeamAddresses installs that seam with an initial answer. Like
@@ -29,8 +34,27 @@ type bgAddressSeam struct {
 // interface it was found on as its zone.
 func bgSeamAddresses(s *Server, addrs ...string) *bgAddressSeam {
 	seam := &bgAddressSeam{addrs: addrs}
+	s.bg.local.setZoneLookup(seam.index)
 	s.bg.local.setLookup(seam.lookup)
 	return seam
+}
+
+// interfaces names the machine's interfaces, so a zone on either side of the
+// comparison can be resolved to an index. It is called before anything serves,
+// like every other knob in these fixtures.
+func (a *bgAddressSeam) interfaces(table map[string]int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.zones = table
+}
+
+func (a *bgAddressSeam) index(name string) (int, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if n, ok := a.zones[name]; ok {
+		return n, nil
+	}
+	return 0, fmt.Errorf("no interface named %q", name)
 }
 
 func (a *bgAddressSeam) lookup() ([]string, error) {
@@ -263,7 +287,10 @@ func TestALinkLocalPeerIsMatchedWithItsZone(t *testing.T) {
 	s, _, _ := bgFixture(t)
 	now := time.Date(2026, 9, 17, 12, 0, 0, 0, time.UTC)
 	s.BreakGlassGate().Now = func() time.Time { return now }
-	bgSeamAddresses(s, "fe80::55%eth1", "192.168.1.10")
+	seam := bgSeamAddresses(s, "fe80::55%eth1", "192.168.1.10")
+	// Both sides of the comparison are reduced to the interface INDEX (Astra r10
+	// #2), so the test has to say which interfaces this machine has.
+	seam.interfaces(map[string]int{"eth0": 2, "eth1": 3})
 
 	// The operator's machine, reached over eth0. Same address, different host.
 	const operator = "fe80::55%eth0"

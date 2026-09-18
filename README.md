@@ -144,5 +144,6 @@ Docker or QDK on the development box. `powershell -File scripts/build-local.ps1`
 
 ## License
 
-The package declares **MIT** (`QPKG_LICENSE` in [qpkg/qpkg.cfg](qpkg/qpkg.cfg)). No `LICENSE` file is checked in yet; one
-should be added before the 1.0.0 tag so the declaration and the repository agree.
+**MIT** — see [LICENSE](LICENSE); `QPKG_LICENSE` in [qpkg/qpkg.cfg](qpkg/qpkg.cfg) declares the same. The Go standard
+library and `golang.org/x/crypto` are BSD-3-Clause; their notices are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md),
+which is shipped inside the QPKG beside the binary as that licence requires.

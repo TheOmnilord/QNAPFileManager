@@ -213,6 +213,8 @@ jobs:
           cp -r dist/amd64/. qpkg/x86_64/
           cp -r dist/arm64/. qpkg/arm_64/
           cp config.example.json qpkg/shared/
+          # The BSD-3 notices for Go and x/crypto must travel with the binary.
+          cp LICENSE THIRD_PARTY_NOTICES.md qpkg/shared/
           chmod -R a+rx qpkg/x86_64 qpkg/arm_64
 
       # Registers binfmt handlers so the arm_64 tree's binaries execute

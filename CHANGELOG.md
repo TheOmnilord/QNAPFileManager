@@ -10,7 +10,10 @@ reasoning behind any decision named here is in [PLAN.md](PLAN.md) and in `docs/d
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- `LICENSE` (MIT, matching `QPKG_LICENSE`) and `THIRD_PARTY_NOTICES.md` (the BSD-3 notices for the Go standard library
+  and `golang.org/x/crypto`), both shipped inside the QPKG beside the binary.
 
 ### Deferred to 1.1
 

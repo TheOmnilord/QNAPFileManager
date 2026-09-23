@@ -130,6 +130,20 @@ export function mountsNote({local = 0,network = 0} = {},{crossMounts = false,can
  return parts.join(' ');
 }
 
+// searchCrossOffered says whether the search dialog shows "Include mounted
+// sub-folders". Every signed-in session gets it, QTS and hero alike: on QTS the
+// volumes under the /share RAM disk are separate mounts too, and a search of
+// /share reaches none of them without it (decision 9, amended). The delete,
+// copy, archive and permissions dialogs keep their hero-only gating unchanged:
+// only the search dialog was changed.
+export function searchCrossOffered(session) { return !!session; }
+
+// SEARCH_CROSS_DEFAULT is the state "Include mounted sub-folders" starts every
+// session in, and it must agree with the `checked` in index.html (a test pins
+// the two together). Ticked: searching /share is the natural way to search
+// every volume (decision 9, amended), and unticked it finds nothing there.
+export const SEARCH_CROSS_DEFAULT=true;
+
 // resultRow shapes one hit into the four things its row shows, plus the
 // reference the click needs.
 //
@@ -296,9 +310,13 @@ export function openSearch() {
  $('#searchRoot').value=state.path;
  // The query survives between openings: refining a search is the common case,
  // and retyping it is the annoying one.
- const hero=state.session?.family==='quts_hero';
- $('#searchCrossRow').hidden=!hero;
- if (!hero) $('#searchCross').checked=false;
+ // "Include mounted sub-folders" is offered on QTS as well as hero (owner,
+ // 2026-09-23). It used to be hero-only because crossing a same-domain mount
+ // never fired on QTS; searching the /share RAM disk is where it does, since
+ // decision 9's read rule enters every volume under it. Its state is left as
+ // the user last set it within a session; every new session starts it at
+ // SEARCH_CROSS_DEFAULT (the teardown in initSearch), on both.
+ $('#searchCrossRow').hidden=!searchCrossOffered(state.session);
  setError('');
  $('#searchOK').disabled=false;
  openDialog('#dlgSearch');
@@ -596,7 +614,13 @@ export function initSearch() {
   $('#resultsRows').replaceChildren();
   // The form too: a query is as much the previous user's as the hits are.
   $('#searchQuery').value=''; $('#searchRoot').value='';
-  $('#searchGlob').checked=false; $('#searchHidden').checked=false; $('#searchCross').checked=false;
+  // Back to the DEFAULTS, not to "off": the reason for clearing is that the
+  // flags were the previous user's, and the next user's are the markup's. The
+  // crossing box is ticked by default, and clearing it to false here left it
+  // unticked on every first load too — connect() publishes update({listener})
+  // while the session is still null, which reads as a sign-out (Astra r5 on the
+  // QKVM fix) — so a default search of /share excluded every volume.
+  $('#searchGlob').checked=false; $('#searchHidden').checked=false; $('#searchCross').checked=SEARCH_CROSS_DEFAULT;
   for (const radio of $('#dlgSearch').querySelectorAll('input[name=searchKind]')) radio.checked=radio.value==='any';
   setError('');
  });

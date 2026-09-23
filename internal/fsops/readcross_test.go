@@ -12,6 +12,7 @@ package fsops
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -285,5 +286,110 @@ func TestOnlyStorageMountsAreCountedAsNotSearched(t *testing.T) {
 			t.Errorf("size cross=%v: files %d, MountsSkipped %d; want nothing counted and only /data reported",
 				cross, size.Files, size.MountsSkipped)
 		}
+	}
+}
+
+// qtsGoldenUnder is the captured QTS mount table (internal/platform/testdata,
+// PLAN.md decision 15) re-rooted under a temporary directory, so the walk can
+// be run against it on real directories. Every mount point gets api in front and
+// every mount ID and parent ID is moved past synthMountIDBase, for the reason
+// that constant exists: the walk names a mount by its descriptor first, and the
+// captured IDs (17, 25, 30…) are small enough to collide with the CI kernel's.
+// extra lines, in the same format and already un-prefixed, are appended after
+// the captured ones and are rewritten the same way.
+func qtsGoldenUnder(t *testing.T, api string, extra ...string) *platform.Platform {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join("..", "platform", "testdata", "qts_mountinfo.txt"))
+	if err != nil {
+		t.Fatalf("reading the golden QTS table: %v", err)
+	}
+	lines := append(strings.Split(strings.TrimSpace(string(raw)), "\n"), extra...)
+	var b strings.Builder
+	for _, line := range lines {
+		f := strings.Fields(strings.TrimSpace(line))
+		if len(f) < 5 {
+			continue
+		}
+		for _, i := range []int{0, 1} {
+			var id int
+			if _, err := fmt.Sscan(f[i], &id); err != nil {
+				t.Fatalf("mount id %q: %v", f[i], err)
+			}
+			f[i] = fmt.Sprint(synthMountIDBase + id)
+		}
+		mp := strings.TrimSuffix(api+f[4], "/")
+		f[4] = strings.ReplaceAll(mp, " ", `\040`)
+		b.WriteString(strings.Join(f, " ") + "\n")
+	}
+	p, err := platform.FromMountinfo(strings.NewReader(b.String()))
+	if err != nil {
+		t.Fatalf("re-rooted golden table: %v", err)
+	}
+	return p
+}
+
+// TestSearchOfShareOnTheQTSTable is the search dialog's "Include mounted
+// sub-folders" box on QTS (owner, 2026-09-23: offered there too, not only on
+// hero), against the captured QTS table plus three lines it does not have: a
+// second volume, a USB disk mounted INSIDE a volume and a tmpfs inside a volume.
+//
+// Ticked, a search of /share enters every volume under the RAM disk and, inside
+// a volume, only its own domain — which on QTS includes the bind mount "Public
+// Files", one device with its volume, so what is under it is found a second time
+// by that path. The USB disk the table mounts under /share/external hangs off the
+// RAM disk too, and is entered by the same rule; the one inside a volume is
+// another domain and is not. Network and tmpfs mounts are never entered.
+func TestSearchOfShareOnTheQTSTable(t *testing.T) {
+	base := tempDir(t)
+	for _, d := range []string{
+		"share",
+		"share/CACHEDEV1_DATA",
+		"share/CACHEDEV1_DATA/Public",
+		"share/CACHEDEV1_DATA/Public Files",
+		"share/CACHEDEV1_DATA/usbstick",
+		"share/CACHEDEV1_DATA/ram",
+		"share/CACHEDEV2_DATA",
+		"share/external/DEV3301_1",
+		"share/remote",
+	} {
+		mkdir(t, base, d)
+		write(t, base, d+"/probe-"+strings.ReplaceAll(filepath.Base(d), " ", "_")+".txt", "x")
+	}
+	r, api := hostRoot(t, base)
+	plat := qtsGoldenUnder(t, api,
+		"35 30 9:2 / /share/CACHEDEV2_DATA rw,relatime - ext4 /dev/md2 rw,data=ordered",
+		"36 31 8:49 / /share/CACHEDEV1_DATA/usbstick rw,relatime - ext4 /dev/sdd1 rw",
+		"37 31 0:50 / /share/CACHEDEV1_DATA/ram rw,relatime - tmpfs tmpfs rw",
+	)
+
+	tests := []struct {
+		name    string
+		cross   bool
+		hits    []string
+		mounts  int64
+		network int64
+	}{
+		{"box ticked", true, []string{
+			"probe-CACHEDEV1_DATA.txt", "probe-CACHEDEV2_DATA.txt", "probe-DEV3301_1.txt",
+			"probe-Public.txt", "probe-Public_Files.txt", "probe-share.txt",
+		}, 1, 1}, // usbstick is counted; the tmpfs is not; the NFS mount is network
+		{"box unticked", false, []string{"probe-share.txt"}, 3, 1}, // both volumes and the USB disk
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := searchReq("probe", api+"/share")
+			req.Hidden, req.CrossMounts = true, tc.cross
+			res, err := Search(context.Background(), r, plat, req, Emit{})
+			if err != nil {
+				t.Fatalf("Search: %v", err)
+			}
+			if got := sortedHitNames(res); strings.Join(got, ",") != strings.Join(tc.hits, ",") {
+				t.Errorf("hits = %v, want %v", got, tc.hits)
+			}
+			if res.MountsSkipped != tc.mounts || res.MountsNetwork != tc.network {
+				t.Errorf("MountsSkipped = %d, MountsNetwork = %d, want %d and %d",
+					res.MountsSkipped, res.MountsNetwork, tc.mounts, tc.network)
+			}
+		})
 	}
 }

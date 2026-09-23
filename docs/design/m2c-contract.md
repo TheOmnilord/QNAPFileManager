@@ -94,7 +94,7 @@ ui-ux-safety-plan §4 (upload progress, Ctrl+F). Where the UI plan (resumable ch
    route never lists hits under a Deny prefix the guard hides from listing today (apply the same read-side rule
    `browse` applies). Audit intent/result (roots, query, hits, truncated). Job kind `search`, class metadata.
 4. **UI.** `Ctrl+F` and a toolbar "Search…" open a dialog: query, "match pattern", "include hidden", "include
-   mounted sub-folders" (hero), root = current folder (editable). Submit → job → when done, the list pane switches
+   mounted sub-folders" (hero; on QTS as well since 2026-09-23, see PLAN.md decision 9), root = current folder (editable). Submit → job → when done, the list pane switches
    to a **results view** (path column, size, modified; click opens the parent and selects the item; Escape returns);
    the Operations panel shows the job with visited count; `Detail` shown as the results header. `REFRESH_KINDS`
    unchanged (search changes nothing).

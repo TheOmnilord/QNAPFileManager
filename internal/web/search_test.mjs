@@ -1,7 +1,8 @@
 // Run with: node --test internal/web/search_test.mjs
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
-import {rootRef,searchRequest,searchProblem,resultsTitle,mountsNote,resultRow,escapeReturnsToListing,searchOutcomeWins,claimResults,revealNeedsHidden,searchTeardown,resultLink,KINDS} from './static/js/search.js';
+import {readFileSync} from 'node:fs';
+import {rootRef,searchRequest,searchProblem,resultsTitle,mountsNote,searchCrossOffered,resultRow,escapeReturnsToListing,searchOutcomeWins,claimResults,revealNeedsHidden,searchTeardown,resultLink,KINDS} from './static/js/search.js';
 import {activeView,actionsEnabledFor} from './static/js/state.js';
 import {revealIndex,revealApplies,revealFilter,matchesFilter} from './static/js/list.js';
 
@@ -463,7 +464,7 @@ test('mountsNote says where the search did not look, and promises nothing more',
  // from inside a pool), so it is offered as a possibility.
  assert.equal(mountsNote({local:2},{crossMounts:false,canCross:true}),
   `${n(2)} mounted folders were not searched. Ticking “Include mounted sub-folders” may include them.`);
- // No box on screen (QTS): no advice about one.
+ // No box on screen: no advice about one.
  assert.equal(mountsNote({local:2},{crossMounts:false,canCross:false}),
   `${n(2)} mounted folders were not searched.`);
  for (const local of [1,5]) for (const crossMounts of [false,true]) {
@@ -479,4 +480,24 @@ test('a network share is reported, never offered as somewhere to search', () => 
  const both = mountsNote({local:1,network:2},{crossMounts:true,canCross:true});
  assert.equal(both,`1 mounted folder was not searched. ${n(2)} network shares were skipped; network shares cannot be searched.`);
  assert.doesNotMatch(mountsNote({network:4},{crossMounts:false,canCross:true}),/Tick|search (it|them|inside)/i);
+});
+
+// --- the box on QTS (owner, 2026-09-23) ---------------------------------------
+
+test('the search dialog offers "Include mounted sub-folders" on QTS as well as hero', () => {
+ assert.equal(searchCrossOffered({family:'qts'}),true);
+ assert.equal(searchCrossOffered({family:'quts_hero'}),true);
+ assert.equal(searchCrossOffered(null),false);
+ // The default is the markup's, the same on both: visible and ticked.
+ const html = readFileSync(new URL('./static/index.html', import.meta.url), 'utf8');
+ const row = html.match(/<p id="searchCrossRow"[^>]*>.*?<\/p>/s)?.[0] ?? '';
+ assert.doesNotMatch(row.match(/<p[^>]*>/)[0],/\bhidden\b/);
+ assert.match(row,/<input type="checkbox" id="searchCross" checked>/);
+});
+
+test('on QTS an unticked box now earns the hint, since it is on screen', () => {
+ const canCross = searchCrossOffered({family:'qts'});
+ assert.equal(mountsNote({local:1},{crossMounts:false,canCross}),
+  '1 mounted folder was not searched. Ticking “Include mounted sub-folders” may include it.');
+ assert.equal(mountsNote({local:1},{crossMounts:true,canCross}),'1 mounted folder was not searched.');
 });

@@ -17,10 +17,18 @@ import (
 // exactly when the worker moves and therefore exactly when it may write a
 // notice. It reports each entry on `entered` — buffered and offered rather than
 // sent, so a call the test is not watching for cannot park on it.
+//
+// The release at the end is close(step), not a flag plus a send. `entered` is
+// signalled before the call waits, so a test that has just read it cannot know
+// whether the worker is already parked on step or still about to be: with a
+// "free" flag stored in that gap, the worker saw it, never read step, and the
+// test's last send waited for a receiver that would never come (CI run
+// 35924016562, ten minutes under -race). A closed channel releases a worker
+// that is parked and one that has not got there yet alike, and never blocks
+// the goroutine that closes it.
 type pacedMirror struct {
 	step    chan struct{}
 	entered chan struct{}
-	free    atomic.Bool
 
 	mu   sync.Mutex
 	msgs []string
@@ -35,9 +43,7 @@ func (p *pacedMirror) log(_ qnap.Severity, msg string) error {
 	case p.entered <- struct{}{}:
 	default:
 	}
-	if !p.free.Load() {
-		<-p.step
-	}
+	<-p.step
 	p.mu.Lock()
 	p.msgs = append(p.msgs, msg)
 	p.mu.Unlock()
@@ -155,8 +161,7 @@ func TestSkippedMirrorsCostOneStderrNoticePerMinute(t *testing.T) {
 	}
 
 	// Let the rest through so Close is not waiting on a mirror the test parked.
-	mirror.free.Store(true)
-	mirror.step <- struct{}{}
+	close(mirror.step)
 	if err := l.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}

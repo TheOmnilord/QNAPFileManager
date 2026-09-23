@@ -128,9 +128,9 @@ export const NARROW_HINT='Narrow the search: pick a folder closer to what you ar
 // only when it is on screen (canCross) and unticked, and as "may": ticking it
 // does not reach another pool from inside a pool. Empty when nothing was
 // skipped.
-export function mountsNote({local = 0,network = 0} = {},{crossMounts = false,canCross = false} = {}) {
+export function mountsNote({local = 0,network = 0,hidden = 0} = {},{crossMounts = false,canCross = false} = {}) {
  const whole=v => Math.max(0,Math.floor(Number(v)||0));
- const n=whole(local),m=whole(network);
+ const n=whole(local),m=whole(network),h=whole(hidden);
  const parts=[];
  if (n) {
   const them=n===1 ? 'it' : 'them';
@@ -138,6 +138,10 @@ export function mountsNote({local = 0,network = 0} = {},{crossMounts = false,can
   if (!crossMounts && canCross) parts.push(`Ticking “Include mounted sub-folders” may include ${them}.`);
  }
  if (m) parts.push(`${m===1 ? '1 network share was' : `${m.toLocaleString()} network shares were`} skipped; network shares cannot be searched.`);
+ // Hidden folders (hiddenSkipped) are counted only when hidden items were
+ // off, so the box is always the thing to tick; "may", because what is inside
+ // them may still be refused or out of bounds.
+ if (h) parts.push(`${h===1 ? '1 hidden folder was' : `${h.toLocaleString()} hidden folders were`} not searched. Ticking “Include hidden items” may include ${h===1 ? 'it' : 'them'}.`);
  return parts.join(' ');
 }
 
@@ -154,6 +158,13 @@ export function searchCrossOffered(session) { return !!session; }
 // the two together). Ticked: searching /share is the natural way to search
 // every volume (decision 9, amended), and unticked it finds nothing there.
 export const SEARCH_CROSS_DEFAULT=true;
+
+// SEARCH_HIDDEN_DEFAULT is the same for "Include hidden items" (owner,
+// 2026-09-23), with the same rules: every new session starts ticked, an untick
+// lasts for the session, and index.html carries the same `checked` (a test pins
+// the two). Off, a search of /share never entered .qpkg — the QKVM report again —
+// because on a NAS what a user goes looking for as root is often in a dot-folder.
+export const SEARCH_HIDDEN_DEFAULT=true;
 
 // resultRow shapes one hit into the four things its row shows, plus the
 // reference the click needs.
@@ -393,7 +404,7 @@ async function submit() {
    visited:Number(result.files) || 0,
    // The mount points it passed over, and what the dialog asked for, so the
    // pane can say where it did not look and what would change that.
-   mounts:mountsNote({local:result.mountsSkipped,network:result.mountsNetwork},
+   mounts:mountsNote({local:result.mountsSkipped,network:result.mountsNetwork,hidden:result.hiddenSkipped},
     {crossMounts:!!body.crossMounts,canCross:!$('#searchCrossRow').hidden}),
    hits,
    // focus is the roving tabindex's position: which row owns the keyboard, and
@@ -652,11 +663,12 @@ export function initSearch() {
   $('#searchQuery').value=''; $('#searchRoot').value='';
   // Back to the DEFAULTS, not to "off": the reason for clearing is that the
   // flags were the previous user's, and the next user's are the markup's. The
-  // crossing box is ticked by default, and clearing it to false here left it
+  // crossing and hidden boxes are ticked by default, and clearing the first to
+  // false here left it
   // unticked on every first load too — connect() publishes update({listener})
   // while the session is still null, which reads as a sign-out (Astra r5 on the
   // QKVM fix) — so a default search of /share excluded every volume.
-  $('#searchGlob').checked=false; $('#searchHidden').checked=false; $('#searchCross').checked=SEARCH_CROSS_DEFAULT;
+  $('#searchGlob').checked=false; $('#searchHidden').checked=SEARCH_HIDDEN_DEFAULT; $('#searchCross').checked=SEARCH_CROSS_DEFAULT;
   for (const radio of $('#dlgSearch').querySelectorAll('input[name=searchKind]')) radio.checked=radio.value==='any';
   setError('');
  });

@@ -117,34 +117,37 @@ func TestSearchFromTheRAMDiskEntersEveryVolume(t *testing.T) {
 	}
 }
 
-// TestSearchCountsHiddenMountsOnlyWhenHiddenIsOn: a hidden mount point is passed
-// over because it is hidden, not because it is a mount, and saying "1 mounted
-// folder was not searched" about a folder the user asked not to see would be
-// noise.
-func TestSearchCountsHiddenMountsOnlyWhenHiddenIsOn(t *testing.T) {
+// TestAHiddenMountIsAMountNotAHiddenFolder is Astra r9: with hidden items off,
+// a hidden mount point the walk would not cross anyway is a MOUNTED folder not
+// searched — ticking "Include hidden items" would not get into it — and a plain
+// hidden directory is a HIDDEN folder not searched. Never both, and with hidden
+// items on there is nothing hidden to report.
+func TestAHiddenMountIsAMountNotAHiddenFolder(t *testing.T) {
 	base := tempDir(t)
 	mkdir(t, base, "share/.hidden_vol")
-	mkdir(t, base, "share/vol")
+	mkdir(t, base, "share/.plain_hidden")
 	r, api := hostRoot(t, base)
 	plat := synthPlatform(t,
 		synthMount{mountPoint: api, fsType: "ext4", dev: "8:1"},
 		synthMount{mountPoint: api + "/share", fsType: "tmpfs", dev: "0:23", source: "tmpfs"},
 		synthMount{mountPoint: api + "/share/.hidden_vol", fsType: "ext4", dev: "8:2", source: "/dev/sdb1"},
-		synthMount{mountPoint: api + "/share/vol", fsType: "ext4", dev: "8:3", source: "/dev/sdc1"},
 	)
-	for _, hidden := range []bool{false, true} {
+	for _, tc := range []struct {
+		hidden          bool
+		mounts, hiddenN int64
+	}{
+		{false, 1, 1},
+		{true, 1, 0},
+	} {
 		req := searchReq("nothing-matches", api+"/share")
-		req.Hidden = hidden
+		req.Hidden = tc.hidden
 		res, err := Search(context.Background(), r, plat, req, Emit{})
 		if err != nil {
 			t.Fatalf("Search: %v", err)
 		}
-		want := int64(1)
-		if hidden {
-			want = 2
-		}
-		if res.MountsSkipped != want {
-			t.Errorf("hidden=%v: MountsSkipped = %d, want %d", hidden, res.MountsSkipped, want)
+		if res.MountsSkipped != tc.mounts || res.HiddenSkipped != tc.hiddenN {
+			t.Errorf("hidden=%v: MountsSkipped = %d, HiddenSkipped = %d, want %d and %d",
+				tc.hidden, res.MountsSkipped, res.HiddenSkipped, tc.mounts, tc.hiddenN)
 		}
 	}
 }

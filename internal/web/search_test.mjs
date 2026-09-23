@@ -544,3 +544,14 @@ test('the name wins the width: the target shrinks first and may shrink to nothin
  assert.ok(shrink(target) > 1000 * shrink(name),`target shrink ${shrink(target)} vs name ${shrink(name)}`);
  assert.match(name,/min-width:\s*[1-9]/);
 });
+
+// --- hidden folders passed over (owner, 2026-09-23) ---------------------------
+
+test('the note says how many hidden folders were not searched, singular and plural', () => {
+ assert.equal(mountsNote({hidden:1}),'1 hidden folder was not searched. Ticking “Include hidden items” may include it.');
+ assert.equal(mountsNote({hidden:4}),`${n(4)} hidden folders were not searched. Ticking “Include hidden items” may include them.`);
+ assert.equal(mountsNote({hidden:0}),'');
+ // After the mount sentences, which it does not change.
+ assert.equal(mountsNote({local:2,network:1,hidden:1},{crossMounts:true,canCross:true}),
+  `${n(2)} mounted folders were not searched. 1 network share was skipped; network shares cannot be searched. 1 hidden folder was not searched. Ticking “Include hidden items” may include it.`);
+});

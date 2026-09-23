@@ -1,6 +1,6 @@
 package web
 
-// JobResult.MountsSkipped end to end on the web side (PLAN.md decision 9,
+// JobResult.MountsSkipped (and MountsNetwork, HiddenSkipped) end to end on the web side (PLAN.md decision 9,
 // amended 2026-09-23): the count of mount points a search or a size did not
 // enter has to reach the UI, including after a search's hits have been moved
 // out of the manager into the retention ledger and spliced back on read.
@@ -34,22 +34,22 @@ func TestSearchMountsSkippedSurvivesTheHitsHandoff(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			s, fj := transferFixture(t)
-			fj.result = wproto.JobResult{Files: 4, MountsSkipped: 3, MountsNetwork: 1, Hits: tc.hits}
+			fj.result = wproto.JobResult{Files: 4, MountsSkipped: 3, MountsNetwork: 1, HiddenSkipped: 5, Hits: tc.hits}
 			c, csrf := sessionCookie(t, s)
 			j := acceptedJob(t, post(s, "/api/jobs/search", c, csrf, `{"roots":[{"path":"/src"}],"query":"qkvm","hidden":true,"crossMounts":true}`))
 			_, view := awaitSearchView(t, s, j.ID)
-			if view.MountsSkipped != 3 || view.MountsNetwork != 1 {
+			if view.MountsSkipped != 3 || view.MountsNetwork != 1 || view.HiddenSkipped != 5 {
 				t.Fatalf("manager's summary: %+v", view)
 			}
 			one := request(s, "GET", "/api/jobs/"+j.ID, c, nil)
-			if one.Code != 200 || !strings.Contains(one.Body.String(), `"mountsSkipped":3`) || !strings.Contains(one.Body.String(), `"mountsNetwork":1`) {
+			if one.Code != 200 || !strings.Contains(one.Body.String(), `"mountsSkipped":3`) || !strings.Contains(one.Body.String(), `"mountsNetwork":1`) || !strings.Contains(one.Body.String(), `"hiddenSkipped":5`) {
 				t.Fatalf("single job: %d %s", one.Code, one.Body)
 			}
 			if len(tc.hits) > 0 && !strings.Contains(one.Body.String(), `"hits"`) {
 				t.Fatalf("single job lost its hits: %s", one.Body)
 			}
 			list := request(s, "GET", "/api/jobs", c, nil)
-			if list.Code != 200 || !strings.Contains(list.Body.String(), `"mountsSkipped":3`) || !strings.Contains(list.Body.String(), `"mountsNetwork":1`) {
+			if list.Code != 200 || !strings.Contains(list.Body.String(), `"mountsSkipped":3`) || !strings.Contains(list.Body.String(), `"mountsNetwork":1`) || !strings.Contains(list.Body.String(), `"hiddenSkipped":5`) {
 				t.Fatalf("job list: %d %s", list.Code, list.Body)
 			}
 		})

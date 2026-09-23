@@ -652,6 +652,12 @@ type JobResult struct {
 	// network share, whether by crossing or as its root, so "search inside it"
 	// would be a promise the app cannot keep.
 	MountsNetwork int64 `json:"mn,omitempty"`
+	// HiddenSkipped counts the hidden DIRECTORIES a search passed over because
+	// it was not asked to include hidden items: each one at the level the skip
+	// happened, nothing beneath it (which was never visited). Zero when hidden
+	// items were included, and for every other job. omitempty keeps an older
+	// peer's frames byte-identical.
+	HiddenSkipped int64 `json:"hs,omitempty"`
 }
 
 // SizeReq measures trees: files, directories and bytes under each path.

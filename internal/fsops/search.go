@@ -219,7 +219,10 @@ type searcher struct {
 	mounts int64
 	// network counts the network mounts the table refused (JobResult.MountsNetwork).
 	network int64
-	hits    []fsx.Entry
+	// hiddenDirs counts the hidden directories passed over because hidden items
+	// were not asked for (JobResult.HiddenSkipped). Zero when they were.
+	hiddenDirs int64
+	hits       []fsx.Entry
 	// hitBytes is what the hits collected so far will weigh on the wire,
 	// against searchResultBytesCap.
 	hitBytes int64
@@ -397,12 +400,13 @@ func (s *searcher) visit(it WalkItem) error {
 	skipHidden := !s.hidden && strings.HasPrefix(it.Name, ".")
 
 	s.visited++
-	if it.Mount && it.Searchable && !skipHidden {
+	if it.Mount && it.Searchable {
 		// A mount point the walk would not enter: the directory itself is still
-		// matched below, but nothing under it was looked at. A hidden one is not
-		// counted — hidden-ness, not the mount, is why it was passed over — and
-		// neither is a pseudo-filesystem (proc, sys, dev, cgroup …) or one that
-		// could not be named: nobody can search inside those (it.Searchable).
+		// matched below, but nothing under it was looked at. It is counted here
+		// whether or not its name is hidden: the mount, not the name, is what kept
+		// the walk out, and ticking "Include hidden items" would not change that
+		// (Astra r9). A pseudo-filesystem (proc, sys, dev, cgroup …) or one that
+		// could not be named is not counted: nobody can search inside those.
 		s.mounts++
 	}
 	if it.isDir() {
@@ -447,6 +451,17 @@ func (s *searcher) visit(it WalkItem) error {
 	// Last, so that a bound reached on this very entry ends the whole walk
 	// rather than only this branch of it.
 	if skipHidden && it.isDir() {
+		if !it.opened {
+			// A mount boundary or a directory that could not be opened: the walk
+			// was never going to enter it, so the hidden-items option is not what
+			// kept the search out, and counting it would promise that ticking the
+			// box gets in (Astra r9).
+			return fs.SkipDir
+		}
+		// Counted HERE, at the level the skip happens: what is beneath it is
+		// never visited, so there is nothing further to count and nothing that
+		// could be (JobResult.HiddenSkipped).
+		s.hiddenDirs++
 		return fs.SkipDir
 	}
 	return nil
@@ -510,11 +525,12 @@ func (s *searcher) entry(it WalkItem) fsx.Entry {
 // reported once, exactly as a size job reports it.
 //
 // A network mount the table refused (refusedByTable) is also a mount the search
-// did not enter. It is counted apart from the local ones (MountsNetwork), under
-// the same hidden-name rule visit applies, because no search can enter it at all.
+// did not enter. It is counted apart from the local ones (MountsNetwork),
+// whether its name is hidden or not, because no search can enter it at all
+// (Astra r9).
 func (s *searcher) warn(apiPath string, err error) {
 	s.skipped++
-	if isMountNotEntered(err) && (s.hidden || !strings.HasPrefix(fsx.Base(apiPath), ".")) {
+	if isMountNotEntered(err) {
 		s.network++
 	}
 	s.emit.warnErr(apiPath, err)
@@ -528,6 +544,7 @@ func (s *searcher) result() wproto.JobResult {
 		Detail:        s.stop,
 		MountsSkipped: s.mounts,
 		MountsNetwork: s.network,
+		HiddenSkipped: s.hiddenDirs,
 	}
 	return res
 }

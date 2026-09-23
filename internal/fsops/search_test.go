@@ -520,3 +520,86 @@ func TestSearchSpansEveryRootInWalkOrder(t *testing.T) {
 		t.Fatalf("hits = %v", got)
 	}
 }
+
+// TestSearchCountsTheHiddenFoldersItPassedOver: with hidden items off, every
+// hidden DIRECTORY the walk reaches is counted once, at the level it was
+// skipped — never what is beneath it, which is not visited — and a hidden FILE
+// is not a folder the search failed to look in. With hidden items on there is
+// nothing to count.
+func TestSearchCountsTheHiddenFoldersItPassedOver(t *testing.T) {
+	base := tempDir(t)
+	mkdir(t, base, "tree/.qpkg/QKVM/.deeper")
+	mkdir(t, base, "tree/sub/.cache")
+	write(t, base, "tree/.hidden-file", "x")
+	write(t, base, "tree/sub/.cache/QKVM.txt", "x")
+	r := newRoot(t, base)
+
+	for _, tc := range []struct {
+		hidden bool
+		want   int64
+		hits   int
+	}{
+		{false, 2, 0}, // .qpkg and sub/.cache; not QKVM/.deeper, not the file
+		{true, 0, 2},  // QKVM and QKVM.txt are found instead
+	} {
+		req := searchReq("qkvm", "/tree")
+		req.Hidden = tc.hidden
+		res, err := Search(context.Background(), r, nil, req, Emit{})
+		if err != nil {
+			t.Fatalf("hidden=%v: %v", tc.hidden, err)
+		}
+		if res.HiddenSkipped != tc.want || len(res.Hits) != tc.hits {
+			t.Errorf("hidden=%v: HiddenSkipped = %d, hits %v; want %d and %d hits",
+				tc.hidden, res.HiddenSkipped, hitNames(res), tc.want, tc.hits)
+		}
+	}
+}
+
+// TestAnUnreadableHiddenFolderIsNotCountedAsHidden is Astra r9: a hidden
+// directory the kernel will not let the walk open is a directory it could not
+// read (Skipped, with a warning) whatever the hidden-items option says, so it
+// is not reported as a hidden folder that ticking the box would reach.
+func TestAnUnreadableHiddenFolderIsNotCountedAsHidden(t *testing.T) {
+	requireOwnPermissions(t)
+	base := tempDir(t)
+	mkdir(t, base, "tree/.locked/inside")
+	mkdir(t, base, "tree/.open")
+	locked := filepath.Join(base, "tree", ".locked")
+	if err := os.Chmod(locked, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
+	r := newRoot(t, base)
+
+	res, err := Search(context.Background(), r, nil, searchReq("nothing-matches", "/tree"), Emit{})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if res.HiddenSkipped != 1 || res.Skipped != 1 {
+		t.Errorf("HiddenSkipped = %d, Skipped = %d; want 1 (.open) and 1 (.locked)", res.HiddenSkipped, res.Skipped)
+	}
+}
+
+// TestAHiddenFolderAtTheDepthBoundIsNotCountedAsHidden is Astra r10: a
+// readable hidden directory AT the depth bound is one the walk will not descend
+// into whatever the hidden-items option says, so it is not reported as a hidden
+// folder that ticking the box would reach. The bound is lowered for the test;
+// a 256-level tree does not fit in a Windows path.
+func TestAHiddenFolderAtTheDepthBoundIsNotCountedAsHidden(t *testing.T) {
+	prev := maxWalkDepth
+	maxWalkDepth = 3
+	t.Cleanup(func() { maxWalkDepth = prev })
+
+	base := tempDir(t)
+	mkdir(t, base, "tree/a/b/.deep/inside") // .deep is at depth 3, the bound
+	mkdir(t, base, "tree/.shallow")         // depth 1: an ordinary hidden folder
+	r := newRoot(t, base)
+
+	res, err := Search(context.Background(), r, nil, searchReq("nothing-matches", "/tree"), Emit{})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if res.HiddenSkipped != 1 {
+		t.Errorf("HiddenSkipped = %d, want 1 (.shallow only, not .deep at the depth bound)", res.HiddenSkipped)
+	}
+}

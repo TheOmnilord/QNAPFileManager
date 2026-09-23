@@ -161,6 +161,9 @@ type jobResultView struct {
 	// MountsNetwork is the network mounts it refused (wproto.JobResult.
 	// MountsNetwork): kept apart, because nothing can search inside one.
 	MountsNetwork int64 `json:"mountsNetwork,omitempty"`
+	// HiddenSkipped is the hidden directories a search passed over
+	// (wproto.JobResult.HiddenSkipped).
+	HiddenSkipped int64 `json:"hiddenSkipped,omitempty"`
 }
 
 // ForList returns a copy of the result suitable for list responses, omitting hits to reduce bandwidth.
@@ -175,6 +178,7 @@ func (v jobResultView) ForList() jobResultView {
 		TrashIDs:      v.TrashIDs,
 		MountsSkipped: v.MountsSkipped,
 		MountsNetwork: v.MountsNetwork,
+		HiddenSkipped: v.HiddenSkipped,
 		// Hits intentionally omitted.
 	}
 }
@@ -224,7 +228,7 @@ func viewOf(res wproto.JobResult) jobResultView {
 	// known to have been a delete-to-trash (jobDelete), so that a result carrying
 	// ids can never be published for an operation whose items are gone for good.
 	return jobResultView{Files: res.Files, Dirs: res.Dirs, Bytes: res.Bytes, Skipped: res.Skipped, Warnings: res.Warnings, Detail: res.Detail,
-		MountsSkipped: res.MountsSkipped, MountsNetwork: res.MountsNetwork}
+		MountsSkipped: res.MountsSkipped, MountsNetwork: res.MountsNetwork, HiddenSkipped: res.HiddenSkipped}
 }
 
 // --- requested ⇄ resolved roots (findings W4 and W5) -------------------------

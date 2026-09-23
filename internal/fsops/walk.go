@@ -47,7 +47,17 @@ import (
 // descent is an fd leak with a stack in front of it; a tree deeper than this is
 // reported as an item-level failure and left alone. Real trees are two orders
 // of magnitude shallower — PATH_MAX itself stops a Linux pathname at 4096 bytes.
-const maxWalkDepth = 256
+//
+// It is a variable only so a test can reach the bound without a 256-level tree,
+// which Windows' MAX_PATH will not hold (Astra r10). Production never assigns
+// to it.
+var maxWalkDepth = 256
+
+// beyondWalkDepth is the one comparison against maxWalkDepth that decides
+// whether the walk descends into an item: visit refuses at it, and directory
+// asks it before telling the visitor the item will be opened (WalkItem.opened),
+// so the two can never disagree.
+func beyondWalkDepth(depth int) bool { return depth >= maxWalkDepth }
 
 // maxDirPasses is the walker's own backstop on the re-read loop a mutating
 // visitor can ask for (errRetryDir). The visitor is expected to give up long
@@ -162,6 +172,13 @@ type WalkItem struct {
 	// descended into or not, so at most one is outstanding per level. A visitor
 	// must use it and must not close it.
 	held *os.File
+
+	// opened says the walk OPENED this directory and will descend into it if
+	// the visitor lets it: not a mount boundary it refused (Mount), not one whose
+	// open failed (the Unopened/warn path). Pre is called in all three cases, and
+	// only in this one is the visitor's own SkipDir what keeps the walk out — the
+	// distinction HiddenSkipped needs (search.go, Astra r9).
+	opened bool
 }
 
 // isDir reports whether the item is a directory, without following anything.
@@ -392,7 +409,7 @@ func (w *walker) visit(ctx context.Context, it WalkItem, open dirOpener) error {
 	if !it.isDir() || it.Mount || open == nil {
 		return nil
 	}
-	if it.Depth >= maxWalkDepth {
+	if beyondWalkDepth(it.Depth) {
 		w.warn(it.Path, fmt.Errorf("%q is nested more than %d levels deep: %w", it.Path, maxWalkDepth, fsx.ErrUnsupported))
 		return nil
 	}
@@ -671,6 +688,9 @@ func (w *walker) directory(ctx context.Context, parentDir *dirRef, it WalkItem, 
 		}
 		return d, nil
 	}
+	// Only where visit will really descend: a readable directory at the depth
+	// bound is left alone by the walk whatever the visitor says (Astra r10).
+	it.opened = !beyondWalkDepth(it.Depth)
 	verr := w.visit(ctx, it, open)
 	if first != nil {
 		// Pre returned fs.SkipDir, so the descriptor was never consumed.

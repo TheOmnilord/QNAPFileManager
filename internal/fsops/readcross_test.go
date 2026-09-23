@@ -640,4 +640,19 @@ func TestSearchOfRootOnTheTVSh1688x(t *testing.T) {
 	if res.MountsSkipped != 15 {
 		t.Errorf("unticked MountsSkipped = %d, want 15", res.MountsSkipped)
 	}
+
+	// The hardware report's own search: /share, box ticked. A complete walk
+	// passes over exactly four storage or RAM mounts inside the shares — the
+	// msg.lock tmpfs and the system-docker zvol in ZFS530_DATA, and the two lxd
+	// tmpfs mounts in ZFS19_DATA — so a count of 2 on the NAS is a walk the visit
+	// bound cut short, having reached one of those two pairs.
+	req = searchReq("probe", api+"/share")
+	req.Hidden, req.CrossMounts = true, true
+	res, err = Search(context.Background(), r, plat, req, Emit{})
+	if err != nil {
+		t.Fatalf("Search of /share: %v", err)
+	}
+	if res.MountsSkipped != 4 || res.MountsNetwork != 0 {
+		t.Errorf("/share: MountsSkipped = %d, MountsNetwork = %d, want 4 and 0", res.MountsSkipped, res.MountsNetwork)
+	}
 }

@@ -5,7 +5,7 @@ const listeners = new Set();
 // searchResults is the last search's outcome — {query,root,detail,hits,open} or
 // null — and it OUTLIVES the results view being closed. Following a hit into
 // its folder must not be a one-way door: the walk that produced the hits can
-// take a minute, so they are kept for the session and `open` says only whether
+// take minutes, so they are kept for the session and `open` says only whether
 // the view is currently showing them.
 //
 // pendingReveal is a request from the results view to the listing: {name,path,
@@ -13,7 +13,7 @@ const listeners = new Set();
 // consumed exactly once, by loadList.
 //
 // searchJob is {seq,id} for the search that owns the results pane, or null. A
-// search is a job that can run for a minute, so a second one can be submitted
+// search is a job that can run for minutes, so a second one can be submitted
 // (and finish) while the first is still walking; only the latest may paint.
 // `seq` is the SUBMISSION ticket, not the order the 202s came back in — see
 // claimResults in search.js for why those are not the same order.

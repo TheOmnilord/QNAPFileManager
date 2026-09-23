@@ -9,7 +9,7 @@ import {loadTree} from './tree.js';
 import {emptyState} from './empty.js';
 
 // Search (M2-C, contract §3.4). A search is a JOB — it walks trees that can take
-// a minute — so the dialog only submits it; the Operations panel owns the
+// minutes — so the dialog only submits it; the Operations panel owns the
 // progress and the cancel, and the list pane switches to a results view when it
 // finishes.
 //
@@ -100,8 +100,19 @@ export function searchProblem(body) {
 export function resultsTitle(count,query,root,detail) {
  const n=Math.max(0,Number(count)||0);
  const head=`${n.toLocaleString()} result${n===1 ? '' : 's'} for “${String(query??'')}” in ${String(root??'')}`;
- return detail ? `${head} · ${detail}` : head;
+ if (!detail) return head;
+ return stoppedEarly(detail) ? `${head} · ${detail}. ${NARROW_HINT}` : `${head} · ${detail}`;
 }
+
+// stoppedEarly says whether the worker's detail names one of the search's own
+// bounds — the hit cap ("first 1000 of many") or the visit or time cap
+// ("stopped after …") — rather than a cancellation or a retention note. Those
+// are the cases where the tree was bigger than one search, and the one useful
+// thing to add is how to make it smaller.
+export function stoppedEarly(detail) {
+ return /(^|· )(first \d+ of many|stopped after )/.test(String(detail??''));
+}
+export const NARROW_HINT='Narrow the search: pick a folder closer to what you are looking for.';
 
 // mountsNote is the sentence under the results header when the walk passed over
 // mount points it did not enter (PLAN.md decision 9). On QTS and hero every
@@ -170,7 +181,7 @@ export function resultRow(entry) {
  };
 }
 
-// A search is a job: it can walk for a minute, and nothing stops the user from
+// A search is a job: it can walk for minutes, and nothing stops the user from
 // starting another one meanwhile. Search A (slow) then B: B finishes first and
 // is displayed, then A lands and replaced B's results with its own — the user
 // was left reading answers to a question they had already moved on from, under
@@ -259,7 +270,7 @@ export function escapeReturnsToListing(current) {
 
 // The root the dialog opened on, kept as a reference until the user edits the
 // field (see rootRef). pending and generation are the same submission lock
-// transfer.js uses: a search can take a minute, dismissal is never blocked, and
+// transfer.js uses: a search can take minutes, dismissal is never blocked, and
 // a late answer must not land on a dialog that has been reopened since.
 let rootPicked=null,pending=false,generation=0;
 // submitted counts the search SUBMISSIONS, so a ticket taken before the request

@@ -46,10 +46,20 @@ import (
 
 // The maxima of contract §3.2. The route sends these; the worker clamps to
 // them, so a request asking for a million hits gets a thousand.
+//
+// The visit and time bounds bound WORK, not memory: hits are bounded by count
+// and by bytes below, visited entries are never retained, and the progress
+// frame reuses one slice per directory (currentWire). They were 500 000 and
+// 60 s until a search of /share on the TVS-h1688X stopped at the visit bound
+// before it reached the share it was looking in (hardware report, 2026-09-23);
+// a search is a cancellable job in Operations, and nothing between the worker
+// and the page times out under it (a pool job is not bounded by CallTimeout, the
+// job manager's context has no deadline, and the UI polls for up to ten
+// minutes).
 const (
 	searchMaxHits    = 1000
-	searchMaxVisited = 500_000
-	searchMaxSeconds = 60
+	searchMaxVisited = 10_000_000
+	searchMaxSeconds = 300
 
 	// maxSearchResultBytes bounds what the HITS may weigh, which the count of
 	// them does not (M2-C review round 6 adversarial).
@@ -220,6 +230,13 @@ type searcher struct {
 	stop string
 	// current is the directory being scanned, for the progress frames.
 	current string
+	// currentWire is current as the bytes a progress frame carries, converted
+	// once per DIRECTORY rather than once per entry: every visited entry emits a
+	// progress update (the worker coalesces them to ten frames a second), and at
+	// ten million entries a fresh copy of the same path per entry is ten million
+	// allocations nobody reads. The slice is never written after it is made, so
+	// the frame the coalescing holds back may keep a reference to it.
+	currentWire []byte
 }
 
 func newSearch(r fsx.Root, plat *platform.Platform, req wproto.SearchReq, emit Emit) (*searcher, error) {
@@ -342,7 +359,7 @@ func (s *searcher) root(ctx context.Context, apiPath string) error {
 		held.close()
 		return err
 	}
-	s.current = tg.api
+	s.setCurrent(tg.api)
 
 	v := Visitor{
 		Pre:  func(it WalkItem) error { return s.visit(it) },
@@ -389,14 +406,14 @@ func (s *searcher) visit(it WalkItem) error {
 		s.mounts++
 	}
 	if it.isDir() {
-		s.current = it.Path
+		s.setCurrent(it.Path)
 	}
 	s.emit.prog(wproto.Prog{
 		Files: s.visited,
 		// -1 rather than 0: a search has no denominator and never will, and a
 		// UI that saw a zero total would draw a full bar (§3.2).
 		FilesTotal: -1,
-		Current:    []byte(s.current),
+		Current:    s.currentWire,
 		Phase:      wproto.PhaseScanning,
 	})
 	if !skipHidden && s.matches(it) {
@@ -592,4 +609,12 @@ func foldEqual(a, b rune) bool {
 		}
 	}
 	return false
+}
+
+// setCurrent records the directory being scanned, for the progress frames.
+func (s *searcher) setCurrent(apiPath string) {
+	if apiPath != s.current || s.currentWire == nil {
+		s.current = apiPath
+		s.currentWire = []byte(apiPath)
+	}
 }

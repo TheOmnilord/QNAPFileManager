@@ -33,8 +33,8 @@ func TestJobSearchRoundTrip(t *testing.T) {
 			Roots:       [][]byte{[]byte("/a")},
 			Query:       "REPORT",
 			MaxHits:     1000,
-			MaxVisited:  500000,
-			MaxDuration: 60,
+			MaxVisited:  10_000_000,
+			MaxDuration: 300,
 		}),
 	})
 	s := readJob(t, tr, 9)

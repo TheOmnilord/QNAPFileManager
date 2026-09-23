@@ -82,7 +82,7 @@ ui-ux-safety-plan §4 (upload progress, Ctrl+F). Where the UI plan (resumable ch
    **substring** of the entry name (Unicode simple folding); `glob:true` treats it as a `path.Match` pattern on the
    name. Empty query → 422.
 2. **Worker.** `JobSearch` with `SearchReq{Roots, Query, Glob, Hidden, CrossMounts, Kind, MaxHits, MaxVisited,
-   MaxDuration}`; the route sends the caps (`1000` hits, `500 000` visited, `60 s`) — the worker also clamps to
+   MaxDuration}`; the route sends the caps (`1000` hits, `10 000 000` visited, `300 s`; raised from `500 000` and `60 s` on 2026-09-23, when a search of `/share` on the TVS-h1688X hit the visit bound before reaching the share it was looking in) — the worker also clamps to
    those maxima. Walk on held descriptors, never following symlinks, `ProtectSnapshots`, crossing by decision 9;
    `/proc`, `/sys`, `/dev` never entered (the walker's Storage rule). Progress: `Files` = visited, `FilesTotal` =
    -1, `Current` = the directory being scanned, prog frames coalesced by the worker as today. Result:

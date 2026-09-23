@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
 import {readFileSync} from 'node:fs';
-import {rootRef,searchRequest,searchProblem,resultsTitle,mountsNote,searchCrossOffered,resultNameParts,resultRow,escapeReturnsToListing,searchOutcomeWins,claimResults,revealNeedsHidden,searchTeardown,resultLink,KINDS} from './static/js/search.js';
+import {rootRef,searchRequest,searchProblem,resultsTitle,stoppedEarly,NARROW_HINT,mountsNote,searchCrossOffered,resultNameParts,resultRow,escapeReturnsToListing,searchOutcomeWins,claimResults,revealNeedsHidden,searchTeardown,resultLink,KINDS} from './static/js/search.js';
 import {activeView,actionsEnabledFor} from './static/js/state.js';
 import {revealIndex,revealApplies,revealFilter,matchesFilter} from './static/js/list.js';
 
@@ -108,7 +108,22 @@ test('resultsTitle says how many, for what, and where', () => {
 test('resultsTitle never lets a capped search read as a complete one', () => {
  // The server's own sentence is what says the rest of the truth.
  assert.equal(resultsTitle(1000,'a','/share','first 1000 of many'),
-  `${n(1000)} results for “a” in /share · first 1000 of many`);
+  `${n(1000)} results for “a” in /share · first 1000 of many. Narrow the search: pick a folder closer to what you are looking for.`);
+});
+
+test('a search that stopped at a bound says how to make it smaller, and nothing else does', () => {
+ const hint = 'Narrow the search: pick a folder closer to what you are looking for.';
+ assert.equal(NARROW_HINT,hint);
+ assert.equal(resultsTitle(0,'QKVM','/share','stopped after 10000000 entries'),
+  `0 results for “QKVM” in /share · stopped after 10000000 entries. ${hint}`);
+ assert.equal(resultsTitle(3,'QKVM','/','stopped after 300 s'),`3 results for “QKVM” in / · stopped after 300 s. ${hint}`);
+ // A cancelled search that had also hit a bound still gets it; a cancellation
+ // alone, or the note that retained hits were dropped, does not.
+ assert.ok(stoppedEarly('stopped after 300 s · cancelled — partial results'));
+ assert.equal(stoppedEarly('cancelled — partial results'),false);
+ assert.equal(resultsTitle(2,'a','/share','cancelled — partial results'),'2 results for “a” in /share · cancelled — partial results');
+ assert.equal(stoppedEarly('kept the first 10 of 20; further hits were dropped'),false);
+ assert.equal(stoppedEarly('first 4 of many — results too large'),true);
 });
 
 // --- one row -----------------------------------------------------------------

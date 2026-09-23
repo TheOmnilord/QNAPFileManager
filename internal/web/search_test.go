@@ -80,7 +80,7 @@ func TestSearchSubmitCapsHitsAndAudit(t *testing.T) {
 	if err := json.Unmarshal(reqs[0].Body, &req); err != nil {
 		t.Fatal(err)
 	}
-	if string(req.Roots[0]) != "/real" || req.Query != "*.txt" || !req.Glob || !req.Hidden || !req.CrossMounts || req.Kind != "file" || req.MaxHits != 1000 || req.MaxVisited != 500000 || req.MaxDuration != 60 {
+	if string(req.Roots[0]) != "/real" || req.Query != "*.txt" || !req.Glob || !req.Hidden || !req.CrossMounts || req.Kind != "file" || req.MaxHits != 1000 || req.MaxVisited != 10_000_000 || req.MaxDuration != 300 {
 		t.Fatalf("request: %+v", req)
 	}
 	if len(view.Hits) != 3 || view.Hits[0].Path != "/src/a.txt" || view.Hits[1].Path != "/src/sub/b.txt" || view.Hits[2].PathB64 != base64.RawURLEncoding.EncodeToString([]byte("/src/bad\xff")) {

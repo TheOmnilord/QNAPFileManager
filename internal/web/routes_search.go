@@ -87,7 +87,7 @@ func (s *Server) jobSearch(w http.ResponseWriter, r *http.Request, sess *session
 		wire[i] = []byte(resolved[i])
 	}
 	reqBody, err := json.Marshal(wproto.SearchReq{Roots: wire, Query: body.Query, Glob: body.Glob, Hidden: body.Hidden,
-		CrossMounts: body.CrossMounts, Kind: body.Kind, MaxHits: 1000, MaxVisited: 500000, MaxDuration: 60})
+		CrossMounts: body.CrossMounts, Kind: body.Kind, MaxHits: 1000, MaxVisited: 10_000_000, MaxDuration: 300})
 	if err != nil {
 		s.fail(w, r, "internal", "The search could not be prepared.", m.path, "")
 		return

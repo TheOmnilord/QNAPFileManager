@@ -204,6 +204,11 @@ type searcher struct {
 
 	visited int64
 	skipped int64
+	// mounts counts the local mount points the walk reached and did not enter, so an
+	// empty result can say where it did not look (JobResult.MountsSkipped).
+	mounts int64
+	// network counts the network mounts the table refused (JobResult.MountsNetwork).
+	network int64
 	hits    []fsx.Entry
 	// hitBytes is what the hits collected so far will weigh on the wire,
 	// against searchResultBytesCap.
@@ -243,7 +248,10 @@ func newSearch(r fsx.Root, plat *platform.Platform, req wproto.SearchReq, emit E
 		glob:   req.Glob,
 		hidden: req.Hidden,
 		kind:   req.Kind,
-		opts:   WalkOptions{CrossMounts: req.CrossMounts, Protect: ProtectSnapshots},
+		// ReadCrossing: a search reads nothing but names, so it takes the read
+		// walk's crossing rule — from the tmpfs /share into every volume under it
+		// (PLAN.md decision 9, amended; the QKVM hardware report).
+		opts: WalkOptions{CrossMounts: req.CrossMounts, ReadCrossing: true, Protect: ProtectSnapshots},
 	}
 	s.maxHits = clampInt(req.MaxHits, searchMaxHits)
 	s.maxVisited = clampInt64(req.MaxVisited, searchMaxVisited)
@@ -372,6 +380,14 @@ func (s *searcher) visit(it WalkItem) error {
 	skipHidden := !s.hidden && strings.HasPrefix(it.Name, ".")
 
 	s.visited++
+	if it.Mount && it.Searchable && !skipHidden {
+		// A mount point the walk would not enter: the directory itself is still
+		// matched below, but nothing under it was looked at. A hidden one is not
+		// counted — hidden-ness, not the mount, is why it was passed over — and
+		// neither is one that is not storage (proc, sys, dev, a tmpfs) or that
+		// could not be named: nobody can search inside those (it.Searchable).
+		s.mounts++
+	}
 	if it.isDir() {
 		s.current = it.Path
 	}
@@ -475,17 +491,26 @@ func (s *searcher) entry(it WalkItem) fsx.Entry {
 
 // warn records a directory the walk could not read: counted in Skipped and
 // reported once, exactly as a size job reports it.
+//
+// A network mount the table refused (refusedByTable) is also a mount the search
+// did not enter. It is counted apart from the local ones (MountsNetwork), under
+// the same hidden-name rule visit applies, because no search can enter it at all.
 func (s *searcher) warn(apiPath string, err error) {
 	s.skipped++
+	if isMountNotEntered(err) && (s.hidden || !strings.HasPrefix(fsx.Base(apiPath), ".")) {
+		s.network++
+	}
 	s.emit.warnErr(apiPath, err)
 }
 
 func (s *searcher) result() wproto.JobResult {
 	res := wproto.JobResult{
-		Files:   s.visited,
-		Skipped: s.skipped,
-		Hits:    s.hits,
-		Detail:  s.stop,
+		Files:         s.visited,
+		Skipped:       s.skipped,
+		Hits:          s.hits,
+		Detail:        s.stop,
+		MountsSkipped: s.mounts,
+		MountsNetwork: s.network,
 	}
 	return res
 }

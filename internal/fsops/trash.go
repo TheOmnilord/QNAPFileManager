@@ -819,7 +819,7 @@ func trashSizeOf(ctx context.Context, r fsx.Root, plat *platform.Platform, apiPa
 		return trashSize{bytes: fi.Size(), files: 1, scanned: fi}, nil
 	}
 	lim := scanLimits{deadline: time.Now().Add(scanMaxDuration), maxEntries: trashScanMaxEntries}
-	scan, serr := scanTrees(ctx, r, plat, []string{apiPath}, false, Emit{}, lim, true, ProtectSnapshots)
+	scan, serr := scanTrees(ctx, r, plat, []string{apiPath}, false, false, Emit{}, lim, true, ProtectSnapshots)
 	if cerr := ctx.Err(); cerr != nil {
 		return trashSize{}, cerr
 	}

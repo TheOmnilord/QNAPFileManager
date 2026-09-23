@@ -873,7 +873,7 @@ func (c *copier) scan(ctx context.Context, srcs []source) error {
 			p.Bytes += doneBytes
 			c.emit.prog(p)
 		}}
-		res, err := scanTrees(ctx, c.r, c.plat, []string{srcs[i].api}, c.cross, off, rl, true, ProtectWrite)
+		res, err := scanTrees(ctx, c.r, c.plat, []string{srcs[i].api}, c.cross, false, off, rl, true, ProtectWrite)
 		if err != nil {
 			return err
 		}

@@ -103,6 +103,33 @@ export function resultsTitle(count,query,root,detail) {
  return detail ? `${head} · ${detail}` : head;
 }
 
+// mountsNote is the sentence under the results header when the walk passed over
+// mount points it did not enter (PLAN.md decision 9). On QTS and hero every
+// volume is its own mount under the /share RAM disk, so a search that says
+// nothing about those boundaries reads as "not there" when the truth is "not
+// looked at" — the QKVM hardware report.
+//
+// Neither count promises more than the app does (Astra r1 and r3 on the QKVM
+// fix). A LOCAL mount not entered is only reported: it may be one the guard
+// refuses as a search root (the app's own config or logs on a mount of their
+// own), and this function does not ask the guard, so it offers no next step. A
+// NETWORK share cannot be searched at all and says so. The checkbox is mentioned
+// only when it is on screen (canCross) and unticked, and as "may": ticking it
+// does not reach another pool from inside a pool. Empty when nothing was
+// skipped.
+export function mountsNote({local = 0,network = 0} = {},{crossMounts = false,canCross = false} = {}) {
+ const whole=v => Math.max(0,Math.floor(Number(v)||0));
+ const n=whole(local),m=whole(network);
+ const parts=[];
+ if (n) {
+  const them=n===1 ? 'it' : 'them';
+  parts.push(`${n===1 ? '1 mounted folder was' : `${n.toLocaleString()} mounted folders were`} not searched.`);
+  if (!crossMounts && canCross) parts.push(`Ticking “Include mounted sub-folders” may include ${them}.`);
+ }
+ if (m) parts.push(`${m===1 ? '1 network share was' : `${m.toLocaleString()} network shares were`} skipped; network shares cannot be searched.`);
+ return parts.join(' ');
+}
+
 // resultRow shapes one hit into the four things its row shows, plus the
 // reference the click needs.
 //
@@ -335,6 +362,10 @@ async function submit() {
    // How many entries the walk actually visited, so a search with no hits can
    // say what it looked at rather than only what it failed to find (§8.2).
    visited:Number(result.files) || 0,
+   // The mount points it passed over, and what the dialog asked for, so the
+   // pane can say where it did not look and what would change that.
+   mounts:mountsNote({local:result.mountsSkipped,network:result.mountsNetwork},
+    {crossMounts:!!body.crossMounts,canCross:!$('#searchCrossRow').hidden}),
    hits,
    // focus is the roving tabindex's position: which row owns the keyboard, and
    // which entry the single-item toolbar actions point at.
@@ -405,6 +436,8 @@ function paintResults() {
  const found=state.searchResults;
  if (!found) return;
  $('#resultsTitle').textContent=resultsTitle(found.hits.length,found.query,found.root,found.detail);
+ $('#resultsMounts').textContent=found.mounts||'';
+ $('#resultsMounts').hidden=!found.mounts;
  // The same idiom the file list uses: a click focuses, a double-click (or
  // Enter) opens — except on a narrow screen, where the list opens on a single
  // tap and so does this.
@@ -431,7 +464,7 @@ function paintResults() {
  $('#results').hidden=false; $('#list').hidden=true;
  $('#btnResults').hidden=false;
  $('#btnResults').textContent=`Results (${found.hits.length.toLocaleString()})`;
- announce($('#resultsTitle').textContent);
+ announce([$('#resultsTitle').textContent,found.mounts].filter(Boolean).join('. '));
  applyRoving(found.focus);
  rows[found.focus]?.focus?.();
 }

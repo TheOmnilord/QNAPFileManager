@@ -636,12 +636,35 @@ type JobResult struct {
 	// (the M3 pre-scan) must read the whole answer as "unknown" rather than as
 	// the number it happens to carry.
 	Capped bool `json:"cp,omitempty"`
+	// MountsSkipped counts the local STORAGE mount points a search or a size walk
+	// reached and did not enter: another volume or pool, or any storage mount at
+	// all with CrossMounts off. The mount point itself is still visited (and a
+	// hit if its name matches); only what is under it went unexamined, and a
+	// search rooted inside it can look. A mount that is not Storage (/proc, /sys,
+	// /dev, a tmpfs) or that the walk could not identify is not counted: nobody
+	// can search inside it (Astra r2 on the QKVM fix). It is a count, not a list,
+	// so the frame stays bounded however many shares a tree holds, and omitempty
+	// keeps an older peer's frames byte-identical.
+	MountsSkipped int64 `json:"ms,omitempty"`
+	// MountsNetwork counts the NETWORK mounts the walk refused from the mount
+	// table alone (NFS, CIFS, FUSE). They are kept apart from MountsSkipped
+	// because the advice differs (Astra r1 on the QKVM fix): no search enters a
+	// network share, whether by crossing or as its root, so "search inside it"
+	// would be a promise the app cannot keep.
+	MountsNetwork int64 `json:"mn,omitempty"`
 }
 
 // SizeReq measures trees: files, directories and bytes under each path.
 type SizeReq struct {
 	Paths       [][]byte `json:"p"`
 	CrossMounts bool     `json:"x,omitempty"`
+	// ReadCross opts this measurement into platform.MayCrossRead (PLAN.md
+	// decision 9, amended): from a non-storage parent such as the tmpfs /share
+	// the walk may enter a storage volume. The folder-size route sets it when the
+	// client asks (Properties does; the Permissions impact estimate does not).
+	// The pre-scans that measure in order to confirm a change (permissions,
+	// transfer) leave it off, so their count is the one the change will walk.
+	ReadCross bool `json:"rx,omitempty"`
 	// MaxEntries bounds the walk. Zero is the size job's own default; a caller
 	// that is measuring in order to decide something — the M3 permissions
 	// pre-scan, which runs inside a 15 s request — passes the contract's 500 000

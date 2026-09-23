@@ -6,6 +6,7 @@
 // show and a packet capture should not have to.
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
+import {readFileSync} from 'node:fs';
 
 // A document double, so the dialog's OWN handlers can be driven. Two of the
 // things this file has to prove live in the wiring rather than in the pure
@@ -455,6 +456,14 @@ test('sizeRequest is one path and the hero crossing question', () => {
  assert.deepEqual(sizeRequest([dir('/share/Public')],{crossMounts:true}),{paths:[{path:'/share/Public'}],crossMounts:true});
 });
 
+test('sizeRequest states the read rule only when it can change the answer', () => {
+ // Properties asks for decision 9's read rule; without crossing the two rules
+ // give the same answer, so nothing is sent and the two dialogs can share a walk.
+ assert.deepEqual(sizeRequest([dir('/share')],{crossMounts:true,readCross:true}),{paths:[{path:'/share'}],crossMounts:true,readCross:true});
+ assert.deepEqual(sizeRequest([dir('/share')],{readCross:true}),{paths:[{path:'/share'}]});
+ assert.deepEqual(sizeRequest([dir('/share')],{crossMounts:true}),{paths:[{path:'/share'}],crossMounts:true});
+});
+
 test('sizeReport says what the job said, and never guesses', () => {
  assert.equal(sizeReport(null).text,'Still measuring — see Operations.');
  assert.match(sizeReport({state:'cancelled'}).text,/Measurement cancelled\./);
@@ -462,6 +471,15 @@ test('sizeReport says what the job said, and never guesses', () => {
  const done = sizeReport({state:'done',result:{bytes:1024,files:2,dirs:1}});
  assert.equal(done.state,'done');
  assert.equal(done.text,'1 KiB in 2 file(s) and 1 folder(s)');
+});
+
+test('sizeReport says how many mounted folders the total leaves out', () => {
+ // decision 9: a mount point the walk did not enter is not in the number, and a
+ // volume's worth of missing bytes must not read as the size.
+ assert.equal(sizeReport({state:'done',result:{bytes:1024,files:2,dirs:1,mountsSkipped:1}}).text,
+  '1 KiB in 2 file(s) and 1 folder(s) · 1 mounted folder not counted');
+ assert.equal(sizeReport({state:'done',result:{bytes:0,files:0,dirs:1,mountsSkipped:3}}).text,
+  '0 B in 0 file(s) and 1 folder(s) · 3 mounted folders not counted');
 });
 
 // A runner with every DOM-touching collaborator injected: this is the wiring,
@@ -496,6 +514,43 @@ test('opening the dialog on a folder SUBMITS the size job', async t => {
  assert.equal(runner.jobId,null);                    // finished: nothing left to cancel
 });
 
+
+test('sizeReport names the network shares it could not measure apart', () => {
+ assert.equal(sizeReport({state:'done',result:{bytes:1024,files:2,dirs:1,mountsSkipped:2,mountsNetwork:1}}).text,
+  '1 KiB in 2 file(s) and 1 folder(s) · 2 mounted folders not counted · 1 network share not counted');
+});
+
+// Astra r1 on the QKVM fix: the Permissions impact line predicts a chmod, which
+// keeps the strict crossing rule, so it must never be answered by — or answer —
+// a Properties measurement made under the read rule.
+test('a read-rule measurement and a strict one never share a walk', async t => {
+ const props = harness(),perms = harness(),posts = [];
+ mockFetch(t,posts);
+ await props.runner.start([dir('/share/QKVMRules')],{crossMounts:true,readCross:true});
+ await perms.runner.start([dir('/share/QKVMRules')],{crossMounts:true});
+ assert.equal(posts.length,2,'the strict estimate reused the relaxed total');
+ assert.equal(posts[0].body.readCross,true);
+ assert.equal('readCross' in posts[1].body,false);
+});
+
+test('without crossing the two dialogs still measure a folder once', async t => {
+ const props = harness(),perms = harness(),posts = [];
+ mockFetch(t,posts);
+ await props.runner.start([dir('/share/QKVMOnce')],{readCross:true});
+ await perms.runner.start([dir('/share/QKVMOnce')]);
+ assert.equal(posts.length,1);
+});
+
+test('the Permissions impact estimate never asks for the read rule', () => {
+ // Pinned at the source: startImpact is DOM wiring, and the one property that
+ // matters about it is what it does NOT pass.
+ const src = readFileSync(new URL('./static/js/perms.js', import.meta.url), 'utf8');
+ const calls = src.split('\n').filter(line => line.includes('impactRunner.start('));
+ assert.ok(calls.length > 0);
+ for (const line of calls) assert.doesNotMatch(line,/readCross/);
+ const props = readFileSync(new URL('./static/js/props.js', import.meta.url), 'utf8');
+ for (const line of props.split('\n').filter(l => l.includes('sizeRunner.start('))) assert.match(line,/readCross:true/);
+});
 test('closing the dialog CANCELS the job it started', async t => {
  // A du over a multi-terabyte share must not outlive the dialog that asked.
  let release;

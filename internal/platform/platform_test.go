@@ -609,3 +609,50 @@ func mountPoints(ms []Mount) []string {
 	}
 	return out
 }
+
+// TestMayCrossRead is decision 9's amendment (2026-09-23), on the captured
+// tables: a read-only walk may step from the tmpfs /share into a volume — the
+// QKVM hardware report, a search of /share that could reach nothing — and every
+// crossing that starts inside a storage mount is still MayCross's own. The
+// strict column is asserted beside it so the exception cannot leak into the
+// rule that delete, trash, chmod and copy use.
+func TestMayCrossRead(t *testing.T) {
+	hero := load(t, "hero_mountinfo.txt")
+	qts := load(t, "qts_mountinfo.txt")
+	tests := []struct {
+		name         string
+		p            *Platform
+		from, to     string
+		read, strict bool // MayCrossRead, MayCross
+	}{
+		{"hero: tmpfs /share into a pool volume", hero, "/share", "/share/ZFS530_DATA", true, false},
+		{"hero: tmpfs /share into the second pool", hero, "/share", "/share/ZFS531_DATA", true, false},
+		{"hero: tmpfs /share into a network share", hero, "/share", "/share/remote/x", false, false},
+		{"hero: tmpfs /share into proc", hero, "/share", "/proc/self", false, false},
+		{"hero: tmpfs /share into another tmpfs", hero, "/share", "/share", false, false},
+		{"hero: volume into its own dataset", hero, "/share/ZFS530_DATA", "/share/ZFS530_DATA/Public", true, true},
+		{"hero: pool into the other pool", hero, "/share/ZFS530_DATA/Public", "/share/ZFS531_DATA/Backup", false, false},
+		{"hero: pool back into tmpfs /share", hero, "/share/ZFS530_DATA", "/share", false, false},
+		{"hero: pool into a network share", hero, "/share/ZFS530_DATA", "/share/remote/x", false, false},
+		{"qts: tmpfs /share into the volume", qts, "/share", "/share/CACHEDEV1_DATA", true, false},
+		// An ext4 USB disk mounted straight under the RAM disk is storage too, and a
+		// read-only walk of /share reaches it; only a walk from a VOLUME is kept out.
+		{"qts: tmpfs /share into a USB disk", qts, "/share", "/share/external/DEV3301_1", true, false},
+		{"qts: tmpfs /share into nfs", qts, "/share", "/share/remote/x", false, false},
+		{"qts: tmpfs /share into /tmp tmpfs", qts, "/share", "/tmp", false, false},
+		{"qts: volume into a USB disk", qts, "/share/CACHEDEV1_DATA", "/share/external/DEV3301_1", false, false},
+		{"qts: volume into its bind mount", qts, "/share/CACHEDEV1_DATA", "/share/CACHEDEV1_DATA/Public Files", true, true},
+		{"qts: storage / into tmpfs /share", qts, "/", "/share", false, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			from, to := tc.p.For(tc.from), tc.p.For(tc.to)
+			if got := tc.p.MayCrossRead(from, to); got != tc.read {
+				t.Errorf("MayCrossRead(%s, %s) = %v, want %v", from.Mount, to.Mount, got, tc.read)
+			}
+			if got := tc.p.MayCross(from, to); got != tc.strict {
+				t.Errorf("MayCross(%s, %s) = %v, want %v (the strict rule must not change)", from.Mount, to.Mount, got, tc.strict)
+			}
+		})
+	}
+}

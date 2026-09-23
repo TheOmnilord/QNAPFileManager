@@ -1,7 +1,7 @@
 // Run with: node --test internal/web/search_test.mjs
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
-import {rootRef,searchRequest,searchProblem,resultsTitle,resultRow,escapeReturnsToListing,searchOutcomeWins,claimResults,revealNeedsHidden,searchTeardown,resultLink,KINDS} from './static/js/search.js';
+import {rootRef,searchRequest,searchProblem,resultsTitle,mountsNote,resultRow,escapeReturnsToListing,searchOutcomeWins,claimResults,revealNeedsHidden,searchTeardown,resultLink,KINDS} from './static/js/search.js';
 import {activeView,actionsEnabledFor} from './static/js/state.js';
 import {revealIndex,revealApplies,revealFilter,matchesFilter} from './static/js/list.js';
 
@@ -446,4 +446,37 @@ test('escapeReturnsToListing is true only while a results view is actually open'
  assert.equal(escapeReturnsToListing({searchResults:null}),false);
  assert.equal(escapeReturnsToListing({}),false);
  assert.equal(escapeReturnsToListing(null),false);
+});
+
+// --- mount points the walk did not enter (decision 9, amended) --------------
+
+test('mountsNote says where the search did not look, and promises nothing more', () => {
+ assert.equal(mountsNote({local:0,network:0},{crossMounts:true,canCross:true}),'');
+ assert.equal(mountsNote(),'');
+ // Local mounts are only reported: one may be a root the guard refuses, and
+ // the note does not ask (Astra r3), so it offers no next step.
+ assert.equal(mountsNote({local:1},{crossMounts:true,canCross:true}),
+  '1 mounted folder was not searched.');
+ assert.equal(mountsNote({local:3},{crossMounts:true,canCross:true}),
+  `${n(3)} mounted folders were not searched.`);
+ // Unticked and on screen: the box MAY help (it does not reach another pool
+ // from inside a pool), so it is offered as a possibility.
+ assert.equal(mountsNote({local:2},{crossMounts:false,canCross:true}),
+  `${n(2)} mounted folders were not searched. Ticking “Include mounted sub-folders” may include them.`);
+ // No box on screen (QTS): no advice about one.
+ assert.equal(mountsNote({local:2},{crossMounts:false,canCross:false}),
+  `${n(2)} mounted folders were not searched.`);
+ for (const local of [1,5]) for (const crossMounts of [false,true]) {
+  assert.doesNotMatch(mountsNote({local},{crossMounts,canCross:true}),/search (it|them|inside)|directly/i);
+ }
+});
+
+test('a network share is reported, never offered as somewhere to search', () => {
+ // Neither crossing nor a search rooted inside it reaches a network share, so
+ // no sentence about one may suggest either.
+ const one = mountsNote({network:1},{crossMounts:false,canCross:true});
+ assert.equal(one,'1 network share was skipped; network shares cannot be searched.');
+ const both = mountsNote({local:1,network:2},{crossMounts:true,canCross:true});
+ assert.equal(both,`1 mounted folder was not searched. ${n(2)} network shares were skipped; network shares cannot be searched.`);
+ assert.doesNotMatch(mountsNote({network:4},{crossMounts:false,canCross:true}),/Tick|search (it|them|inside)/i);
 });

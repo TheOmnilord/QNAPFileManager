@@ -196,6 +196,9 @@ function startImpact() {
  const {roots,unmeasured:skipped} = impactRoots(targets,{recursive:recursive()});
  unmeasured = skipped;
  if (!roots.length) { impactRunner.stop(); $('#pImpact').textContent = impactNote(unmeasured); return; }
+ // No readCross: this estimates what a chmod will change, and a chmod keeps the
+ // strict crossing rule (decision 9; Astra r1 on the QKVM fix). It shares a walk
+ // with Properties only where the two rules cannot differ (sizeRequest).
  impactRunner.start(roots,{crossMounts:state.session?.family === 'quts_hero'});
 }
 

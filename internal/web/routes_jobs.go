@@ -154,18 +154,27 @@ type jobResultView struct {
 	Warnings int         `json:"warnings,omitempty"`
 	Detail   string      `json:"detail,omitempty"`
 	TrashIDs []string    `json:"trashIds,omitempty"`
+	// MountsSkipped is how many local storage mount points a search or a size walk
+	// reached and did not enter (wproto.JobResult.MountsSkipped), so the UI can say
+	// where an empty result did not look.
+	MountsSkipped int64 `json:"mountsSkipped,omitempty"`
+	// MountsNetwork is the network mounts it refused (wproto.JobResult.
+	// MountsNetwork): kept apart, because nothing can search inside one.
+	MountsNetwork int64 `json:"mountsNetwork,omitempty"`
 }
 
 // ForList returns a copy of the result suitable for list responses, omitting hits to reduce bandwidth.
 func (v jobResultView) ForList() jobResultView {
 	return jobResultView{
-		Files:    v.Files,
-		Dirs:     v.Dirs,
-		Bytes:    v.Bytes,
-		Skipped:  v.Skipped,
-		Warnings: v.Warnings,
-		Detail:   v.Detail,
-		TrashIDs: v.TrashIDs,
+		Files:         v.Files,
+		Dirs:          v.Dirs,
+		Bytes:         v.Bytes,
+		Skipped:       v.Skipped,
+		Warnings:      v.Warnings,
+		Detail:        v.Detail,
+		TrashIDs:      v.TrashIDs,
+		MountsSkipped: v.MountsSkipped,
+		MountsNetwork: v.MountsNetwork,
 		// Hits intentionally omitted.
 	}
 }
@@ -214,7 +223,8 @@ func viewOf(res wproto.JobResult) jobResultView {
 	// TrashIDs is deliberately NOT copied here. It is filled only where a job is
 	// known to have been a delete-to-trash (jobDelete), so that a result carrying
 	// ids can never be published for an operation whose items are gone for good.
-	return jobResultView{Files: res.Files, Dirs: res.Dirs, Bytes: res.Bytes, Skipped: res.Skipped, Warnings: res.Warnings, Detail: res.Detail}
+	return jobResultView{Files: res.Files, Dirs: res.Dirs, Bytes: res.Bytes, Skipped: res.Skipped, Warnings: res.Warnings, Detail: res.Detail,
+		MountsSkipped: res.MountsSkipped, MountsNetwork: res.MountsNetwork}
 }
 
 // --- requested ⇄ resolved roots (findings W4 and W5) -------------------------
@@ -1044,6 +1054,11 @@ func (s *Server) jobSize(w http.ResponseWriter, r *http.Request, sess *session) 
 	var body struct {
 		Paths       []pathRef `json:"paths"`
 		CrossMounts bool      `json:"crossMounts"`
+		// ReadCross is the measurement's PURPOSE, stated by the client: Properties
+		// asks for the read rule (PLAN.md decision 9, amended); the Permissions
+		// dialog's impact estimate does not, because it predicts what a chmod —
+		// which keeps the strict rule — will change (Astra r1 on the QKVM fix).
+		ReadCross bool `json:"readCross"`
 	}
 	if !s.decodeBody(w, r, &body) {
 		return
@@ -1064,7 +1079,10 @@ func (s *Server) jobSize(w http.ResponseWriter, r *http.Request, sess *session) 
 	for i, p := range paths {
 		wire[i] = []byte(p)
 	}
-	reqBody, err := json.Marshal(wproto.SizeReq{Paths: wire, CrossMounts: body.CrossMounts})
+	// ReadCross only when the client asked for it (see the body above). The
+	// server-side pre-scans that confirm a change measure through transferSize,
+	// which never sets it.
+	reqBody, err := json.Marshal(wproto.SizeReq{Paths: wire, CrossMounts: body.CrossMounts, ReadCross: body.ReadCross})
 	if err != nil {
 		s.fail(w, r, "internal", "The size request could not be prepared.", "", err.Error())
 		return

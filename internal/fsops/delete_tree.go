@@ -81,7 +81,7 @@ func DeleteTree(ctx context.Context, r fsx.Root, plat *platform.Platform, paths 
 
 	if o.Recursive {
 		lim := scanLimits{deadline: time.Now().Add(scanMaxDuration), maxEntries: scanMaxEntries}
-		scan, err := scanTrees(ctx, r, plat, paths, o.CrossMounts, emit, lim, true, ProtectWrite)
+		scan, err := scanTrees(ctx, r, plat, paths, o.CrossMounts, false, emit, lim, true, ProtectWrite)
 		if err != nil {
 			return d.res, err
 		}

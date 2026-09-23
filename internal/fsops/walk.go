@@ -17,7 +17,8 @@ package fsops
 //     never leaves the filesystem it started on; with it on it may descend into
 //     a mount of the same storage domain — every share of one ZFS pool — and
 //     still never into /proc, /sys, /dev, a tmpfs, a USB disk, another pool or a
-//     network mount.
+//     network mount. A read-only walk (ReadCrossing) may also step from a
+//     non-storage parent such as the tmpfs /share into a storage volume.
 //   - A per-item failure is a warning, never the end of the job. EACCES on one
 //     subdirectory of a million-file tree must not abandon the other 999 999
 //     items; the visitor is told and the walk carries on. Only the context being
@@ -80,6 +81,15 @@ type WalkOptions struct {
 	// visit everything twice.
 	Mutating bool
 
+	// ReadCrossing selects platform.MayCrossRead instead of MayCross: from a
+	// parent mount that is not storage at all — the tmpfs /share every volume is
+	// mounted under — the walk may enter a Storage, non-network child (PLAN.md
+	// decision 9, amended). It is an explicit opt-in, set only by the two walks
+	// that read and nothing else: Search and Size. It is deliberately not
+	// derived from Mutating, which the recursive chmod leaves false while it
+	// writes, and a walk that is mutating() by either test ignores it.
+	ReadCrossing bool
+
 	// Protect refuses the never-write components the front-end guard refuses,
 	// per component, as the recursion reaches them (F10, never_write.go). The
 	// guard only ever sees a job's root paths, so without this a delete of a
@@ -102,6 +112,12 @@ type WalkItem struct {
 	// descend into. Its contents are on another filesystem, so a size job must
 	// not count them and a delete must not remove them.
 	Mount bool
+	// Searchable is set with Mount when the walk identified that mount and it is
+	// Storage and not Network — somewhere a search could be started directly.
+	// A read-only caller counts only these as "mounted folders not searched"
+	// (JobResult.MountsSkipped); /proc, /sys, /dev, a tmpfs, and a mount the
+	// table cannot name are passed over without a word (Astra r2 on the QKVM fix).
+	Searchable bool
 
 	// remove unlinks this item from its parent directory, through the
 	// descriptor the walk is holding rather than through a pathname. It is
@@ -552,14 +568,30 @@ func (w *walker) refusedByTable(parentOS, name, childPath string) error {
 	if !ok || !caps.Network {
 		return nil
 	}
-	if w.opts.CrossMounts && w.plat.MayCross(w.plat.For(parentOS), caps) {
+	if w.opts.CrossMounts && w.mayCross(w.plat.For(parentOS), caps) {
 		// Unreachable while MayCross refuses every network mount, and written out
 		// anyway: the refusal has to stay a CONSEQUENCE of the crossing rule
 		// rather than a second copy of it that could drift.
 		return nil
 	}
-	return fmt.Errorf("%q is a %s mount this walk may not enter, and it was left untouched: %w",
-		childPath, caps.FSType, fsx.ErrProtected)
+	return mountNotEntered{fmt.Errorf("%q is a %s mount this walk may not enter, and it was left untouched: %w",
+		childPath, caps.FSType, fsx.ErrProtected)}
+}
+
+// mountNotEntered marks a refusal that is a mount boundary the walk would not
+// cross, as opposed to a directory it could not read. The code and the sentence
+// are the wrapped error's; the type only lets a read-only caller COUNT the mounts
+// it passed over (JobResult.MountsNetwork), so a search that could not reach a
+// network share says so beside its hits and not only in a warning row.
+type mountNotEntered struct{ err error }
+
+func (e mountNotEntered) Error() string { return e.err.Error() }
+func (e mountNotEntered) Unwrap() error { return e.err }
+
+// isMountNotEntered reports whether err is refusedByTable's refusal.
+func isMountNotEntered(err error) bool {
+	var m mountNotEntered
+	return errors.As(err, &m)
 }
 
 // literalChild joins a directory's OS path with one entry name, byte for byte
@@ -604,10 +636,10 @@ func (w *walker) directory(ctx context.Context, parentDir *dirRef, it WalkItem, 
 		w.warn(it.Path, err)
 		return nil
 	}
-	if boundary {
+	if boundary.hit {
 		// Visited as an item so a size job can report the directory itself,
 		// never descended into and never removed.
-		it.Mount = true
+		it.Mount, it.Searchable = true, boundary.searchable
 		return w.visit(ctx, it, nil)
 	}
 
@@ -627,7 +659,7 @@ func (w *walker) directory(ctx context.Context, parentDir *dirRef, it WalkItem, 
 		if err != nil {
 			return nil, err
 		}
-		if boundary {
+		if boundary.hit {
 			// openChild closed the descriptor itself; there is nothing here to
 			// release, and nothing to descend into either.
 			return nil, fmt.Errorf("%q became a mount point and was left alone: %w", it.Path, fsx.ErrProtected)
@@ -667,11 +699,11 @@ func openedInfo(d *dirRef) (os.FileInfo, error) {
 
 // openChild opens one child directory and decides, from that descriptor alone,
 // whether it is a mount boundary the walk may not cross (F4). It returns either
-// an open dirRef to descend into, or boundary = true with nothing open.
-func (w *walker) openChild(parentDir *dirRef, name, childPath, parentOS string, parentID mountIdentity) (*dirRef, bool, error) {
+// an open dirRef to descend into, or boundary.hit with nothing open.
+func (w *walker) openChild(parentDir *dirRef, name, childPath, parentOS string, parentID mountIdentity) (*dirRef, mountBoundary, error) {
 	child, err := parentDir.child(name)
 	if err != nil {
-		return nil, false, err
+		return nil, mountBoundary{}, err
 	}
 	childID := identityFor(child)
 	// B4: a mutating walk may not descend into a directory whose mount the
@@ -682,16 +714,49 @@ func (w *walker) openChild(parentDir *dirRef, name, childPath, parentOS string, 
 	// recursive delete may not, so the child is visited, warned about and left.
 	if w.mutating() && unidentifiedMount(childID, parentID) {
 		child.close()
-		return nil, false, unnamedMountRefusal(childPath)
+		return nil, mountBoundary{}, unnamedMountRefusal(childPath)
 	}
 	if !w.isMountPoint(childPath, childID, parentID) {
-		return child, false, nil
+		return child, mountBoundary{}, nil
 	}
-	if !w.mayCrossInto(parentOS, parentID, childPath, childID) {
+	cross, caps, known := w.mayCrossInto(parentOS, parentID, childPath, childID)
+	if !cross {
 		child.close()
-		return nil, true, nil
+		if !known {
+			// Crossing was never asked about (CrossMounts off), so the mount has
+			// not been named yet. It is named here the same way — by the held
+			// descriptor first — only to say whether it could be searched.
+			caps, known = w.boundaryCaps(childPath, childID)
+		}
+		return nil, mountBoundary{hit: true, searchable: known && caps.Storage && !caps.Network}, nil
 	}
-	return child, false, nil
+	return child, mountBoundary{}, nil
+}
+
+// mountBoundary is what openChild found at a mount point it will not descend
+// into. searchable says the mount was IDENTIFIED and is Storage, non-network:
+// a place a search could be started directly (Astra r2 on the QKVM fix). /proc,
+// /sys, /dev, a tmpfs, a network share and a mount nobody can name are not —
+// the first four are never searchable and never what anybody was looking for,
+// the last fails closed — so a caller counting "mounted folders not searched"
+// counts only these.
+type mountBoundary struct {
+	hit        bool
+	searchable bool
+}
+
+// boundaryCaps names the mount a boundary descriptor is on, for the count alone.
+// It is capsFor without the refresh mayCrossInto makes: nothing is authorised by
+// the answer, and a mount the table does not know yet is simply not counted.
+func (w *walker) boundaryCaps(childPath string, childID mountIdentity) (platform.FSCaps, bool) {
+	if w.plat == nil {
+		return platform.FSCaps{}, false
+	}
+	childOS, err := w.r.OS(childPath)
+	if err != nil || childOS == "" {
+		return platform.FSCaps{}, false
+	}
+	return w.capsFor(childID, childOS, true)
 }
 
 // isMountPoint reports whether a child directory that is now OPEN is the root of
@@ -733,13 +798,18 @@ func (w *walker) isMountPoint(childPath string, childID mountIdentity, parentID 
 // to leave the filesystem it started on, and crossing into a mount nobody can
 // name is precisely the case decision 9 refuses — a USB disk, another pool, a
 // network share. With no mount table there is no way to ask at all.
-func (w *walker) mayCrossInto(parentOS string, parentID mountIdentity, childPath string, childID mountIdentity) bool {
+//
+// It also hands back the child's caps and whether they were identified, so a
+// boundary it refuses can be counted by what it is (openChild) without a second
+// lookup. known is false when the question was never asked (CrossMounts off) or
+// the child could not be named; the crossing answer is false either way.
+func (w *walker) mayCrossInto(parentOS string, parentID mountIdentity, childPath string, childID mountIdentity) (cross bool, child platform.FSCaps, known bool) {
 	if !w.opts.CrossMounts || w.plat == nil {
-		return false
+		return false, platform.FSCaps{}, false
 	}
 	childOS, err := w.r.OS(childPath)
 	if err != nil || childOS == "" || parentOS == "" {
-		return false
+		return false, platform.FSCaps{}, false
 	}
 	// A mount made since the last read is exactly what the fd identity just
 	// caught, so the table is re-read before it is asked about it. On a static
@@ -747,7 +817,7 @@ func (w *walker) mayCrossInto(parentOS string, parentID mountIdentity, childPath
 	_ = w.plat.Refresh()
 	childCaps, ok := w.capsFor(childID, childOS, true)
 	if !ok {
-		return false
+		return false, platform.FSCaps{}, false
 	}
 	// The parent is allowed the longest-prefix answer by NAME — it is not the
 	// thing being entered — but not a wrong answer by identity: if the kernel
@@ -756,9 +826,25 @@ func (w *walker) mayCrossInto(parentOS string, parentID mountIdentity, childPath
 	// crossing is authorised by both halves or by neither.
 	parentCaps, ok := w.capsFor(parentID, parentOS, false)
 	if !ok {
-		return false
+		return false, childCaps, true
 	}
-	return w.plat.MayCross(parentCaps, childCaps)
+	return w.mayCross(parentCaps, childCaps), childCaps, true
+}
+
+// mayCross is the final predicate of a crossing decision: MayCross, or
+// MayCrossRead for a walk that opted in with ReadCrossing. Everything before it
+// — the fd identity, B4, B5, the fail-closed lookups — is the same for both, so
+// the relaxation changes the answer for a mount that has been positively
+// identified and for nothing else.
+//
+// mutating() is asked again here rather than trusted to the caller: a walk that
+// changes the filesystem, or the pre-scan that gives one its denominator, keeps
+// the strict rule even if some later caller sets both flags.
+func (w *walker) mayCross(from, to platform.FSCaps) bool {
+	if w.opts.ReadCrossing && !w.mutating() {
+		return w.plat.MayCrossRead(from, to)
+	}
+	return w.plat.MayCross(from, to)
 }
 
 // capsFor names the mount a descriptor belongs to and returns its capabilities.

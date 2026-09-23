@@ -57,6 +57,13 @@ type scanResult struct {
 	// ignores this.
 	incomplete bool
 
+	// mounts counts the local STORAGE mount points the walk reached and did not
+	// enter (WalkItem.Searchable), and network the network mounts the table
+	// refused, so a size can say what its total leaves out (JobResult.MountsSkipped
+	// and MountsNetwork). /proc, /sys, /dev and a tmpfs are in neither.
+	mounts  int64
+	network int64
+
 	// rootInfo is the fstat of the DESCRIPTOR the scan opened for the first root
 	// it visited (Visitor.Opened), kept so that a caller can prove afterwards
 	// that the tree it counted is the object it is still acting on. Only the
@@ -106,12 +113,17 @@ func (res *scanResult) addBytes(n int64) bool {
 // pre-scan passes ProtectWrite so its denominator counts exactly what the delete
 // will go on to remove; Size passes ProtectSnapshots, which skips .zfs and still
 // counts @Recycle.
+//
+// readCross is WalkOptions.ReadCrossing, and only Size may pass true. Every other
+// caller is the pre-scan of something that CHANGES the tree (delete, chmod/chown,
+// copy, trash), and its count has to be the count that change will walk — which
+// keeps the strict MayCross rule.
 func scanTrees(ctx context.Context, r fsx.Root, plat *platform.Platform, paths []string,
-	crossMounts bool, emit Emit, lim scanLimits, quiet bool, protect Protect) (scanResult, error) {
+	crossMounts, readCross bool, emit Emit, lim scanLimits, quiet bool, protect Protect) (scanResult, error) {
 
 	var res scanResult
 	var since int64
-	opts := WalkOptions{CrossMounts: crossMounts, Protect: protect}
+	opts := WalkOptions{CrossMounts: crossMounts, ReadCrossing: readCross, Protect: protect}
 
 	for _, p := range paths {
 		if err := ctx.Err(); err != nil {
@@ -135,6 +147,11 @@ func scanTrees(ctx context.Context, r fsx.Root, plat *platform.Platform, paths [
 					// The item itself is still counted, as decision 9 says it must
 					// be; what is recorded is that the total is a floor.
 					res.incomplete = true
+					if it.Searchable {
+						// Counted for the dialog only where it names a place that
+						// could be measured on its own (WalkItem.Searchable).
+						res.mounts++
+					}
 				}
 				if it.isDir() {
 					res.dirs++
@@ -175,6 +192,9 @@ func scanTrees(ctx context.Context, r fsx.Root, plat *platform.Platform, paths [
 		// or a tree past maxWalkDepth came back as a complete-looking total.
 		v.Warn = func(apiPath string, err error) {
 			res.incomplete = true
+			if isMountNotEntered(err) {
+				res.network++
+			}
 			if !quiet {
 				emit.warnErr(apiPath, err)
 			}
@@ -198,6 +218,19 @@ func scanTrees(ctx context.Context, r fsx.Root, plat *platform.Platform, paths [
 		}
 	}
 	return res, nil
+}
+
+// SizeOptions are the knobs of one size job, as the wire's SizeReq carries them.
+type SizeOptions struct {
+	// CrossMounts is "include mounted sub-folders" (WalkOptions.CrossMounts).
+	CrossMounts bool
+	// ReadCross opts the measurement into platform.MayCrossRead
+	// (WalkOptions.ReadCrossing). The folder-size route sets it; a pre-scan that
+	// measures in order to confirm a change does not, because its number has to
+	// be the one the change will walk.
+	ReadCross bool
+	// MaxEntries bounds the walk; see Size.
+	MaxEntries int64
 }
 
 // Size measures the trees named by paths: how many files, how many directories
@@ -243,18 +276,23 @@ func scanTrees(ctx context.Context, r fsx.Root, plat *platform.Platform, paths [
 // what it counted so far, and says Capped — and a capped measurement is not a
 // count, so the caller reads the whole answer as "unknown" rather than as the
 // number it happens to carry.
+//
+// MountsSkipped and MountsNetwork say how many mount points the total leaves
+// out, so the dialog can say so rather than present a volume's worth of missing
+// bytes as the size.
 func Size(ctx context.Context, r fsx.Root, plat *platform.Platform, paths []string,
-	crossMounts bool, maxEntries int64, emit Emit) (wproto.JobResult, error) {
+	o SizeOptions, emit Emit) (wproto.JobResult, error) {
 
 	lim := sizeScanLimits
-	if maxEntries > 0 && (lim.maxEntries <= 0 || maxEntries < lim.maxEntries) {
+	if maxEntries := o.MaxEntries; maxEntries > 0 && (lim.maxEntries <= 0 || maxEntries < lim.maxEntries) {
 		// The tighter of the two wins. sizeScanLimits is unbounded in production
 		// and is only ever narrowed by a test, so "the smaller bound" is the rule
 		// that keeps both honest.
 		lim.maxEntries = maxEntries
 	}
-	res, err := scanTrees(ctx, r, plat, paths, crossMounts, emit, lim, false, ProtectSnapshots)
-	out := wproto.JobResult{Files: res.files, Dirs: res.dirs, Bytes: res.bytes, Capped: res.capped}
+	res, err := scanTrees(ctx, r, plat, paths, o.CrossMounts, o.ReadCross, emit, lim, false, ProtectSnapshots)
+	out := wproto.JobResult{Files: res.files, Dirs: res.dirs, Bytes: res.bytes, Capped: res.capped,
+		MountsSkipped: res.mounts, MountsNetwork: res.network}
 	if err != nil {
 		return out, err
 	}

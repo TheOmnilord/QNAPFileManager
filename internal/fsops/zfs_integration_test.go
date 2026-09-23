@@ -290,6 +290,34 @@ func TestZFSFixtureSearchCrossesDatasetsOnlyWhenAsked(t *testing.T) {
 	if !found {
 		t.Fatalf("with CrossMounts the probe in %s must be found; hits = %d", zfsPublic, len(res.Hits))
 	}
+
+	// From the RAM disk itself (decision 9, amended — the QKVM hardware report):
+	// /share is a tmpfs, so no volume under it shares its domain, and a search
+	// of /share reached nothing at all. The read rule enters the volume, and the
+	// same-pool rule then carries it into Public; unticked, the volumes are
+	// counted as not searched rather than passed over in silence.
+	shareReq := wproto.SearchReq{Roots: [][]byte{[]byte(zfsShare)}, Query: "qfm-search-probe", Hidden: true, CrossMounts: true}
+	res, err = Search(ctx, r, plat, shareReq, Emit{})
+	if err != nil {
+		t.Fatalf("Search of %s with CrossMounts: %v", zfsShare, err)
+	}
+	found = false
+	for _, h := range res.Hits {
+		found = found || h.Path == probe
+	}
+	if !found {
+		t.Fatalf("a search of %s with CrossMounts must reach %s; hits = %d, mounts skipped = %d",
+			zfsShare, probe, len(res.Hits), res.MountsSkipped)
+	}
+	shareReq.CrossMounts = false
+	res, err = Search(ctx, r, plat, shareReq, Emit{})
+	if err != nil {
+		t.Fatalf("Search of %s without CrossMounts: %v", zfsShare, err)
+	}
+	if len(res.Hits) != 0 || res.MountsSkipped < 2 {
+		t.Fatalf("without CrossMounts: hits = %d, mounts skipped = %d; want none, and both volumes counted",
+			len(res.Hits), res.MountsSkipped)
+	}
 }
 
 // TestZFSFixtureArchiveOfADataset streams a real dataset and reads it back with

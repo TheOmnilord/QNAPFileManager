@@ -207,7 +207,7 @@ func (j *modeJob) run(ctx context.Context, paths []string) (wproto.JobResult, er
 			}
 		}
 		lim := scanLimits{deadline: time.Now().Add(scanMaxDuration), maxEntries: modeScanMaxEntries}
-		scan, err := scanTrees(ctx, j.r, j.plat, paths, j.cross, j.emit, lim, true, ProtectWrite)
+		scan, err := scanTrees(ctx, j.r, j.plat, paths, j.cross, false, j.emit, lim, true, ProtectWrite)
 		if err != nil {
 			return j.res, err
 		}

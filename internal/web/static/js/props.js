@@ -20,10 +20,18 @@ import {capsSentence} from './why.js';
 // sizeRequest is the body POST /api/jobs/size takes. Crossing is the hero
 // question: a share whose sub-folders are separate datasets measures as nothing
 // at all unless the walk is allowed to cross (decision 9).
-export function sizeRequest(entries,{crossMounts = false} = {}) {
+//
+// readCross is the measurement's PURPOSE (decision 9, amended; Astra r1 on the
+// QKVM fix). Properties is a read and asks for the read rule, which may step
+// from the /share RAM disk into a volume; the Permissions impact estimate
+// predicts a chmod, which never does, and so never asks. It is sent only with
+// crossing on, because without crossing the two rules give the same answer —
+// and then the two dialogs may still share one walk (sizeJobKey).
+export function sizeRequest(entries,{crossMounts = false,readCross = false} = {}) {
  const list = (Array.isArray(entries) ? entries : [entries]).filter(Boolean);
  const body = {paths:list.map(pathArgs)};
  if (crossMounts) body.crossMounts = true;
+ if (crossMounts && readCross) body.readCross = true;
  return body;
 }
 
@@ -33,10 +41,17 @@ export function sizeReport(job) {
  if (!job) return {state:'pending',text:'Still measuring — see Operations.',result:null};
  if (job.state !== 'done') return {state:job.state,text:job.note || job.error || `Measurement ${job.state}.`,result:job.result || null};
  const r = job.result || {};
+ // Mount points the walk did not enter are part of what the number leaves out
+ // (PLAN.md decision 9), and a volume's worth of missing bytes has to be said.
+ // Network shares are named apart: they are never measured at all.
+ const whole = v => Math.max(0,Math.floor(Number(v) || 0));
+ const mounts = whole(r.mountsSkipped),network = whole(r.mountsNetwork);
+ const left = (mounts ? ` · ${mounts.toLocaleString()} mounted folder${mounts === 1 ? '' : 's'} not counted` : '')
+  + (network ? ` · ${network.toLocaleString()} network share${network === 1 ? '' : 's'} not counted` : '');
  return {
   state:'done',
   result:r,
-  text:`${formatBytes(r.bytes || 0)} in ${(r.files || 0).toLocaleString()} file(s) and ${(r.dirs || 0).toLocaleString()} folder(s)`,
+  text:`${formatBytes(r.bytes || 0)} in ${(r.files || 0).toLocaleString()} file(s) and ${(r.dirs || 0).toLocaleString()} folder(s)${left}`,
  };
 }
 
@@ -58,9 +73,11 @@ const sizeJobs = new Map();
 
 // sizeJobKey is the identity of a measurement: the exact body it would post.
 // Crossing is part of it — a share measured with and without crossing into its
-// sub-datasets are two different answers (decision 9).
-export function sizeJobKey(entries,{crossMounts = false} = {}) {
- return JSON.stringify(sizeRequest(entries,{crossMounts}));
+// sub-datasets are two different answers (decision 9), and so are a read-rule
+// measurement and a strict one: a relaxed total must never be shown as the
+// impact of a chmod that will not cross, nor the reverse.
+export function sizeJobKey(entries,{crossMounts = false,readCross = false} = {}) {
+ return JSON.stringify(sizeRequest(entries,{crossMounts,readCross}));
 }
 
 // sizeJobUsable says whether an existing measurement may be attached to. Pure
@@ -311,7 +328,7 @@ export function createSizeRunner({report = () => {},track = trackJob,cancel = ca
    const sent = [release(had),...retryStopping(had)].filter(Boolean);
    return sent.length ? Promise.all(sent).then(() => undefined) : undefined;
   },
-  async start(entries,{crossMounts = false} = {}) {
+  async start(entries,{crossMounts = false,readCross = false} = {}) {
    runner.stop();
    // The measurement is held to its OWNER, not to the session object it was
    // started under. A du over a multi-terabyte share runs for minutes, and the
@@ -323,7 +340,7 @@ export function createSizeRunner({report = () => {},track = trackJob,cancel = ca
    // "Measuring…" for ever over a measurement nobody was making (Astra r7 #3).
    // A switch or a sign-out still ends it: that is what the epoch moves on.
    const ticket = run,valid = ownerGuard();
-   const key = sizeJobKey(entries,{crossMounts});
+   const key = sizeJobKey(entries,{crossMounts,readCross});
    report({state:'running',text:'Measuring…',result:null});
    pruneSizeJobs();
    let entry = sizeJobs.get(key);
@@ -339,7 +356,7 @@ export function createSizeRunner({report = () => {},track = trackJob,cancel = ca
      cancelPending:false,ownerEpoch:state.ownerEpoch,cancelEpoch:-1};
     entry.promise = (async () => {
      const res = await api('api/jobs/size',{},{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify(sizeRequest(entries,{crossMounts}))});
+      body:JSON.stringify(sizeRequest(entries,{crossMounts,readCross}))});
      entry.id = res.job?.id ?? null;
      // Abandoned while the 202 was in flight: the job exists on the server and
      // nobody is waiting for it, so it is cancelled rather than left to walk.
@@ -549,7 +566,7 @@ export async function properties(entry) {
   propsData = data;
   paint(data);
   if (isDirectory(data.entry || entry)) {
-   sizeRunner.start([entry],{crossMounts:state.session?.family === 'quts_hero'});
+   sizeRunner.start([entry],{crossMounts:state.session?.family === 'quts_hero',readCross:true});
   } else {
    $('#propsSize').textContent = `${Number((data.entry || entry).size || 0).toLocaleString()} bytes`;
   }
@@ -575,7 +592,7 @@ export function initProps() {
  $('#dlgProps').addEventListener('close',() => { sizeRunner.stop(); propsEntry = null; propsData = null; });
  $('#btnCalcSize').addEventListener('click',() => {
   const entry = propsTarget();
-  if (entry) sizeRunner.start([entry],{crossMounts:state.session?.family === 'quts_hero'});
+  if (entry) sizeRunner.start([entry],{crossMounts:state.session?.family === 'quts_hero',readCross:true});
  });
  $('#btnStopSize').addEventListener('click',() => { sizeRunner.stop(); $('#propsSize').textContent = 'Measurement stopped.'; $('#btnStopSize').disabled = true; });
 }

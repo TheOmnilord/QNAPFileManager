@@ -909,6 +909,29 @@ func (p *Platform) MayCross(from, to FSCaps) bool {
 	return to.Storage && !to.Network && to.Domain == from.Domain
 }
 
+// MayCrossRead is MayCross for a walk that only READS — search and the
+// folder-size probe — and it differs in exactly one case: a parent that is not
+// storage at all (PLAN.md decision 9, amended 2026-09-23).
+//
+// /share on QTS and QuTS hero is a tmpfs RAM disk and every volume is its own
+// mount under it, so "same domain" can never hold between /share and a volume:
+// a search of /share for a folder on ZFS530_DATA found nothing and said nothing
+// (hardware report, QKVM under .qpkg). A RAM disk has no domain worth
+// protecting, so from a non-storage parent the walk may enter a Storage,
+// non-network child. Once inside a storage mount the parent IS storage, and
+// every further crossing is MayCross's own: pool to USB, pool to pool, anything
+// to a network share, /proc, /sys, /dev or a tmpfs stays refused.
+//
+// It is never the rule for a walk that changes anything. Delete, trash,
+// chmod/chown, copy/move and archive keep MayCross, so a delete of /share can
+// never reach a volume by way of this exception.
+func (p *Platform) MayCrossRead(from, to FSCaps) bool {
+	if p.MayCross(from, to) {
+		return true
+	}
+	return !from.Storage && to.Storage && !to.Network
+}
+
 // TrashRootFor returns the mount root under which a trash directory for
 // osPath belongs (PLAN.md decision 10 / identity plan §4.2): the NEAREST
 // enclosing mount, which must itself be a Storage, non-network filesystem. On

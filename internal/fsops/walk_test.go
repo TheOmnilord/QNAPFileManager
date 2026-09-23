@@ -561,7 +561,7 @@ func TestSizeSaysWhenItsScanWasCapped(t *testing.T) {
 	t.Cleanup(func() { sizeScanLimits = prev })
 
 	var log jobLog
-	res, err := Size(context.Background(), r, nil, []string{"/a"}, false, 0, log.emit())
+	res, err := Size(context.Background(), r, nil, []string{"/a"}, SizeOptions{}, log.emit())
 	if err != nil {
 		t.Fatalf("Size: %v", err)
 	}

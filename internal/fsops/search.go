@@ -249,8 +249,8 @@ func newSearch(r fsx.Root, plat *platform.Platform, req wproto.SearchReq, emit E
 		hidden: req.Hidden,
 		kind:   req.Kind,
 		// ReadCrossing: a search reads nothing but names, so it takes the read
-		// walk's crossing rule — from the tmpfs /share into every volume under it
-		// (PLAN.md decision 9, amended; the QKVM hardware report).
+		// walk's crossing rule — from / into /share and on into every volume
+		// under it (PLAN.md decision 9, amended; the QKVM hardware reports).
 		opts: WalkOptions{CrossMounts: req.CrossMounts, ReadCrossing: true, Protect: ProtectSnapshots},
 	}
 	s.maxHits = clampInt(req.MaxHits, searchMaxHits)
@@ -384,7 +384,7 @@ func (s *searcher) visit(it WalkItem) error {
 		// A mount point the walk would not enter: the directory itself is still
 		// matched below, but nothing under it was looked at. A hidden one is not
 		// counted — hidden-ness, not the mount, is why it was passed over — and
-		// neither is one that is not storage (proc, sys, dev, a tmpfs) or that
+		// neither is a pseudo-filesystem (proc, sys, dev, cgroup …) or one that
 		// could not be named: nobody can search inside those (it.Searchable).
 		s.mounts++
 	}

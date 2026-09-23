@@ -435,18 +435,43 @@ function focusResult(index,{open=false}={}) {
  if (open) openHit(found.hits[i]);
 }
 
+// resultNameParts is what the Name cell of one result row shows, in order:
+// the kind glyph, the entry's own NAME, its badges, and last the "→ target" of
+// a symlink. Pure, so the order is a unit test rather than something to look
+// at (hardware report: a symlink row showed "🔗 🛡 → /share/…" and no name).
+//
+// The name comes from resultRow, which falls back to the path's last component
+// when the hit carries only nameB64 — a name that is not valid UTF-8 must
+// still be shown as something rather than as nothing.
+export function resultNameParts(entry) {
+ const e=entry||{};
+ const parts=[{kind:'glyph',text:e.isSymlink ? '🔗' : isDirectory(e) ? '📁' : e.type==='file' ? '📄' : '⚙'}];
+ parts.push({kind:'name',text:resultRow(e).name});
+ if (e.class==='protected') parts.push({kind:'protected',text:'🛡'});
+ if (e.mountPoint) parts.push({kind:'mount',text:'⏏'});
+ const link=resultLink(e);
+ if (link) parts.push({kind:'target',text:link.text,title:link.title});
+ return parts;
+}
+
 // resultNameCell is the listing's name cell minus the claims a search cannot
 // make. It is not nameCell(): that one strikes an unresolved symlink through
 // and calls it broken, which for a search hit is simply not known.
+//
+// The NAME wins the width. The target is the part that gives way — it is
+// truncated first, and to nothing if need be (app.css, .name .target) — because
+// a row whose own name has been squeezed out names nothing at all.
 function resultNameCell(entry) {
  const cell=el('span',{role:'gridcell',class:'name',title:entry.path});
- const glyph=entry.isSymlink ? '🔗' : isDirectory(entry) ? '📁' : entry.type==='file' ? '📄' : '⚙';
- cell.append(el('span',{'aria-hidden':'true',class:'badge'},glyph));
- cell.append(el('span',{class:'nameText'},entry.name));
- if (entry.class==='protected') cell.append(el('span',{class:'badge',title:'Protected system path','aria-label':'Protected system path'},'🛡'));
- if (entry.mountPoint) cell.append(el('span',{class:'badge',title:'Mount point','aria-label':'Mount point'},'⏏'));
- const link=resultLink(entry);
- if (link) cell.append(el('span',{class:'target',title:link.title},link.text));
+ for (const part of resultNameParts(entry)) {
+  switch (part.kind) {
+  case 'glyph': cell.append(el('span',{'aria-hidden':'true',class:'badge'},part.text)); break;
+  case 'name': cell.append(el('span',{class:'nameText'},part.text)); break;
+  case 'protected': cell.append(el('span',{class:'badge',title:'Protected system path','aria-label':'Protected system path'},part.text)); break;
+  case 'mount': cell.append(el('span',{class:'badge',title:'Mount point','aria-label':'Mount point'},part.text)); break;
+  case 'target': cell.append(el('span',{class:'target',title:part.title},part.text)); break;
+  }
+ }
  return cell;
 }
 

@@ -17,8 +17,9 @@ package fsops
 //     never leaves the filesystem it started on; with it on it may descend into
 //     a mount of the same storage domain — every share of one ZFS pool — and
 //     still never into /proc, /sys, /dev, a tmpfs, a USB disk, another pool or a
-//     network mount. A read-only walk (ReadCrossing) may also step from a
-//     non-storage parent such as the tmpfs /share into a storage volume.
+//     network mount. A read-only walk (ReadCrossing) may also step out of a
+//     "system" filesystem — the mount at "/" or a tmpfs such as /share — into a
+//     RAM filesystem or a storage volume.
 //   - A per-item failure is a warning, never the end of the job. EACCES on one
 //     subdirectory of a million-file tree must not abandon the other 999 999
 //     items; the visitor is told and the walk carries on. Only the context being
@@ -82,12 +83,13 @@ type WalkOptions struct {
 	Mutating bool
 
 	// ReadCrossing selects platform.MayCrossRead instead of MayCross: from a
-	// parent mount that is not storage at all — the tmpfs /share every volume is
-	// mounted under — the walk may enter a Storage, non-network child (PLAN.md
-	// decision 9, amended). It is an explicit opt-in, set only by the two walks
-	// that read and nothing else: Search and Size. It is deliberately not
-	// derived from Mutating, which the recursive chmod leaves false while it
-	// writes, and a walk that is mutating() by either test ignores it.
+	// "system" parent — the mount at "/", or a RAM filesystem such as the tmpfs
+	// /share every volume is mounted under — the walk may enter a RAM or a
+	// Storage, non-network child (PLAN.md decision 9, amended). It is an explicit
+	// opt-in, set only by the two walks that read and nothing else: Search and
+	// Size. It is deliberately not derived from Mutating, which the recursive
+	// chmod leaves false while it writes, and a walk that is mutating() by either
+	// test ignores it.
 	ReadCrossing bool
 
 	// Protect refuses the never-write components the front-end guard refuses,
@@ -113,10 +115,13 @@ type WalkItem struct {
 	// not count them and a delete must not remove them.
 	Mount bool
 	// Searchable is set with Mount when the walk identified that mount and it is
-	// Storage and not Network — somewhere a search could be started directly.
-	// A read-only caller counts only these as "mounted folders not searched"
-	// (JobResult.MountsSkipped); /proc, /sys, /dev, a tmpfs, and a mount the
-	// table cannot name are passed over without a word (Astra r2 on the QKVM fix).
+	// either Storage or a RAM filesystem (tmpfs, ramfs), and not Network: a
+	// place that holds, or like /share can hold mounts of, user data. A read-only
+	// caller counts only these as "mounted folders not searched"
+	// (JobResult.MountsSkipped); /proc, /sys, /dev and the other pseudo-
+	// filesystems, and a mount the table cannot name, are passed over without a
+	// word (Astra r2 on the QKVM fix; RAM filesystems since the "search of /"
+	// hardware report, where /share itself was the boundary).
 	Searchable bool
 
 	// remove unlinks this item from its parent directory, through the
@@ -728,18 +733,17 @@ func (w *walker) openChild(parentDir *dirRef, name, childPath, parentOS string, 
 			// descriptor first — only to say whether it could be searched.
 			caps, known = w.boundaryCaps(childPath, childID)
 		}
-		return nil, mountBoundary{hit: true, searchable: known && caps.Storage && !caps.Network}, nil
+		return nil, mountBoundary{hit: true, searchable: known && !caps.Network && (caps.Storage || caps.RAM)}, nil
 	}
 	return child, mountBoundary{}, nil
 }
 
 // mountBoundary is what openChild found at a mount point it will not descend
-// into. searchable says the mount was IDENTIFIED and is Storage, non-network:
-// a place a search could be started directly (Astra r2 on the QKVM fix). /proc,
-// /sys, /dev, a tmpfs, a network share and a mount nobody can name are not —
-// the first four are never searchable and never what anybody was looking for,
-// the last fails closed — so a caller counting "mounted folders not searched"
-// counts only these.
+// into. searchable says the mount was IDENTIFIED and is Storage or a RAM
+// filesystem, and not network (WalkItem.Searchable). A pseudo-filesystem is
+// never searchable and never what anybody was looking for; a network share is
+// counted apart (MountsNetwork); a mount nobody can name fails closed and is not
+// counted at all.
 type mountBoundary struct {
 	hit        bool
 	searchable bool

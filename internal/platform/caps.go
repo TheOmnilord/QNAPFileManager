@@ -39,6 +39,14 @@ type FSCaps struct {
 
 	Network bool // nfs, cifs, sshfs, most fuse mounts: never crossed by default
 	Tmpfs   bool // memory-backed: never a storage target
+
+	// RAM is a general-purpose RAM filesystem — tmpfs or ramfs, NOT devtmpfs —
+	// the kind QTS builds /share and /tmp out of, which can hold mount points
+	// for real storage. Root is the mount at "/", decided from the mount row
+	// itself. Together they say what a read walk may treat as a "system" parent
+	// (MayCrossRead, PLAN.md decision 9 as amended).
+	RAM  bool
+	Root bool
 }
 
 // storageFSTypes are the filesystems that hold user data on QTS and QuTS hero.
@@ -108,6 +116,8 @@ func CapsFor(m Mount) FSCaps {
 		Mount:   m.MountPoint,
 		Network: IsNetworkFS(t),
 		Tmpfs:   IsMemoryFS(t),
+		RAM:     t == "tmpfs" || t == "ramfs",
+		Root:    m.MountPoint == "/",
 	}
 	if t == "zfs" {
 		c.Domain = "zfs:" + ZFSPool(m.Source)

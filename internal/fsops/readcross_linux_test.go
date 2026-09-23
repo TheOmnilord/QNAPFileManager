@@ -43,3 +43,33 @@ func TestChmodTreeNeverTakesTheReadRule(t *testing.T) {
 		}
 	}
 }
+
+// TestChmodTreeOfRootNeverTakesTheReadRule: the "search of /" rule lets a READ
+// walk step from / into /share and on into a pool. A recursive chmod of / with
+// crossing on must still stop at /share, as it always has.
+func TestChmodTreeOfRootNeverTakesTheReadRule(t *testing.T) {
+	base := tempDir(t)
+	mkdir(t, base, "share/ZFS530_DATA")
+	write(t, base, "share/ZFS530_DATA/on-the-pool.txt", "x")
+	write(t, base, "on-root.txt", "x")
+	r, api := hostRoot(t, base)
+	plat := goldenUnder(t, "hero_mountinfo.txt", api)
+	inside := filepath.Join(base, "share", "ZFS530_DATA", "on-the-pool.txt")
+	before := modeOf(t, inside)
+
+	var warns []wproto.Warn
+	if _, err := ChmodTree(context.Background(), r, plat, []string{api}, ChmodOptions{
+		Files:       perm.ModeSpec{Mask: 0o7777, Value: 0o0600},
+		Dirs:        perm.ModeSpec{Mask: 0o7777, Value: 0o0700},
+		Recursive:   true,
+		CrossMounts: true,
+	}, collect(&warns)); err != nil {
+		t.Fatalf("ChmodTree = %v", err)
+	}
+	if after := modeOf(t, inside); after != before {
+		t.Fatalf("a file on a pool went %o -> %o: the chmod of / crossed into /share", before, after)
+	}
+	if m := modeOf(t, filepath.Join(base, "on-root.txt")); m != 0o600 {
+		t.Errorf("the file on / itself is %o, want 0600", m)
+	}
+}

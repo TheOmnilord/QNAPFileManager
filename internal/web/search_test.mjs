@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
 import {readFileSync} from 'node:fs';
-import {rootRef,searchRequest,searchProblem,resultsTitle,mountsNote,searchCrossOffered,resultRow,escapeReturnsToListing,searchOutcomeWins,claimResults,revealNeedsHidden,searchTeardown,resultLink,KINDS} from './static/js/search.js';
+import {rootRef,searchRequest,searchProblem,resultsTitle,mountsNote,searchCrossOffered,resultNameParts,resultRow,escapeReturnsToListing,searchOutcomeWins,claimResults,revealNeedsHidden,searchTeardown,resultLink,KINDS} from './static/js/search.js';
 import {activeView,actionsEnabledFor} from './static/js/state.js';
 import {revealIndex,revealApplies,revealFilter,matchesFilter} from './static/js/list.js';
 
@@ -500,4 +500,32 @@ test('on QTS an unticked box now earns the hint, since it is on screen', () => {
  assert.equal(mountsNote({local:1},{crossMounts:false,canCross}),
   '1 mounted folder was not searched. Ticking “Include mounted sub-folders” may include it.');
  assert.equal(mountsNote({local:1},{crossMounts:true,canCross}),'1 mounted folder was not searched.');
+});
+
+// --- a symlink hit's name (hardware report, search of /) ---------------------
+
+test('a symlink hit shows its own name first, and the target after it', () => {
+ const hit = {path:'/etc/init.d/QKVM.sh',name:'QKVM.sh',type:'symlink',isSymlink:true,class:'protected',
+  linkTarget:'/share/ZFS530_DATA/.qpkg/QKVM/QKVM.sh'};
+ const parts = resultNameParts(hit);
+ const kinds = parts.map(p => p.kind);
+ assert.deepEqual(kinds,['glyph','name','protected','target']);
+ assert.equal(parts[1].text,'QKVM.sh');
+ assert.equal(parts[3].text,'→ /share/ZFS530_DATA/.qpkg/QKVM/QKVM.sh');
+ // A name that arrives only as bytes is still shown as something.
+ const b64 = Buffer.from('/etc/rcS.d/S99QKVM','binary').toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+ const bytesOnly = resultNameParts({pathB64:b64,type:'symlink',isSymlink:true,linkTarget:'/x'});
+ assert.equal(bytesOnly[1].kind,'name');
+ assert.equal(bytesOnly[1].text,'S99QKVM');
+});
+
+test('the name wins the width: the target shrinks first and may shrink to nothing', () => {
+ const css = readFileSync(new URL('./static/app.css', import.meta.url), 'utf8');
+ const rule = sel => { const i = css.indexOf(' ' + sel + ' {'); return i < 0 ? '' : css.slice(i, css.indexOf('}', i)); };
+ const target = rule('.target'),name = rule('.nameText');
+ assert.match(target,/min-width:0/);
+ assert.match(target,/overflow:hidden/);
+ const shrink = decl => Number(decl.match(/flex:\s*\d+\s+(\d+)/)?.[1]);
+ assert.ok(shrink(target) > 1000 * shrink(name),`target shrink ${shrink(target)} vs name ${shrink(name)}`);
+ assert.match(name,/min-width:\s*[1-9]/);
 });

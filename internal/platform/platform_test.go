@@ -629,7 +629,13 @@ func TestMayCrossRead(t *testing.T) {
 		{"hero: tmpfs /share into the second pool", hero, "/share", "/share/ZFS531_DATA", true, false},
 		{"hero: tmpfs /share into a network share", hero, "/share", "/share/remote/x", false, false},
 		{"hero: tmpfs /share into proc", hero, "/share", "/proc/self", false, false},
-		{"hero: tmpfs /share into another tmpfs", hero, "/share", "/share", false, false},
+		{"hero: tmpfs /share into another tmpfs", hero, "/share", "/share", true, false},
+		{"hero: root / into tmpfs /share", hero, "/", "/share", true, false},
+		{"hero: root / into proc", hero, "/", "/proc", false, false},
+		{"hero: root / into sysfs", hero, "/", "/sys", false, false},
+		{"hero: root / into devtmpfs", hero, "/", "/dev", false, false},
+		{"hero: root / into a network share", hero, "/", "/share/remote/x", false, false},
+		{"hero: root / straight into a pool", hero, "/", "/share/ZFS530_DATA", true, false},
 		{"hero: volume into its own dataset", hero, "/share/ZFS530_DATA", "/share/ZFS530_DATA/Public", true, true},
 		{"hero: pool into the other pool", hero, "/share/ZFS530_DATA/Public", "/share/ZFS531_DATA/Backup", false, false},
 		{"hero: pool back into tmpfs /share", hero, "/share/ZFS530_DATA", "/share", false, false},
@@ -639,10 +645,12 @@ func TestMayCrossRead(t *testing.T) {
 		// read-only walk of /share reaches it; only a walk from a VOLUME is kept out.
 		{"qts: tmpfs /share into a USB disk", qts, "/share", "/share/external/DEV3301_1", true, false},
 		{"qts: tmpfs /share into nfs", qts, "/share", "/share/remote/x", false, false},
-		{"qts: tmpfs /share into /tmp tmpfs", qts, "/share", "/tmp", false, false},
+		{"qts: tmpfs /share into /tmp tmpfs", qts, "/share", "/tmp", true, false},
+		{"qts: root / into /tmp", qts, "/", "/tmp", true, false},
 		{"qts: volume into a USB disk", qts, "/share/CACHEDEV1_DATA", "/share/external/DEV3301_1", false, false},
 		{"qts: volume into its bind mount", qts, "/share/CACHEDEV1_DATA", "/share/CACHEDEV1_DATA/Public Files", true, true},
-		{"qts: storage / into tmpfs /share", qts, "/", "/share", false, false},
+		{"qts: root / into tmpfs /share", qts, "/", "/share", true, false},
+		{"qts: volume into tmpfs /tmp", qts, "/share/CACHEDEV1_DATA", "/tmp", false, false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -654,5 +662,95 @@ func TestMayCrossRead(t *testing.T) {
 				t.Errorf("MayCross(%s, %s) = %v, want %v (the strict rule must not change)", from.Mount, to.Mount, got, tc.strict)
 			}
 		})
+	}
+}
+
+// TestMayCrossReadFromCapsAlone pins the cases the captured tables do not have,
+// straight from CapsFor: a tmpfs mounted INSIDE a pool is not entered; a ramfs
+// is a RAM filesystem like a tmpfs; devtmpfs and the other pseudo-filesystems
+// are neither Storage nor RAM and are entered from nowhere; and "/" is decided
+// by the mount row's own mount point.
+func TestMayCrossReadFromCapsAlone(t *testing.T) {
+	p := load(t, "hero_mountinfo.txt")
+	caps := func(mp, fstype string, minor int, src string) FSCaps {
+		return CapsFor(Mount{MountPoint: mp, FSType: fstype, Major: 0, Minor: minor, Source: src})
+	}
+	root := caps("/", "ext4", 2, "/dev/sda2")
+	share := caps("/share", "tmpfs", 23, "tmpfs")
+	pool := caps("/share/ZFS530_DATA", "zfs", 40, "zpool1/zfs530_data")
+	hdaRoot := caps("/mnt/HDA_ROOT", "ext4", 9, "/dev/md9")
+	if !root.Root || hdaRoot.Root || !share.RAM || pool.RAM || caps("/dev", "devtmpfs", 6, "devtmpfs").RAM {
+		t.Fatalf("classification: root %+v share %+v pool %+v", root, share, pool)
+	}
+	type row struct {
+		name     string
+		from, to FSCaps
+		want     bool
+	}
+	tests := []row{
+		{"pool into a tmpfs inside it", pool, caps("/share/ZFS530_DATA/ram", "tmpfs", 50, "tmpfs"), false},
+		{"root into ramfs", root, caps("/ram", "ramfs", 51, "ramfs"), true},
+		{"root into storage directly under it", root, hdaRoot, true},
+		{"a non-root storage mount is no system parent", hdaRoot, share, false},
+		{"pool into a USB disk", pool, caps("/share/ZFS530_DATA/usb", "ext4", 49, "/dev/sdd1"), false},
+	}
+	for _, fs := range []string{"proc", "sysfs", "devtmpfs", "devpts", "cgroup", "cgroup2", "debugfs",
+		"securityfs", "pstore", "bpf", "tracefs", "configfs", "fusectl", "mqueue", "hugetlbfs", "autofs"} {
+		tests = append(tests,
+			row{"root into " + fs, root, caps("/x", fs, 99, fs), false},
+			row{"RAM disk into " + fs, share, caps("/share/x", fs, 98, fs), false})
+	}
+	for _, tc := range tests {
+		if got := p.MayCrossRead(tc.from, tc.to); got != tc.want {
+			t.Errorf("%s: MayCrossRead = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestTVSh1688xTable is the mount table the owner captured on the TVS-h1688X
+// (QuTS hero), verbatim. It is authoritative where the older hero fixture is
+// not: "/" here is a tmpfs, not ext4.
+func TestTVSh1688xTable(t *testing.T) {
+	p := load(t, "hero_tvsh1688x_mountinfo.txt")
+	type want struct {
+		path                 string
+		root, ram, storage   bool
+		fstype, domainPrefix string
+	}
+	for _, w := range []want{
+		{"/", true, true, false, "tmpfs", ""},
+		{"/share", false, true, false, "tmpfs", ""},
+		{"/tmp/wfm", false, true, false, "tmpfs", ""},
+		{"/mnt/ext", false, false, true, "ext4", "dev:"},
+		{"/mnt/HDA_ROOT", false, false, true, "ext3", "dev:"},
+		{"/dev", false, false, false, "devtmpfs", ""},
+		{"/dev/pts", false, false, false, "devpts", ""},
+		{"/proc", false, false, false, "proc", ""},
+		{"/sys", false, false, false, "sysfs", ""},
+		{"/sys/fs/cgroup/cpu", false, false, false, "cgroup", ""},
+		{"/sys/kernel/security", false, false, false, "securityfs", ""},
+		{"/sys/kernel/debug", false, false, false, "debugfs", ""},
+		// The loop mount stacked on the FileStation6 tmpfs is what the path shows.
+		{"/mnt/ext/opt/FileStation6", false, false, true, "ext3", "dev:7:0"},
+	} {
+		c := p.For(w.path)
+		if c.Root != w.root || c.RAM != w.ram || c.Storage != w.storage || c.FSType != w.fstype ||
+			!strings.HasPrefix(c.Domain, w.domainPrefix) || c.Network {
+			t.Errorf("%s: %+v, want root=%v ram=%v storage=%v fstype=%s", w.path, c, w.root, w.ram, w.storage, w.fstype)
+		}
+	}
+	shares := map[string]string{
+		"ZFS1_DATA": "zfs:zpool1", "ZFS2_DATA": "zfs:zpool1", "ZFS18_DATA": "zfs:zpool1",
+		"ZFS19_DATA": "zfs:zpool1", "ZFS530_DATA": "zfs:zpool1",
+		"ZFS20_DATA": "zfs:zpool2", "ZFS21_DATA": "zfs:zpool2", "ZFS531_DATA": "zfs:zpool2",
+	}
+	for name, domain := range shares {
+		c := p.For("/share/" + name)
+		if c.Mount != "/share/"+name || c.FSType != "zfs" || !c.Storage || c.RAM || c.Domain != domain {
+			t.Errorf("/share/%s: %+v, want zfs Storage in %s", name, c, domain)
+		}
+	}
+	if got := len(p.VolumeRoots()); got != len(shares) {
+		t.Errorf("VolumeRoots = %d, want the %d shares", got, len(shares))
 	}
 }

@@ -57,10 +57,11 @@ type scanResult struct {
 	// ignores this.
 	incomplete bool
 
-	// mounts counts the local STORAGE mount points the walk reached and did not
-	// enter (WalkItem.Searchable), and network the network mounts the table
-	// refused, so a size can say what its total leaves out (JobResult.MountsSkipped
-	// and MountsNetwork). /proc, /sys, /dev and a tmpfs are in neither.
+	// mounts counts the local STORAGE or RAM mount points the walk reached and
+	// did not enter (WalkItem.Searchable), and network the network mounts the
+	// table refused, so a size can say what its total leaves out
+	// (JobResult.MountsSkipped and MountsNetwork). /proc, /sys, /dev and the other pseudo-filesystems are
+	// in neither.
 	mounts  int64
 	network int64
 

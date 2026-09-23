@@ -910,26 +910,39 @@ func (p *Platform) MayCross(from, to FSCaps) bool {
 }
 
 // MayCrossRead is MayCross for a walk that only READS — search and the
-// folder-size probe — and it differs in exactly one case: a parent that is not
-// storage at all (PLAN.md decision 9, amended 2026-09-23).
+// folder-size probe — and it adds exactly one kind of crossing: out of a
+// "system" filesystem (PLAN.md decision 9, amended 2026-09-23).
 //
-// /share on QTS and QuTS hero is a tmpfs RAM disk and every volume is its own
-// mount under it, so "same domain" can never hold between /share and a volume:
-// a search of /share for a folder on ZFS530_DATA found nothing and said nothing
-// (hardware report, QKVM under .qpkg). A RAM disk has no domain worth
-// protecting, so from a non-storage parent the walk may enter a Storage,
-// non-network child. Once inside a storage mount the parent IS storage, and
-// every further crossing is MayCross's own: pool to USB, pool to pool, anything
-// to a network share, /proc, /sys, /dev or a tmpfs stays refused.
+// A system parent is the mount at "/" (decided from the mount ROW, FSCaps.Root,
+// never from the walk's path) or a RAM filesystem — tmpfs or ramfs
+// (FSCaps.RAM). /share on QTS and QuTS hero is a tmpfs, every volume is its own
+// mount under it, and "/" is a RAM-disk root filesystem above that: so "same
+// domain" can never hold on the way from / to /share to a pool, and a search of
+// either found nothing and said nothing (hardware reports, QKVM under .qpkg).
+// Neither has a domain worth protecting, so from a system parent a read walk
+// may enter:
+//
+//   - a RAM filesystem (/ to /share, / to /tmp, /share to a tmpfs under it), or
+//   - a Storage, non-network filesystem (/share to a volume, / to
+//     /mnt/HDA_ROOT).
+//
+// Nothing else: never a network mount, never a pseudo-filesystem (proc, sysfs,
+// devtmpfs, devpts, cgroup, debugfs and the rest are neither Storage nor RAM).
+// Once inside a Storage mount that is not "/", the parent is no longer a system
+// one and every further crossing is MayCross's own: pool to USB, pool to pool,
+// and a tmpfs mounted inside a pool all stay refused.
 //
 // It is never the rule for a walk that changes anything. Delete, trash,
-// chmod/chown, copy/move and archive keep MayCross, so a delete of /share can
-// never reach a volume by way of this exception.
+// chmod/chown, copy/move and archive keep MayCross, so a delete of / or /share
+// can never reach a volume by way of this exception.
 func (p *Platform) MayCrossRead(from, to FSCaps) bool {
 	if p.MayCross(from, to) {
 		return true
 	}
-	return !from.Storage && to.Storage && !to.Network
+	if to.Network || !(from.Root || from.RAM) {
+		return false
+	}
+	return to.RAM || to.Storage
 }
 
 // TrashRootFor returns the mount root under which a trash directory for

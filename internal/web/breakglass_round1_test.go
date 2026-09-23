@@ -37,7 +37,7 @@ func TestBreakGlassServesAtTheRootRegardlessOfTheProxyPrefix(t *testing.T) {
 		t.Fatalf("GET / on the break-glass listener: %d", shell.Code)
 	}
 	body := shell.Body.String()
-	for _, want := range []string{`href="/app.css"`, `src="/js/app.js"`, `content="/"`} {
+	for _, want := range []string{`href="/app.css"`, `href="/favicon.svg"`, `src="/js/app.js"`, `content="/"`} {
 		if !strings.Contains(body, want) {
 			t.Errorf("the break-glass shell does not carry %s:\n%s", want, firstLines(body, 12))
 		}
@@ -46,7 +46,7 @@ func TestBreakGlassServesAtTheRootRegardlessOfTheProxyPrefix(t *testing.T) {
 		t.Errorf("the break-glass shell references the proxy prefix:\n%s", firstLines(body, 12))
 	}
 	// The URLs it names actually answer on that listener.
-	for _, path := range []string{"/app.css", "/js/app.js", "/api/session"} {
+	for _, path := range []string{"/app.css", "/favicon.svg", "/js/app.js", "/api/session"} {
 		if w := bgRequest(s, "GET", path, nil, nil, ""); w.Code != http.StatusOK {
 			t.Errorf("break-glass %s = %d %s", path, w.Code, w.Body)
 		}

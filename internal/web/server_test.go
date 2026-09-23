@@ -391,7 +391,7 @@ func TestStaticAndHeaders(t *testing.T) {
 	s.cfg.Web.ProxyPrefix = "/qnapfilemanager"
 	s.cfg.Web.FrameAncestors = []string{"https://desktop.example"}
 	for _, prefix := range []string{"", "/qnapfilemanager"} {
-		for _, asset := range []struct{ path, ct string }{{"/", "text/html"}, {"/index.html", "text/html"}, {"/app.css", "text/css"}, {"/js/app.js", "text/javascript"}} {
+		for _, asset := range []struct{ path, ct string }{{"/", "text/html"}, {"/index.html", "text/html"}, {"/app.css", "text/css"}, {"/favicon.svg", "image/svg+xml"}, {"/js/app.js", "text/javascript"}} {
 			w := request(s, "GET", prefix+asset.path, nil, nil)
 			if w.Code != 200 || !strings.HasPrefix(w.Header().Get("Content-Type"), asset.ct) {
 				t.Errorf("%s: %d %v", asset.path, w.Code, w.Header())
@@ -440,6 +440,7 @@ func TestStaticShellWithInvalidSession(t *testing.T) {
 					{"/", "index.html", "text/html"},
 					{"/index.html", "index.html", "text/html"},
 					{"/app.css", "app.css", "text/css"},
+					{"/favicon.svg", "favicon.svg", "image/svg+xml"},
 					{"/js/app.js", "js/app.js", "text/javascript"},
 				} {
 					w := request(s, "GET", prefix+asset.path, cookie, headers)

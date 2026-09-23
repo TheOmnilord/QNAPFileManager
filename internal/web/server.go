@@ -527,6 +527,8 @@ func (s *Server) static(w http.ResponseWriter, r *http.Request) {
 		ct = "text/html; charset=utf-8"
 	case name == "app.css":
 		ct = "text/css; charset=utf-8"
+	case name == "favicon.svg":
+		ct = "image/svg+xml"
 	case strings.HasPrefix(name, "js/") && strings.HasSuffix(name, ".js"):
 		ct = "text/javascript; charset=utf-8"
 	}
@@ -584,7 +586,7 @@ func (s *Server) baseFor(r *http.Request) string {
 	return s.basePath()
 }
 
-// shellWithBase rewrites the shell's two asset references to absolute URLs
+// shellWithBase rewrites the shell's three asset references to absolute URLs
 // under basePath and injects that base for the scripts.
 //
 // The QTS desktop opens the app at the bare proxy path, "/qnapfilemanager"
@@ -603,6 +605,7 @@ func (s *Server) shellWithBase(shell []byte) []byte {
 func (s *Server) shellWithBaseAt(shell []byte, base string) []byte {
 	out := string(shell)
 	out = strings.Replace(out, `href="app.css"`, `href="`+base+`app.css"`, 1)
+	out = strings.Replace(out, `href="favicon.svg"`, `href="`+base+`favicon.svg"`, 1)
 	out = strings.Replace(out, `src="js/app.js"`, `src="`+base+`js/app.js"`, 1)
 	out = strings.Replace(out, `<meta charset="utf-8">`, `<meta charset="utf-8"><meta name="qfm-base" content="`+base+`">`, 1)
 	return []byte(out)

@@ -25,6 +25,7 @@ func TestShellUsesAbsoluteURLsUnderTheProxyPrefix(t *testing.T) {
 		body := w.Body.String()
 		for _, want := range []string{
 			`href="` + base + `app.css"`,
+			`href="` + base + `favicon.svg"`,
 			`src="` + base + `js/app.js"`,
 			`<meta name="qfm-base" content="` + base + `">`,
 		} {
@@ -32,7 +33,7 @@ func TestShellUsesAbsoluteURLsUnderTheProxyPrefix(t *testing.T) {
 				t.Errorf("prefix %q: shell lacks %s", prefix, want)
 			}
 		}
-		if strings.Contains(body, `href="app.css"`) || strings.Contains(body, `src="js/app.js"`) {
+		if strings.Contains(body, `href="app.css"`) || strings.Contains(body, `href="favicon.svg"`) || strings.Contains(body, `src="js/app.js"`) {
 			t.Errorf("prefix %q: a relative asset reference survived", prefix)
 		}
 		// The same shell must be reachable through the prefixed mount too,

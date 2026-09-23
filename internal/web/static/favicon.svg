@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="80" height="80" viewBox="0 0 80 80">
+  <title>QNAPFileManager — root access</title>
+  <rect x="3" y="3" width="74" height="74" rx="16" fill="#253445"/>
+  <path fill="#edaa42" d="M18 22H32L40 29H62A4 4 0 0 1 66 33V57A4 4 0 0 1 62 61H18A4 4 0 0 1 14 57V26A4 4 0 0 1 18 22Z"/>
+  <g fill="#253445">
+    <path d="M28 35H31.5L28 54H24.5ZM37 35H40.5L37 54H33.5Z"/>
+    <path d="M23.75 40H42.5V43.75H23.75ZM22.5 47.5H41.25V51.25H22.5ZM45 50H57.5V53.75H45Z"/>
+  </g>
+</svg>

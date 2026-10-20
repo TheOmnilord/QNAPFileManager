@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
-	"time"
 
 	"qnapfilemanager/internal/audit"
 	"qnapfilemanager/internal/backend"
@@ -56,12 +55,14 @@ func transferTitle(mode string, paths []string, dest string) string {
 }
 
 // transferSize measures a root through the user's worker, never the root
-// front-end. The shared request deadline bounds the whole pre-flight scan.
+// front-end. The caller's context is the measurement's clock: both pre-flights
+// that use this pass the request's own deadline less the reserve the rest of
+// the request needs (preflightContext, permScan).
 //
-// maxEntries is the walk's own entry budget, or 0 for the size job's default.
-// A transfer pre-flight passes 0 — it is already bounded by its 30 s context and
-// it wants the real totals for the dialog; M3's permissions pre-scan passes the
-// contract's bound and reads Capped as "unknown".
+// maxEntries is the walk's own entry budget, or 0 for the size job's default
+// (no bound). Both pre-flights pass what is left of their selection-wide budget
+// (stabilization contract §2.4): the permissions pre-scan reads Capped as
+// "unknown", the copy/move pre-flight as a minimum.
 func (s *Server) transferSize(ctx context.Context, who backend.Principal, root string, cross bool, maxEntries int64) (wproto.JobResult, error) {
 	id, err := jobs.NewID()
 	if err != nil {
@@ -72,6 +73,79 @@ func (s *Server) transferSize(ctx context.Context, who backend.Principal, root s
 		return wproto.JobResult{}, err
 	}
 	return s.jobRunner.Job(ctx, who, wproto.JobReq{JobID: id, Kind: wproto.JobSize, Body: body}, nil, nil)
+}
+
+// transferScanMaxEntries is the entry budget of one copy or move pre-flight
+// across ALL of its roots (stabilization contract §2.4). It is the permissions
+// pre-scan's bound and a total for the same reason that one is (Astra M3 r2
+// #8): an allowance per root is no bound on a selection, because the caller
+// chooses how many roots there are.
+const transferScanMaxEntries = modeScanMaxEntries
+
+// preflightContext is the budget a confirmation pre-flight measures under
+// (stabilization contract §2.4): the request's own deadline less
+// permScanReserve, which is what the request still needs once the measuring
+// stops — the token, the durable audit intent's fsync, the job submission and
+// the reply. server.go gives an ordinary JSON route 15 s, so that is 13 s of
+// measuring at most. A request with less than the reserve left gets a context
+// that is already done and measures nothing; one with no deadline at all (a
+// fixture) measures under its own context.
+//
+// It is permScan's rule, stated once more for the pre-flights that do not go
+// through that function: the sizing of a copy or a move, and the stats of a
+// delete. The caller cancels it when its measuring is over.
+func preflightContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if deadline, ok := ctx.Deadline(); ok {
+		return context.WithDeadline(ctx, deadline.Add(-permScanReserve))
+	}
+	return context.WithCancel(ctx)
+}
+
+// rootSize is one root's share of a copy or move pre-flight.
+type rootSize struct {
+	res wproto.JobResult
+	// whole says res is the whole tree: the walk ran to its end, nothing in it
+	// was unreadable or skipped, and no bound, deadline or cancellation stopped
+	// it. A root the budget never reached is not whole, and its res is zero.
+	whole bool
+}
+
+// measureTransfer sizes the roots of a copy or move for the confirmation
+// summary the way permScan sizes a recursive permissions change (stabilization
+// contract §2.4): under preflightContext's deadline, and against ONE entry
+// budget for the whole selection, each root walked with what the roots before
+// it left. When either runs out, the roots not yet reached are not sized at
+// all, and the caller says the totals are a minimum.
+//
+// Each root was measured in full before, bounded only by a 30 s timeout that
+// the route's own 15 s deadline always pre-empted, so a selection whose
+// measuring took the whole of it left nothing for what follows: the challenge
+// came back after the deadline had passed, and the confirmed re-post — which
+// measures again — could then be refused outright, because its durable intent
+// line cannot be written under an expired request.
+func (s *Server) measureTransfer(ctx context.Context, who backend.Principal, roots []string, cross bool) []rootSize {
+	out := make([]rootSize, len(roots))
+	scanCtx, cancel := preflightContext(ctx)
+	defer cancel()
+	var counted int64
+	for i, root := range roots {
+		remaining := transferScanMaxEntries - counted
+		if remaining <= 0 || scanCtx.Err() != nil {
+			break
+		}
+		res, err := s.transferSize(scanCtx, who, root, cross, remaining)
+		out[i] = rootSize{res: res, whole: err == nil && !res.Cancelled && !res.Capped && res.Warnings == 0 && res.Skipped == 0}
+		// What the walk counted is what it spent of the budget. A count it could
+		// not have reached inside the bound it was given — negative, or the whole
+		// of what remained — spends the rest, so nothing a worker reports can
+		// stretch the budget or wrap it.
+		if n := res.Files + res.Dirs; res.Files < 0 || res.Dirs < 0 || n < 0 || n >= remaining {
+			counted = transferScanMaxEntries
+		} else {
+			counted += n
+		}
+	}
+	return out
 }
 
 func transferBytes(n int64) string {
@@ -219,35 +293,47 @@ func (s *Server) jobTransfer(w http.ResponseWriter, r *http.Request, sess *sessi
 			*total += n
 		}
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-	defer cancel()
 	crossDevice := false
+	// A move's per-root prediction is asked for FIRST, per root and under the
+	// request context rather than the measuring budget (stabilization contract
+	// §2.4). Whether a root sits on another volume decides whether the dialog
+	// warns that this move copies and then deletes, which is not something to
+	// give up because the measuring ran out of time; and asking before the
+	// measuring starts means the measuring, not the reserve after it, pays for
+	// these round trips.
 	var destID wproto.FSIdentityResp
 	var destErr error
+	srcIDs := make([]wproto.FSIdentityResp, len(resolved))
+	srcErrs := make([]error, len(resolved))
 	if mode == "move" {
-		destID, destErr = s.jobRunner.FSIdentity(ctx, who, rdest)
+		destID, destErr = s.jobRunner.FSIdentity(r.Context(), who, rdest)
+		for i, root := range resolved {
+			srcIDs[i], srcErrs[i] = s.jobRunner.FSIdentity(r.Context(), who, root)
+		}
 	}
-	for i, root := range resolved {
-		size, sizeErr := s.transferSize(ctx, who, root, body.CrossMounts, 0)
+	for i, size := range s.measureTransfer(r.Context(), who, resolved, body.CrossMounts) {
 		// Files counts every entry the job will create — directories included,
 		// since a hundred empty folders are as much "one big operation" for the
 		// ladder and the audit milestone as a hundred files. Size reports them
 		// apart in Dirs, so a directory-only tree would otherwise count as zero
 		// items and slip under the >100-item confirmation (round-6 review).
-		add(&summary.Files, size.Files)
-		add(&summary.Files, size.Dirs)
-		add(&summary.Bytes, size.Bytes)
-		if sizeErr != nil || size.Cancelled || size.Warnings > 0 || size.Skipped > 0 {
+		add(&summary.Files, size.res.Files)
+		add(&summary.Files, size.res.Dirs)
+		add(&summary.Bytes, size.res.Bytes)
+		// A root the budget did not reach, or reached and could not finish, is
+		// a floor; so the totals are a minimum, and the summary says so — which
+		// also asks for the confirmation a measured selection of this size
+		// might not have needed.
+		if !size.whole {
 			warn(noticeSizeMinimum)
 		}
 		if mode == "move" {
-			srcID, srcErr := s.jobRunner.FSIdentity(ctx, who, root)
-			if srcErr != nil || destErr != nil {
+			if srcErrs[i] != nil || destErr != nil {
 				warn(noticeCrossUnknown)
-			} else if !srcID.Same(destID) {
+			} else if !srcIDs[i].Same(destID) {
 				crossDevice = true
-				n := size.Bytes
-				if sizeErr != nil || size.Cancelled || size.Warnings > 0 || size.Skipped > 0 {
+				n := size.res.Bytes
+				if !size.whole {
 					n = -1
 				}
 				summary.Warnings = append(summary.Warnings, fmt.Sprintf("%s and %s "+crossDeviceMark+" %s and then deletes the source instead of an instant rename; it can be cancelled, and a cancelled move leaves both copies.", fsx.Base(paths[i]), fsx.Base(dest), transferBytes(n)))
@@ -286,7 +372,11 @@ func (s *Server) jobTransfer(w http.ResponseWriter, r *http.Request, sess *sessi
 		s.fail(w, r, "internal", "The operation could not be prepared.", "", err.Error())
 		return
 	}
-	big := summary.Files >= milestoneFiles || summary.Bytes >= milestoneBytes
+	// The selection's own size counts too, as it does for a delete: when the
+	// measuring budget ends early the totals are only what was reached, and a
+	// hundred selected roots are a hundred items whatever the measurement
+	// managed (§2.4).
+	big := summary.Files >= milestoneFiles || summary.Bytes >= milestoneBytes || int64(len(paths)) >= milestoneFiles
 	detail := jobIntentDetail(id, mode+" to "+dest, paths)
 	if err := s.writeAudit(sess, r, m, "intent", "", "", detail, big); err != nil {
 		writeError(w, http.StatusInternalServerError, "audit_unavailable", "The change was refused: its audit record could not be saved.", paths[0], mode, err.Error())

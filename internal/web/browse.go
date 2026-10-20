@@ -90,9 +90,16 @@ func intQuery(r *http.Request, key string, def, max int) (int, error) {
 }
 
 func boolQuery(r *http.Request, key string) (bool, error) {
+	return boolQueryOr(r, key, false)
+}
+
+// boolQueryOr is boolQuery for a flag whose absence means def. A value that is
+// there is parsed exactly as boolQuery parses one, so a malformed flag is the
+// same 400 whichever way its default points.
+func boolQueryOr(r *http.Request, key string, def bool) (bool, error) {
 	raw := r.URL.Query().Get(key)
 	if raw == "" {
-		return false, nil
+		return def, nil
 	}
 	return strconv.ParseBool(raw)
 }
@@ -114,8 +121,13 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request, sess *session) {
 	hidden, e3 := boolQuery(r, "hidden")
 	volumes, e4 := boolQuery(r, "volumes")
 	desc, e5 := boolQuery(r, "desc")
+	// Folders first unless the request says otherwise (stabilization contract
+	// §1.2): it is how a file manager is read, and fsx.ListOptions.DirsFirst
+	// already keeps the grouping out of Desc's reach. dirsFirst=false asks for
+	// the plain order.
+	dirsFirst, e6 := boolQueryOr(r, "dirsFirst", true)
 	sort := r.URL.Query().Get("sort")
-	if e1 != nil || e2 != nil || e3 != nil || e4 != nil || e5 != nil || !fsx.ValidSortKey(sort) {
+	if e1 != nil || e2 != nil || e3 != nil || e4 != nil || e5 != nil || e6 != nil || !fsx.ValidSortKey(sort) {
 		s.fail(w, r, "bad_request", "Invalid listing options.", p, "")
 		return
 	}
@@ -127,7 +139,7 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request, sess *session) {
 	// lgetxattr per entry answering ENODATA; on a mount with no backend it is
 	// nothing. Without this the badge is inert, which is how it shipped in the
 	// first M3 round.
-	listing, err := s.backend.List(r.Context(), sess.who, p, fsx.ListOptions{Offset: offset, Limit: limit, Sort: sort, Desc: desc, ShowHidden: hidden, ShowVolumeRoots: volumes, ResolveLinks: true, ACLProbe: true})
+	listing, err := s.backend.List(r.Context(), sess.who, p, fsx.ListOptions{Offset: offset, Limit: limit, Sort: sort, Desc: desc, DirsFirst: dirsFirst, ShowHidden: hidden, ShowVolumeRoots: volumes, ResolveLinks: true, ACLProbe: true})
 	if err != nil {
 		s.backendError(w, r, p, err)
 		return

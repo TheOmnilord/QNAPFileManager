@@ -108,8 +108,63 @@ export function parseRoute(hash) {
 export function rawPath(entry) { return entry.pathB64 ? atob(entry.pathB64.replace(/-/g,'+').replace(/_/g,'/')) : String.fromCharCode(...new TextEncoder().encode(entry.path)); }
 export function bytePath(raw) { return {path:new TextDecoder().decode(Uint8Array.from(raw,c=>c.charCodeAt(0))),pathB64:btoa(raw).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'')}; }
 // CSSOM updates external stylesheet rules; no inline style attributes or blocks.
+const appSheet = () => [...(document.styleSheets || [])].find(s => s.href && new URL(s.href).pathname.endsWith('/app.css'));
 export function heightRule(selector) {
- const sheet = [...document.styleSheets].find(s => s.href && new URL(s.href).pathname.endsWith('/app.css'));
+ const sheet = appSheet();
  const index = sheet.insertRule(`${selector} { height: 0px; }`,sheet.cssRules.length);
  return pixels => { sheet.cssRules[index].style.height = `${Math.max(0,pixels)}px`; };
+}
+
+// placeRule is heightRule for something that floats: one rule, appended once to
+// app.css's own sheet, whose left and top are then moved (stabilization
+// contract §3.7). It is the only way to put a fixed-position menu at a pointer
+// under this CSP — no inline style, no style attribute — and because it is
+// appended after app.css's own rule for the same selector, it wins by order:
+// right and bottom go to auto so the stylesheet's corner placement no longer
+// pulls against the coordinates. A page without the sheet gets a no-op, so a
+// menu that cannot be placed still opens where the stylesheet puts it.
+export function placeRule(selector) {
+ const sheet = appSheet();
+ if (!sheet) return () => {};
+ const index = sheet.insertRule(`${selector} { left: 0px; top: 0px; right: auto; bottom: auto; }`,sheet.cssRules.length);
+ // The rule object, not its index: an index is a position in a list other code
+ // may insert into, while the object stays the rule this function wrote.
+ const rule = sheet.cssRules[index];
+ const px = value => `${Math.round(Number(value) || 0)}px`;
+ return (left,top) => { rule.style.left = px(left); rule.style.top = px(top); };
+}
+
+// menuPlacement is where a floating menu of a given size goes, as arithmetic
+// (stabilization contract §3.7). Pure — viewport, anchor and menu size in,
+// {left,top} out — so the clamping is a table test rather than a screenshot at
+// every window size.
+//
+// The anchor is a rectangle in viewport coordinates. A pointer is a rectangle
+// of no size; a row is its left edge, from its top to its bottom, so the menu
+// opens just below it and, flipped, just above it rather than over it. The menu
+// opens below and to the right of the anchor; where that would cross the far
+// edge it flips — up, or to the left — when the other side has the room (or
+// more of it than this side does), and whatever still does not fit is clamped
+// inside the viewport, `margin` pixels from each edge. A menu larger than the
+// viewport keeps its top-left corner on screen: that is the end the first item
+// is at.
+export function menuPlacement({viewport = {},anchor = {},menu = {},margin = 8} = {}) {
+ const num = value => (Number.isFinite(Number(value)) ? Number(value) : 0);
+ const vw = Math.max(0,num(viewport.width)),vh = Math.max(0,num(viewport.height));
+ const w = Math.max(0,num(menu.width)),h = Math.max(0,num(menu.height));
+ const left = num(anchor.left),top = num(anchor.top);
+ const right = anchor.right === undefined ? left : num(anchor.right);
+ const bottom = anchor.bottom === undefined ? top : num(anchor.bottom);
+ // One axis at a time, the same rule on both: the natural side if it fits;
+ // otherwise the far side if it fits there or is roomier.
+ const place = (start,end,size,extent) => {
+  if (start+size <= extent-margin) return start;
+  const before = end-margin,after = extent-margin-start;
+  return before >= size || before > after ? end-size : start;
+ };
+ const clamp = (at,size,extent) => Math.max(margin,Math.min(at,extent-margin-size));
+ return {
+  left:Math.round(clamp(place(left,right,w,vw),w,vw)),
+  top:Math.round(clamp(place(bottom,top,h,vh),h,vh)),
+ };
 }

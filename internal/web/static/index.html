@@ -20,9 +20,12 @@
    <input id="bgPassword" type="password" autocomplete="current-password" spellcheck="false" required>
    <button id="bgSubmit" type="submit">Sign in</button></form>
   <p id="bgError" class="banner" role="alert" hidden></p></section>
+ <!-- The toolbar is the COMMANDS row and fits one line at 1280, 1024 and 900 px
+      (stabilization contract §4.1). Navigation, the name filter and the Hidden
+      toggle live in the path bar below it, beside the path they act on, and the
+      lower-priority actions fold into ⋯ by the width rule in js/narrow.js. -->
  <nav id="toolbar" aria-label="File actions">
   <button id="btnTree" aria-controls="tree" aria-expanded="false">Folders</button>
-  <button id="btnBack" title="Back (Alt+Left)">←</button><button id="btnFwd" title="Forward (Alt+Right)">→</button><button id="btnUp" title="Parent folder (Backspace)">↑</button><button id="btnRefresh" title="Refresh (F5)">↻</button>
   <button id="btnMkdir" disabled>New folder</button>
   <button id="btnUpload" disabled>Upload</button><input id="upFile" type="file" multiple hidden>
   <span class="split"><button id="btnDownload" disabled>Download</button><button id="btnDownloadAs" disabled aria-haspopup="menu" aria-expanded="false" aria-label="Download as…" title="Download as…">▾</button>
@@ -31,12 +34,16 @@
   <button id="btnRename" disabled>Rename</button><button id="btnCopy" disabled>Copy to…</button><button id="btnMove" disabled>Move to…</button><button id="btnDelete" disabled>Delete</button>
   <button id="btnSearch" disabled title="Search this folder and below (Ctrl+F)">Search…</button><button id="btnResults" hidden>Results</button>
   <button id="btnTrash">Trash</button><button id="btnJobs" aria-controls="jobsPanel" aria-expanded="false">Operations</button>
-  <span class="split"><button id="btnMore" aria-haspopup="menu" aria-expanded="false" aria-label="More actions" title="More actions" hidden>⋯</button>
+  <button id="btnShortcuts" title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">?</button>
+  <span class="moreSplit"><button id="btnMore" aria-haspopup="menu" aria-expanded="false" aria-label="More actions" title="More actions" hidden>⋯</button>
    <div id="moreMenu" role="menu" aria-label="More actions" hidden></div></span>
-  <label class="filter"><span class="visually-hidden">Filter loaded names</span><input id="searchBox" type="text" placeholder="Filter loaded names (/)"></label>
-  <label><input id="chkHidden" type="checkbox"> Hidden</label><button id="btnShortcuts" title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">?</button>
  </nav>
- <div class="pathbar"><nav id="crumbs" aria-label="Breadcrumb"></nav><label class="visually-hidden" for="pathEdit">Absolute path</label><input id="pathEdit" type="text" aria-label="Absolute path (Ctrl+L)" value="/share"></div>
+ <div class="pathbar">
+  <span class="navButtons"><button id="btnBack" title="Back (Alt+Left)" aria-label="Back">←</button><button id="btnFwd" title="Forward (Alt+Right)" aria-label="Forward">→</button><button id="btnUp" title="Parent folder (Backspace)" aria-label="Parent folder">↑</button><button id="btnRefresh" title="Refresh (F5)" aria-label="Refresh">↻</button></span>
+  <nav id="crumbs" aria-label="Breadcrumb"></nav><label class="visually-hidden" for="pathEdit">Absolute path</label><input id="pathEdit" type="text" aria-label="Absolute path (Ctrl+L)" value="/share">
+  <span class="listOptions"><label class="filter"><span class="visually-hidden">Filter loaded names</span><input id="searchBox" type="text" placeholder="Filter loaded names (/)"></label>
+   <label><input id="chkHidden" type="checkbox"> Hidden</label></span>
+ </div>
  <div id="pathNotice" class="banner" hidden></div>
  <div id="bannerReadonly" class="banner bannerBar" role="status" hidden><span class="bannerMark" aria-hidden="true">🔒</span><span id="bannerReadonlyText"></span> <span id="bannerReadonlyTail" class="bannerTail"></span> <button id="bannerReadonlySettings" hidden>Open Settings</button></div>
  <div id="bannerBreakGlass" class="banner bannerBar bannerWarn" role="status" hidden><span class="bannerMark" aria-hidden="true">⚠</span><span id="bannerBreakGlassText"></span></div>
@@ -176,7 +183,7 @@
    <tr><th scope="row">Shift + movement</th><td>Extend the selection</td><td>File list</td></tr>
    <tr><th scope="row">Ctrl + movement</th><td>Move without changing the selection</td><td>File list</td></tr>
    <tr><th scope="row">Space</th><td>Select or deselect the focused row</td><td>File list</td></tr>
-   <tr><th scope="row">Ctrl+A</th><td>Select everything in this folder</td><td>File list</td></tr>
+   <tr><th scope="row">Ctrl+A</th><td>Select every visible item (up to 1,000)</td><td>File list</td></tr>
    <tr><th scope="row">Enter</th><td>Open the folder or file</td><td>File list</td></tr>
    <tr><th scope="row">Alt+Enter</th><td>Properties</td><td>File list</td></tr>
    <tr><th scope="row">F4</th><td>View the file as text</td><td>File list</td></tr>
@@ -184,6 +191,7 @@
    <tr><th scope="row">Esc</th><td>Clear the selection</td><td>File list</td></tr>
    <tr><th scope="row">Type a name</th><td>Jump to the first loaded match</td><td>File list</td></tr>
    <tr><th scope="row">Delete</th><td>Move the selection to Trash</td><td>Anywhere</td></tr>
+   <tr><th scope="row">F2</th><td>Rename the selected item</td><td>Anywhere</td></tr>
    <tr><th scope="row">F9</th><td>Permissions</td><td>Anywhere</td></tr>
    <tr><th scope="row">Ctrl+C</th><td>Mark the selection to copy</td><td>Anywhere</td></tr>
    <tr><th scope="row">Ctrl+X</th><td>Mark the selection to move</td><td>Anywhere</td></tr>

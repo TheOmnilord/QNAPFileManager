@@ -6,8 +6,8 @@
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
 import {
- ACTIONS, CAUSES, DISABLING, GUARD_SENTENCE, KIND_SENTENCES, PAUSED_SENTENCE,
- READONLY_SENTENCE, SELECT_SENTENCE, capsSentence, entryKind, reasonsFor, whyDisabled,
+ ACTIONS, CAUSES, DISABLING, GUARD_SENTENCE, KIND_SENTENCES, MAX_ROOTS, PAUSED_SENTENCE,
+ READONLY_SENTENCE, SELECT_SENTENCE, capsSentence, entryKind, reasonsFor, tooManySentence, whyDisabled,
 } from './static/js/why.js';
 
 const names = Object.keys(ACTIONS);
@@ -192,6 +192,60 @@ test('the read-only sentence is the contract’s, verbatim', () => {
 
 test('an unknown action is a programming error, not a silently enabled button', () => {
  assert.throws(() => whyDisabled('selfDestruct', allowedCtx()), /unknown action selfDestruct/);
+});
+
+// --- stabilization contract §3.5: too many ------------------------------------
+//
+// The server refuses a job of more than maxJobRoots roots (routes_jobs.go), and
+// maxroots_contract_test.go pins MAX_ROOTS to it. Past it, every action that
+// sends the selection itself is refused here, as a selection reason, in a
+// sentence that says how many are selected.
+
+// The actions that send one path (or trash id) per selected item.
+const ROOTED = ['delete', 'copy', 'move', 'permissions', 'download', 'trashRestore'];
+
+test('MAX_ROOTS is 1,000, and the actions bounded by it are exactly the six that send the selection', () => {
+ assert.equal(MAX_ROOTS, 1000);
+ assert.deepEqual(names.filter(n => ACTIONS[n].roots).sort(), [...ROOTED].sort());
+});
+
+test('the too-many sentence, verbatim, with both numbers formatted', () => {
+ assert.equal(tooManySentence(1500), `Select at most ${(1000).toLocaleString()} items at a time (${(1500).toLocaleString()} are selected).`);
+ // In the locale the contract is written in, that is its sentence word for word.
+ if ((1000).toLocaleString() === '1,000') {
+  assert.equal(tooManySentence(1001), 'Select at most 1,000 items at a time (1,001 are selected).');
+ }
+});
+
+test('past MAX_ROOTS every action that sends the selection is refused as a SELECTION reason', () => {
+ for (const name of ROOTED) {
+  assert.equal(whyDisabled(name, {...allowedCtx(), count: MAX_ROOTS, one: false}).allowed, true, `${name} carries exactly ${MAX_ROOTS}`);
+  const verdict = whyDisabled(name, {...allowedCtx(), count: MAX_ROOTS + 1, one: false});
+  assert.equal(verdict.allowed, false, name);
+  assert.equal(verdict.cause, 'selection', name);
+  assert.equal(verdict.sentence, tooManySentence(MAX_ROOTS + 1), name);
+ }
+ // The count it names is the count it was given.
+ assert.equal(whyDisabled('delete', {...allowedCtx(), count: 2501, one: false}).sentence, tooManySentence(2501));
+});
+
+test('Empty Trash is not bounded by how much is in it — it names nothing', () => {
+ const verdict = whyDisabled('trashEmpty', {...allowedCtx(), count: 50000, one: false});
+ assert.equal(verdict.allowed, true);
+ assert.equal(verdict.sentence, ACTIONS.trashEmpty.enabled);
+});
+
+test('a single-item action keeps its own sentence however many are selected', () => {
+ assert.equal(whyDisabled('rename', {...allowedCtx(), count: 5000, one: false}).sentence, 'Select one item to rename.');
+ assert.equal(whyDisabled('properties', {...allowedCtx(), count: 5000, one: false}).sentence, 'Select one item to inspect.');
+});
+
+test('read-only and the paused listing still outrank "too many"', () => {
+ const many = {...allowedCtx(), count: 1200, one: false};
+ assert.equal(whyDisabled('delete', {...many, readOnly: true}).cause, 'readonly');
+ assert.equal(whyDisabled('delete', {...many, paused: true}).sentence, PAUSED_SENTENCE);
+ // A read is never refused for read-only mode, so there "too many" is the answer.
+ assert.equal(whyDisabled('download', {...many, readOnly: true}).sentence, tooManySentence(1200));
 });
 
 test('reasonsFor lists every applicable cause in precedence order', () => {

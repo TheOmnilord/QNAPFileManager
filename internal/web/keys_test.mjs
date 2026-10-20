@@ -15,10 +15,12 @@
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
 import {readFileSync} from 'node:fs';
-import {KEYMAP, LISTING_CHORDS, LISTING_PAUSED_MESSAGE, WHERE, appBindings, chordOf, dispatchKey, keymapRows} from './static/js/keys.js';
+import {KEYMAP, LISTING_CHORDS, LISTING_PAUSED_MESSAGE, WHERE, appBindings, chordOf, dispatchKey, keymapRows, pressOrExplain} from './static/js/keys.js';
+import {WHY_UNAVAILABLE} from './static/js/dom.js';
 
 const html = readFileSync(new URL('./static/index.html', import.meta.url), 'utf8');
 const listSource = readFileSync(new URL('./static/js/list.js', import.meta.url), 'utf8');
+const appSource = readFileSync(new URL('./static/js/app.js', import.meta.url), 'utf8');
 
 // The dialog's rows, parsed out of the embedded shell.
 function dialogRows() {
@@ -39,13 +41,22 @@ function stubs() {
   deps: {
    editPath: record('editPath'), openSearch: record('openSearch'), openShortcuts: record('openShortcuts'),
    markClipboard: record('markClipboard'), pasteHere: record('pasteHere'), deleteSelection: record('deleteSelection'),
-   openPerms: record('openPerms'), refresh: record('refresh'), parent: record('parent'),
+   rename: record('rename'), openPerms: record('openPerms'), refresh: record('refresh'), parent: record('parent'),
    back: record('back'), forward: record('forward'), toggleHidden: record('toggleHidden'),
    focusFilter: record('focusFilter'), escape: record('escape'), textSelected: () => false,
   },
  };
 }
 const event = (key, extra = {}) => ({key, preventDefault() { this.defaulted = true; }, target: {matches: () => false}, ...extra});
+// The press that produces each listing chord, spelled out rather than derived:
+// deriving it from the chord's last character turned F2 into Ctrl+2.
+const LISTING_PRESSES = {
+ 'Delete': () => event('Delete'),
+ 'F2': () => event('F2'),
+ 'Ctrl+C': () => event('c', {ctrlKey: true}),
+ 'Ctrl+X': () => event('x', {ctrlKey: true}),
+ 'Ctrl+V': () => event('v', {ctrlKey: true}),
+};
 
 test('the Shortcuts dialog and KEYMAP are the same table, row for row', () => {
  assert.deepEqual(dialogRows(), keymapRows());
@@ -115,9 +126,10 @@ test('while the results cover the listing, the listing chords do nothing and say
  const {deps, calls} = stubs();
  const bindings = appBindings(deps);
  const said = [];
+ assert.deepEqual([...LISTING_CHORDS].sort(), Object.keys(LISTING_PRESSES).sort(), 'every listing chord has a press below');
  for (const chord of LISTING_CHORDS) {
-  const key = chord === 'Delete' ? 'Delete' : chord.slice(-1).toLowerCase();
-  const ev = event(key, chord === 'Delete' ? {} : {ctrlKey: true});
+  const ev = LISTING_PRESSES[chord]();
+  assert.equal(chordOf(ev), chord);
   assert.equal(dispatchKey(ev, bindings, {listingMutable: false, announce: m => said.push(m)}), 'paused', chord);
   assert.equal(ev.defaulted, true, `${chord} must not also reach the browser`);
  }
@@ -144,7 +156,7 @@ test('each binding runs the thing its row promises', () => {
   ['Ctrl+L', 'editPath'], ['Ctrl+F', 'openSearch'], ['Ctrl+H', 'toggleHidden'], ['Delete', 'deleteSelection'],
   ['F9', 'openPerms'], ['F5', 'refresh'], ['Backspace', 'parent'], ['Alt+ArrowLeft', 'back'],
   ['Alt+ArrowRight', 'forward'], ['/', 'focusFilter'], ['?', 'openShortcuts'], ['Escape', 'escape'],
-  ['Ctrl+V', 'pasteHere'],
+  ['Ctrl+V', 'pasteHere'], ['F2', 'rename'],
  ];
  for (const [chord, name] of expected) {
   calls.length = 0;
@@ -192,4 +204,81 @@ test('Ctrl+R is never bound, and the map says why', () => {
  const row = KEYMAP.find(r => r.keys === 'Ctrl+R');
  assert.ok(row, 'the map documents the one chord the app deliberately leaves alone');
  assert.match(row.what, /never intercepted/);
+});
+
+test('Ctrl+A promises what it does since the stabilization patch (§3.3)', () => {
+ // Every VISIBLE row — all of them, or those the filter shows — and only up to
+ // the action limit; past it, the key says why instead.
+ const row = KEYMAP.find(r => r.keys === 'Ctrl+A');
+ assert.equal(row.what, 'Select every visible item (up to 1,000)');
+ assert.ok(dialogRows().some(r => r.keys === 'Ctrl+A' && r.what === row.what));
+});
+
+// --- F2 renames (stabilization contract §4.3) --------------------------------
+
+// A button double: what pressOrExplain reads, and the one thing it may do.
+const button = ({disabled = false, title = ''} = {}) => ({disabled, title, clicks: 0, click() { this.clicks++; }});
+
+test('F2 is a row, a binding and a listing chord, and the dialog says so', () => {
+ const row = KEYMAP.find(r => r.chord === 'F2');
+ assert.deepEqual(row, {scope: 'app', keys: 'F2', what: 'Rename the selected item', chord: 'F2'});
+ assert.ok(appBindings(stubs().deps).has('F2'));
+ assert.ok(LISTING_CHORDS.has('F2'), 'the item it renames is a listing row');
+ assert.ok(dialogRows().some(r => r.keys === 'F2' && r.what === row.what && r.where === WHERE.app));
+ assert.equal(chordOf({key: 'F2'}), 'F2');
+ assert.equal(chordOf({key: 'F2', shiftKey: true}), 'Shift+F2', 'Shift+F2 is not F2');
+});
+
+test('an enabled Rename button is pressed, and nothing is announced', () => {
+ const said = [], rename = button();
+ assert.equal(pressOrExplain(rename, m => said.push(m)), 'pressed');
+ assert.equal(rename.clicks, 1);
+ assert.deepEqual(said, []);
+});
+
+test('a disabled one is not pressed, and its own sentence is announced', () => {
+ const said = [], rename = button({disabled: true, title: 'Select one item to rename.'});
+ assert.equal(pressOrExplain(rename, m => said.push(m)), 'explained');
+ assert.equal(rename.clicks, 0, 'F2 is never a way past the reason table');
+ assert.deepEqual(said, ['Select one item to rename.']);
+});
+
+test('a button disabled before any verdict says the neutral line, never nothing', () => {
+ const said = [];
+ assert.equal(pressOrExplain(button({disabled: true, title: '  '}), m => said.push(m)), 'explained');
+ assert.deepEqual(said, [WHY_UNAVAILABLE]);
+ assert.equal(pressOrExplain(null, m => said.push(m)), 'missing');
+ assert.equal(said.length, 1);
+});
+
+test('F2 through the dispatcher: pressed, explained, paused, or left alone', () => {
+ const said = [], rename = button();
+ const bindings = appBindings({...stubs().deps, rename: () => pressOrExplain(rename, m => said.push(m))});
+ // Enabled: pressed once, and the key goes no further.
+ const pressed = event('F2');
+ assert.equal(dispatchKey(pressed, bindings, {}), 'ran');
+ assert.equal(rename.clicks, 1);
+ assert.equal(pressed.defaulted, true);
+ // Disabled: explained in the button's own words.
+ rename.disabled = true;
+ rename.title = 'Read-only mode is on, so nothing can be changed. An administrator can turn it off in Settings.';
+ assert.equal(dispatchKey(event('F2'), bindings, {}), 'ran');
+ assert.equal(rename.clicks, 1);
+ assert.deepEqual(said, [rename.title]);
+ // The search results cover the listing: the paused sentence, and no press.
+ rename.disabled = false;
+ const paused = [];
+ assert.equal(dispatchKey(event('F2'), bindings, {listingMutable: false, announce: m => paused.push(m)}), 'paused');
+ assert.deepEqual(paused, [LISTING_PAUSED_MESSAGE]);
+ // Typing in a field, or a dialog open: F2 is not the app's to take.
+ assert.equal(dispatchKey(event('F2'), bindings, {editing: true}), 'ignored');
+ assert.equal(dispatchKey(event('F2'), bindings, {dialogOpen: true}), 'ignored');
+ assert.equal(rename.clicks, 1, 'only the one press, of the enabled button');
+});
+
+test('app.js hands F2 the toolbar’s own Rename button', () => {
+ // app.js is the entry module and cannot be imported without a browser, so its
+ // one line of wiring is read from source, as settings_test.mjs does.
+ assert.match(appSource, /import \{[^}]*\bpressOrExplain\b[^}]*\} from '\.\/keys\.js'/);
+ assert.match(appSource, /rename:\(\) => pressOrExplain\(\$\('#btnRename'\),announce\)/);
 });

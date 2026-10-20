@@ -2,16 +2,20 @@
 
 A file manager for the QNAP QTS / QuTS hero desktop, installed from App Center as a QPKG and opened as a window in the
 QTS desktop with your QTS login, exactly like File Station. Unlike File Station it can browse and manage the **whole**
-filesystem — `/`, `/etc`, `/root`, `.qpkg` directories, raw volume mounts — edit permissions and ownership, and it never
-needs SSH or Telnet.
+filesystem — `/`, `/etc`, `/root`, `.qpkg` directories, raw volume mounts — and edit permissions and ownership. Normal
+use needs no SSH or Telnet; setting up the optional break-glass door does, because its password is set from the NAS
+shell as root ([The two doors](#the-two-doors)).
 
 Every operation runs with the signed-in user's own Linux identity, in a separate process that has already dropped to that
 user's uid and groups, so the **kernel** decides what is allowed. Administrators operate as root, the way File Station
 does, with a guard and a confirmation ladder standing between a mis-click and an irreversible change.
 
-**Status:** M0–M3 implemented and reviewed; M0, M1 and M2-A verified on real hardware (a QTS unit and a QuTS hero unit,
-firmware 5.2.x). M4 — the break-glass listener, the non-admin and accessibility passes, and these documents — is in
-progress. Not yet tagged; the first release will be 1.0.0. Start with [PLAN.md](PLAN.md).
+**Status:** M0–M4 are implemented and reviewed on `main`. Development builds have run on a QuTS hero unit and a QTS
+unit, where M0, M1 and M2-A were verified ([Compatibility](#compatibility)). A stabilization patch is in progress —
+select-all, large folders, bounded measurements and interface polish, specified in
+[docs/design/stabilization-contract.md](docs/design/stabilization-contract.md). Nothing has been released or tagged: the
+first release will be 1.0.0, after that patch and the full hardware pass on both units
+([docs/release-checklist.md](docs/release-checklist.md) §3). Start with [PLAN.md](PLAN.md).
 
 ## Who it is for
 
@@ -33,8 +37,9 @@ level-2 confirmation.*
 
 ## What it does
 
-- **Browse everything** — a tree, breadcrumbs, an editable path, sorting, filtering, hidden files — with listings that
-  stay responsive on directories with hundreds of thousands of entries.
+- **Browse everything** — a tree, breadcrumbs, an editable path, sorting, filtering, hidden files. A folder of up to
+  50,000 entries is listed in full; a larger one lists the first 50,000 entries read and says that the rest are
+  missing. Each page of a long listing re-reads the folder; listing generations, planned for 1.1, are the fix.
 - **Copy, move, rename, delete** as cancellable jobs with progress and per-item warnings, including a pre-flight that
   predicts a cross-filesystem move before it starts (on QuTS hero every share is its own dataset).
 - **Trash** on the same volume, so deleting is instant and restorable, with permanent delete one rung further up the
@@ -62,6 +67,21 @@ the break-glass listener never calls the QTS validation path at all.
 
 Read [docs/identity.md](docs/identity.md) before relying on any of that.
 
+## Compatibility
+
+| Firmware | Filesystem | CPU architecture | Status |
+|---|---|---|---|
+| QuTS hero h5.2.9 (a TVS-h1688X) | ZFS | x86_64 | verified on hardware |
+| QTS 5.2.x | ext4 | not yet recorded; to be recorded at the hardware pass | verified on hardware |
+| any | any | arm_64 (aarch64) | built and smoke-run under emulation only |
+| firmware 6 (QuTS hero h6.0 is in public beta) | any | any | untested |
+
+"Verified on hardware" means development builds have been installed and used on that unit; the full release pass
+([docs/release-checklist.md](docs/release-checklist.md) §3) runs on both units before 1.0.0. Any architecture that has
+not run on a physical unit is listed as built and smoke-run under emulation only: CI runs both architecture trees under
+qemu before packaging. The package declares 5.2.0 as its minimum firmware, the lowest line verified on hardware. 32-bit
+ARM models are not targeted.
+
 ## Install
 
 [docs/qnap-install.md](docs/qnap-install.md) — App Center install on QTS and QuTS hero, the proxy path and the ports,
@@ -80,14 +100,17 @@ chords.
 | `Shift` + movement | extend the selection | | `/` | filter loaded names |
 | `Ctrl` + movement | move, keep the selection | | `Ctrl+F` | search this subtree |
 | `Space` | select or deselect | | `Ctrl+C` `Ctrl+X` `Ctrl+V` | copy / cut / paste |
-| `Ctrl+A` | select everything here | | `Del` | move to Trash |
-| `Enter` | open | | `F9` | permissions |
-| type a name | jump to the first match | | `Alt+Enter` | properties |
-| `Backspace` | parent folder | | `F4` | view as text |
-| `Alt+←` / `Alt+→` | back / forward | | `Ctrl+H` | hidden items |
-| `Shift+F10` / `Menu` | actions menu | | `F5` | refresh |
-| `Esc` | clear or close | | `Ctrl+R` | the browser's reload, never intercepted |
-| `?` | the keyboard map | | | |
+| `Ctrl+A` | select every visible item (up to 1,000) | | `Del` | move to Trash |
+| `Enter` | open | | `F2` | rename the selected item |
+| type a name | jump to the first match | | `F9` | permissions |
+| `Backspace` | parent folder | | `Alt+Enter` | properties |
+| `Alt+←` / `Alt+→` | back / forward | | `F4` | view as text |
+| `Shift+F10` / `Menu` | actions menu | | `Ctrl+H` | hidden items |
+| `Esc` | clear or close | | `F5` | refresh |
+| `?` | the keyboard map | | `Ctrl+R` | the browser's reload, never intercepted |
+
+`Ctrl+A` also needs the folder to have loaded in one response, which folders of up to 2,000 entries do; otherwise it
+says why.
 
 ## Build from source
 
@@ -120,6 +143,7 @@ Docker or QDK on the development box. `powershell -File scripts/build-local.ps1`
 
 - [PLAN.md](PLAN.md): decisions, milestones, accepted residuals, verification, open questions.
 - [CHANGELOG.md](CHANGELOG.md): what each milestone shipped, and what is deferred to 1.1.
+- [SECURITY.md](SECURITY.md): how to report a vulnerability privately, and what is in scope.
 - [docs/identity.md](docs/identity.md): identity, the two doors, what an administrator can and cannot do, the guard and
   the confirmation ladder, the audit log, and what the kernel decides versus what the app predicts.
 - [docs/qnap-install.md](docs/qnap-install.md): install, first run, break-glass setup, upgrade, removal, troubleshooting.
@@ -136,6 +160,9 @@ Docker or QDK on the development box. `powershell -File scripts/build-local.ps1`
   [m2c-contract.md](docs/design/m2c-contract.md),
   [m3-contract.md](docs/design/m3-contract.md),
   [m4-contract.md](docs/design/m4-contract.md): the milestone contracts fixed before each implementation.
+- [docs/design/roadmap-deliberation.md](docs/design/roadmap-deliberation.md) and
+  [docs/design/stabilization-contract.md](docs/design/stabilization-contract.md): recommendations to the owner for
+  1.0.0 and after, and the patch before 1.0.0 taken from them.
 - [docs/design/astra-per-user-review.md](docs/design/astra-per-user-review.md) and
   [docs/design/codex-independent-review.md](docs/design/codex-independent-review.md): independent critiques.
 - [docs/design/gitbackup-exploration.md](docs/design/gitbackup-exploration.md): what to lift from GitBackup.

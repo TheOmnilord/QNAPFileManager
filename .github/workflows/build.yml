@@ -15,7 +15,9 @@ env:
   # Pinned to the exact patch: govulncheck gates stdlib advisories against
   # whatever toolchain built the tree, so a floating minor means a Go security
   # release reddens CI until the runner image catches up.
-  GO_VERSION: '1.26.8'
+  # 1.26.9 (2026-10): security fixes in net/http, net/textproto and crypto/tls
+  # (GO-2026-6603 … GO-2026-6617), all reachable from this daemon.
+  GO_VERSION: '1.26.9'
 
 jobs:
   test:

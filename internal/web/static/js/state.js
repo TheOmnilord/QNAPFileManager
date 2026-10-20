@@ -41,7 +41,18 @@ const listeners = new Set();
 // ownerEpoch is WHOSE page this is, and it changes only when that answer does:
 // a sign-out, or a different user. See update() below for why it is not
 // sessionGeneration.
-export const state = {session:null,sessionGeneration:0,ownerEpoch:0,path:'/share',pathB64:'',sort:'name',desc:false,hidden:false,total:0,pages:new Map(),selection:new Set(),exclude:false,focus:0,anchor:0,filter:'',generation:0,loading:false,clipboard:null,searchResults:null,pendingReveal:null,searchJob:null,listError:null,listener:'',dirClass:''};
+//
+// selection is a Map from a listing index to the ENTRY that row showed when it
+// was selected (stabilization contract §3.1). The index is what the rows are
+// painted from; the entry is what an action acts on — the concrete path or
+// pathB64 the user was looking at, never whatever the same index resolves to
+// in a listing read later. A value is null only for a row chosen before its
+// page had arrived (a Shift range over a large folder); list.js gives it its
+// entry when the page lands, or drops it if the row turns out to be hidden.
+// There is no select-all mode any more: the old `exclude` flag selected
+// "everything except these" over rows that had never been loaded, and no
+// action could act on that, so all of them refused it (§3.3).
+export const state = {session:null,sessionGeneration:0,ownerEpoch:0,path:'/share',pathB64:'',sort:'name',desc:false,hidden:false,total:0,pages:new Map(),selection:new Map(),focus:0,anchor:0,filter:'',generation:0,loading:false,clipboard:null,searchResults:null,pendingReveal:null,searchJob:null,listError:null,listener:'',dirClass:''};
 // Capture before awaiting: even signing back in as the same user invalidates old work.
 export function sessionGuard() { const generation=state.sessionGeneration; return () => generation===state.sessionGeneration; }
 
@@ -123,8 +134,13 @@ export function update(patch) {
  for (const fn of listeners) fn(state);
 }
 export function subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); }
-export const selected = index => state.exclude !== state.selection.has(index);
-export const countSelected = () => state.exclude ? Math.max(0,state.total-state.selection.size) : state.selection.size;
+// selected and countSelected read the selection as it is. Every member is a row
+// the user can see or, pending its page, one they are about to; the count is
+// the one the status bar shows and the reason table judges, and selectionEntries
+// (list.js) refuses past MAX_ROOTS on the same number, so the toolbar and the
+// keyboard can never disagree about "too many".
+export const selected = index => state.selection.has(index);
+export const countSelected = () => state.selection.size;
 
 // activeView says which pane is ON SCREEN. The listing and the search results
 // share one pane, so this is the difference between "12 items are selected" and

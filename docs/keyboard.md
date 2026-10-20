@@ -20,7 +20,7 @@ is reachable only by keyboard. `Ctrl+R` is never intercepted — it is the brows
 | `Shift` + movement | extend the selection |
 | `Ctrl` + movement | move without changing the selection |
 | `Space` | select or deselect the focused row |
-| `Ctrl+A` | select everything in this folder |
+| `Ctrl+A` | select every visible item (up to 1,000) |
 | `Enter` | open the folder or file |
 | `Alt+Enter` | properties |
 | `F4` | view the file as text |
@@ -33,6 +33,7 @@ is reachable only by keyboard. `Ctrl+R` is never intercepted — it is the brows
 | Keys | What it does |
 |---|---|
 | `Delete` | move the selection to Trash |
+| `F2` | rename the selected item |
 | `F9` | permissions |
 | `Ctrl+C` | mark the selection to copy |
 | `Ctrl+X` | mark the selection to move |
@@ -59,15 +60,20 @@ is reachable only by keyboard. `Ctrl+R` is never intercepted — it is the brows
 - `Ctrl+F` is the app's **subtree search**, not the browser's find-in-page. On a virtualised listing of a million files,
   find-in-page could only ever search the rows currently painted. Like `Ctrl+L`, it works from inside the filter box.
 - `Ctrl+C` with text selected leaves the keys to the browser — you are copying text, not files.
-- `Delete`, `Ctrl+C`, `Ctrl+X` and `Ctrl+V` act on the *listing's* selection. While search results are covering the
-  listing they do nothing and say so once, rather than silently acting on rows nobody can see. Press `Esc` to close the
-  results first.
+- `Ctrl+A` also needs the whole folder to have arrived in one response, which folders of up to 2,000 entries do;
+  otherwise it leaves the selection as it was and says why. With a filter set, the visible items are the ones matching
+  it: a `Shift` range likewise adds only those, and narrowing the filter drops the rows it hides from the selection.
+- `F2` does what the Rename button does. When Rename is unavailable it says why, in the same sentence the greyed-out
+  button gives.
+- `Delete`, `F2`, `Ctrl+C`, `Ctrl+X` and `Ctrl+V` act on the *listing's* selection. While search results are covering
+  the listing they do nothing and say so once, rather than silently acting on rows nobody can see. Press `Esc` to close
+  the results first.
 - No shortcut fires while a dialog is open or while you are typing in a field, except the two marked above as working
   from the filter box.
 
 ## Not bound in 1.0
 
-The design's shortcut table (`ui-ux-safety-plan` §3.9) also lists `Ctrl+Shift+N` for a new folder, `F2` for rename and
-`Shift+Del` for permanent delete. They are **not bound** in 1.0 and so are not in the dialog or in the tables above. All
-three actions are reachable from the toolbar and the context menu; permanent delete is also offered as a choice in the
-delete confirmation.
+The design's shortcut table (`ui-ux-safety-plan` §3.9) also lists `Ctrl+Shift+N` for a new folder and `Shift+Del` for
+permanent delete. They are **not bound** in 1.0 and so are not in the dialog or in the tables above. Both actions are
+reachable from the toolbar and the context menu; permanent delete is also offered as a choice in the delete
+confirmation.

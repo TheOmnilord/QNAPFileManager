@@ -110,6 +110,16 @@ func TestMoveKeepsAFileRewrittenWithTheSameLengthAndMtime(t *testing.T) {
 // probe: the container and its ancestry are not the whole story. A directory
 // this job CREATED, renamed into the tree being walked, was copied back into
 // itself until the volume filled.
+//
+// The rename is made the moment the job reports the root's own folder, /dst/a.
+// makeDir reports a folder once it has created and remembered it, and copyTree
+// makes the root's folder before the walk of /src/a has read a single name — so
+// whichever of one.txt and zsub getdents hands out first, zsub's names are read
+// with the output already inside it. It used to be made during one.txt's copy,
+// which assumed one.txt came first: Readdirnames returns the kernel's order,
+// not a sorted one, and where zsub came first it had been walked before the
+// output arrived, the job — correctly — never met it, and the test failed
+// without having proved anything.
 func TestCopyRefusesItsOwnOutputMovedIntoTheSource(t *testing.T) {
 	base := tempDir(t)
 	mkdir(t, base, "src/a/zsub")
@@ -119,7 +129,9 @@ func TestCopyRefusesItsOwnOutputMovedIntoTheSource(t *testing.T) {
 	r := newRoot(t, base)
 
 	var log jobLog
-	emit := onceAt(&log, "/dst/a/one.txt", 1, func() {
+	staged := false
+	emit := onceAt(&log, "/dst/a", 1, func() {
+		staged = true
 		// /dst/a is this job's own output, and no ancestry check has ever heard
 		// of it.
 		if err := os.Rename(filepath.Join(base, "dst", "a"),
@@ -132,13 +144,18 @@ func TestCopyRefusesItsOwnOutputMovedIntoTheSource(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Copy: %v", err)
 	}
+	if !staged {
+		t.Fatal("the job never reported its root folder, so its output was never moved into the source")
+	}
 	if indexOf(log.codes(), "invalid_target") < 0 {
 		t.Fatalf("warn codes = %v, want invalid_target when the job met its own output", log.codes())
 	}
 	if res.Skipped == 0 {
 		t.Errorf("result = %+v, want the root reported as skipped", res)
 	}
-	if exists(t, base, "src/a/zsub/planted/a/zsub/planted") {
+	// planted IS /dst/a and the copy of zsub is made inside it, so entering
+	// planted would first have created /dst/a/zsub/planted — which is this path.
+	if exists(t, base, "src/a/zsub/planted/zsub/planted") {
 		t.Fatal("the copy recursed into its own output")
 	}
 }

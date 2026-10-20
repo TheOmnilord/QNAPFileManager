@@ -28,6 +28,10 @@ import (
 // buffer produces exactly two working updates, one from the counting writer
 // when its bytes have been written and one when the entry is complete. n = 1 is
 // "while this entry is being copied", n = 2 is "once it has been published".
+// A folder produces one, when it has been created and before anything is
+// copied into it — for the root of a tree, before the walk has read a single
+// name, which is the one moment that does not depend on the order getdents
+// hands siblings out in.
 func onceAt(log *jobLog, path string, n int, do func()) Emit {
 	e := log.emit()
 	seen := 0
@@ -265,6 +269,16 @@ func assertNoTempLeft(t *testing.T, base, rel string) {
 // containment answer was taken once, before a pre-scan that can run for thirty
 // seconds, and never asked again. Here the destination is moved into the tree
 // while the copy is running, which the held descriptor follows.
+//
+// It is moved the moment the job reports the root's own folder, /dst/a: after
+// this root's containment answer has been taken (refreshAncestry, insideSource)
+// and before the walk of /src/a has read a single name. Whichever of one.txt
+// and zsub getdents hands out first, zsub's names are read with the destination
+// already inside it, and only the question the walk asks of every directory it
+// meets (meetsDestination) can see it there. Moving it during one.txt's copy
+// assumed one.txt came first; where zsub came first the destination arrived in
+// a part of the tree already walked, nothing met it — correctly — and the test
+// failed without having proved anything.
 func TestCopyRefusesTheDestinationThatArrivesInsideTheSource(t *testing.T) {
 	requireRenameOfOpenDirectories(t)
 	base := tempDir(t)
@@ -275,7 +289,9 @@ func TestCopyRefusesTheDestinationThatArrivesInsideTheSource(t *testing.T) {
 	r := newRoot(t, base)
 
 	var log jobLog
-	emit := onceAt(&log, "/dst/a/one.txt", 1, func() {
+	staged := false
+	emit := onceAt(&log, "/dst/a", 1, func() {
+		staged = true
 		// The destination becomes a directory inside the source. The job holds
 		// its descriptor, so every write still lands in it — now from inside
 		// the tree being copied.
@@ -287,6 +303,9 @@ func TestCopyRefusesTheDestinationThatArrivesInsideTheSource(t *testing.T) {
 	res, err := Copy(context.Background(), r, nil, copyReq("/dst", wproto.CopyOptions{}, "/src/a"), false, emit)
 	if err != nil {
 		t.Fatalf("Copy: %v", err)
+	}
+	if !staged {
+		t.Fatal("the job never reported its root folder, so the destination was never moved into the source")
 	}
 	if indexOf(log.codes(), "invalid_target") < 0 {
 		t.Fatalf("warn codes = %v, want invalid_target once the destination was met inside the source", log.codes())

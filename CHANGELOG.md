@@ -14,11 +14,59 @@ reasoning behind any decision named here is in [PLAN.md](PLAN.md) and in `docs/d
 
 - `LICENSE` (MIT, matching `QPKG_LICENSE`) and `THIRD_PARTY_NOTICES.md` (the BSD-3 notices for the Go standard library
   and `golang.org/x/crypto`), both shipped inside the QPKG beside the binary.
+- `SECURITY.md`: how to report a vulnerability privately, and what is in scope.
+
+### Changed
+
+- **Folders are listed first**, whichever column you sort by and in either direction, and **names sort without regard
+  to case**: `apple`, `Banana`, `cherry` rather than `Banana`, `apple`, `cherry`.
+- **Sizes and dates read like a file manager's.** Sizes are shown in KiB, MiB, GiB and so on, with the exact byte count
+  on hover; dates are short, with the full date and time on hover.
+- **`F2` renames**, as the Rename button does. When Rename is unavailable it says why instead.
+- **A selection of more than 1,000 items is refused before you act.** Delete, Copy, Move, Permissions, Download and the
+  Trash panel's Restore are unavailable above 1,000 items, and say so before you press them: "Select at most 1,000
+  items at a time (N are selected)."
+- **Expanding a folder in the tree loads one page** — up to 500 entries, folders first — instead of every entry in the
+  folder. When that page holds only folders and the folder has more entries, the branch ends with "More entries are not
+  shown — open this folder."
+- **Folder measurements have limits.** A folder's size in Properties, and the Permissions dialog's estimate of what a
+  change will touch, stop at 10 million entries or 10 minutes and then read "At least …", saying that the measurement
+  stopped at its limit. A measurement left running by a closed tab now ends by itself.
+- The package declares **5.2.0** as its minimum firmware, the lowest line verified on hardware. It declared 4.5.0, on
+  which nothing had been run.
+
+### Fixed
+
+- **`Ctrl+A` works.** It used to highlight every row and leave Delete, Copy, Move, Permissions and Download refusing the
+  selection. It now selects every visible item — with a name filter set, every item matching it — and every bulk
+  action works on that selection. It does so when there are at most 1,000 such items and the folder loaded in one
+  response (folders of up to 2,000 entries do); otherwise it leaves the selection as it was and says why, naming the
+  number.
+- **A selection never includes rows you cannot see.** A `Shift` range and `Ctrl+A` skip the rows the name filter
+  hides, and narrowing the filter drops the rows it hides from the selection.
+- **A folder too large to list in full says so honestly.** When a folder holds more than 50,000 entries, the listing
+  now says that only the first 50,000 entries read are listed, that others are missing, and that sorting applies only
+  to the entries listed. A folder of exactly 50,000 entries is no longer reported as capped.
+- **The right-click menu opens at the pointer**, and `Shift+F10` or `Menu` opens it at the focused row, kept inside
+  the window. It used to open pinned to the bottom right.
+- **The toolbar no longer wraps** onto a second row at common window widths (1280, 1024 and 900 px). Back, Forward, Up
+  and Refresh moved into the path bar, beside the path; every action is still a button or an item in the ⋯ menu.
+- **The confirmation for a large copy, move or delete arrives in time.** With up to 1,000 items selected, it is
+  prepared within the request's time limit instead of risking a timeout; when there is not time to measure everything,
+  a copy or move states its size as a minimum.
+
+### Security
+
+- **Built with Go 1.26.9**, which fixes ten standard-library advisories reachable from the daemon — in `net/http`,
+  `net/textproto` and `crypto/tls` (GO-2026-6603 to GO-2026-6617). The package is built by CI with the pinned
+  toolchain, so the fix ships in the binary.
 
 ### Deferred to 1.1
 
 Named here so a 1.0.0 tag is not read as a claim that they exist:
 
+- **Paging a large folder without re-reading it.** Each page of a long listing re-reads the folder, and a listing reads
+  at most 50,000 entries of it. Listing generations will page from one sorted snapshot of the folder instead.
 - **Trash janitor.** `trash.days` is validated and carried in the configuration but nothing enforces it. Trash is emptied
   only through "Empty Trash…".
 - **Extract.** Archives can be created and downloaded but not unpacked; there is no design yet for zip-slip and conflict
@@ -41,8 +89,9 @@ Named here so a 1.0.0 tag is not read as a claim that they exist:
 *The date is filled in when the tag is cut; see [docs/release-checklist.md](docs/release-checklist.md).*
 
 A file manager for the QNAP QTS and QuTS hero desktop that can reach the whole filesystem — `/`, `/etc`, `/root`, the
-`.qpkg` trees, raw volume mounts — and never needs SSH. Installed from App Center as a QPKG, opened as a window on the QTS
-desktop with the QTS login, with every operation running as the signed-in user's own Linux identity.
+`.qpkg` trees, raw volume mounts — with no SSH in normal use (setting up the break-glass door is done from the NAS
+shell). Installed from App Center as a QPKG, opened as a window on the QTS desktop with the QTS login, with every
+operation running as the signed-in user's own Linux identity.
 
 ### M4 — Polish and release
 
@@ -207,7 +256,7 @@ Four residuals were accepted rather than closed, each with the reasoning in [PLA
   dropped to that user's uid and groups, so the Linux kernel enforces permissions — the app never re-implements them.
   Downloads and uploads pass an open file descriptor up rather than letting the root process open anything.
 - Browse the whole filesystem, with a tree, breadcrumbs, an editable path, sorting, filtering, hidden files, a text
-  viewer, and listings that stay responsive on directories with hundreds of thousands of entries.
+  viewer, and paged listings of up to 50,000 entries per folder.
 - One binary for QTS and QuTS hero, with a per-mount capability table read from `/proc/self/mountinfo`. No operation
   branches on "QTS or hero"; every operation asks what the mount underneath it can do.
 - Packaging and CI: a single static binary with no cgo, both architecture trees, and CI jobs that run the permission

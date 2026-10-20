@@ -591,7 +591,9 @@ async function undoWhenDone(job,requested) {
 // resolves the selection through selectionEntries, which fetches any selected
 // pages that were never loaded, so a Shift-range spanning unloaded pages is
 // deleted in full or not at all — never a silently truncated subset reported as
-// success (standard P2).
+// success (standard P2). The same call refuses a selection past MAX_ROOTS in
+// the reason table's words, so the Delete key cannot send what the disabled
+// button would not (stabilization contract §3.5).
 export async function deleteSelection() {
  // The gate, enforced where the action IS and not only where its button is: a
  // Delete key must not reach a selection the search results are covering
@@ -601,7 +603,6 @@ export async function deleteSelection() {
  try {
   entries=await selectionEntries();
  } catch(err) { error(err); return; }
- if (entries===null) { error(new Error('Select items individually to delete them in this version.')); return; }
  deleteEntries(entries);
 }
 

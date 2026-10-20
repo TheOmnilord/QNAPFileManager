@@ -631,7 +631,8 @@ type JobResult struct {
 	// Hits are a search job's matches in walk order, capped by SearchReq.MaxHits
 	// (M2-C). Detail says when the cap was hit.
 	Hits []fsx.Entry `json:"hits,omitempty"`
-	// Capped marks a measurement that stopped at SizeReq.MaxEntries. The counts
+	// Capped marks a measurement that stopped at SizeReq.MaxEntries or
+	// SizeReq.MaxDuration (stabilization contract §2.1). The counts
 	// are then a MINIMUM, not a total, and a caller deciding something from them
 	// (the M3 pre-scan) must read the whole answer as "unknown" rather than as
 	// the number it happens to carry.
@@ -672,12 +673,24 @@ type SizeReq struct {
 	// (permissions, transfer) leave it off, so their count is the one the change
 	// will walk.
 	ReadCross bool `json:"rx,omitempty"`
-	// MaxEntries bounds the walk. Zero is the size job's own default; a caller
-	// that is measuring in order to decide something — the M3 permissions
-	// pre-scan, which runs inside a 15 s request — passes the contract's 500 000
-	// bound so an enormous tree ends the walk instead of the request. A walk that
-	// hit the bound answers Capped, and a capped measurement is not a count.
+	// MaxEntries bounds the walk. Zero is the size job's own default, which is no
+	// bound at all. A caller that is measuring in order to decide something —
+	// the permissions and transfer pre-scans, which run inside a 15 s request —
+	// passes what is left of its 500 000-entry budget so an enormous tree ends
+	// the walk instead of the request; the folder-size route passes ten million
+	// (stabilization contract §2.1). A walk that hit the bound answers Capped,
+	// and a capped measurement is not a count.
 	MaxEntries int64 `json:"me,omitempty"`
+	// MaxDuration bounds the walk's wall-clock time, in whole seconds. Zero is
+	// no time bound of its own. The folder-size route sends it with MaxEntries
+	// (stabilization contract §2.1): a measurement is a job in Operations, and
+	// one whose dialog was closed or whose page went away would otherwise walk
+	// a NAS for as long as the tree lasts with nobody left to read the answer.
+	// A walk that reaches it ends where it stands and answers Capped, exactly
+	// as an entry bound does; a cancelled walk still answers Cancelled. The
+	// pre-scans leave it at zero — the request deadline they run under is
+	// their clock.
+	MaxDuration int64 `json:"md,omitempty"`
 }
 
 // TrashListReq lists the caller's own trashed items (OpTrashList — a plain

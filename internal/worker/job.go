@@ -17,6 +17,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"sync"
 	"time"
@@ -158,12 +159,13 @@ func (s *session) jobWork(ctx context.Context, req wproto.JobReq, e *progEmitter
 		if err := jobBody(req.Body, &body); err != nil {
 			return wproto.JobResult{}, err
 		}
-		// MaxEntries is the caller's own bound and is passed through as it came:
-		// an ordinary folder-size job sends zero and gets the real number, and
-		// the permissions pre-scan sends the contract's 500 000 so an enormous
-		// tree ends the walk instead of the request (finding 10).
-		return fsops.Size(ctx, s.root, s.plat, pathsOf(body.Paths), fsops.SizeOptions{
-			CrossMounts: body.CrossMounts, ReadCross: body.ReadCross, MaxEntries: body.MaxEntries}, emit)
+		// The bounds are the caller's own and are passed through as they came
+		// (sizeOptions): the folder-size route sends ten million entries and ten
+		// minutes so a measurement nobody is waiting for ends on its own
+		// (stabilization contract §2.1), and the pre-scans that confirm a change
+		// send what is left of their entry budget so an enormous tree ends the
+		// walk instead of the request (finding 10, contract §2.4).
+		return fsops.Size(ctx, s.root, s.plat, pathsOf(body.Paths), sizeOptions(body), emit)
 
 	case wproto.JobSearch:
 		var body wproto.SearchReq
@@ -280,6 +282,27 @@ func jobBody(raw json.RawMessage, v any) error {
 		return nil
 	}
 	return json.Unmarshal(raw, v)
+}
+
+// sizeOptions carries a SizeReq into the walk's own options.
+//
+// MaxDuration travels in whole seconds, and fsops reads any duration that is
+// not positive as "no time bound". A count of seconds too large for a
+// time.Duration would WRAP when multiplied out — into a negative, which is no
+// bound at all, or into a short positive one, which caps a measurement nobody
+// asked to be cut short — so it is clamped to the largest duration there is
+// instead: some 292 years, which is the bound the caller asked for in every
+// sense that matters. Zero or less is no time bound, as the field says.
+func sizeOptions(body wproto.SizeReq) fsops.SizeOptions {
+	o := fsops.SizeOptions{CrossMounts: body.CrossMounts, ReadCross: body.ReadCross, MaxEntries: body.MaxEntries}
+	switch secs := body.MaxDuration; {
+	case secs <= 0:
+	case secs > int64(math.MaxInt64/time.Second):
+		o.MaxDuration = math.MaxInt64
+	default:
+		o.MaxDuration = time.Duration(secs) * time.Second
+	}
+	return o
 }
 
 // pathsOf converts the wire's byte paths into the strings fsops takes. The

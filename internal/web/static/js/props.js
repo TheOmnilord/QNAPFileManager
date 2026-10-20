@@ -35,6 +35,14 @@ export function sizeRequest(entries,{crossMounts = false,readCross = false} = {}
  return body;
 }
 
+// CAPPED_NOTE is how a measurement that stopped at its bound ends
+// (stabilization contract §3.8). A size walk is bounded — ten million entries
+// or ten minutes (§2.1) — and one that reaches either answers with what it had
+// counted by then: a floor, not a total. The number is still worth showing; it
+// must never be shown as if it were the size. The Permissions impact line ends
+// the same way (perms.js impactText), so the two dialogs say it in one voice.
+export const CAPPED_NOTE = '— the measurement stopped at its limit (10 million entries or 10 minutes).';
+
 // sizeReport turns a finished (or unfinished) size job into what the dialog
 // says. Pure, so the four outcomes are unit-tested rather than watched for.
 export function sizeReport(job) {
@@ -48,12 +56,24 @@ export function sizeReport(job) {
  const mounts = whole(r.mountsSkipped),network = whole(r.mountsNetwork);
  const left = (mounts ? ` · ${mounts.toLocaleString()} mounted folder${mounts === 1 ? '' : 's'} not counted` : '')
   + (network ? ` · ${network.toLocaleString()} network share${network === 1 ? '' : 's'} not counted` : '');
+ const counted = `${formatBytes(r.bytes || 0)} in ${(r.files || 0).toLocaleString()} file(s) and ${(r.dirs || 0).toLocaleString()} folder(s)${left}`;
  return {
   state:'done',
   result:r,
-  text:`${formatBytes(r.bytes || 0)} in ${(r.files || 0).toLocaleString()} file(s) and ${(r.dirs || 0).toLocaleString()} folder(s)${left}`,
+  // `capped` is the job result's own flag (routes_jobs.go jobResultView), not a
+  // sentence to be parsed: the walk ended at a bound, so every count is a floor.
+  text:r.capped === true ? `At least ${counted} ${CAPPED_NOTE}` : counted,
  };
 }
+
+// SIZE_POLL_TRIES is how long a dialog waits for its measurement, in awaitJob's
+// half-second polls: fifteen minutes. The server ends a walk at ten minutes of
+// its own and answers with what it counted, capped (§2.1) — but those ten
+// minutes start when the walk leaves the queue, and awaitJob's default of ten
+// minutes starts at the submission. Waiting no longer than the walk may run
+// reported "did not answer, and it was stopped" for exactly the measurement that
+// had a floor to show (§3.8).
+export const SIZE_POLL_TRIES = 1800;
 
 // --- one measurement per folder, shared ---------------------------------------
 //
@@ -377,7 +397,7 @@ export function createSizeRunner({report = () => {},track = trackJob,cancel = ca
      // (round 1, finding 14). Either way the job is cancelled by the id the
      // entry still holds, and the failure is what this measurement reports.
      let job;
-     try { job = await poll(entry.id,{guard:ownerGuard}); }
+     try { job = await poll(entry.id,{guard:ownerGuard,tries:SIZE_POLL_TRIES}); }
      catch(err) { abandon(entry); throw err; }
      if (!job) { abandon(entry); throw new Error('The measurement did not answer, and it was stopped. Press Recount to measure again.'); }
      entry.job = job; entry.finishedAt = Date.now();

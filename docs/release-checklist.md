@@ -34,6 +34,8 @@ release nobody tested.
 - [ ] [docs/identity.md](identity.md) and [docs/qnap-install.md](qnap-install.md) match the shipped behaviour: ports,
       default configuration values, the `break-glass` subcommand names and flags, the cookie names.
 - [ ] [docs/keyboard.md](keyboard.md) and the README's map agree with the app's own shortcuts dialog.
+- [ ] Private vulnerability reporting is on for the repository, so the link in [SECURITY.md](../SECURITY.md) works:
+      `gh api repos/TheOmnilord/QNAPFileManager/private-vulnerability-reporting` answers `{"enabled":true}`.
 - [ ] Nothing in the documents describes a v1.1 feature as present.
 
 This item is a human reading the documents. Nothing executes them, and that is the weakest link in this checklist.
@@ -45,6 +47,11 @@ unit and on the QTS unit, and work through the list. Anything that fails here st
 
 ### Browse and identity
 
+- [ ] App Center installs the package on **both** units with no firmware-compatibility warning, now that it declares
+      `QTS_MINI_VERSION="5.2.0"` (the unsigned-package warning is expected, and is a different one). Record what
+      `getcfg System Version` and `uname -m` print on each unit: on the QuTS hero unit that settles how its version
+      compares (PLAN "must verify" item 6), and on the QTS unit it records the CPU architecture the README's
+      compatibility matrix is waiting for.
 - [ ] The App Center tile opens a **desktop window**, and the app is signed in with no prompt of its own.
 - [ ] A non-administrator sees the filesystem's shape but is refused where their account would be refused over SSH, and
       the refusal names the owner and mode rather than showing an empty folder.
@@ -114,7 +121,8 @@ From the ten Astra rounds (`docs/reviews/m3-astra-round10.md`), with disposable 
 - [ ] Cancelling a recursive job reports the partial count; the warnings and the audit lines carry it.
 - [ ] Ownership plus mode on a multi-item selection: the chmod waits for the chown job.
 - [ ] A size walk survives a same-user session refresh, is cancelled on dialog close, and is retried after a lost
-      cancel; a closed tab leaves the walk running until it completes (§17.17 — observe it in Operations).
+      cancel; a closed tab leaves the walk running until it completes or reaches its limit of 10 million entries or
+      10 minutes (§17.17 — observe it in Operations).
 - [ ] A domain user's numeric ids and a hero dataset's quota-relative free space display sensibly.
 
 ### The break-glass door (M4)
@@ -155,11 +163,33 @@ From the ten Astra rounds (`docs/reviews/m4-astra-round10.md`):
       instruction; the browser sees the new one only after the restart.
 - [ ] A login latency check under a job load: the door answers within its floor plus one bcrypt plus at most a second.
 
+### Select-all, large folders and measurements (the stabilization patch)
+
+See [docs/design/stabilization-contract.md](design/stabilization-contract.md). The measurements are recorded, with the
+unit and the build, in PLAN.md (§6 below): they are the baseline later releases are compared against.
+
+- [ ] **A select-all of 1,000 items, through every action.** In a folder of exactly 1,000 small files, `Ctrl+A` selects
+      all of them, and Delete (to Trash), Copy, Move, Permissions and Download each accept that selection and complete,
+      through their confirmation where they ask for one. Re-create the folder after Move and Delete. Note how long each
+      confirmation took to appear. With a 1,001st file, `Ctrl+A` changes nothing and says why, naming the number.
+- [ ] **Listing latency at 10,000 and 50,000 entries.** In folders of 10,000 and of 50,000 empty files, time how long
+      the first rows take to appear, and how long the last page takes after a scroll to the bottom. Add one more file
+      to the 50,000 folder: the listing then says that only the first 50,000 entries read are listed and that others
+      are missing.
+- [ ] **A cross-dataset move's throughput.** On the QuTS hero unit, move a few GB of files of mixed sizes between two
+      datasets and record the wall time and the throughput it implies, beside the time `cp -a` takes for the same data
+      between the same datasets over SSH. The difference is what the move's byte verification and its copy engine cost
+      ([roadmap-deliberation](design/roadmap-deliberation.md), finding 9).
+- [ ] **A capped Properties measurement reads "At least …".** Open Properties on a tree large enough to reach a limit —
+      10 million entries or 10 minutes; the root of the fullest volume is the likeliest — and check that the size reads
+      "At least …" and says the measurement stopped at its limit. If nothing on the unit reaches a limit, record that
+      and the largest count measured: the item is then not verified on hardware, rather than passed.
+
 ### Accessibility and layout (M4, manual by design — there is no npm, so no axe run)
 
 - [ ] The QTS desktop window at its default size passes the 768 px rung: no horizontal scroll on the body, every toolbar
       action reachable, every dialog fitting with its action row pinned.
-- [ ] The same at 1280×800, 1024×768, 900×600 and 375×667.
+- [ ] The same at 1280×800, 1024×768, 900×600 and 375×667 — and at the first three the toolbar stays on one row.
 - [ ] A keyboard-only pass: browse → select → permissions → confirm → job, with no trap and no action reachable by mouse
       alone.
 - [ ] An NVDA pass over the same path.

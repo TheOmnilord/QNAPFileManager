@@ -3,8 +3,11 @@
 Everything an operator needs: install, first run, the emergency door, upgrade, removal, where things live, and what to do
 when it does not work. For *why* any of it behaves as it does, see [docs/identity.md](identity.md).
 
-Tested on QTS 5.2.x (ext4) and QuTS hero 5.2.x (ZFS). Architectures: `x86_64` and `arm_64` (aarch64); 32-bit ARM models
-are not targeted. Minimum firmware declared in the package is 4.5.0.
+Verified on hardware: QuTS hero h5.2.9 (ZFS, x86_64) and QTS 5.2.x (ext4; that unit's CPU architecture is still to be
+recorded). The package carries `x86_64` and `arm_64` (aarch64) trees; `arm_64` is built and smoke-run under emulation
+only, because it has not run on a physical unit. 32-bit ARM models are not targeted, and firmware 6 is untested. The
+package declares 5.2.0 as its minimum firmware, the lowest line verified on hardware. The README's
+[compatibility matrix](../README.md#compatibility) is the reference.
 
 ## 1. Install from App Center
 

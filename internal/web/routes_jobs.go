@@ -66,6 +66,17 @@ const (
 	// finished job, matching guard.NeedsConfirm's scale rule.
 	milestoneFiles = 100
 	milestoneBytes = 1 << 30
+	// sizeJobMaxEntries and sizeJobMaxDuration bound a measurement started from
+	// POST /api/jobs/size (stabilization contract §2.1). They are search's order
+	// of magnitude — a search stops at ten million entries or five minutes
+	// (jobSearch) — so the folder-size probe of an ordinary tree never meets
+	// them. What they bound is the ORPHANED measurement: the Properties dialog
+	// closed or the page reloaded, and a job left walking a whole volume in
+	// Operations with nobody waiting for the number. A measurement that reaches
+	// either ends where it stands and answers Capped, which the result view
+	// carries (jobResultView.Capped) and the dialog reads as "at least".
+	sizeJobMaxEntries  = 10_000_000
+	sizeJobMaxDuration = 10 * time.Minute
 )
 
 // jobPath matches the two job-id request forms, "/api/jobs/<id>" and
@@ -164,6 +175,12 @@ type jobResultView struct {
 	// HiddenSkipped is the hidden directories a search passed over
 	// (wproto.JobResult.HiddenSkipped).
 	HiddenSkipped int64 `json:"hiddenSkipped,omitempty"`
+	// Capped says the walk stopped at one of its bounds before the end of the
+	// tree (wproto.JobResult.Capped), so Files, Dirs and Bytes are a floor and
+	// not a total (stabilization contract §2.2). The measuring dialogs read it
+	// and say "at least"; the "capped" warning beside it says the same thing in
+	// a sentence, but a sentence is not something a client should parse.
+	Capped bool `json:"capped,omitempty"`
 }
 
 // ForList returns a copy of the result suitable for list responses, omitting hits to reduce bandwidth.
@@ -179,6 +196,7 @@ func (v jobResultView) ForList() jobResultView {
 		MountsSkipped: v.MountsSkipped,
 		MountsNetwork: v.MountsNetwork,
 		HiddenSkipped: v.HiddenSkipped,
+		Capped:        v.Capped,
 		// Hits intentionally omitted.
 	}
 }
@@ -228,7 +246,7 @@ func viewOf(res wproto.JobResult) jobResultView {
 	// known to have been a delete-to-trash (jobDelete), so that a result carrying
 	// ids can never be published for an operation whose items are gone for good.
 	return jobResultView{Files: res.Files, Dirs: res.Dirs, Bytes: res.Bytes, Skipped: res.Skipped, Warnings: res.Warnings, Detail: res.Detail,
-		MountsSkipped: res.MountsSkipped, MountsNetwork: res.MountsNetwork, HiddenSkipped: res.HiddenSkipped}
+		MountsSkipped: res.MountsSkipped, MountsNetwork: res.MountsNetwork, HiddenSkipped: res.HiddenSkipped, Capped: res.Capped}
 }
 
 // --- requested ⇄ resolved roots (findings W4 and W5) -------------------------
@@ -634,6 +652,14 @@ func (s *Server) jobDelete(w http.ResponseWriter, r *http.Request, sess *session
 	var warnings []string
 	seen := map[string]bool{}
 	var totalBytes int64
+	// The stats are the measuring half of this pre-flight, and they get the
+	// measuring budget (stabilization contract §2.4): the request's deadline
+	// less the reserve that the token, the durable intent line and the
+	// submission still need. The resolves do not — they are the guard's input,
+	// and a root that cannot be resolved refuses the whole job, so they run
+	// under the request context itself.
+	statCtx, statCancel := preflightContext(r.Context())
+	defer statCancel()
 	for i, p := range paths {
 		rp, rerr := s.resolveForGuard(r.Context(), sess.who, p, false)
 		if rerr != nil {
@@ -651,8 +677,15 @@ func (s *Server) jobDelete(w http.ResponseWriter, r *http.Request, sess *session
 		}
 		// Measure each root as the user so the summary and the milestone see real
 		// sizes. A stat failure simply leaves it out; the worker's own scan is the
-		// authority once the job runs.
-		if e, statErr := s.backend.Stat(r.Context(), sess.who, p); statErr == nil {
+		// authority once the job runs. So does a stat there is no budget left for
+		// (§2.4): a thousand-root selection on a slow worker still gets its
+		// confirmation before the deadline rather than a timeout after it, and
+		// what it loses is part of a figure that was only ever the roots' own
+		// stat sizes — a folder's is its directory entry, not its tree.
+		if statCtx.Err() != nil {
+			continue
+		}
+		if e, statErr := s.backend.Stat(statCtx, sess.who, p); statErr == nil {
 			totalBytes += e.Size
 		}
 	}
@@ -1086,7 +1119,17 @@ func (s *Server) jobSize(w http.ResponseWriter, r *http.Request, sess *session) 
 	// ReadCross only when the client asked for it (see the body above). The
 	// server-side pre-scans that confirm a change measure through transferSize,
 	// which never sets it.
-	reqBody, err := json.Marshal(wproto.SizeReq{Paths: wire, CrossMounts: body.CrossMounts, ReadCross: body.ReadCross})
+	//
+	// The bounds go with every measurement this route starts (§2.1). A job
+	// whose walk reaches one ends with its counts as a floor and Capped set;
+	// cancelling it is still a cancellation. Either way its slot in the
+	// metadata class is held until the walk has stopped (§2.3): the manager
+	// gives a slot back only when the work function below returns, and the
+	// pool's Job returns after a cancel only once the worker has reported
+	// where it stopped — or once the pool has given up waiting and terminated
+	// that worker (workerpool's cancelAndDrain).
+	reqBody, err := json.Marshal(wproto.SizeReq{Paths: wire, CrossMounts: body.CrossMounts, ReadCross: body.ReadCross,
+		MaxEntries: sizeJobMaxEntries, MaxDuration: int64(sizeJobMaxDuration / time.Second)})
 	if err != nil {
 		s.fail(w, r, "internal", "The size request could not be prepared.", "", err.Error())
 		return

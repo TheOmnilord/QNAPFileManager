@@ -1330,7 +1330,7 @@ func TestNotesForARAMDisk(t *testing.T) {
 	if !strings.Contains(joined, "mount point") || !strings.Contains(joined, "RAM disk") {
 		t.Fatalf("notes = %v", notes)
 	}
-	if notes := dirNotes(plat, "/big", "/", false, true); len(notes) == 0 || !strings.Contains(notes[0], "capped") {
+	if notes := dirNotes(plat, "/big", "/", false, true); len(notes) == 0 || notes[0] != cappedNote(listReadCap) {
 		t.Fatalf("a capped listing must say so: %v", notes)
 	}
 }

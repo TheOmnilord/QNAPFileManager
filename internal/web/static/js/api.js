@@ -16,7 +16,7 @@ export function connectionNotice(title,message) {
  announce(message);
 }
 export function signInNotice() {
- update({session:null,pages:new Map(),selection:new Set(),total:0,exclude:false,generation:state.generation+1});
+ update({session:null,pages:new Map(),selection:new Map(),total:0,generation:state.generation+1});
  // Which door this page is standing at was answered by the server the last time
  // /api/session was read, and it does not change under a running page. On the
  // emergency listener the QTS notice is the one thing that must NEVER appear:

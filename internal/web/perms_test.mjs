@@ -61,7 +61,7 @@ const {
  impactText,initPerms,loadIds,octalState,openPerms,permsApplies,reportResult,
 } = await import('./static/js/perms.js');
 const {update} = await import('./static/js/state.js');
-const {createSizeRunner,flagsText,modeText,ownerText,propsSections,sizeReport,sizeRequest} = await import('./static/js/props.js');
+const {CAPPED_NOTE,SIZE_POLL_TRIES,createSizeRunner,flagsText,modeText,ownerText,propsSections,sizeReport,sizeRequest} = await import('./static/js/props.js');
 const {warningCode,warningLine,warningsLabel} = await import('./static/js/jobs.js');
 const {actionMessage} = await import('./static/js/actions.js');
 const {EMPTY,SETUID,jobSpecs,parseOctal,toggleBit} = await import('./static/js/perm.js');
@@ -331,6 +331,21 @@ test('#pImpact reports the measurement, and says so while it is not one', () => 
  assert.equal(impactText(null),'');
 });
 
+// Stabilization contract §3.8: a measurement that stopped at its bound counted
+// part of the tree, and a recursive chmod does not stop there. The estimate is a
+// floor and must say so — never "Will change N items" as if N were the impact.
+test('a capped Permissions estimate is a floor, and never presents itself as the exact impact', () => {
+ const text = impactText({state:'done',result:{files:7204,dirs:837,capped:true}});
+ assert.equal(text,
+  `At least ${(8041).toLocaleString()} items (${(7204).toLocaleString()} files, ${(837).toLocaleString()} folders) will change — the measurement stopped at its limit (10 million entries or 10 minutes).`);
+ assert.ok(text.startsWith('At least'));
+ assert.ok(text.endsWith('— the measurement stopped at its limit (10 million entries or 10 minutes).'));
+ assert.doesNotMatch(text,/^Will change/);
+ assert.equal(text,impactText(sizeReport({state:'done',result:{files:7204,dirs:837,capped:true}})),'the dialog reads it through sizeReport');
+ // Only the flag counts: no flag, or a false one, is a total.
+ assert.match(impactText({state:'done',result:{files:1,dirs:0,capped:false}}),/^Will change/);
+});
+
 test('a diff is a WARNING with a line that stays, never a success (§3.3, §12)', () => {
  const clean = reportResult({before:{},entry:{},diffs:[]},{op:'chmod'});
  assert.deepEqual(clean,{warned:false,lines:[],tone:'none'});
@@ -471,6 +486,32 @@ test('sizeReport says what the job said, and never guesses', () => {
  const done = sizeReport({state:'done',result:{bytes:1024,files:2,dirs:1}});
  assert.equal(done.state,'done');
  assert.equal(done.text,'1 KiB in 2 file(s) and 1 folder(s)');
+});
+
+// Stabilization contract §3.8: the size job ends at ten million entries or ten
+// minutes and answers `capped` with what it had counted. Properties shows the
+// number — it is worth having — as the floor it is.
+test('sizeReport with capped starts "At least" and says where the measurement stopped', () => {
+ const capped = sizeReport({state:'done',result:{bytes:1024,files:2,dirs:1,capped:true}});
+ assert.equal(capped.state,'done');
+ assert.equal(capped.text,'At least 1 KiB in 2 file(s) and 1 folder(s) — the measurement stopped at its limit (10 million entries or 10 minutes).');
+ assert.equal(capped.text,`At least 1 KiB in 2 file(s) and 1 folder(s) ${CAPPED_NOTE}`);
+ // What the walk did not enter is still said, inside the floor.
+ assert.equal(sizeReport({state:'done',result:{bytes:1024,files:2,dirs:1,mountsSkipped:1,capped:true}}).text,
+  'At least 1 KiB in 2 file(s) and 1 folder(s) · 1 mounted folder not counted — the measurement stopped at its limit (10 million entries or 10 minutes).');
+ // An uncapped one is the total, worded exactly as before.
+ assert.equal(sizeReport({state:'done',result:{bytes:1024,files:2,dirs:1,capped:false}}).text,'1 KiB in 2 file(s) and 1 folder(s)');
+ // A cancelled or failed walk is not a floor; it says what the job said.
+ assert.match(sizeReport({state:'cancelled',result:{capped:true}}).text,/Measurement cancelled\./);
+});
+
+test('a dialog waits longer for its measurement than the server lets the walk run', () => {
+ // The walk ends by its own bound at ten minutes, counted from when it leaves
+ // the queue; awaitJob polls every half second. Fifteen minutes of polls is
+ // what lets a capped answer arrive instead of "did not answer".
+ assert.ok(SIZE_POLL_TRIES*0.5 > 10*60,`${SIZE_POLL_TRIES} polls of 500 ms must outlast ten minutes`);
+ const src = readFileSync(new URL('./static/js/props.js', import.meta.url), 'utf8');
+ assert.match(src,/poll\(entry\.id,\{guard:ownerGuard,tries:SIZE_POLL_TRIES\}\)/);
 });
 
 test('sizeReport says how many mounted folders the total leaves out', () => {

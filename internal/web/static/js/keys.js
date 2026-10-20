@@ -14,7 +14,10 @@
 //                   same shape as the Go element-id and route contract tests.
 //
 // Nothing here touches the DOM: appBindings takes its collaborators as
-// arguments, so the whole table can be built in node and inspected.
+// arguments, so the whole table can be built in node and inspected. The one
+// import is a sentence, so a control with no reason of its own says the same
+// words wherever it is asked.
+import {WHY_UNAVAILABLE} from './dom.js';
 
 // chordOf normalises a keyboard event to one string.
 //
@@ -42,8 +45,9 @@ export function chordOf(event) {
 
 // LISTING_CHORDS act on the LISTING's selection. While the search results cover
 // the listing they do nothing at all and say so once: the selection they would
-// act on is invisible (round 1, finding 1).
-export const LISTING_CHORDS = new Set(['Delete', 'Ctrl+C', 'Ctrl+X', 'Ctrl+V']);
+// act on is invisible (round 1, finding 1). F2 is one of them (stabilization
+// contract §4.3): the item it would rename is a listing row.
+export const LISTING_CHORDS = new Set(['Delete', 'F2', 'Ctrl+C', 'Ctrl+X', 'Ctrl+V']);
 export const LISTING_PAUSED_MESSAGE = 'Close the search results (Esc) to act on this folder.';
 
 // KEYMAP is the dialog's table. `keys` is what the table prints, `chord` is what
@@ -57,7 +61,7 @@ export const KEYMAP = [
  {scope: 'list', keys: 'Shift + movement', what: 'Extend the selection', cases: []},
  {scope: 'list', keys: 'Ctrl + movement', what: 'Move without changing the selection', cases: []},
  {scope: 'list', keys: 'Space', what: 'Select or deselect the focused row', cases: [' ']},
- {scope: 'list', keys: 'Ctrl+A', what: 'Select everything in this folder', cases: ['a', 'A']},
+ {scope: 'list', keys: 'Ctrl+A', what: 'Select every visible item (up to 1,000)', cases: ['a', 'A']},
  {scope: 'list', keys: 'Enter', what: 'Open the folder or file', cases: ['Enter']},
  {scope: 'list', keys: 'Alt+Enter', what: 'Properties', cases: ['Enter']},
  {scope: 'list', keys: 'F4', what: 'View the file as text', cases: ['F4']},
@@ -65,6 +69,7 @@ export const KEYMAP = [
  {scope: 'list', keys: 'Esc', what: 'Clear the selection', cases: ['Escape']},
  {scope: 'list', keys: 'Type a name', what: 'Jump to the first loaded match', cases: []},
  {scope: 'app', keys: 'Delete', what: 'Move the selection to Trash', chord: 'Delete'},
+ {scope: 'app', keys: 'F2', what: 'Rename the selected item', chord: 'F2'},
  {scope: 'app', keys: 'F9', what: 'Permissions', chord: 'F9'},
  {scope: 'app', keys: 'Ctrl+C', what: 'Mark the selection to copy', chord: 'Ctrl+C'},
  {scope: 'app', keys: 'Ctrl+X', what: 'Mark the selection to move', chord: 'Ctrl+X'},
@@ -91,6 +96,27 @@ export function keymapRows() {
  return KEYMAP.map(row => ({keys: row.keys, what: row.what, where: WHERE[row.scope]}));
 }
 
+// pressOrExplain is F2's whole behaviour (stabilization contract §4.3): press
+// the button when it is enabled, so the key does exactly what a click does,
+// through the same handler; otherwise announce why it is not, in the button's
+// own words.
+//
+// The BUTTON is pressed, rather than a rename function called, so that one
+// place decides: its enablement already folds in read-only mode, the paused
+// listing, how many items are selected and the guard, through the reason table
+// (why.js). Its title is that table's sentence — the same one its tooltip, its
+// ⋯ menu item and its aria-describedby node carry — so the key can never
+// explain itself differently from the control. A button disabled before any
+// verdict was put on it (no session yet) has no title, and says the neutral
+// line instead of nothing. Pure over a button-shaped object, so it is a unit
+// test. It answers what it did: 'pressed', 'explained' or 'missing'.
+export function pressOrExplain(button, announce) {
+ if (!button) return 'missing';
+ if (!button.disabled) { button.click(); return 'pressed'; }
+ announce(String(button.title || '').trim() || WHY_UNAVAILABLE);
+ return 'explained';
+}
+
 // appBindings is the document-level handler's table. deps are app.js's own
 // collaborators; every run() owns its own preventDefault, because Escape
 // deliberately does not swallow the key when there is no results view to close
@@ -98,7 +124,7 @@ export function keymapRows() {
 export function appBindings(deps) {
  const {
   editPath, openSearch, openShortcuts, markClipboard, pasteHere,
-  deleteSelection, openPerms, refresh, parent, back, forward, toggleHidden,
+  deleteSelection, rename, openPerms, refresh, parent, back, forward, toggleHidden,
   focusFilter, escape, textSelected,
  } = deps;
  // A clipboard chord must never be taken from somewhere the user is copying
@@ -115,6 +141,7 @@ export function appBindings(deps) {
   ['Ctrl+V', {run: clipboard(pasteHere)}],
   ['Ctrl+H', {run: simple(toggleHidden)}],
   ['Delete', {run: simple(deleteSelection)}],
+  ['F2', {run: simple(rename)}],
   ['F9', {run: simple(openPerms)}],
   ['F5', {run: simple(refresh)}],
   ['Backspace', {run: simple(parent)}],

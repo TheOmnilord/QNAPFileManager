@@ -4,7 +4,7 @@ import {state,update,subscribe,sessionGuard,sessionTransition} from './state.js'
 import {isDirectory} from './badges.js';
 import {actionMessage,confirmDialog,runMutation} from './actions.js';
 import {awaitJob,trackJob} from './jobs.js';
-import {loadList,render,revealEntry} from './list.js';
+import {loadList,render,revealEntry,navigable,pruneSelection,selectionPairs} from './list.js';
 import {loadTree} from './tree.js';
 import {emptyState} from './empty.js';
 
@@ -433,7 +433,10 @@ let rows=[];
 // stashed is the listing's selection while the results cover it. It is put away
 // rather than thrown away — building a selection is work — but it is only given
 // back if the listing has not been reloaded underneath it, because an index
-// into a listing that has since changed names a different file.
+// into a listing that has since changed names a different file. And it comes
+// back through the filter as it stands THEN: the box can be typed into while the
+// results are up, and a row it now hides must not return selected and out of
+// sight (stabilization contract §3.1).
 let stashed=null;
 
 function applyRoving(index) {
@@ -541,8 +544,8 @@ function paintResults() {
 function openResultsView() {
  const found=state.searchResults;
  if (!found) return;
- if (!stashed) stashed={generation:state.generation,selection:new Set(state.selection),exclude:state.exclude,focus:state.focus,anchor:state.anchor};
- update({searchResults:{...found,open:true},selection:new Set(),exclude:false});
+ if (!stashed) stashed={generation:state.generation,selection:new Map(selectionPairs(state.selection)),focus:state.focus,anchor:state.anchor};
+ update({searchResults:{...found,open:true},selection:new Map()});
  render();
  paintResults();
 }
@@ -559,7 +562,7 @@ export function closeResults() {
  // Only a selection made against THIS listing can be restored; once the
  // listing has been reloaded its indices mean something else entirely.
  const restore=stashed && stashed.generation===state.generation
-  ? {selection:stashed.selection,exclude:stashed.exclude,focus:stashed.focus,anchor:stashed.anchor}
+  ? {selection:pruneSelection(stashed.selection,navigable),focus:stashed.focus,anchor:stashed.anchor}
   : null;
  stashed=null;
  if (found?.open) update({searchResults:{...found,open:false},...(restore||{})});

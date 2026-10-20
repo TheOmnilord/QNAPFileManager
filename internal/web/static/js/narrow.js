@@ -10,6 +10,13 @@
 //
 // overflowFor is pure over a width, so the five acceptance sizes are a table
 // test rather than five screenshots.
+//
+// Above 768 px the same rule keeps the toolbar to ONE row (stabilization
+// contract §4.1). Before the patch the bar wrapped to two rows even at 1280 px:
+// it carried navigation, the filter and the Hidden toggle as well as eighteen
+// commands. Those three moved into the path bar, and what is left is still
+// wider than a 1024 or 900 px window, so the lower-priority actions fold into ⋯
+// at the wide rungs below — the same relocation, never a removal.
 import {$, el} from './dom.js';
 
 // The rungs, in CSS pixels. 48rem = 768 px is the contract's explicit rung and
@@ -23,26 +30,65 @@ export const COMPACT_BREAKPOINT = 480;
 export const SECONDARY = ['btnMkdir', 'btnUpload', 'btnView', 'btnProps', 'btnPerms', 'btnRename', 'btnCopy', 'btnMove', 'btnDelete'];
 // COMPACT_EXTRA collapses as well on a phone-width screen.
 export const COMPACT_EXTRA = ['btnTrash', 'btnShortcuts'];
-// PRIMARY never collapses: navigation, download, search, the results switch,
-// the jobs drawer and the ⋯ button itself. Stated as data so the test can
-// assert the two sets do not overlap — a button in both would be a button that
-// is hidden and has no menu item.
-export const PRIMARY = ['btnTree', 'btnBack', 'btnFwd', 'btnUp', 'btnRefresh', 'btnDownload', 'btnDownloadAs', 'btnSearch', 'btnResults', 'btnJobs', 'btnMore'];
+// PRIMARY never collapses: the folder drawer, download, search, the results
+// switch, the jobs drawer and the ⋯ button itself. Stated as data so the test
+// can assert the two sets do not overlap — a button in both would be a button
+// that is hidden and has no menu item. Back, Forward, Up and Refresh never fold
+// either; they live in the path bar now, beside the path they move along.
+export const PRIMARY = ['btnTree', 'btnDownload', 'btnDownloadAs', 'btnSearch', 'btnResults', 'btnJobs', 'btnMore'];
 
 // The five sizes §9.5 fixes as acceptance.
 export const ACCEPTANCE_WIDTHS = [1280, 1024, 900, 768, 375];
 
+// FOLD_ORDER is the order in which secondary actions give way above 768 px,
+// first to last (stabilization contract §4.1). Each of them is also in a row's
+// context menu; the first four have a key of their own (F4, Alt+Enter, F2,
+// F9), and Copy and Move have Ctrl+C / Ctrl+X then Ctrl+V. New folder, Upload
+// and Delete stay longest: the first two are what a window with nothing
+// selected can still do, and a bar of greyed-out buttons with the live ones
+// folded away would be the wrong way round.
+export const FOLD_ORDER = ['btnView', 'btnProps', 'btnRename', 'btnPerms', 'btnCopy', 'btnMove'];
+// WIDE_RUNGS: at or below `max` px, the first `fold` actions of FOLD_ORDER are
+// in ⋯. The numbers come from the bar as measured in Chromium with Segoe UI
+// (system-ui) at 14 px, in its WIDEST state: after a search, whose button
+// reads "Results (1,000)" at most (search stops at 1,000 hits), and which
+// stays on the bar once there are results to go back to. Selecting changes
+// nothing: the Download button is always as wide as "Download as ZIP",
+// whichever label it shows (app.css).
+//   all actions on the bar  1,257 px, so nothing folds above 1,300;
+//   two folded              1,122 px, the rung from 1,300 down to 1,131 —
+//                             1280 has 158 px to spare;
+//   four folded               954 px, down to 961 — 1024 has 70 px to spare;
+//   six folded                855 px with Folders, which joins the bar at
+//                             960 px, where the tree becomes a drawer — 900
+//                             has 45 px to spare.
+// The first rung starts at 1,300, not at the 1,257 Segoe UI needs, because a
+// system font wider than Segoe UI eats the spare: with nothing folded, the
+// post-search bar at 1280 had room for one less than 3% wider. Folding View
+// text and Properties there leaves room for one about 20% wider (conductor's
+// decision, 2026-10-21); both keep their keys and their context-menu items.
+// Just above 1,300 the full bar has 44 px, about 5%. Before any search the bar
+// is 112 px narrower throughout, and it never wraps above 768 px; after one,
+// it wraps only between 769 and 855 px. narrow_test.mjs carries the per-button
+// widths, so a rung changed without re-measuring fails there and not on
+// someone's screen.
+export const WIDE_RUNGS = [{max: 1300, fold: 2}, {max: 1130, fold: 4}, {max: 960, fold: 6}];
+
 // overflowFor is the membership rule: which toolbar ids live in the ⋯ menu at
-// this width. Above the rung the menu is empty and the button is hidden.
+// this width. Above every rung the menu is empty and the button is hidden. The
+// ids come back in toolbar order, which is the order the menu lists them in.
 export function overflowFor(width) {
  const w = Number(width) || 0;
  // A width nobody could measure collapses nothing: the safe default is the full
  // toolbar, never a bar whose actions have all moved into a menu that a
  // layout-less document may not even be able to open.
  if (w <= 0) return [];
- if (w > OVERFLOW_BREAKPOINT) return [];
- if (w > COMPACT_BREAKPOINT) return [...SECONDARY];
- return [...SECONDARY, ...COMPACT_EXTRA];
+ if (w <= COMPACT_BREAKPOINT) return [...SECONDARY, ...COMPACT_EXTRA];
+ if (w <= OVERFLOW_BREAKPOINT) return [...SECONDARY];
+ let fold = 0;
+ for (const rung of WIDE_RUNGS) if (w <= rung.max) fold = Math.max(fold, rung.fold);
+ const folded = new Set(FOLD_ORDER.slice(0, fold));
+ return SECONDARY.filter(id => folded.has(id));
 }
 
 // labelFor is what the menu item says. The toolbar button's own text is right

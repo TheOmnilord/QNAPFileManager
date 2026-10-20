@@ -5,9 +5,9 @@ import {state,sessionGuard,listingActions,subscribe} from './state.js';
 import {isDirectory,isSymlink,hasTarget,fileTarget} from './badges.js';
 import {runMutation,confirmDialog,actionMessage} from './actions.js';
 import {trackJob,awaitJob} from './jobs.js';
-import {loadList,selectionEntries,activeSelection,extraActions} from './list.js';
+import {loadList,selectionEntries,activeSelection,extraActions,navigable} from './list.js';
 import {loadTree} from './tree.js';
-import {createSizeRunner,propsTarget,capsHint} from './props.js';
+import {createSizeRunner,propsTarget,capsHint,CAPPED_NOTE} from './props.js';
 import {
  ALL,APPLY_MODES,BITS,SPECIAL_BITS,EMPTY,
  aclBadge,applySpec,bitState,diffTexts,diffTone,idItems,idLabel,idProblem,jobSpecs,octal,octalField,parseId,parseOctal,
@@ -160,12 +160,19 @@ export function impactNote(unmeasured) {
 // impactText is #pImpact: the measured scale of a recursive change, from the
 // size job (§8.4). It never guesses — an unfinished or cancelled measurement
 // says so in the job's own words.
+//
+// A measurement that stopped at its bound counted only part of the tree, and a
+// recursive chmod does not stop there: the change reaches everything below,
+// however far the estimate got. So a capped estimate says "At least" and why,
+// and never presents itself as the exact impact (stabilization contract §3.8).
 export function impactText(report) {
  if (!report) return '';
  if (report.state !== 'done') return report.text || '';
  const r = report.result || {};
  const files = Number(r.files || 0),dirs = Number(r.dirs || 0);
- return `Will change ${(files+dirs).toLocaleString()} items (${files.toLocaleString()} files, ${dirs.toLocaleString()} folders).`;
+ const counts = `${(files+dirs).toLocaleString()} items (${files.toLocaleString()} files, ${dirs.toLocaleString()} folders)`;
+ if (r.capped === true) return `At least ${counts} will change ${CAPPED_NOTE}`;
+ return `Will change ${counts}.`;
 }
 
 // --- the dialog --------------------------------------------------------------
@@ -553,13 +560,15 @@ async function applyNow() {
 // openPermsForSelection is what the toolbar, F9 and the context menu call. It
 // resolves the explicit selection the same way delete does — fetching pages
 // that hold selected rows but were never loaded — so a Shift-range spanning
-// unloaded pages is acted on in full or not at all.
+// unloaded pages is acted on in full or not at all, and never past MAX_ROOTS
+// (stabilization contract §3.5). With nothing selected, F9 falls back to the
+// focused row — only while that row can be seen, because a dialog about a row
+// the filter has hidden is a change to something nobody is looking at (§3.1).
 export async function openPermsForSelection() {
  if (!listingActions().mutate) return;
  let entries;
  try { entries = await selectionEntries(); } catch(err) { error(err); return; }
- if (entries === null) { error(new Error('Select items individually to change their permissions in this version.')); return; }
- if (!entries.length) { const {entry} = activeSelection(); if (entry) entries = [entry]; }
+ if (!entries.length) { const {entry} = activeSelection(); if (entry && navigable(entry)) entries = [entry]; }
  if (!entries.length) return;
  openPerms(entries);
 }

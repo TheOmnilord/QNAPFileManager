@@ -11,7 +11,8 @@
 // PRECEDENCE, and why it is not simply "first match wins":
 //
 //   readonly   (global)  certain
-//   selection  (nothing selected, wrong kind, too many, listing not on screen)
+//   selection  (nothing selected, wrong kind, too many, more than MAX_ROOTS,
+//               listing not on screen)
 //                        certain
 //   capability (uid/gid arithmetic, perm.capsFor)
 //                        a PREDICTION — INV-2
@@ -51,6 +52,23 @@ export const PAUSED_SENTENCE = 'Close the search results to change files in this
 export const SELECT_SENTENCE = 'Select a file or folder first.';
 export const GUARD_SENTENCE = 'This location is protected and cannot be changed here.';
 
+// MAX_ROOTS is the most items one action may name (stabilization contract
+// §3.5). It is the server's maxJobRoots (routes_jobs.go): the guard resolves and
+// stats every root before a job is dispatched, so the route refuses a longer
+// list outright — and a refusal that arrives as a 400 after the dialog has been
+// filled in is the worst place to learn it. The two numbers are one number:
+// maxroots_contract_test.go reads this line and fails when they differ.
+export const MAX_ROOTS = 1000;
+
+// tooManySentence is what a control says when the selection is past MAX_ROOTS.
+// It names how many ARE selected, because "at most 1,000" alone does not tell
+// the user how far over they are — and a selection made by Shift+End in a large
+// folder can be far over without looking it.
+export function tooManySentence(count) {
+ const n = Math.max(0, Math.floor(Number(count) || 0));
+ return `Select at most ${MAX_ROOTS.toLocaleString()} items at a time (${n.toLocaleString()} are selected).`;
+}
+
 // KIND_SENTENCES answer "this is the wrong sort of thing". The `special` line
 // is the contract's own example sentence.
 export const KIND_SENTENCES = {
@@ -68,6 +86,10 @@ export const KIND_SENTENCES = {
 //
 //   mutating  — subject to read-only mode and to the paused-listing gate
 //   needs     — 'none' | 'one' | 'some'
+//   roots     — true when the action sends the selection itself, one path (or
+//               trash id) per item, and so is bounded by MAX_ROOTS. Empty
+//               Trash is 'some' but names nothing — it empties whatever is
+//               there — so it is not bounded by how much that is.
 //   kind      — 'readable' when the single selection must be a plain file
 //   capability— true when perm.capsFor predicts whether the kernel will allow it
 //   verb      — used in the "select one item to …" sentence
@@ -75,14 +97,14 @@ export const KIND_SENTENCES = {
 export const ACTIONS = {
  newFolder: {mutating: true, needs: 'none', enabled: 'New folder'},
  upload: {mutating: true, needs: 'none', enabled: 'Upload files into this folder (or drop them on the list)'},
- rename: {mutating: true, needs: 'one', verb: 'rename', enabled: 'Rename'},
- delete: {mutating: true, needs: 'some', enabled: 'Delete'},
- copy: {mutating: true, needs: 'some', enabled: 'Copy to another folder (Ctrl+C, then Ctrl+V)'},
- move: {mutating: true, needs: 'some', enabled: 'Move to another folder (Ctrl+X, then Ctrl+V)'},
- permissions: {mutating: true, needs: 'some', capability: true, enabled: 'Permissions (F9)'},
- trashRestore: {mutating: true, needs: 'some', selectionEmpty: 'Select items in Trash to restore.', enabled: 'Restore the selected items'},
+ rename: {mutating: true, needs: 'one', verb: 'rename', enabled: 'Rename (F2)'},
+ delete: {mutating: true, needs: 'some', roots: true, enabled: 'Delete'},
+ copy: {mutating: true, needs: 'some', roots: true, enabled: 'Copy to another folder (Ctrl+C, then Ctrl+V)'},
+ move: {mutating: true, needs: 'some', roots: true, enabled: 'Move to another folder (Ctrl+X, then Ctrl+V)'},
+ permissions: {mutating: true, needs: 'some', roots: true, capability: true, enabled: 'Permissions (F9)'},
+ trashRestore: {mutating: true, needs: 'some', roots: true, selectionEmpty: 'Select items in Trash to restore.', enabled: 'Restore the selected items'},
  trashEmpty: {mutating: true, needs: 'some', selectionEmpty: 'The Trash is already empty.', enabled: 'Empty the Trash'},
- download: {mutating: false, needs: 'some', enabled: 'Download the selection'},
+ download: {mutating: false, needs: 'some', roots: true, enabled: 'Download the selection'},
  viewText: {mutating: false, needs: 'one', kind: 'readable', verb: 'view', enabled: 'View this file as text (F4)'},
  properties: {mutating: false, needs: 'one', verb: 'inspect', enabled: 'Properties (Alt+Enter)'},
  search: {mutating: false, needs: 'none', enabled: 'Search this folder and below (Ctrl+F)'},
@@ -117,6 +139,11 @@ export function reasonsFor(action, ctx = {}) {
  // sentences: in both, there is nothing on screen this action could act on.
  if (spec.mutating && ctx.paused) out.push({cause: 'selection', sentence: PAUSED_SENTENCE});
  else if (spec.needs !== 'none' && count < 1) out.push({cause: 'selection', sentence: spec.selectionEmpty || SELECT_SENTENCE});
+ // Too many is a selection reason like too few (stabilization contract §3.5):
+ // there is nothing wrong with the items, only with how many of them one action
+ // may carry. Asked of the READS as well — a download names every root in one
+ // request, under the same bound.
+ else if (spec.roots && count > MAX_ROOTS) out.push({cause: 'selection', sentence: tooManySentence(count)});
  else if (spec.needs === 'one' && !one) out.push({cause: 'selection', sentence: `Select one item to ${spec.verb || 'use this'}.`});
  else if (spec.kind === 'readable' && ctx.kind && ctx.kind !== 'file') out.push({cause: 'selection', sentence: KIND_SENTENCES[ctx.kind] || KIND_SENTENCES.special});
  // The arithmetic is only run over an entry there actually is. Asking capsFor

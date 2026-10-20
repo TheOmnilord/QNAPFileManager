@@ -17,7 +17,7 @@ import {confirmDialog} from './actions.js';
 import {sessionBootstrap,transientAuthError} from './bootstrap.js';
 import {banners,bannerSignature,identityLabel} from './banners.js';
 import {initBreakGlass,hideLocalSignIn,listenerOf} from './breakglass.js';
-import {appBindings,dispatchKey} from './keys.js';
+import {appBindings,dispatchKey,pressOrExplain} from './keys.js';
 import {initA11y} from './a11y.js';
 import {initNarrow,closeMore} from './narrow.js';
 
@@ -172,6 +172,11 @@ $('#btnLogout').addEventListener('click',async () => {
 // list's own key handler because perms.js resolves the selection through
 // list.js, and list.js importing it back would close a cycle for no gain.
 //
+// F2 presses the toolbar's Rename button, or says why it cannot (stabilization
+// contract §4.3). It presses the button even while ⋯ holds it at a narrow or
+// mid width: a folded button is display:none, not gone, and a click on it is
+// still the one path into renaming.
+//
 // Ctrl+R deliberately retains the browser's normal refresh behaviour.
 const shortcuts=appBindings({
  editPath:() => { $('#pathEdit').focus(); $('#pathEdit').select(); },
@@ -184,6 +189,7 @@ const shortcuts=appBindings({
  markClipboard,
  pasteHere,
  deleteSelection,
+ rename:() => pressOrExplain($('#btnRename'),announce),
  openPerms:openPermsForSelection,
  refresh:() => loadList(),
  parent:up,

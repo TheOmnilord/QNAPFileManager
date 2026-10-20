@@ -39,7 +39,7 @@ globalThis.matchMedia = () => ({matches: false});
 globalThis.location = {hash: ''};
 
 const {state, update} = await import('./static/js/state.js');
-const {initSearch, openSearch, SEARCH_CROSS_DEFAULT, SEARCH_HIDDEN_DEFAULT} = await import('./static/js/search.js');
+const {initSearch, openSearch, showResults, closeResults, SEARCH_CROSS_DEFAULT, SEARCH_HIDDEN_DEFAULT} = await import('./static/js/search.js');
 
 // The page as index.html builds it: the crossing row visible, both boxes
 // ticked, "match pattern" not.
@@ -109,3 +109,28 @@ for (const family of ['qts', 'quts_hero']) {
   });
  }
 }
+
+// Stabilization contract §3.1: a selection never holds a row the user cannot
+// see. The listing's selection is put away while the results cover it, and the
+// quick filter can be typed into meanwhile; what comes back is only what that
+// filter still shows. And a listing reloaded underneath gets nothing back at
+// all, because its indices now name other files.
+test('a selection put away by the results comes back only as far as the filter now shows it', () => {
+ const alpha = {name: 'alpha', path: '/f/alpha'}, beta = {name: 'beta', path: '/f/beta'};
+ const results = {query: 'a', root: '/f', detail: '', hits: [], focus: -1, open: false};
+ update({session: alice('qts')});
+ update({path: '/f', filter: '', selection: new Map([[0, alpha], [1, beta]]), focus: 1, anchor: 0, searchResults: results});
+ showResults();
+ assert.equal(state.selection.size, 0, 'under the results the listing’s selection counts for nothing');
+ update({filter: 'al'});
+ closeResults();
+ assert.deepEqual([...state.selection], [[0, alpha]], 'beta is hidden by the filter now, so it does not come back');
+ assert.equal('exclude' in state, false);
+ // Reloaded while the results were up: nothing is restored.
+ update({filter: '', selection: new Map([[0, alpha]])});
+ showResults();
+ update({generation: state.generation + 1});
+ closeResults();
+ assert.equal(state.selection.size, 0);
+ update({session: null, searchResults: null, filter: ''});
+});

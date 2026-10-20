@@ -2,7 +2,30 @@ import {api} from './api.js';
 import {$,el,error,pathArgs,route} from './dom.js';
 import {state,sessionGuard} from './state.js';
 import {isDirectory,volumeGroup} from './badges.js';
-let typeAhead='',typedAt=0;
+let typeAhead='',typedAt=0,moreSeq=0;
+
+// An expansion reads ONE page (stabilization contract §4.2). It used to read
+// every page of the folder to find the subfolders among its files — a folder
+// of 200,000 files was 400 requests before one arrow turned. It asks for
+// dirsFirst instead, so the server lists every folder before any file, and the
+// first page holds all of them unless it holds nothing else.
+export const TREE_PAGE=500;
+export const TREE_MORE='More entries are not shown — open this folder.';
+
+// treeContinues says whether the page can be hiding folders: only when it is
+// full, every entry in it is a folder, and the folder holds more than it. A
+// page with a single file in it already holds every folder there is. "Folder"
+// is the server's own word for ordering, type "dir"; a symlink to a folder
+// sorts among the files (contract §1.2). So one that sorts after the first page
+// is not offered here, and nothing says so — the listing and the path field
+// still reach it. `limit` is the page size the server actually used, which a
+// configured ListMax can make smaller than the one asked for.
+export function treeContinues(page,requested=TREE_PAGE) {
+ const entries=page?.entries || [];
+ const limit=Number(page?.limit) || requested;
+ return entries.length>0 && entries.length>=limit && Number(page?.total)>entries.length && entries.every(e => e.type==='dir');
+}
+
 // node renders one folder. ctx carries what used to be hard-wired to the
 // sidebar, so the same renderer can be mounted anywhere (M2-B: the transfer
 // dialog's destination picker): the container it lives in — keyboard navigation
@@ -22,13 +45,17 @@ function node(entry,level,ctx) {
   if (!loaded) {
    toggle.disabled=true;
    try {
+    const page=await api('api/fs/list',{...pathArgs(entry),limit:TREE_PAGE,sort:'name',dirsFirst:true,hidden:state.hidden,volumes:false});
+    if (!valid() || !item.isConnected || !state.session) return;
     const group=el('div',{role:'group'});
-    for (let offset=0;;) {
-     const page=await api('api/fs/list',{...pathArgs(entry),offset,limit:500,sort:'name',hidden:state.hidden,volumes:false});
-     if (!valid() || !item.isConnected || !state.session) return;
-     for (const child of page.entries.filter(e => isDirectory(e) && (ctx.volumeRoots || !e.volumeRoot))) group.append(node(child,level+1,ctx));
-     offset+=page.entries.length;
-     if (!page.entries.length || offset>=page.total) break;
+    for (const child of (page.entries || []).filter(e => isDirectory(e) && (ctx.volumeRoots || !e.volumeRoot))) group.append(node(child,level+1,ctx));
+    // The continuation is a plain line, not a treeitem, so the arrow keys pass
+    // it by. A screen reader that never lands on it still hears it: the folder
+    // it belongs to is described by it.
+    if (treeContinues(page)) {
+     const more=el('div',{class:'treeMore',id:`treeMore-${++moreSeq}`},TREE_MORE);
+     group.append(more);
+     item.setAttribute('aria-describedby',more.id);
     }
     item.append(group); loaded=true;
    } catch(err) { if (valid() && item.isConnected) error(err); return; }

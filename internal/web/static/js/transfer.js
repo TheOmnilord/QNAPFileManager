@@ -376,7 +376,9 @@ export function publishMarking(captured,current) { return captured===current; }
 
 // markClipboard is Ctrl+C / Ctrl+X. It resolves the selection the same way
 // deleteSelection does — fetching any selected pages that were never loaded —
-// so a Shift-range spanning unloaded pages is marked in full or not at all.
+// so a Shift-range spanning unloaded pages is marked in full or not at all, and
+// a selection past MAX_ROOTS is refused HERE, at the marking, rather than at a
+// paste minutes later in another folder (stabilization contract §3.5).
 export async function markClipboard(kind) {
  if (!state.session?.canWrite) return;
  const mine=++markGeneration,valid=sessionGuard();
@@ -387,7 +389,6 @@ export async function markClipboard(kind) {
  try { items=await selectionEntries(); }
  catch(err) { if (live()) error(err); return; }
  if (!live()) return;
- if (items===null) { error(new Error('Select items individually to copy or move them in this version.')); return; }
  if (!items.length) return;
  update({clipboard:{mode:kind,entries:items}});
  toast(clipboardToast(kind,items.length));
@@ -409,7 +410,6 @@ export async function transferSelection(kind) {
  let items;
  try { items=await selectionEntries(); }
  catch(err) { error(err); return; }
- if (items===null) { error(new Error('Select items individually to copy or move them in this version.')); return; }
  if (!items.length) return;
  openTransfer({mode:kind,entries:items,start:state.path});
 }

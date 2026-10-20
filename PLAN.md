@@ -1,9 +1,13 @@
 # QNAPFileManager — master plan
 
-Status: planning complete, no code yet. Revised 2026-09-09 (rev 2) for three requirement changes from the owner:
-QuTS hero is in scope for v1; the app is a native QTS-desktop app with no separate login; every operation runs with
-the identity of the user signed into QTS. This file is the single source of truth; the design documents under
-`docs/design/` are inputs and are superseded by the decisions here where they disagree.
+Status (2026-10-20): M0–M4 are implemented and reviewed on `main`; nothing has been released or tagged. v1.0.0 waits
+for the stabilization patch (`docs/design/stabilization-contract.md`, scoped from `docs/design/roadmap-deliberation.md`)
+and then for the full hardware pass on both units (`docs/release-checklist.md` §3).
+
+The plan was revised 2026-09-09 (rev 2) for three requirement changes from the owner: QuTS hero is in scope for v1; the
+app is a native QTS-desktop app with no separate login; every operation runs with the identity of the user signed into
+QTS. This file is the single source of truth; the design documents under `docs/design/` are inputs and are superseded
+by the decisions here where they disagree.
 
 ## Context
 
@@ -17,10 +21,10 @@ A note on "not web based": QTS has no native GUI toolkit. Every QNAP app, File S
 window inside the QTS web desktop. "Native app" therefore means: a tile in App Center and the main menu, opened as a QTS
 desktop window, same origin as QTS, no login of its own, identity taken from the QTS session. That is what this plan builds.
 
-Deliverable: a `.qpkg` for QTS and QuTS hero 4.5+ (x86_64, arm_64) giving every QTS user a File-Station-like UI over the
+Deliverable: a `.qpkg` for QTS and QuTS hero 5.2+ (x86_64, arm_64) giving every QTS user a File-Station-like UI over the
 whole filesystem, with the kernel enforcing that user's permissions, and giving administrators an explicit root mode for
-system paths. Operations: browse, copy, move, rename, delete with trash, mkdir, upload, download, text edit, search,
-chmod, chown, ACL awareness.
+system paths (superseded by decision 6: administrators operate as root, with no separate mode). Operations: browse,
+copy, move, rename, delete with trash, mkdir, upload, download, text edit, search, chmod, chown, ACL awareness.
 
 ## Inputs
 
@@ -34,6 +38,8 @@ chmod, chown, ACL awareness.
 | `docs/design/gitbackup-exploration.md` | What to lift from `C:\Dev\GitBackup`, with line numbers |
 | `docs/research/existing-tools.md`, `docs/research/qts-integration-facts.md` | Alternatives with sources; verified QTS auth and packaging facts (Tailscale, QDK) |
 | `docs/development.md` | How to drive Codex / GPT-6 Astra as agents |
+| `docs/design/roadmap-deliberation.md` | What would make the app great: recommendations to the owner from three rounds with gpt-6-astra and gemini-4-argon-high (2026-10-20) — a stabilization patch, the full hardware gate, v1.0.0, then 1.1–1.3; transcripts beside it |
+| `docs/design/stabilization-contract.md` | The patch before v1.0.0, owner-approved scope (2026-10-20): select-all, listing order and honesty, bounded measurements and pre-flights, toolbar, tree, `F2`, and the documents' truth pass |
 
 ## Two invariants
 
@@ -108,7 +114,8 @@ fixes were needed on top of the CI-green M0, each described in docs/research/qts
    this, so the hero worked without staging.)
 5. Make the install tree traversable and log worker-spawn failures with their cause.
 
-Running build at verification: 0.0.35. Still open: the administrator identity decision (below), and the M1 items.
+Running build at verification: 0.0.35. Still open then: the administrator identity decision (made the same day as
+decision 6), and the M1 items.
 
 ## M2 plan — jobs + transfer (started 2026-09-11)
 
@@ -227,8 +234,9 @@ upload finishes without a 408 or 409, keep-both names the file and the audit say
 selection downloads and unzips, a cancelled search shows a small response, and `FSIdentity` reports a birth time
 on ext4 and on ZFS (the inode-reuse guard degrades silently without one).
 
-**M3 contract drafted 2026-09-13:** `docs/design/m3-contract.md` (Opus draft accepted by Fable; the gpt-6-astra
-review of it is pending while Astra is paused). Decisions it fixes beyond this plan: mode changes travel as
+**M3 contract drafted 2026-09-13:** `docs/design/m3-contract.md` (Opus draft accepted by Fable; ~~the gpt-6-astra
+review of it is pending while Astra is paused~~ gpt-6-astra has since reviewed it with the code, in the ten rounds from
+2026-09-17 noted under the M4 status). Decisions it fixes beyond this plan: mode changes travel as
 `{mask, value}`; a new stdlib-only `internal/perm` holds the arithmetic, capability hints, the post-call diff and the
 NFSv4 trivial/non-trivial judgement; the ACL badge reports a state (`none|posix|nfs4|nfs4-trivial|unknown`), not a
 boolean; an unknown `aclmode` is treated as `discard`; a recursive chmod may clear but never set a special bit; M3
@@ -237,12 +245,14 @@ adds no wire error codes and pays for that with a code-coverage table test.
 **M3 status (2026-09-13/14):** implemented by three Opus agents against the contract (engine `internal/perm`,
 `fsops/mode*.go`, `props.go`, `aclstate*.go`; routes `routes_perm.go`; UI `perm.js`/`perms.js`/`props.js`).
 Reviewed in five Opus adversarial rounds — 31 findings, 30 accepted and fixed, one recorded as M1 behaviour —
-`docs/reviews/m3-round1..5.md`; **gpt-6-astra has reviewed neither the contract nor the change** (paused by the
-owner), so M3 is not hardware-signed until those passes run. What the loop settled beyond the contract: recursive
-roots resolve to their targets and mount-point roots are descended (every hero share is one); a root worker skips
-hard-linked files it did not name; with crossing, the ladder is the worst dataset below the roots and names it;
-chown ids are bounded to uid_t; the recursive job's diff sentences travel as details, not skips; `NFS4State`
-tolerates NUL-counted and unpadded encoders and refuses trailing bytes; the node tests run in CI.
+`docs/reviews/m3-round1..5.md`; ~~**gpt-6-astra has reviewed neither the contract nor the change** (paused by the
+owner), so M3 is not hardware-signed until those passes run~~ — those passes have since run (ten gpt-6-astra rounds
+from 2026-09-17, noted under the M4 status), and hardware sign-off waits for the release's hardware pass. What the
+loop settled beyond the contract: recursive roots resolve to their targets and mount-point roots are descended (every
+hero share is one); a root worker skips hard-linked files it did not name; with crossing, the ladder is the worst
+dataset below the roots and names it; chown ids are bounded to uid_t; the recursive job's diff sentences travel as
+details, not skips; `NFS4State` tolerates NUL-counted and unpadded encoders and refuses trailing bytes; the node tests
+run in CI.
 
 **To confirm on hardware first (both units), M3:** (1) `zfs get -Hp -o value aclmode` as root on hero for an
 ordinary share — an empty answer makes every hero chmod L2; (2) list an ordinary hero share and confirm the ACL
@@ -259,14 +269,17 @@ and the audit line must carry the diff.
 validation, CI single-dependency/`SHA256SUMS`/tag guard; UI: `why.js`, `empty.js`, `banners.js`, `keys.js`,
 `a11y.js`, `narrow.js`, the sign-in form; docs: `identity.md`, `qnap-install.md`, `keyboard.md`,
 `release-checklist.md`, `nas-checklist.md`, `CHANGELOG.md`, README). Four Opus adversarial rounds — 45 findings, all
-accepted and fixed — `docs/reviews/m4-round1..4.md`; **gpt-6-astra has reviewed none of M3 or M4** (paused by the
-owner). What the loop settled beyond the contract: the break-glass listener serves at `/` regardless of the proxy
-prefix; the door has a sign-in form; the daemon never writes `auth.local` and both writers serialise through a
-lock file; a declared-but-unsent body cannot park a connection on 8771 (the wrapper keys on body consumption, every
+accepted and fixed — `docs/reviews/m4-round1..4.md`; ~~**gpt-6-astra has reviewed none of M3 or M4** (paused by the
+owner)~~ — since the owner lifted that pause on 2026-09-17, gpt-6-astra has run ten rounds on each
+(`docs/reviews/m3-astra-round1..10.md`, `docs/reviews/m4-astra-round1..10.md`; final commits `9a7132b` for M3 and
+`ea8e393` for M4). What the loop settled beyond the contract: the break-glass listener serves at `/` regardless of
+the proxy prefix; the door has a sign-in form; the daemon never writes `auth.local` and both writers serialise through
+a lock file; a declared-but-unsent body cannot park a connection on 8771 (the wrapper keys on body consumption, every
 route drains); only a wrong password advances the lockout ladder; the certificate is a leaf, generated when the
-password is set, and a running daemon binds the listener when a credential appears; the config lock is `flock`
-on Linux (no stale state), O_EXCL with an age-break only on the dev box. Open for the owner: no
-`LICENSE` file exists (`qpkg.cfg` says MIT); the v1.0.0 tag (annotated, from a green main SHA, never moved).
+password is set, and a running daemon binds the listener when a credential appears; the config lock is `flock` on
+Linux (no stale state), O_EXCL with an age-break only on the dev box. Open for the owner: ~~no `LICENSE` file exists
+(`qpkg.cfg` says MIT)~~ (resolved: the MIT `LICENSE` was added on 2026-09-18, `5d994a7`); the v1.0.0 tag (annotated,
+from a green main SHA, never moved).
 
 **To confirm on hardware first (both units), M4:** (1) `break-glass set-password` as root prints a fingerprint and
 `status` agrees; (2) `https://<nas>:8771/` shows the local sign-in form (no QTS notice), the browser's certificate
@@ -285,7 +298,7 @@ a screen reader if one is at hand.
 | Milestone | Exit criterion | Share |
 |---|---|---|
 | **M0 Platform table + worker spine + browse** | `platform`, `idmap`, `wproto`/`worker`/`workerpool` (List, Stat, OpenRead, Ping), `qtsauth`; browse the whole NAS as a chosen non-root user with the kernel enforcing permissions; hero paths pass against synthetic mountinfo and a file-backed ZFS pool in CI | 22% |
-| **M1 Safety spine + basic ops + first NAS install** | guard, confirm tokens, readOnly, root-mode arming, audit + QuLog; mkdir/rename/single delete/OpenWrite+Finalize over RPC; `qpkg/` with proxy config; **first real install on QTS and on hero**; NAS checklist items 1-14 answered; both auth doors work | 20% |
+| **M1 Safety spine + basic ops + first NAS install** | guard, confirm tokens, readOnly, root-mode arming (superseded by decision 6: administrators operate as root, with no arming), audit + QuLog; mkdir/rename/single delete/OpenWrite+Finalize over RPC; `qpkg/` with proxy config; **first real install on QTS and on hero**; NAS checklist items 1-14 answered; both auth doors work | 20% |
 | **M2 Jobs + transfer** | job RPC with progress and warnings, cancel; copy/move/delete/size/search/archive; upload and download via passed fds; per-uid sticky trash; EXDEV pre-flight; crossing checkbox | 23% |
 | **M3 Permissions + properties** | chmod/chown with post-call diff and partial-success jobs; capability hints; ACL badge per backend; `aclmode=discard` confirmation; properties with streaming size | 17% |
 | **M4 Polish** | non-admin UX pass, break-glass TLS listener, accessibility/keyboard/narrow passes, `docs/identity.md`, `docs/qnap-install.md`, tagged v1.0.0 | 18% |
@@ -318,6 +331,7 @@ Ordering: `platform` before `fsops`; `workerpool` before any write path; `idmap.
 
 ## Open questions for the owner
 
-- Break-glass listener on `0.0.0.0:8771` with a local admin password: keep it (recommended, so the tool works when Apache or App Center is broken) or drop it for a smaller surface?
-- Should administrators be allowed to *stay* in root mode across sessions, or is the 60-minute arming always required? (Plan: always required.)
-- Do you have a QuTS hero unit available for the M1 install, or only the QTS NAS from the screenshots? Hero verification needs real hardware.
+- Break-glass listener on `0.0.0.0:8771` with a local admin password: keep it, and with which default? It is built (M4), defaults to `web.breakGlass.enabled=true`, and binds only once a password is set from the NAS shell. The standing recommendation is to keep the door, so the tool works when Apache or App Center is broken, and ship it with `web.breakGlass.enabled=false`.
+- ~~Should administrators be allowed to *stay* in root mode across sessions, or is the 60-minute arming always required? (Plan: always required.)~~ Answered: there is no arming. Administrators operate as root (decision 6), which has been the app's behaviour since 2026-09-10.
+- ~~Do you have a QuTS hero unit available for the M1 install, or only the QTS NAS from the screenshots? Hero verification needs real hardware.~~ Answered: both exist — a QuTS hero TVS-h1688X (h5.2.9, ZFS, x86_64) and a QTS unit (5.2.x, ext4) — and the release's hardware pass runs on both.
+- Also open, from `docs/design/roadmap-deliberation.md` ("Owner decisions"): the product name, and the proposed review rule.

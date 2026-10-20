@@ -16,8 +16,9 @@ The conductor wrote down its own position before reading either model, so as not
 claim that moved a decision was checked in the code or reproduced in the running development build. The full text of
 every brief and answer is in [roadmap-deliberation-transcripts.md](roadmap-deliberation-transcripts.md).
 
-**Status: recommendations to the owner.** Nothing here is decided until the owner says so. PLAN.md and CLAUDE.md are
-unchanged.
+**Status: recommendations to the owner.** Nothing here is decided until the owner says so. On 2026-10-20 the owner
+approved stabilization items 1–6, now specified in [stabilization-contract.md](stabilization-contract.md); the name
+and the review rule are still open, and CLAUDE.md is unchanged.
 
 ## Verdict
 
@@ -172,8 +173,9 @@ Behaviour already offered is repaired. Nothing new is promised. Each item names 
    - README status, scale claim, and "never needs SSH" qualified for break-glass setup;
    - `QTS_MINI_VERSION` set to the tested baseline;
    - `SECURITY.md`, with GitHub private vulnerability reporting turned on;
-   - a compatibility matrix: QTS 5.2.x ext4 x86_64 and QuTS hero h5.2.x ZFS x86_64 verified; ARM64 built and smoke-run
-     under emulation only; firmware 6 untested.
+   - a compatibility matrix: QuTS hero h5.2.9 ZFS x86_64 verified; QTS 5.2.x ext4 verified, its CPU architecture
+     still to be recorded; any architecture not run on a physical unit "built and smoke-run under emulation only";
+     firmware 6 untested.
 7. **The naming decision applied**, if the owner renames anything (see Owner decisions). It must land before the
    hardware pass, because install paths and the proxy path change with it.
 8. **Four task screenshots**, taken after the polish:

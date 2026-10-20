@@ -232,6 +232,9 @@ type SizeOptions struct {
 	ReadCross bool
 	// MaxEntries bounds the walk; see Size.
 	MaxEntries int64
+	// MaxDuration bounds the walk's wall-clock time, and zero (or less) is no
+	// time bound; see Size.
+	MaxDuration time.Duration
 }
 
 // Size measures the trees named by paths: how many files, how many directories
@@ -256,27 +259,40 @@ type SizeOptions struct {
 // "unknown" (trashSizeOf).
 //
 // A CAPPED scan is different from an incomplete one and is always reported.
-// Size asks for no bound at all, so the only thing that can stop it early is the
-// byte total outgrowing an int64 (addBytes) — at which point the scan ends
-// where it stands, including for any selected path it had not reached yet. The
-// number that comes back is then a floor with nothing in the reply to say so,
-// which is exactly the shape of a lie a Properties panel would render as fact.
-// So the reason goes out as a warning (warnScanCapped), which the worker folds
-// into JobResult.Warnings.
+// Something stopped it before the end of the tree — one of the caller's bounds
+// below, or the byte total outgrowing an int64 (addBytes) — and it ends where it
+// stands, including for any selected path it had not reached yet. The number
+// that comes back is then a floor, and a floor with nothing in the reply to say
+// so is exactly the shape of a lie a Properties panel would render as fact. So
+// the result says Capped, and the reason also goes out as a warning
+// (warnScanCapped), which the worker folds into JobResult.Warnings.
 //
 // ".zfs" is skipped even though this pass writes nothing (F10): a snapshot
 // directory holds the whole history of a share, so counting it would answer a
 // question nobody asked with a number nobody could use. "@Recycle" is counted —
 // it is an ordinary directory whose bytes are really there, and decision 10 only
 // forbids WRITING to it.
-// maxEntries bounds the walk, and zero is the unbounded default above. It is
-// there for the one caller that measures in order to DECIDE something rather
-// than to display it: the permissions pre-scan, which runs inside a 15-second
-// request and must not turn an enormous tree into a timed-out POST (M3 Astra
-// round-1 finding 10). A walk that hits the bound stops where it stands, reports
-// what it counted so far, and says Capped — and a capped measurement is not a
-// count, so the caller reads the whole answer as "unknown" rather than as the
-// number it happens to carry.
+//
+// MaxEntries and MaxDuration bound the walk, and zero is no bound of that kind.
+// The daemon's callers state theirs on the wire (wproto.SizeReq):
+//
+//   - The pre-scans that measure in order to DECIDE something — the permissions
+//     and transfer confirmations, which run inside a 15-second request and must
+//     not turn an enormous tree into a timed-out POST (M3 Astra round-1 finding
+//     10, stabilization contract §2.4) — pass what is left of their entry
+//     budget, and read a capped answer as "unknown" or as a minimum rather than
+//     as the number it happens to carry. Their clock is the request's deadline,
+//     which arrives here as a cancellation.
+//   - The folder-size job passes ten million entries and ten minutes
+//     (stabilization contract §2.1). A user who asked for a folder's size asked
+//     for the real number, and a bound that generous almost never changes it;
+//     what it does change is a measurement nobody is waiting for any more,
+//     which no longer walks the NAS for as long as the tree lasts.
+//
+// Either bound, reached, ends the walk where it stands with Capped set. A
+// CANCELLATION is not a bound and is never reported as one, even when it lands
+// in the instant the walk reached its bound: the job stopped because somebody
+// asked, and its partial counts are reported as a cancellation's.
 //
 // MountsSkipped and MountsNetwork say how many mount points the total leaves
 // out, so the dialog can say so rather than present a volume's worth of missing
@@ -291,27 +307,77 @@ func Size(ctx context.Context, r fsx.Root, plat *platform.Platform, paths []stri
 		// that keeps both honest.
 		lim.maxEntries = maxEntries
 	}
-	res, err := scanTrees(ctx, r, plat, paths, o.CrossMounts, o.ReadCross, emit, lim, false, ProtectSnapshots)
+	if d := o.MaxDuration; d > 0 {
+		// The same rule for time (stabilization contract §2.1): the earlier of
+		// the two deadlines wins. The clock starts here, when the walk does, not
+		// when the request was written.
+		if deadline := time.Now().Add(d); lim.deadline.IsZero() || deadline.Before(lim.deadline) {
+			lim.deadline = deadline
+		}
+	}
+	// The time bound is a CONTEXT as well as a clock reading, as Search's is (M2-C
+	// adversarial finding 5; stabilization Astra r1 P2). The reading in the
+	// visitor happens only when an entry is counted, and a directory the user may
+	// list but not enter counts none of its children: every lstat under it fails,
+	// and each failure goes through Warn without a visit. A measurement of such a
+	// directory ran on past its ten minutes, held its metadata slot for all of
+	// it, and finished without Capped. The context reaches every path the walk
+	// takes — the per-entry check in the enumeration loop, the opens, the reads —
+	// so the bound holds however the walk spends its time. Without a time bound
+	// the walk runs under the caller's context alone, as before.
+	walkCtx, cancel := ctx, context.CancelFunc(func() {})
+	if !lim.deadline.IsZero() {
+		walkCtx, cancel = sizeWalkDeadline(ctx, lim.deadline)
+	}
+	defer cancel()
+	res, err := scanTrees(walkCtx, r, plat, paths, o.CrossMounts, o.ReadCross, emit, lim, false, ProtectSnapshots)
 	out := wproto.JobResult{Files: res.files, Dirs: res.dirs, Bytes: res.bytes, Capped: res.capped,
 		MountsSkipped: res.mounts, MountsNetwork: res.network}
-	if err != nil {
+	switch cerr := ctx.Err(); {
+	case cerr != nil && (err != nil || res.capped):
+		// The CALLER's context first, always. A bound and a cancellation can
+		// arrive in the same instant — the visitor counted the entry that reached
+		// the bound after the job was cancelled, or the deadline expired while the
+		// cancellation was on its way — and the bound is then not why the job
+		// stopped: somebody asked it to. A cancellation is what the job reports
+		// (§2.1), with its partial counts and without a "stopped at its limit"
+		// that would read as the measurement's own verdict.
+		out.Capped = false
+		return out, cerr
+	case err != nil && walkCtx.Err() != nil:
+		// The walk's own deadline and not the caller's: the time bound, reached
+		// somewhere the visitor's clock reading never ran. It is the same answer
+		// that reading gives — a floor, Capped, said once — and not an error, so
+		// the job ends done with what it counted.
+		out.Capped = true
+		warnScanCapped(emit)
+		return out, nil
+	case err != nil:
 		return out, err
-	}
-	if res.capped {
+	case res.capped:
 		warnScanCapped(emit)
 	}
 	return out, nil
 }
 
-// sizeScanLimits is what Size bounds its pass by: nothing. A user who asked for
-// a folder's size asked for the real number, and the only stop is the overflow
-// guard inside the counter.
+// sizeWalkDeadline gives a walk its own deadline. It is a variable so that a
+// test can hand back a context that is already done: the branch it guards is a
+// walk that spends its bound on entries it never visits, which a portable test
+// cannot stage any other way (the same reason Search has searchTimeout).
+// Production never assigns to it.
+var sizeWalkDeadline = context.WithDeadline
+
+// sizeScanLimits is what Size bounds its pass by before the caller's own
+// SizeOptions bounds are applied: nothing. A user who asked for a folder's size
+// asked for the real number, so the bounds that apply are the ones the caller
+// states (the folder-size route's ten million entries and ten minutes, a
+// pre-scan's budget) and the overflow guard inside the counter.
 //
 // It is a variable rather than a literal so that this package's tests can reach
-// the capped branch, which otherwise needs a tree whose declared bytes do not
-// fit in an int64 — four exabytes of sparse files, which no filesystem here will
-// create (the same reason trashScanMaxEntries is one). Production never assigns
-// to it.
+// the capped branch without a caller's bound, which otherwise needs a tree
+// whose declared bytes do not fit in an int64 — four exabytes of sparse files,
+// which no filesystem here will create (the same reason trashScanMaxEntries is
+// one). Production never assigns to it.
 var sizeScanLimits scanLimits
 
 // scanCappedCode is the warning code a job reports when its counting pass

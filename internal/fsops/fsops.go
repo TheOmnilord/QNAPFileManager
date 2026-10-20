@@ -32,8 +32,11 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
+	"unicode"
+	"unicode/utf8"
 
 	"qnapfilemanager/internal/fsx"
 	"qnapfilemanager/internal/idmap"
@@ -44,6 +47,12 @@ import (
 // time. It doubles as the cancellation granularity: a listing of a directory
 // with a million entries notices a disconnected client within one chunk.
 const readChunk = 256
+
+// listReadCap is fsx.MaxListLimit as a variable, so a test can reach the cap —
+// and the entry just past it, which is what decides whether the listing was cut
+// short — without building a folder of fifty thousand entries. Production never
+// assigns to it.
+var listReadCap = fsx.MaxListLimit
 
 // maxLinkHops bounds symlink following in resolve. It is deliberately the
 // kernel's own SYMLOOP_MAX, so a cycle inside the jail ends the same way a
@@ -544,6 +553,13 @@ func apiOf(parts []string) string {
 // set and lets the UI decide what to show, so a page of a /share listing is
 // the same page whichever way that toggle is set.
 //
+// The read stops at listReadCap (fsx.MaxListLimit) entries, in whatever order
+// the filesystem hands them out and before anything is sorted: past the cap,
+// entries are not in the listing at all and the sort orders only what was read,
+// which is what the cap's note says. Whether anything IS past the cap is learned
+// by reading on to one more entry the listing would have shown — a folder of
+// exactly the cap is complete and carries no note (stabilization contract §1.3).
+//
 // plat may be nil, in which case no entry is flagged as a mount point or a
 // volume root. It is used, never mutated.
 func List(ctx context.Context, r fsx.Root, plat *platform.Platform, dir string, o fsx.ListOptions) (fsx.Listing, error) {
@@ -594,8 +610,11 @@ func List(ctx context.Context, r fsx.Root, plat *platform.Platform, dir string, 
 	ids := IDMap()
 
 	entries := make([]fsx.Entry, 0, 64)
+	// capped is set only by finding an entry past the cap. Stopping AT the cap
+	// and calling that capped told a folder of exactly fifty thousand entries
+	// that it was missing some, which it was not (stabilization contract §1.3).
 	capped := false
-	for !capped {
+	for {
 		des, readErr := readDirInfos(f, readChunk, o.ShowHidden)
 		for _, de := range des {
 			name := de.name
@@ -607,13 +626,23 @@ func List(ctx context.Context, r fsx.Root, plat *platform.Platform, dir string, 
 			if hidden && !o.ShowHidden {
 				continue
 			}
-			if de.err != nil {
+			if de.err != nil && errors.Is(de.err, fs.ErrNotExist) {
 				// The entry was unlinked between getdents and the stat. That
 				// is a normal race in a live directory, not a failure of the
-				// listing.
-				if errors.Is(de.err, fs.ErrNotExist) {
-					continue
-				}
+				// listing — and not an entry past the cap either.
+				continue
+			}
+			if len(entries) >= listReadCap {
+				// The peek: an entry the listing would have shown, one past
+				// the cap, so the folder really does hold more than was read.
+				// It is counted and nothing else — never described, never
+				// added. Its metadata is not needed for that, and a stat that
+				// failed (which inside the cap fails the listing, below) still
+				// says the entry is there.
+				capped = true
+				break
+			}
+			if de.err != nil {
 				return fsx.Listing{}, de.err
 			}
 			fi := de.info
@@ -641,12 +670,13 @@ func List(ctx context.Context, r fsx.Root, plat *platform.Platform, dir string, 
 				}
 			}
 			entries = append(entries, e)
-			if len(entries) >= fsx.MaxListLimit {
-				capped = true
-				break
-			}
 		}
-		if readErr == io.EOF {
+		// An entry past the cap settles the one question the rest of the folder
+		// could still answer, so the read ends there, and an error that came
+		// back with the same chunk is about entries further along that this
+		// listing would never show. Until then a failed read is the listing's
+		// failure, as it always was.
+		if capped || readErr == io.EOF {
 			break
 		}
 		if readErr != nil {
@@ -956,9 +986,18 @@ func typeRank(t string) int {
 	return 6
 }
 
-// sortEntries orders a listing. Every comparison falls through to the name,
-// which is unique within one directory, so the order is total: two pages of
-// the same listing can never overlap or drop an entry, whatever the sort key.
+// sortEntries orders a listing. Every comparison falls through to the name
+// order of compareNames, which ties only on identical bytes, and a name is
+// unique within one directory — so the order is total: two pages of the same
+// listing can never overlap or drop an entry, whatever the sort key.
+//
+// Total is also why the sort is not a stable one. With no ties there is nothing
+// for stability to keep, so any correct sort gives this exact order, and a
+// stable one only costs more: it moves the entries — each one a few hundred
+// bytes — many more times, and a folder of fifty thousand is sorted again for
+// every page of it that is asked for. The folded name comparison is dearer than
+// the byte comparison it replaced (stabilization contract §1.1); dropping the
+// stability more than pays for it.
 func sortEntries(es []fsx.Entry, o fsx.ListOptions) {
 	key := o.Sort
 	if !fsx.ValidSortKey(key) || key == "" {
@@ -979,9 +1018,9 @@ func sortEntries(es []fsx.Entry, o fsx.ListOptions) {
 				return ra < rb
 			}
 		}
-		return a.Name < b.Name
+		return compareNames(a.Name, b.Name) < 0
 	}
-	sort.SliceStable(es, func(i, j int) bool {
+	sort.Slice(es, func(i, j int) bool {
 		a, b := &es[i], &es[j]
 		if o.DirsFirst {
 			// Directories first is applied before Desc on purpose: reversing
@@ -997,6 +1036,65 @@ func sortEntries(es []fsx.Entry, o fsx.ListOptions) {
 		}
 		return less(a, b)
 	})
+}
+
+// compareNames is the name order a listing falls through to (stabilization
+// contract §1.1), returning -1, 0 or +1 like strings.Compare — and 0 only for
+// identical bytes.
+//
+// Names are compared rune by rune on a folded key, so "Report.pdf" sorts
+// between "readme" and "zebra" instead of above every lower-case name, which is
+// where byte order put it. A name that runs out first is the smaller, as in a
+// dictionary. Folding loses information — "README" and "readme" fold alike — so
+// names that fold to the same keys are ordered by their bytes, which keeps the
+// order total: no two different names compare equal, and a page boundary falls
+// in the same place every time a fixed directory is read.
+//
+// What this is not: a collation or a natural order. "é" keys as U+00E9, after
+// "z", and "file10" sorts before "file2"; both are out of scope.
+func compareNames(a, b string) int {
+	i, j := 0, 0
+	for i < len(a) && j < len(b) {
+		ka, wa := nameKey(a, i)
+		kb, wb := nameKey(b, j)
+		if ka != kb {
+			if ka < kb {
+				return -1
+			}
+			return 1
+		}
+		i += wa
+		j += wb
+	}
+	switch {
+	case i < len(a):
+		return 1 // b ran out first
+	case j < len(b):
+		return -1
+	}
+	return strings.Compare(a, b)
+}
+
+// nameKey is the folded key of the rune that starts at s[i], and how many bytes
+// it took. A valid rune keys as its lower case. A byte that does not begin valid
+// UTF-8 keys as 0x110000 plus its value: a Linux name is bytes, not text, and
+// such a byte has no case to fold — this puts it after every code point, and
+// keeps it apart from both a different invalid byte and a real U+FFFD, which
+// decoding alone would have made all one key.
+func nameKey(s string, i int) (rune, int) {
+	if c := s[i]; c < utf8.RuneSelf {
+		// ASCII, which is most of any NAS, folds without decoding: this is
+		// exactly what unicode.ToLower answers for it.
+		if 'A' <= c && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		return rune(c), 1
+	}
+	r, w := utf8.DecodeRuneInString(s[i:])
+	if r == utf8.RuneError && w == 1 {
+		return 0x110000 + rune(s[i]), 1
+	}
+	return unicode.ToLower(r), w
 }
 
 // page normalises Offset and Limit against the caps in fsx.
@@ -1124,11 +1222,12 @@ func childMountPoints(plat *platform.Platform, osDir string) map[string]bool {
 // dirNotes are the human-readable remarks about the directory itself.
 // mountPoint is mountPointAt's answer for the directory being listed; it is
 // passed in rather than recomputed here because deciding it needs the walk's
-// descriptors, which this function does not have.
+// descriptors, which this function does not have. capped means List found an
+// entry past the cap, and its note comes first.
 func dirNotes(plat *platform.Platform, apiPath, osPath string, mountPoint, capped bool) []string {
 	var notes []string
 	if capped {
-		notes = append(notes, fmt.Sprintf("more than %d entries; the listing was capped", fsx.MaxListLimit))
+		notes = append(notes, cappedNote(listReadCap))
 	}
 	if plat == nil {
 		return notes
@@ -1144,6 +1243,30 @@ func dirNotes(plat *platform.Platform, apiPath, osPath string, mountPoint, cappe
 		}
 	}
 	return notes
+}
+
+// cappedNote is the note of a listing that stopped at its cap with more of the
+// folder unread, verbatim from stabilization contract §1.3. It names both costs
+// the user would otherwise discover by surprise: entries past the cap are not
+// shown at all, and since the read stops before anything is sorted, the sort
+// orders the entries that were read rather than the folder.
+func cappedNote(limit int) string {
+	return "Only the first " + groupDigits(limit) +
+		" entries read are listed, so others are missing, and sorting applies only to the entries listed."
+}
+
+// groupDigits writes a count with a comma between each group of three digits,
+// "50,000", the way the UI's English sentences write a number.
+func groupDigits(n int) string {
+	s := strconv.Itoa(n)
+	sign := ""
+	if n < 0 {
+		sign, s = "-", s[1:]
+	}
+	for i := len(s) - 3; i > 0; i -= 3 {
+		s = s[:i] + "," + s[i:]
+	}
+	return sign + s
 }
 
 // slashClean renders an OS path in the slash form the mount table uses.

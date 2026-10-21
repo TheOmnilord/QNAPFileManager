@@ -1,4 +1,4 @@
-module qnapfilemanager
+module taproot
 
 go 1.26
 

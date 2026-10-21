@@ -9,7 +9,7 @@ import (
 	"syscall"
 	"testing"
 
-	"qnapfilemanager/internal/fsx"
+	"taproot/internal/fsx"
 )
 
 // TestMkdirThroughASearchOnlyParent: creating a directory needs write and

@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/fsx"
+	"taproot/internal/wproto"
 )
 
 // The M2-B engine's tests. Everything that depends on Linux semantics — mode

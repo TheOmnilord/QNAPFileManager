@@ -9,7 +9,7 @@ import (
 	"syscall"
 	"testing"
 
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/wproto"
 )
 
 // Round 13 adversarial, the state a copy and a delete are allowed to rest on:

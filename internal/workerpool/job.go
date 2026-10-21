@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"time"
 
-	"qnapfilemanager/internal/backend"
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/backend"
+	"taproot/internal/fsx"
+	"taproot/internal/wproto"
 )
 
 // --- backend.Jobs ------------------------------------------------------

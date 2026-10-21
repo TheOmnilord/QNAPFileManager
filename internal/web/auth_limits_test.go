@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/idmap"
-	"qnapfilemanager/internal/qtsauth"
+	"taproot/internal/idmap"
+	"taproot/internal/qtsauth"
 )
 
 func assertAuthError(t *testing.T, w *httptest.ResponseRecorder, status int, code, retry string) {
@@ -116,7 +116,7 @@ func TestAuthenticationDeadline(t *testing.T) {
 				old.binding = qtsauth.CacheKey(old.cred)
 				old.checked = time.Now().Add(-time.Minute)
 				s.insertSession(old)
-				cookie = &http.Cookie{Name: "qfm_sid", Value: old.id}
+				cookie = &http.Cookie{Name: "taproot_sid", Value: old.id}
 			}
 			if phase == "session-lock" {
 				old := indexedTestSession("busy", "domainuser")
@@ -125,7 +125,7 @@ func TestAuthenticationDeadline(t *testing.T) {
 				s.insertSession(old)
 				old.mu.Lock()
 				defer old.mu.Unlock()
-				cookie = &http.Cookie{Name: "qfm_sid", Value: old.id}
+				cookie = &http.Cookie{Name: "taproot_sid", Value: old.id}
 			}
 			start := time.Now()
 			w := request(s, "GET", "/api/session?sid=slow", cookie, nil)
@@ -174,7 +174,7 @@ func TestExistingSessionAuthenticationBurstBound(t *testing.T) {
 	old.binding = qtsauth.CacheKey(old.cred)
 	old.checked = time.Now().Add(-time.Minute)
 	s.insertSession(old)
-	cookie := &http.Cookie{Name: "qfm_sid", Value: old.id}
+	cookie := &http.Cookie{Name: "taproot_sid", Value: old.id}
 	results := make(chan *httptest.ResponseRecorder, 200)
 	go func() { results <- request(s, "GET", "/api/session", cookie, nil) }()
 	select {
@@ -216,7 +216,9 @@ func TestExistingSessionAuthenticationBurstBound(t *testing.T) {
 		}
 		s.insertSession(fast)
 		done := make(chan *httptest.ResponseRecorder, 1)
-		go func() { done <- request(s, "GET", "/api/session", &http.Cookie{Name: "qfm_sid", Value: fast.id}, nil) }()
+		go func() {
+			done <- request(s, "GET", "/api/session", &http.Cookie{Name: "taproot_sid", Value: fast.id}, nil)
+		}()
 		select {
 		case w := <-done:
 			if w.Code != 200 {
@@ -340,7 +342,7 @@ func TestSessionFollowersShareTotalWaitingBound(t *testing.T) {
 			go func() {
 				defer followers.Done()
 				r := httptest.NewRequest("GET", "/api/session", nil).WithContext(ctx)
-				r.AddCookie(&http.Cookie{Name: "qfm_sid", Value: old.id})
+				r.AddCookie(&http.Cookie{Name: "taproot_sid", Value: old.id})
 				s.Handler().ServeHTTP(httptest.NewRecorder(), r)
 			}()
 		}
@@ -355,7 +357,7 @@ func TestSessionFollowersShareTotalWaitingBound(t *testing.T) {
 	busy := s.insertSession(indexedTestSession("overflow", "dev"))
 	busy.mu.Lock()
 	defer busy.mu.Unlock()
-	w := request(s, "GET", "/api/session", &http.Cookie{Name: "qfm_sid", Value: busy.id}, nil)
+	w := request(s, "GET", "/api/session", &http.Cookie{Name: "taproot_sid", Value: busy.id}, nil)
 	assertAuthError(t, w, 503, "overloaded", "2")
 	// An already-validated session needs neither waiting nor execution capacity.
 	s.insertSession(indexedTestSession("ready", "dev"))
@@ -363,7 +365,7 @@ func TestSessionFollowersShareTotalWaitingBound(t *testing.T) {
 	readyCtx, readyCancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer readyCancel()
 	readyRequest = readyRequest.WithContext(readyCtx)
-	readyRequest.AddCookie(&http.Cookie{Name: "qfm_sid", Value: "ready"})
+	readyRequest.AddCookie(&http.Cookie{Name: "taproot_sid", Value: "ready"})
 	w = httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, readyRequest)
 	if w.Code != 200 {

@@ -20,7 +20,7 @@ import (
 	"strconv"
 	"strings"
 
-	"qnapfilemanager/internal/fsx"
+	"taproot/internal/fsx"
 )
 
 // ModeSpec is a mode change expressed as a mask and a value, never as an

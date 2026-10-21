@@ -22,9 +22,9 @@ import (
 	"sync"
 	"time"
 
-	"qnapfilemanager/internal/fsops"
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/fsops"
+	"taproot/internal/fsx"
+	"taproot/internal/wproto"
 )
 
 // The coalescing rule from identity plan §2.5: a progress frame goes out when

@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/audit"
-	"qnapfilemanager/internal/breakglass"
-	"qnapfilemanager/internal/fsx"
+	"taproot/internal/audit"
+	"taproot/internal/breakglass"
+	"taproot/internal/fsx"
 )
 
 // §6.1: Door is set once at session creation and stamped on EVERY event that
@@ -20,7 +20,7 @@ func TestDoorIsStampedOnEveryEvent(t *testing.T) {
 		s, _, _ := bgFixture(t)
 		read := withAudit(t, s)
 		cookie, csrf := bgSignIn(t, s)
-		headers := map[string]string{"X-QFM-CSRF": csrf, "Content-Type": "application/json"}
+		headers := map[string]string{"X-Taproot-CSRF": csrf, "Content-Type": "application/json"}
 		if w := bgRequest(s, "POST", "/api/fs/mkdir", []*http.Cookie{cookie}, headers, `{"dir":"/","name":"support"}`); w.Code != http.StatusOK {
 			t.Fatalf("mkdir: %d %s", w.Code, w.Body)
 		}

@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/wproto"
 )
 
 // The route half of the gpt-6-astra M3 round-6 review (docs/reviews/

@@ -8,7 +8,7 @@ package fsops
 // than no badge at all, and the platform's own probe already reports
 // ACLBackend "none" here, so newACLProbe never gets this far.
 
-import "qnapfilemanager/internal/fsx"
+import "taproot/internal/fsx"
 
 // xattrProbeAvailable is false: this platform reads no extended attributes.
 const xattrProbeAvailable = false

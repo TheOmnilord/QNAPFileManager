@@ -2,13 +2,13 @@
 <html lang="en">
 <head>
  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
- <title>QNAPFileManager</title><link rel="stylesheet" href="app.css"><link rel="icon" type="image/svg+xml" href="favicon.svg">
+ <title>Taproot</title><link rel="stylesheet" href="app.css"><link rel="icon" type="image/svg+xml" href="favicon.svg">
  <script type="module" src="js/app.js"></script>
 </head>
 <body>
 <a class="skip" id="skipLink" href="#list">Skip to files</a>
 <div id="app">
- <header id="hdr"><h1>QNAPFileManager</h1><span id="chipReadonly" class="chip">Read-only browse</span><span id="identity"></span><button id="btnSettings">Settings</button><button id="userMenu" aria-haspopup="dialog">Session</button></header>
+ <header id="hdr"><h1>Taproot</h1><span id="chipReadonly" class="chip">Read-only browse</span><span id="identity"></span><button id="btnSettings">Settings</button><button id="userMenu" aria-haspopup="dialog">Session</button></header>
  <section id="signin" role="alert" hidden><h2>Sign in to QTS to continue</h2><p>Your QTS session is unavailable or has expired. Sign in on the QTS desktop, then retry here.</p><button id="btnRetry">Retry connection</button></section>
  <!-- The emergency door's own sign-in (M4 contract §2, §8.4). It is shown ONLY
       on the break-glass listener, where the QTS desktop may be exactly what is
@@ -154,7 +154,7 @@
  <p id="upAllRow" hidden><label><input type="checkbox" id="upAll"> Apply to all remaining files in this batch</label></p>
  <div class="bar"><button id="upSkip">Skip</button><button id="upOverwrite">Overwrite</button><button id="upRename">Keep both</button><button data-close>Cancel</button></div></dialog>
 <dialog id="dlgTrash" aria-labelledby="trashTitle" aria-describedby="trashWhere"><h2 id="trashTitle">Trash</h2>
- <p id="trashWhere" class="hint">Trash lives in .@qfm_trash on each volume.</p>
+ <p id="trashWhere" class="hint">Trash lives in .@taproot_trash on each volume.</p>
  <div id="trashWrap"><table id="trashTable"><thead><tr><th><input type="checkbox" id="trashAll" aria-label="Select all"></th><th>Name</th><th>Original location</th><th>Deleted</th><th>Size</th></tr></thead><tbody id="trashRows"></tbody></table></div>
  <p id="trashEmpty" hidden>Your Trash is empty.</p><p id="trashStatus" role="status"></p>
  <div class="bar"><button id="btnTrashRestore">Restore selected</button><button id="btnTrashEmpty">Empty Trash…</button><button id="btnTrashRefresh">Refresh</button><button data-close>Close</button></div></dialog>

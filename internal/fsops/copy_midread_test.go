@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/wproto"
 )
 
 // rewriteMidRead makes the transfer read part of the source, rewrite it

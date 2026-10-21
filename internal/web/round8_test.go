@@ -12,12 +12,12 @@ import (
 	"sync"
 	"testing"
 
-	"qnapfilemanager/internal/audit"
-	"qnapfilemanager/internal/backend"
-	"qnapfilemanager/internal/config"
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/guard"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/audit"
+	"taproot/internal/backend"
+	"taproot/internal/config"
+	"taproot/internal/fsx"
+	"taproot/internal/guard"
+	"taproot/internal/wproto"
 )
 
 // TestConcurrentReadOnlyTogglesStayConsistent proves the standard-P1/adv-1 fix:
@@ -382,7 +382,7 @@ func TestBatchDeleteStopsOnContextCancel(t *testing.T) {
 	s.mutator = &cancelAfterFirst{fakeBackend: b, cancel: cancel}
 	r := httptest.NewRequest("POST", "/api/fs/delete", strings.NewReader(confirmed)).WithContext(ctx)
 	r.AddCookie(c)
-	r.Header.Set("X-QFM-CSRF", csrf)
+	r.Header.Set("X-Taproot-CSRF", csrf)
 	r.Header.Set("Origin", "http://example.com")
 	r.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -446,7 +446,7 @@ func TestBatchMilestoneSurvivesCancel(t *testing.T) {
 	s.mutator = &cancelAfterFirst{fakeBackend: b, cancel: cancel}
 	r := httptest.NewRequest("POST", "/api/fs/delete", strings.NewReader(confirmed)).WithContext(ctx)
 	r.AddCookie(c)
-	r.Header.Set("X-QFM-CSRF", csrf)
+	r.Header.Set("X-Taproot-CSRF", csrf)
 	r.Header.Set("Origin", "http://example.com")
 	r.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()

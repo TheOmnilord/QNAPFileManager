@@ -15,8 +15,8 @@ import (
 	"context"
 	"testing"
 
-	"qnapfilemanager/internal/perm"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/perm"
+	"taproot/internal/wproto"
 )
 
 // TestLeafCrossingPolicy is Astra r2 #4: a non-directory entry is put through

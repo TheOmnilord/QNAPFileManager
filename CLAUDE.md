@@ -1,4 +1,4 @@
-# QNAPFileManager — working notes for Claude Code
+# Taproot — working notes for Claude Code
 
 ## What this is
 
@@ -6,6 +6,11 @@ A root-capable, per-user web file manager for QNAP QTS and QuTS hero, delivered 
 by App Center spawns one worker process per QTS user and serves an embedded UI inside the QTS desktop through the QTS
 reverse proxy. Everything File Station cannot reach (`/`, `/etc`, `.qpkg`, raw volume mounts) is in scope. Start with
 [PLAN.md](PLAN.md); the design documents under `docs/design/` explain the reasoning.
+
+Taproot was called QNAPFileManager before its first release (renamed 2026-10-21; every old and new name is in
+[docs/design/rename-contract.md](docs/design/rename-contract.md)). The GitHub repository and its directory keep the old
+name, and so does the history: `docs/reviews/`, `docs/research/`, the older design documents and the CHANGELOG's
+milestone sections.
 
 ## Working rules (set by the owner, 2026-09-09)
 
@@ -42,7 +47,7 @@ reverse proxy. Everything File Station cannot reach (`/`, `/etc`, `.qpkg`, raw v
 - Two invariants that tests enforce: INV-1 (`internal/web` never imports `internal/fsops`; user data is touched only in
   the worker) and INV-2 (kernel decides permissions; the app only predicts).
 - Ports: 8770 is the loopback app port, 8771 the break-glass listener, 8899 the dev loop. 8765 belongs to GitBackup.
-- Dev loop: `.claude/launch.json` runs `go run ./cmd/qnapfilemanager serve -config dev-config.json -jail testdata/fakeroot`.
+- Dev loop: `.claude/launch.json` runs `go run ./cmd/taproot serve -config dev-config.json -jail testdata/fakeroot`.
   Always `go run`: a stale `go build` binary keeps serving embedded assets that were already edited.
 - Shell scripts, `qpkg/package_routines` and `qpkg/qpkg.cfg` are LF (enforced by `.gitattributes`); they run under
   busybox sh on the NAS.
@@ -61,9 +66,10 @@ reverse proxy. Everything File Station cannot reach (`/`, `/etc`, `.qpkg`, raw v
 ## Commands
 
 ```bash
-go run ./cmd/qnapfilemanager serve -config dev-config.json -jail testdata/fakeroot -addr 127.0.0.1:8899
+go run ./cmd/taproot serve -config dev-config.json -jail testdata/fakeroot -addr 127.0.0.1:8899
 go test ./...
 powershell -File scripts/build-local.ps1
 ```
 
-The full QPKG is built by GitHub Actions (QDK pinned by commit); there is no Docker or QDK on the dev box.
+The QPKGs (one per architecture, `x86_64` and `arm_64`) are built by GitHub Actions (QDK pinned by commit); there is
+no Docker or QDK on the dev box.

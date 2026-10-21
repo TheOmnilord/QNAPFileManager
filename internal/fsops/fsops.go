@@ -38,9 +38,9 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/idmap"
-	"qnapfilemanager/internal/platform"
+	"taproot/internal/fsx"
+	"taproot/internal/idmap"
+	"taproot/internal/platform"
 )
 
 // readChunk is how many directory entries are pulled out of the kernel at a

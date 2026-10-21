@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/wproto"
 )
 
 // The M2-B half of the job spine: a copy and a move through the real worker

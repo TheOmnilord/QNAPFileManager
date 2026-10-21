@@ -1,4 +1,4 @@
-// Command qnapfilemanager is the QNAPFileManager daemon: a root front-end
+// Command taproot is the Taproot daemon: a root front-end
 // that serves the web UI, and — re-executing itself with -worker — one
 // unprivileged worker process per signed-in user, which is where every
 // filesystem operation actually runs.
@@ -23,21 +23,21 @@ import (
 	"syscall"
 	"time"
 
-	"qnapfilemanager/internal/audit"
-	"qnapfilemanager/internal/backend"
-	"qnapfilemanager/internal/breakglass"
-	"qnapfilemanager/internal/config"
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/guard"
-	"qnapfilemanager/internal/idmap"
-	"qnapfilemanager/internal/jobs"
-	"qnapfilemanager/internal/logfile"
-	"qnapfilemanager/internal/platform"
-	"qnapfilemanager/internal/qtsauth"
-	"qnapfilemanager/internal/trashroot"
-	"qnapfilemanager/internal/web"
-	"qnapfilemanager/internal/worker"
-	"qnapfilemanager/internal/workerpool"
+	"taproot/internal/audit"
+	"taproot/internal/backend"
+	"taproot/internal/breakglass"
+	"taproot/internal/config"
+	"taproot/internal/fsx"
+	"taproot/internal/guard"
+	"taproot/internal/idmap"
+	"taproot/internal/jobs"
+	"taproot/internal/logfile"
+	"taproot/internal/platform"
+	"taproot/internal/qtsauth"
+	"taproot/internal/trashroot"
+	"taproot/internal/web"
+	"taproot/internal/worker"
+	"taproot/internal/workerpool"
 )
 
 // version is set by the linker: -X main.version=$VERSION. "dev" is what a
@@ -63,7 +63,7 @@ func main() {
 	switch args[0] {
 	case "serve":
 		if err := runServe(args[1:], os.Stderr); err != nil {
-			fmt.Fprintf(os.Stderr, "qnapfilemanager: %v\n", err)
+			fmt.Fprintf(os.Stderr, "taproot: %v\n", err)
 			os.Exit(1)
 		}
 	case "break-glass":
@@ -73,22 +73,22 @@ func main() {
 	case "help", "-h", "-help", "--help":
 		usage(os.Stdout)
 	default:
-		fmt.Fprintf(os.Stderr, "qnapfilemanager: unknown command %q\n", args[0])
+		fmt.Fprintf(os.Stderr, "taproot: unknown command %q\n", args[0])
 		usage(os.Stderr)
 		os.Exit(2)
 	}
 }
 
 func usage(w io.Writer) {
-	fmt.Fprintf(w, `qnapfilemanager %s
+	fmt.Fprintf(w, `taproot %s
 
 Usage:
-  qnapfilemanager serve [flags]        run the daemon
-  qnapfilemanager break-glass <sub>    manage the emergency-access password and
-                                       certificate (set-password, disable,
-                                       status, cert) — root, on the NAS shell
-  qnapfilemanager version              print the version
-  qnapfilemanager -worker -uid N       internal: the per-user worker process
+  taproot serve [flags]        run the daemon
+  taproot break-glass <sub>    manage the emergency-access password and
+                               certificate (set-password, disable,
+                               status, cert) — root, on the NAS shell
+  taproot version              print the version
+  taproot -worker -uid N       internal: the per-user worker process
 
 serve flags:
   -config <path>        JSON config file (a missing file means defaults)
@@ -137,7 +137,7 @@ func runWorker(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "worker identity mismatch or unsupported platform (uid %d)\n", *uid)
 		return 2
 	}
-	file := os.NewFile(3, "qfm-worker")
+	file := os.NewFile(3, "taproot-worker")
 	if file == nil {
 		fmt.Fprintln(stderr, "missing worker socket")
 		return 2
@@ -504,7 +504,7 @@ func armBreakGlass(srv *server, frontend *web.Server, cfg config.Config, configP
 		return nil
 	}
 	if cfg.Auth.Local.Hash == "" {
-		logger.Printf("break-glass is enabled but no password is set; run `qnapfilemanager break-glass set-password` on the NAS shell. Nothing is bound on %s; the listener binds within a minute of a password being set, without a restart.", cfg.Web.BreakGlass.Addr)
+		logger.Printf("break-glass is enabled but no password is set; run `taproot break-glass set-password` on the NAS shell. Nothing is bound on %s; the listener binds within a minute of a password being set, without a restart.", cfg.Web.BreakGlass.Addr)
 		srv.bgPending = true
 		return nil
 	}
@@ -563,7 +563,7 @@ func armBreakGlass(srv *server, frontend *web.Server, cfg config.Config, configP
 		// (Astra r2 #3). Audited as well as logged, because the day this door
 		// stops opening is the day nobody can read the log through the app.
 		days := daysUntil(cert.NotAfter, now)
-		logger.Printf("break-glass certificate expires in %d days; run `qnapfilemanager break-glass cert -regenerate` and restart the app when you are ready to compare a new fingerprint", days)
+		logger.Printf("break-glass certificate expires in %d days; run `taproot break-glass cert -regenerate` and restart the app when you are ready to compare a new fingerprint", days)
 		frontend.AuditBreakGlass("breakglass-cert", "warn", fmt.Sprintf("door=local cert expires in %d days (sha256=%s); run `break-glass cert -regenerate`", days, cert.Fingerprint))
 	}
 	frontend.EnableBreakGlass(configPath)
@@ -761,7 +761,7 @@ func (s *server) run(ctx context.Context) error {
 	if s.root.Jailed() {
 		jail = s.root.Base()
 	}
-	s.logger.Printf("qnapfilemanager %s listening on %s (readOnly=%v, jail=%s, proxyPrefix=%q, dev=%v)",
+	s.logger.Printf("taproot %s listening on %s (readOnly=%v, jail=%s, proxyPrefix=%q, dev=%v)",
 		version, ln.Addr(), s.cfg.ReadOnly, jail, s.cfg.Web.ProxyPrefix, s.dev)
 
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)

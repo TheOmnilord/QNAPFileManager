@@ -11,7 +11,7 @@ import (
 	"syscall"
 	"unsafe"
 
-	"qnapfilemanager/internal/fsx"
+	"taproot/internal/fsx"
 )
 
 // dirRef is a directory the walk is standing in: one open descriptor, and the

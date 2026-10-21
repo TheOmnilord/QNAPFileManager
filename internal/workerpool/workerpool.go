@@ -29,14 +29,14 @@ import (
 	"sync/atomic"
 	"time"
 
-	"qnapfilemanager/internal/backend"
-	"qnapfilemanager/internal/config"
-	"qnapfilemanager/internal/fsops"
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/idmap"
-	"qnapfilemanager/internal/platform"
-	"qnapfilemanager/internal/worker"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/backend"
+	"taproot/internal/config"
+	"taproot/internal/fsops"
+	"taproot/internal/fsx"
+	"taproot/internal/idmap"
+	"taproot/internal/platform"
+	"taproot/internal/worker"
+	"taproot/internal/wproto"
 )
 
 // Modes.

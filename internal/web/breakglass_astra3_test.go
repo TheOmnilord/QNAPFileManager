@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/audit"
-	"qnapfilemanager/internal/breakglass"
+	"taproot/internal/audit"
+	"taproot/internal/breakglass"
 )
 
 // --- Astra r3 #2: an aggregate refusal line outlives the request that carries

@@ -9,7 +9,7 @@ import (
 )
 
 // The config file is written by two different processes: the daemon (the
-// read-only toggle) and `qnapfilemanager break-glass` on the shell. Both do a
+// read-only toggle) and `taproot break-glass` on the shell. Both do a
 // read-modify-write, and nothing in the filesystem makes that pair atomic — so
 // a toggle that read the file before the CLI wrote a password hash, and saved
 // after, would publish the old credential over the new one and neither process

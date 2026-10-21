@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/backend"
-	"qnapfilemanager/internal/fsx"
+	"taproot/internal/backend"
+	"taproot/internal/fsx"
 )
 
 type downloadBackend struct {

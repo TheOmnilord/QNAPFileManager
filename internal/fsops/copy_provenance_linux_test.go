@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/wproto"
 )
 
 // TestASwappedDestinationDirectoryIsAbandoned is round 11's first finding, and

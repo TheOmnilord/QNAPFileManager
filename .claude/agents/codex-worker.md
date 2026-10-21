@@ -38,7 +38,7 @@ codex exec --skip-git-repo-check -C "<project root>" \
 Prepend this preamble to the task file, then the task verbatim:
 
 ```
-You are working in the QNAPFileManager repository. Read CLAUDE.md and PLAN.md first if they exist.
+You are working in the Taproot repository. Read CLAUDE.md and PLAN.md first if they exist.
 Do exactly the task below and nothing more. Keep to Go stdlib and the project's conventions.
 Run `go build ./...` and `go test ./...` (or the tests relevant to the task) before finishing.
 End with: a summary of what changed, the test result, and any doubts marked UNVERIFIED.

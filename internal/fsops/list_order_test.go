@@ -12,8 +12,8 @@ import (
 	"time"
 	"unicode"
 
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/platform"
+	"taproot/internal/fsx"
+	"taproot/internal/platform"
 )
 
 // TestCompareNames pins the name order every listing falls through to

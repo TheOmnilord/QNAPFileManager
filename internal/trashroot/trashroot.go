@@ -1,5 +1,5 @@
 // Package trashroot creates the one directory the root front-end is allowed to
-// write anywhere on a user's storage: <mountRoot>/.@qfm_trash, mode 1777
+// write anywhere on a user's storage: <mountRoot>/.@taproot_trash, mode 1777
 // (PLAN.md decision 10, identity plan §4.2).
 //
 // It is a deliberate, single exception to INV-1. A non-admin must be able to
@@ -34,7 +34,7 @@ import (
 	"syscall"
 	"time"
 
-	"qnapfilemanager/internal/platform"
+	"taproot/internal/platform"
 )
 
 // wantOwner is the uid the trash directory must belong to. It is root because
@@ -52,14 +52,14 @@ var wantOwner = 0
 // DirName is the trash directory's name. The "@" prefix matches QNAP's own
 // convention (@Recycle) so it sorts and hides alongside the system's, and the
 // "." keeps it out of a default listing.
-const DirName = ".@qfm_trash"
+const DirName = ".@taproot_trash"
 
 // Mode is what the directory must be: world-writable and sticky.
 const Mode = os.FileMode(0o777) | os.ModeSticky
 
 // tempPrefix is what an UNPUBLISHED trash directory is called (B3). The name is
 // completed with 16 hex digits of randomness, so nothing can be waiting at it,
-// and it keeps the ".@qfm_" prefix so a temporary directory left behind by a
+// and it keeps the ".@taproot_" prefix so a temporary directory left behind by a
 // crash between the mkdir and the rename is recognisably ours.
 const tempPrefix = DirName + ".tmp-"
 
@@ -92,14 +92,14 @@ const maxPublishAttempts = 3
 
 // Logf is where this package reports what it cannot return to its caller. The
 // default is a no-op and the daemon points it at its own log at startup
-// (cmd/qnapfilemanager, runServe).
+// (cmd/taproot, runServe).
 //
 // Exactly one thing needs it (R4-2). When another process publishes the trash
 // directory first, Ensure drops its own temporary directory and returns the
 // winner — a SUCCESS — so any diagnostic attached to that attempt, including
 // "the temporary directory could not be proved to be ours and was left in
 // place", has no error to travel out on and would otherwise be lost. That
-// sentence is how an operator who finds an abandoned .@qfm_trash.tmp-* on a
+// sentence is how an operator who finds an abandoned .@taproot_trash.tmp-* on a
 // volume learns where it came from, so it is logged before it is discarded.
 //
 // Assign it once, before anything can call Ensure: Ensure runs on request
@@ -311,8 +311,8 @@ func Ensure(plat *platform.Platform, osPath string) (trashDir string, created bo
 
 // publish creates the trash directory and moves it into place (B3).
 //
-// The old shape was mkdirat(".@qfm_trash") immediately followed by
-// openat(".@qfm_trash"): two lookups of one name, inside a directory whose
+// The old shape was mkdirat(".@taproot_trash") immediately followed by
+// openat(".@taproot_trash"): two lookups of one name, inside a directory whose
 // children an ordinary user of a share can very often rename. Between the two,
 // the directory just created could be moved aside and another REAL directory
 // slid into the name — concretely QNAP's own root-owned @Recycle, which the
@@ -322,7 +322,7 @@ func Ensure(plat *platform.Platform, osPath string) (trashDir string, created bo
 //
 // So the directory is published rather than named into existence:
 //
-//	(a) mkdirat a RANDOM name, ".@qfm_trash.tmp-<16 hex>", mode 0700, relative
+//	(a) mkdirat a RANDOM name, ".@taproot_trash.tmp-<16 hex>", mode 0700, relative
 //	    to the held mount-root descriptor — nobody can be waiting at a name
 //	    nobody can predict, and nobody but us may write in a 0700 one;
 //	(b) openat that name O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC;
@@ -335,7 +335,7 @@ func Ensure(plat *platform.Platform, osPath string) (trashDir string, created bo
 //	    other is ErrUnsafeTrash and final;
 //	(d) fchmod THROUGH that descriptor to 1777, then fstat it again, because
 //	    what the kernel actually did is the only thing that counts (INV-2);
-//	(e) renameat2 the temporary name onto ".@qfm_trash" with RENAME_NOREPLACE,
+//	(e) renameat2 the temporary name onto ".@taproot_trash" with RENAME_NOREPLACE,
 //	    so the kernel decides the race: either the name was free and we own it,
 //	    or it was taken and errPublishedFirst sends the caller back to validate
 //	    what is there;
@@ -401,7 +401,7 @@ func publish(rootFD *os.File, root, dir string) (retErr error) {
 		// Nothing was removed, because nothing at that name could be proved to be
 		// the directory this process made. The caller logs this error verbatim
 		// server-side (ensureTrashRoots → logRaw), which is where an operator
-		// finding an abandoned .@qfm_trash.tmp-* on a volume learns why.
+		// finding an abandoned .@taproot_trash.tmp-* on a volume learns why.
 		retErr = fmt.Errorf("%w (the temporary directory %s could not be proved to be ours and was left in place; "+
 			"a rename at the mount root may have replaced it)", retErr, tmp)
 	}()

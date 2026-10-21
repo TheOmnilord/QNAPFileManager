@@ -16,9 +16,9 @@ import (
 	"context"
 	"testing"
 
-	"qnapfilemanager/internal/backend"
-	"qnapfilemanager/internal/perm"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/backend"
+	"taproot/internal/perm"
+	"taproot/internal/wproto"
 )
 
 // observedExpectation is the route's rule (internal/web/routes_perm.go,

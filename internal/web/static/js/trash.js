@@ -7,7 +7,7 @@ import {trackJob,formatBytes} from './jobs.js';
 import {emptyState,volumeOf} from './empty.js';
 
 // The trash panel (ui-ux §4.4). It lists only the caller's own items — the
-// kernel's sticky bit on .@qfm_trash is what makes that true, not this code —
+// kernel's sticky bit on .@taproot_trash is what makes that true, not this code —
 // and it discloses where the trash actually lives, because the daemon created
 // those directories on the user's volumes (PLAN.md decision 10).
 
@@ -48,11 +48,11 @@ export async function loadTrash() {
   // sentence about a place, and naming it is what stops it reading as "your
   // Trash is empty everywhere" (§8.1). The detail line then says the panel
   // covers every volume, so naming one cannot mislead.
-  const nothing = emptyState('trash',{items:items.length,dirName:data.dirName || '.@qfm_trash',volume:volumeOf(state.path)});
+  const nothing = emptyState('trash',{items:items.length,dirName:data.dirName || '.@taproot_trash',volume:volumeOf(state.path)});
   $('#trashEmpty').hidden = !nothing;
   if (nothing) $('#trashEmpty').textContent = [nothing.sentence,nothing.detail].filter(Boolean).join(' ');
   $('#trashStatus').textContent = `${items.length.toLocaleString()} item(s) in Trash.`;
-  $('#trashWhere').textContent = `Trash lives in ${data.dirName || '.@qfm_trash'} on each volume.`;
+  $('#trashWhere').textContent = `Trash lives in ${data.dirName || '.@taproot_trash'} on each volume.`;
   paintTrashActions();
  } catch(err) { if (valid()) { $('#trashStatus').textContent = err.message; error(err); } }
 }

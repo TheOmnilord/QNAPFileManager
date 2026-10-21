@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/fsx"
+	"taproot/internal/wproto"
 )
 
 // socketPair is the transport production actually uses: an anonymous Unix

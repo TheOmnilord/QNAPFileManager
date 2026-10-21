@@ -11,10 +11,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"qnapfilemanager/internal/audit"
-	"qnapfilemanager/internal/backend"
-	"qnapfilemanager/internal/idmap"
-	"qnapfilemanager/internal/qtsauth"
+	"taproot/internal/audit"
+	"taproot/internal/backend"
+	"taproot/internal/idmap"
+	"taproot/internal/qtsauth"
 )
 
 const (
@@ -60,7 +60,7 @@ type session struct {
 
 func (s *Server) cookie(w http.ResponseWriter, r *http.Request, value string, age int) {
 	p := s.cfg.Web.ProxyPrefix + "/"
-	http.SetCookie(w, &http.Cookie{Name: "qfm_sid", Value: value, Path: p, MaxAge: age, HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https"})
+	http.SetCookie(w, &http.Cookie{Name: "taproot_sid", Value: value, Path: p, MaxAge: age, HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https"})
 }
 
 func (s *Server) destroy(id string) {
@@ -169,7 +169,7 @@ func (s *Server) reclaimExpiredLocked(old *session, now time.Time) bool {
 func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (*session, error) {
 	cred, hasCred := qtsauth.FromRequest(r)
 	id, binding := "", ""
-	if c, err := r.Cookie("qfm_sid"); err == nil {
+	if c, err := r.Cookie("taproot_sid"); err == nil {
 		id = c.Value
 	}
 	if hasCred && s.pinned == nil {

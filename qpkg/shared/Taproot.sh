@@ -1,6 +1,6 @@
 #!/bin/sh
-# QTS App Center service script for QNAPFileManager.
-QPKG_NAME="QNAPFileManager"
+# QTS App Center service script for Taproot.
+QPKG_NAME="Taproot"
 CONF="/etc/config/qpkg.conf"
 QPKG_ROOT=$(/sbin/getcfg "$QPKG_NAME" Install_Path -f "$CONF")
 # An empty Install_Path (corrupt qpkg.conf, App Center race) would otherwise
@@ -10,8 +10,8 @@ if [ -z "$QPKG_ROOT" ]; then
     echo "$QPKG_NAME: Install_Path missing from $CONF — cannot start." >&2
     exit 1
 fi
-PIDFILE="$QPKG_ROOT/qnapfilemanager.pid"
-LOGFILE="$QPKG_ROOT/logs/qfm.log"
+PIDFILE="$QPKG_ROOT/taproot.pid"
+LOGFILE="$QPKG_ROOT/logs/taproot.log"
 CONFIG="$QPKG_ROOT/config/config.json"
 
 export PATH="$QPKG_ROOT/bin:$PATH"
@@ -28,7 +28,7 @@ is_running() {
     esac
     kill -0 "$pid" 2>/dev/null || return 1
     if [ -r "/proc/$pid/cmdline" ]; then
-        tr '\0' ' ' < "/proc/$pid/cmdline" | grep -q "qnapfilemanager" || return 1
+        tr '\0' ' ' < "/proc/$pid/cmdline" | grep -q "taproot" || return 1
     fi
     return 0
 }
@@ -54,13 +54,13 @@ start)
     # traversal (o+x, not read) on the tree and read+exec on the binary; the
     # config dir stays 0700 so nothing under it is exposed.
     chmod a+x "$QPKG_ROOT" "$QPKG_ROOT/bin" "$QPKG_ROOT/libexec" 2>/dev/null
-    chmod a+rx "$QPKG_ROOT/bin/qnapfilemanager" 2>/dev/null
+    chmod a+rx "$QPKG_ROOT/bin/taproot" 2>/dev/null
     chmod 700 "$QPKG_ROOT/config" 2>/dev/null
     # App Center may invoke this script from a directory that no longer
     # exists; give the daemon a valid cwd.
     cd "$QPKG_ROOT" || exit 1
-    if [ ! -x "$QPKG_ROOT/bin/qnapfilemanager" ]; then
-        echo "$QPKG_NAME: $QPKG_ROOT/bin/qnapfilemanager is missing or not executable — the package did not install correctly" >&2
+    if [ ! -x "$QPKG_ROOT/bin/taproot" ]; then
+        echo "$QPKG_NAME: $QPKG_ROOT/bin/taproot is missing or not executable — the package did not install correctly" >&2
         exit 1
     fi
     # QTS's Apache reverse-proxies QPKG_PROXY_PATH to our loopback port. Read
@@ -84,7 +84,7 @@ start)
     # truncated at every start, which is where a crash before the logger exists
     # (a bad flag, a missing library, a wrong-arch binary) shows up.
     # shellcheck disable=SC2086
-    "$QPKG_ROOT/bin/qnapfilemanager" serve -config "$CONFIG" -log "$LOGFILE" $PROXY_ARGS \
+    "$QPKG_ROOT/bin/taproot" serve -config "$CONFIG" -log "$LOGFILE" $PROXY_ARGS \
         > "$QPKG_ROOT/logs/startup.log" 2>&1 &
     echo $! > "$PIDFILE"
     # Exiting 0 here regardless is how App Center comes to show an app as

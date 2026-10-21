@@ -37,9 +37,9 @@ import (
 	"io/fs"
 	"os"
 
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/platform"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/fsx"
+	"taproot/internal/platform"
+	"taproot/internal/wproto"
 )
 
 // maxWalkDepth bounds the recursion. Every level holds one open directory

@@ -4,20 +4,23 @@ Everything an operator needs: install, first run, the emergency door, upgrade, r
 when it does not work. For *why* any of it behaves as it does, see [docs/identity.md](identity.md).
 
 Verified on hardware: QuTS hero h5.2.9 (ZFS, x86_64) and QTS 5.2.x (ext4; that unit's CPU architecture is still to be
-recorded). The package carries `x86_64` and `arm_64` (aarch64) trees; `arm_64` is built and smoke-run under emulation
-only, because it has not run on a physical unit. 32-bit ARM models are not targeted, and firmware 6 is untested. The
-package declares 5.2.0 as its minimum firmware, the lowest line verified on hardware. The README's
+recorded). There is one package for `x86_64` and one for `arm_64` (aarch64); `arm_64` is built and smoke-run under
+emulation only, because it has not run on a physical unit. 32-bit ARM models are not targeted, and firmware 6 is
+untested. Each package declares 5.2.0 as its minimum firmware, the lowest line verified on hardware. The README's
 [compatibility matrix](../README.md#compatibility) is the reference.
 
 ## 1. Install from App Center
 
-The release artifact is a single `QNAPFileManager_<version>.qpkg` containing both architecture trees.
+A release carries one package per CPU architecture — `Taproot_<version>_x86_64.qpkg` and
+`Taproot_<version>_arm_64.qpkg` — and a `SHA256SUMS` file with the checksums of both. Take the one for your NAS's CPU:
+`uname -m` over SSH prints `x86_64` for the first and `aarch64` for the second. On a unit that ran a pre-1.0 build named
+QNAPFileManager, remove that package first, as [§5](#units-that-ran-a-pre-10-build-named-qnapfilemanager) describes.
 
 1. Sign in to the NAS web interface as an administrator.
-2. **App Center → the gear icon → Install Manually**, choose the `.qpkg`, and confirm.
+2. **App Center → the gear icon → Install Manually**, choose the `.qpkg` for your CPU, and confirm.
 3. App Center runs the package's service script as root and the app starts by itself.
-4. Open it from the **main menu** or from the App Center tile. It opens as a window on the QTS desktop, like File Station —
-   not a new browser tab.
+4. Open **Taproot** from the **main menu** or from its App Center tile. It opens as a window on the QTS desktop, like
+   File Station — not a new browser tab.
 
 The package is **unsigned**. App Center will warn about that, and on newer firmware you must first turn on
 **App Center → gear → Install Manually / General Settings → "Allow installation of applications without a valid digital
@@ -28,10 +31,10 @@ than `CACHEDEV1_DATA`) and that each shared folder is its own dataset, which aff
 
 ## 2. The proxy path, and the ports
 
-The app appears under **`/qnapfilemanager/`** on the NAS's own web address — `https://<nas>/qnapfilemanager/` — not on a
-port of its own. That is deliberate: App Center's reverse proxy (`QPKG_USE_PROXY=1`, `QPKG_PROXY_PATH=/qnapfilemanager`)
-serves the app from the QTS origin, so the QTS session cookies arrive first-party, there is no mixed content, and a unit
-with "Force HTTPS" on works with no certificate of ours involved.
+The app appears under **`/taproot/`** on the NAS's own web address — `https://<nas>/taproot/` — not on a port of its
+own. That is deliberate: App Center's reverse proxy (`QPKG_USE_PROXY=1`, `QPKG_PROXY_PATH=/taproot`) serves the app
+from the QTS origin, so the QTS session cookies arrive first-party, there is no mixed content, and a unit with "Force
+HTTPS" on works with no certificate of ours involved.
 
 | Port | What | Reachable from |
 |---|---|---|
@@ -77,17 +80,17 @@ Over SSH to the NAS, **as root**:
 
 ```sh
 # 1. Find the install path.
-QFM=$(/sbin/getcfg QNAPFileManager Install_Path -f /etc/config/qpkg.conf)
-echo "$QFM"        # e.g. /share/CACHEDEV1_DATA/.qpkg/QNAPFileManager
-                   #  or  /share/ZFS530_DATA/.qpkg/QNAPFileManager on hero
+TAPROOT=$(/sbin/getcfg Taproot Install_Path -f /etc/config/qpkg.conf)
+echo "$TAPROOT"    # e.g. /share/CACHEDEV1_DATA/.qpkg/Taproot
+                   #  or  /share/ZFS530_DATA/.qpkg/Taproot on hero
 
 # 2. Set the password (typed twice, not echoed). 12 to 72 bytes.
 #    This also generates the certificate if there is not one yet.
-"$QFM/bin/qnapfilemanager" break-glass set-password -config "$QFM/config/config.json"
+"$TAPROOT/bin/taproot" break-glass set-password -config "$TAPROOT/config/config.json"
 
 # 3. Read back the state, and note the SHA-256 certificate fingerprint it prints.
 #    You will compare this against what the browser shows.
-"$QFM/bin/qnapfilemanager" break-glass status -config "$QFM/config/config.json"
+"$TAPROOT/bin/taproot" break-glass status -config "$TAPROOT/config/config.json"
 ```
 
 The subcommand refuses to run unless it is uid 0 and the config file is owned by root and not group- or world-readable —
@@ -115,10 +118,10 @@ is simply to run it again once the settings change has landed.
 The other subcommands:
 
 ```sh
-qnapfilemanager break-glass disable            # clear the hash and evict live sessions; see the note below
-qnapfilemanager break-glass status             # enabled, address, whether a hash is set and when, cost, fingerprint
-qnapfilemanager break-glass cert               # print the certificate fingerprint
-qnapfilemanager break-glass cert -regenerate   # after an IP change or a suspected key compromise
+taproot break-glass disable            # clear the hash and evict live sessions; see the note below
+taproot break-glass status             # enabled, address, whether a hash is set and when, cost, fingerprint
+taproot break-glass cert               # print the certificate fingerprint
+taproot break-glass cert -regenerate   # after an IP change or a suspected key compromise
 ```
 
 Every subcommand takes `-config <path>`; `set-password` also takes `-cost <n>` (bcrypt cost, 10–15) and `-stdin` (read
@@ -207,29 +210,98 @@ logs and the audit log live under the install directory and survive.
 Stop is given up to 60 seconds so per-user workers and running jobs can drain, so an upgrade during a large copy takes a
 moment. Check the version afterwards in the app — `api/session` reports it — rather than trusting App Center's tile.
 
+### Units that ran a pre-1.0 build named QNAPFileManager
+
+Before its first release the app was called QNAPFileManager. Taproot is a different App Center package, not a newer
+version of that one, so App Center does not upgrade the one into the other and nothing carries over: Taproot starts
+from an install directory of its own, with no configuration — read-only mode on, every setting at its default, no
+break-glass password — and an empty audit log. On a unit that ran a pre-1.0 build:
+
+1. **Empty the old app's Trash while it is still installed.** Every user who deleted something has a Trash of their
+   own (administrators share root's): each restores what they want back, then uses **Empty Trash…**. Taproot does not
+   read the old Trash, and nothing restores from it once the old app is gone.
+2. **Remove QNAPFileManager in App Center before installing Taproot.** Both packages bind 8770, so Taproot cannot start
+   while the old app runs. Its install directory goes with it, logs included: copy `logs/audit.jsonl` out first if you
+   need the record.
+3. **Delete each volume's leftover `.@qfm_trash` once it is empty.** Inside it is one folder per user, named after
+   the user's uid. Emptying a Trash removes that folder, but restoring every item leaves it behind, empty, and
+   **Empty Trash…** is not offered for a Trash with nothing in it. So the loop below removes the empty per-user folders
+   first, then the `.@qfm_trash` itself. Run it as root over SSH while nobody else is writing to the shares — at a
+   quiet time, or with file sharing paused — so that nothing it looks at can change under it:
+
+   ```sh
+   # Removes each .@qfm_trash, and each per-user (uid) folder directly inside it, only if it is empty.
+   # The mount points come from the kernel's table, which writes a space as \040, a tab as \011, a
+   # newline as \012 and a backslash as \134; unescape turns them back into the real names.
+   unescape() {
+       printf '%s\n' "$1" | LC_ALL=C awk '{
+           s = $0; out = ""
+           while ((i = index(s, "\\")) > 0) {
+               o = substr(s, i + 1, 3)
+               if (o !~ /^[0-7][0-7][0-7]$/) { out = out substr(s, 1, i); s = substr(s, i + 1); continue }
+               c = substr(o, 1, 1) * 64 + substr(o, 2, 1) * 8 + substr(o, 3, 1)
+               out = out substr(s, 1, i - 1) sprintf("%c", c); s = substr(s, i + 4)
+           }
+           printf "%sx", out s
+       }'
+   }
+   remove_if_empty() {   # $1: the folder to remove; $2: its name in the report
+       if err=$(rmdir -- "$1" 2>&1); then printf 'removed %s\n' "$2"; else printf 'kept %s: %s\n' "$2" "${err##*: }"; fi
+   }
+   cut -d' ' -f5 /proc/self/mountinfo | sort -u | while IFS= read -r m; do
+       m=$(unescape "$m"); m=${m%x}
+       t=${m%/}/.@qfm_trash
+       if [ -L "$t" ]; then printf 'skipped %s: a symlink\n' "$t"; continue; fi
+       [ -d "$t" ] || continue
+       (
+           cd -P -- "$t" || exit 1
+           if [ "$(pwd -P)" != "$t" ]; then printf 'skipped %s: changed while checking\n' "$t"; exit 1; fi
+           for u in ./*; do
+               n=${u#./}
+               case $n in *[!0-9]*) continue ;; esac
+               if [ -d "./$n" ] && [ ! -L "./$n" ]; then remove_if_empty "./$n" "$t/$n"; fi
+           done
+       ) && remove_if_empty "$t" "$t"
+   done
+   ```
+
+   The loop reports every folder it removed and every one it kept, with the reason. A kept one is normally the folder
+   of a user who has not emptied their Trash; `ls -la` on it shows what is left. It is written this way because
+   another user who can write to a share root could swap `.@qfm_trash` for a symlink, or move it, while the loop runs.
+   So the per-user folders are removed by their names inside the folder the loop has stepped into and checked, and
+   `.@qfm_trash` itself by its full path: a mount point cannot be renamed and the folders above it are system folders,
+   so only that last name can change, and `rmdir` removes nothing but an empty folder of that name, never through a
+   symlink.
+4. **Install Taproot** as §1 describes. It opens at `/taproot/`.
+5. **If the break-glass door was in use, set its password again** with `taproot break-glass set-password` (§4). The
+   certificate went with the old configuration too, so the new one has a new fingerprint: compare it once,
+   deliberately, before you type the password into the page.
+
+A QuLog Center notification rule that matched the keyword `QNAPFileManager` must be changed to match `Taproot` (§8).
+
 ## 6. Removal
 
 Remove from App Center as usual. Two things are **deliberately left behind**:
 
-- **`.@qfm_trash` directories** at each volume root. They hold files somebody deleted and may still want back, and
+- **`.@taproot_trash` directories** at each volume root. They hold files somebody deleted and may still want back, and
   uninstalling a file manager is not a decision to destroy them. Remove them by hand if you mean to:
-  `rm -rf /share/<VOLUME>_DATA/.@qfm_trash`.
+  `rm -rf /share/<VOLUME>_DATA/.@taproot_trash`.
 - The install directory's `logs/` — including the audit trail — goes with the package. Copy `audit.jsonl` out first if
   you need to keep the record.
 
 ## 7. Where everything lives
 
-With `QFM=$(/sbin/getcfg QNAPFileManager Install_Path -f /etc/config/qpkg.conf)`:
+With `TAPROOT=$(/sbin/getcfg Taproot Install_Path -f /etc/config/qpkg.conf)`:
 
 | Path | What |
 |---|---|
-| `$QFM/bin/qnapfilemanager` | the single static binary — daemon, worker and CLI in one |
-| `$QFM/config/config.json` | the configuration, mode `0600` in a `0700` directory (it holds the break-glass hash) |
-| `$QFM/config/breakglass-cert.pem`, `breakglass-key.pem` | generated when the break-glass password is set, or when the listener first binds; mode `0600` |
-| `$QFM/logs/qfm.log` | the app log; rotated at 8 MiB with one previous generation kept |
-| `$QFM/logs/startup.log` | truncated at every start — where a crash *before* the logger exists shows up |
-| `$QFM/logs/audit.jsonl` | the audit log: two lines per operation, intent and result |
-| `$QFM/qnapfilemanager.pid` | the daemon's pid |
+| `$TAPROOT/bin/taproot` | the single static binary — daemon, worker and CLI in one |
+| `$TAPROOT/config/config.json` | the configuration, mode `0600` in a `0700` directory (it holds the break-glass hash) |
+| `$TAPROOT/config/breakglass-cert.pem`, `breakglass-key.pem` | generated when the break-glass password is set, or when the listener first binds; mode `0600` |
+| `$TAPROOT/logs/taproot.log` | the app log; rotated at 8 MiB with one previous generation kept |
+| `$TAPROOT/logs/startup.log` | truncated at every start — where a crash *before* the logger exists shows up |
+| `$TAPROOT/logs/audit.jsonl` | the audit log: two lines per operation, intent and result |
+| `$TAPROOT/taproot.pid` | the daemon's pid |
 | `/etc/config/qpkg.conf` | App Center's record: `Install_Path`, `WebUI`, `Proxy_Path`, `Enable` |
 
 `logs/` is mode 0700, so a non-root SSH user cannot read it; use `sudo`. The app itself refuses to browse its own
@@ -260,17 +332,18 @@ outcome.
 
 Milestones — sign-ins, the read-only toggle, every denial, every chown, large deletes, writes under `/etc/config`, and
 everything the break-glass door does — are also mirrored to **QuLog Center**, where they sit beside QTS's own events.
-Only *Alert* notification rules (severity plus keyword) can forward them onward; QNAP does not let a third-party package
-raise a notification directly.
+Only *Alert* notification rules (severity plus keyword) can forward them onward, and the keyword to match is `Taproot`:
+every line the app writes there starts with `[Taproot]`. QNAP does not let a third-party package raise a notification
+directly.
 
 ## 9. Troubleshooting
 
 **A blank window, or a window that never finishes loading.**
-Usually the shell loaded but `api/session` did not answer. Check `$QFM/logs/startup.log` first — a wrong-architecture
-binary, a bad flag or an unparsable config all leave the daemon dead with the reason only there, while App Center still
-shows the app as running. Then check `$QFM/logs/qfm.log`. If the daemon is up, confirm the proxy target:
-`/sbin/getcfg QNAPFileManager Proxy_Path -f /etc/config/qpkg.conf` must read `/qnapfilemanager` and `WebUI` must read
-`/qnapfilemanager/`, with the trailing slash. Restart the app from App Center after correcting either.
+Usually the shell loaded but `api/session` did not answer. Check `$TAPROOT/logs/startup.log` first — a
+wrong-architecture binary, a bad flag or an unparsable config all leave the daemon dead with the reason only there,
+while App Center still shows the app as running. Then check `$TAPROOT/logs/taproot.log`. If the daemon is up, confirm
+the proxy target: `/sbin/getcfg Taproot Proxy_Path -f /etc/config/qpkg.conf` must read `/taproot` and `WebUI` must read
+`/taproot/`, with the trailing slash. Restart the app from App Center after correcting either.
 
 **502 (or 503) from the NAS's own web server.**
 Apache is proxying to `127.0.0.1:8770` and nothing is listening there. The daemon is not running, or it failed to bind
@@ -311,11 +384,12 @@ overrode the mode, or a recursive job finishing "changed N of M, K owned by othe
 **A worker fails to start with "permission denied" on QTS.**
 QTS enforces access to ext4 shared-folder contents beyond the POSIX mode, so a non-root worker cannot reach the `.qpkg`
 tree at all. The app stages a root-owned copy of its binary on a safe tmpfs and execs workers from there. If this appears
-after an upgrade, check `qfm.log` for the staging path it chose and whether it fell back.
+after an upgrade, check `taproot.log` for the staging path it chose and whether it fell back.
 
-**Collecting information for a bug report.** `$QFM/logs/startup.log` and the tail of `$QFM/logs/qfm.log`, the output of
-`/sbin/getcfg QNAPFileManager Install_Path -f /etc/config/qpkg.conf` and `getcfg System Version`, whether the unit is QTS
-or QuTS hero, and the exact path and operation. Do **not** attach `config.json` — it holds the break-glass password hash.
+**Collecting information for a bug report.** `$TAPROOT/logs/startup.log` and the tail of `$TAPROOT/logs/taproot.log`,
+the output of `/sbin/getcfg Taproot Install_Path -f /etc/config/qpkg.conf` and `getcfg System Version`, whether the
+unit is QTS or QuTS hero, and the exact path and operation. Do **not** attach `config.json` — it holds the break-glass
+password hash.
 
 ## 10. Releasing
 

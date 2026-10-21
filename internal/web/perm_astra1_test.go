@@ -12,13 +12,13 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/backend"
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/guard"
-	"qnapfilemanager/internal/jobs"
-	"qnapfilemanager/internal/perm"
-	"qnapfilemanager/internal/platform"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/backend"
+	"taproot/internal/fsx"
+	"taproot/internal/guard"
+	"taproot/internal/jobs"
+	"taproot/internal/perm"
+	"taproot/internal/platform"
+	"taproot/internal/wproto"
 )
 
 // The route half of the gpt-6-astra M3 round-1 review (docs/reviews/
@@ -310,7 +310,7 @@ func TestWorkerBackendMayUpgrade(t *testing.T) {
 // upload routes already use.
 func TestRecursiveJobRefusesAnAncestorOfTheInstallation(t *testing.T) {
 	const ancestor = "/data/qpkg"
-	const install = "/data/qpkg/QNAPFileManager"
+	const install = "/data/qpkg/Taproot"
 	for _, route := range []string{"/api/jobs/chmod", "/api/jobs/chown"} {
 		t.Run(route, func(t *testing.T) {
 			s, b, fj := permFixture(t)
@@ -347,8 +347,8 @@ func TestRecursiveJobRefusesAnAncestorOfTheInstallation(t *testing.T) {
 // happens to have something protected somewhere beneath it.
 func TestNonRecursiveJobOverAnAncestorIsOrdinary(t *testing.T) {
 	s, b, _ := permFixture(t)
-	s.guard = guard.New("/data/qpkg/QNAPFileManager", false)
-	mkAPIDir(t, b, "/data/qpkg/QNAPFileManager")
+	s.guard = guard.New("/data/qpkg/Taproot", false)
+	mkAPIDir(t, b, "/data/qpkg/Taproot")
 	c, csrf := sessionCookie(t, s)
 	resp := post(s, "/api/jobs/chmod", c, csrf, `{"paths":[{"path":"/data/qpkg"}],"files":{"mask":511,"value":493}}`)
 	if resp.StatusCode != 202 {

@@ -16,16 +16,16 @@ import (
 	"sync"
 	"time"
 
-	"qnapfilemanager/internal/audit"
-	"qnapfilemanager/internal/backend"
-	"qnapfilemanager/internal/breakglass"
-	"qnapfilemanager/internal/config"
+	"taproot/internal/audit"
+	"taproot/internal/backend"
+	"taproot/internal/breakglass"
+	"taproot/internal/config"
 )
 
 // The break-glass door. One door per listener, and they never mix (M4 contract
 // §2.1): the main listener serves the QTS session door, this one serves only
-// the local bcrypt account. A qfm_sid cookie presented here is ignored; a
-// __Host-qfm_bg cookie presented on the main listener is ignored;
+// the local bcrypt account. A taproot_sid cookie presented here is ignored; a
+// __Host-taproot_bg cookie presented on the main listener is ignored;
 // qtsauth.FromRequest is never called from this path and the local hash is
 // never consulted from the other one.
 const (
@@ -33,7 +33,7 @@ const (
 	// browser refuses the cookie outright if anything ever tries to set it with
 	// a Domain or a narrower Path, which is exactly the confusion a second
 	// listener on the same host invites (contract §13.2).
-	bgCookie = "__Host-qfm_bg"
+	bgCookie = "__Host-taproot_bg"
 
 	// Caps (contract §13.6 / §14). A separate store, so these are separate
 	// numbers from the main listener's: this door is for one operator with one
@@ -502,7 +502,7 @@ func (c *localCred) load() (local config.Local, changed bool, old string, err er
 // --- the listener's own pre-dispatch ----------------------------------------
 
 // breakGlassAuth is the break-glass listener's whole authentication. It answers
-// the two door routes itself and otherwise resolves the __Host-qfm_bg cookie to
+// the two door routes itself and otherwise resolves the __Host-taproot_bg cookie to
 // a session for the shared dispatch. ok is false when it has already written
 // the response.
 func (s *Server) breakGlassAuth(w http.ResponseWriter, r *http.Request) (*session, bool) {
@@ -1386,16 +1386,16 @@ type bgLoginBodyJSON struct {
 //     password is configured. That last one is what the uniform login failure
 //     below exists for, and disclosing it here would have undone it.
 //  2. POST /api/breakglass/login {"password":"…"}. This route is exempt from
-//     the X-QFM-CSRF header — there is no session yet to bind a token to — but
+//     the X-Taproot-CSRF header — there is no session yet to bind a token to — but
 //     NOT from the other two locks: Origin/Referer must equal r.Host and a
 //     Sec-Fetch-Site of cross-site is refused outright (validOrigin, the same
 //     function every other unsafe request uses). A browser fetch from the page
 //     itself satisfies both without doing anything special.
-//  3. On success: 204 with the __Host-qfm_bg cookie. No body — the CSRF token
+//  3. On success: 204 with the __Host-taproot_bg cookie. No body — the CSRF token
 //     is NOT returned here.
 //  4. GET /api/session again. Now authenticated, and it carries "csrf", exactly
 //     as the main listener issues it. Every later mutating request sends that
-//     value in X-QFM-CSRF, the same as on the main listener.
+//     value in X-Taproot-CSRF, the same as on the main listener.
 //  5. POST /api/logout (or /api/breakglass/logout) destroys the session; both
 //     require the token, because destroying a session is a mutation.
 func (d *breakGlassDoor) login(w http.ResponseWriter, r *http.Request) {

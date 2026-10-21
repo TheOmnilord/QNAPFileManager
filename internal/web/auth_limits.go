@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"qnapfilemanager/internal/qtsauth"
+	"taproot/internal/qtsauth"
 )
 
 const (

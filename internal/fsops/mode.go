@@ -36,10 +36,10 @@ import (
 	"io/fs"
 	"os"
 
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/perm"
-	"qnapfilemanager/internal/platform"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/fsx"
+	"taproot/internal/perm"
+	"taproot/internal/platform"
+	"taproot/internal/wproto"
 )
 
 // Chmod applies a mode CHANGE to one already-canonical path and reports what

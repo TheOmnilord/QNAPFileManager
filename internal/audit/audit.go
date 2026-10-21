@@ -22,8 +22,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"qnapfilemanager/internal/logfile"
-	"qnapfilemanager/internal/qnap"
+	"taproot/internal/logfile"
+	"taproot/internal/qnap"
 )
 
 // maxBytes and generations mirror the copied logfile defaults: rotate the
@@ -254,7 +254,7 @@ func Open(path string, qulog bool) (*Logger, error) {
 		logFn: func(sev qnap.Severity, msg string) error {
 			return qnap.Log(context.Background(), sev, msg)
 		},
-		errLog:       func(msg string) { fmt.Fprintln(os.Stderr, "qfm audit: "+msg) },
+		errLog:       func(msg string) { fmt.Fprintln(os.Stderr, "taproot audit: "+msg) },
 		closeTimeout: closeDrainTimeout,
 	}
 	go l.drain()

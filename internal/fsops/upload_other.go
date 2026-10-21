@@ -5,7 +5,7 @@ package fsops
 // The upload's platform half off Linux: the dev loop's.
 //
 // There is no O_TMPFILE here (unnamed_other.go), so every upload takes the
-// named `.qfm-upload-<hex>.part` fallback, and there is no portable dup(2) for
+// named `.taproot-upload-<hex>.part` fallback, and there is no portable dup(2) for
 // an *os.File either. The second descriptor is therefore obtained by opening
 // the `.part` again through the held directory — one extra lookup of a hidden,
 // unguessable name, immediately after this process created it with O_EXCL.
@@ -21,7 +21,7 @@ import (
 	"fmt"
 	"os"
 
-	"qnapfilemanager/internal/fsx"
+	"taproot/internal/fsx"
 )
 
 func dupForWire(h *UploadHandle) (*os.File, error) {

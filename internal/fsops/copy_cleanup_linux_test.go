@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/wproto"
 )
 
 // TestFailedCopyNeverUnlinksSomebodyElsesFile is the round-4 finding 2, which

@@ -25,7 +25,7 @@ import (
 	"os"
 	"syscall"
 
-	"qnapfilemanager/internal/fsx"
+	"taproot/internal/fsx"
 )
 
 // ResolvePath resolves an API path to its canonical spelling as the caller, and

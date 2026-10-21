@@ -298,7 +298,7 @@ function send(file,dir,policy,token,job) {
   xhr.open('POST',uploadURL(dir,file,policy,token),true);
   // The same three-lock CSRF scheme every mutation uses; it does not depend on
   // the content type (contract §1.1).
-  if (state.session?.csrf) xhr.setRequestHeader('X-QFM-CSRF',state.session.csrf);
+  if (state.session?.csrf) xhr.setRequestHeader('X-Taproot-CSRF',state.session.csrf);
   xhr.setRequestHeader('Content-Type','application/octet-stream');
   const started=Date.now();
   xhr.upload.addEventListener('progress',ev => {
@@ -322,7 +322,7 @@ function send(file,dir,policy,token,job) {
    if (xhr.status===401) signInNotice();
    if (err) reject(err); else resolve(data);
   }));
-  xhr.addEventListener('error',settle(() => reject(Object.assign(new Error('Cannot reach the QNAPFileManager service — is it still running?'),{network:true}))));
+  xhr.addEventListener('error',settle(() => reject(Object.assign(new Error('Cannot reach the Taproot service — is it still running?'),{network:true}))));
   xhr.addEventListener('timeout',settle(() => reject(new Error('The upload timed out.'))));
   xhr.addEventListener('abort',settle(() => reject(Object.assign(new Error('Upload cancelled.'),{aborted:true}))));
   xhr.send(file);

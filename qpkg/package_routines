@@ -1,4 +1,4 @@
-# QDK package routines for QNAPFileManager.
+# QDK package routines for Taproot.
 # Variables such as SYS_QPKG_DIR are provided by the QDK install framework.
 
 pkg_post_install(){
@@ -7,7 +7,7 @@ pkg_post_install(){
     # read-only, loopback only — and the break-glass listener binds NOTHING
     # until an operator runs, as root on the NAS shell:
     #
-    #   qnapfilemanager break-glass set-password
+    #   taproot break-glass set-password
     #
     # There is no HTTP route that sets the password and no unauthenticated
     # bootstrap window of any kind (M4 contract §2.5, §4.1). Seeding a config
@@ -24,7 +24,7 @@ pkg_post_install(){
 }
 
 pkg_post_remove(){
-    # The per-volume .@qfm_trash directories are deliberately left in place:
+    # The per-volume .@taproot_trash directories are deliberately left in place:
     # they hold files a user deleted and may still want back, and removing an
     # app is not a decision to destroy them.
     :

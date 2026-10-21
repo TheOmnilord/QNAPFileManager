@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/audit"
-	"qnapfilemanager/internal/breakglass"
+	"taproot/internal/audit"
+	"taproot/internal/breakglass"
 )
 
 // --- Astra r2 #6: every refusal summary is written in the shape it counts ----
@@ -389,7 +389,7 @@ func bgRawMkdir(t *testing.T, conn net.Conn, srv *httptest.Server, cookie *http.
 		"Host: " + strings.TrimPrefix(srv.URL, "https://") + "\r\n" +
 		"Origin: " + srv.URL + "\r\n" +
 		"Content-Type: application/json\r\n" +
-		"X-QFM-CSRF: " + csrf + "\r\n" +
+		"X-Taproot-CSRF: " + csrf + "\r\n" +
 		"Cookie: " + cookie.Name + "=" + cookie.Value + "\r\n" +
 		fmt.Sprintf("Content-Length: %d\r\n\r\n", declared) +
 		body

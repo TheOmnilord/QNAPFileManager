@@ -17,7 +17,7 @@ func anonymous(r *http.Request) bool {
 		for part := range strings.SplitSeq(line, ";") {
 			name, _, _ := strings.Cut(strings.TrimSpace(part), "=")
 			switch strings.TrimSpace(name) {
-			case "qfm_sid", "NAS_USER", "qtoken", "NAS_SID":
+			case "taproot_sid", "NAS_USER", "qtoken", "NAS_SID":
 				return false
 			}
 		}

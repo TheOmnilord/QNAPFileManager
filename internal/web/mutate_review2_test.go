@@ -13,9 +13,9 @@ import (
 	"syscall"
 	"testing"
 
-	"qnapfilemanager/internal/audit"
-	"qnapfilemanager/internal/backend"
-	"qnapfilemanager/internal/fsx"
+	"taproot/internal/audit"
+	"taproot/internal/backend"
+	"taproot/internal/fsx"
 )
 
 // TestMkdirIntoSymlinkedProtectedRootGuarded proves adv 1a at the route level:

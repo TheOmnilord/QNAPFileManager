@@ -13,9 +13,9 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/breakglass"
-	"qnapfilemanager/internal/config"
-	"qnapfilemanager/internal/web"
+	"taproot/internal/breakglass"
+	"taproot/internal/config"
+	"taproot/internal/web"
 )
 
 // run drives the subcommand the way main does, with -stdin: that is the
@@ -574,9 +574,9 @@ func TestSetPasswordSaysAReplacedCertificateNeedsARestart(t *testing.T) {
 func TestDefaultConfigPathComesFromQpkgConf(t *testing.T) {
 	dir := t.TempDir()
 	conf := filepath.Join(dir, "qpkg.conf")
-	install := filepath.Join(dir, "Volume2", ".qpkg", "QNAPFileManager")
+	install := filepath.Join(dir, "Volume2", ".qpkg", "Taproot")
 	body := "[global]\nEnable = TRUE\n\n[GitBackup]\nInstall_Path = /share/CACHEDEV1_DATA/.qpkg/GitBackup\n\n" +
-		"[QNAPFileManager]\n# a comment\nEnable = TRUE\nInstall_Path = \"" + filepath.ToSlash(install) + "\"\n"
+		"[Taproot]\n# a comment\nEnable = TRUE\nInstall_Path = \"" + filepath.ToSlash(install) + "\"\n"
 	if err := os.WriteFile(conf, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}

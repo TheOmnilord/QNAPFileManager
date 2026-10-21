@@ -8,8 +8,8 @@ import (
 	"os"
 	"strconv"
 
-	"qnapfilemanager/internal/audit"
-	"qnapfilemanager/internal/config"
+	"taproot/internal/audit"
+	"taproot/internal/config"
 )
 
 // requireAdmin gates the settings and audit routes. A non-admin session gets
@@ -155,7 +155,7 @@ func (s *Server) postSettings(w http.ResponseWriter, r *http.Request, sess *sess
 	//
 	//    The value written is a READ-MODIFY-WRITE of the file, never s.cfg
 	//    (round-1 P1-3). s.cfg is the snapshot this process started with, and
-	//    `qnapfilemanager break-glass set-password` writes auth.local into the
+	//    `taproot break-glass set-password` writes auth.local into the
 	//    same file from a different process: persisting the snapshot whole would
 	//    silently revert a password the operator had just set — or, worse,
 	//    restore one they had just disabled — as a side effect of flipping a
@@ -163,7 +163,7 @@ func (s *Server) postSettings(w http.ResponseWriter, r *http.Request, sess *sess
 	//    here; the daemon never writes auth.local at all.
 	//
 	//    The whole read-modify-write runs under config.Update's CROSS-PROCESS
-	//    lock, because `qnapfilemanager break-glass` writes the same file from
+	//    lock, because `taproot break-glass` writes the same file from
 	//    another process and nothing else makes the pair atomic (round-2 P3-5).
 	//    LoadDev's relaxations travel with it: a daemon started with -dev on an
 	//    auth.mode "local" configuration must still be able to save it

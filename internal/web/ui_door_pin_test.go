@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"qnapfilemanager/internal/audit"
+	"taproot/internal/audit"
 )
 
 // breakGlassBannerText is the sentence the UI shows for the whole life of a

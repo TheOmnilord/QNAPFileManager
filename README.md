@@ -1,4 +1,4 @@
-# QNAPFileManager
+# Taproot
 
 A file manager for the QNAP QTS / QuTS hero desktop, installed from App Center as a QPKG and opened as a window in the
 QTS desktop with your QTS login, exactly like File Station. Unlike File Station it can browse and manage the **whole**
@@ -9,6 +9,8 @@ shell as root ([The two doors](#the-two-doors)).
 Every operation runs with the signed-in user's own Linux identity, in a separate process that has already dropped to that
 user's uid and groups, so the **kernel** decides what is allowed. Administrators operate as root, the way File Station
 does, with a guard and a confirmation ladder standing between a mis-click and an irreversible change.
+
+Taproot was called QNAPFileManager before its first release.
 
 **Status:** M0–M4 are implemented and reviewed on `main`. Development builds have run on a QuTS hero unit and a QTS
 unit, where M0, M1 and M2-A were verified ([Compatibility](#compatibility)). A stabilization patch is in progress —
@@ -42,8 +44,8 @@ level-2 confirmation.*
   missing. Each page of a long listing re-reads the folder; listing generations, planned for 1.1, are the fix.
 - **Copy, move, rename, delete** as cancellable jobs with progress and per-item warnings, including a pre-flight that
   predicts a cross-filesystem move before it starts (on QuTS hero every share is its own dataset).
-- **Trash** on the same volume, so deleting is instant and restorable, with permanent delete one rung further up the
-  confirmation ladder. QNAP's own `@Recycle` is never touched.
+- **Trash** on the same volume, in a `.@taproot_trash` directory at the volume root, so deleting is instant and
+  restorable, with permanent delete one rung further up the confirmation ladder. QNAP's own `@Recycle` is never touched.
 - **Upload and download** — drag files from your desktop onto the list, or download any selection as a zip or tar.gz,
   streamed as it is walked.
 - **Search** a whole subtree, bounded, with its own results view.
@@ -58,12 +60,13 @@ copy them, and an automatic trash sweeper. See [CHANGELOG.md](CHANGELOG.md).
 
 ## The two doors
 
-On the normal path there is **no login of our own**: the app is served from the QTS origin through App Center's reverse
-proxy, so the QTS desktop's cookies arrive first-party and are validated against QTS itself on loopback. There is a
-**second door** — a local password on its own TLS port, 8771 — for the case where App Center or QTS's Apache is broken and
-the normal path therefore does not exist; it does not bind until a password is set from the NAS shell, and everything
-created through it is owned by `root:root`. The two doors never mix: neither listener will look at the other's cookie, and
-the break-glass listener never calls the QTS validation path at all.
+On the normal path there is **no login of our own**: the app is served from the QTS origin at `/taproot/` through App
+Center's reverse proxy, so the QTS desktop's cookies arrive first-party and are validated against QTS itself on
+loopback. There is a **second door** — a local password on its own TLS port, 8771 — for the case where App Center or
+QTS's Apache is broken and the normal path therefore does not exist; it does not bind until a password is set from the
+NAS shell with `taproot break-glass set-password`, and everything created through it is owned by `root:root`. The two
+doors never mix: neither listener will look at the other's cookie, and the break-glass listener never calls the QTS
+validation path at all.
 
 Read [docs/identity.md](docs/identity.md) before relying on any of that.
 
@@ -84,9 +87,10 @@ ARM models are not targeted.
 
 ## Install
 
-[docs/qnap-install.md](docs/qnap-install.md) — App Center install on QTS and QuTS hero, the proxy path and the ports,
-first run, setting up the break-glass door, upgrade and removal, where the logs and configuration live, and
-troubleshooting.
+[docs/qnap-install.md](docs/qnap-install.md) — choosing the package for your CPU (`Taproot_<version>_x86_64.qpkg` or
+`Taproot_<version>_arm_64.qpkg`) and installing it from App Center on QTS and QuTS hero, the proxy path `/taproot/` and
+the ports, first run, setting up the break-glass door, upgrade (including from a pre-1.0 build under the old name) and
+removal, where the logs and configuration live, and troubleshooting.
 
 ## Keyboard
 
@@ -119,7 +123,7 @@ No npm, no framework — the UI is `go:embed`ed HTML, CSS and ES modules.
 
 ```bash
 go test ./...
-go run ./cmd/qnapfilemanager serve -config dev-config.json -jail testdata/fakeroot -addr 127.0.0.1:8899
+go run ./cmd/taproot serve -config dev-config.json -jail testdata/fakeroot -addr 127.0.0.1:8899
 ```
 
 `-jail` reroots every syscall inside the worker, so the dev loop never touches the real filesystem; `-impersonate <user>`
@@ -136,8 +140,9 @@ GOOS=linux go vet ./... && GOOS=windows go vet ./... && GOOS=linux GOARCH=arm64 
 Permission-semantics tests skip on Windows and when not running as root, deliberately: the kernel decides permissions and
 a test that simulates it would be testing the simulation. Root and ZFS behaviour is covered by the CI jobs.
 
-The full QPKG — both architecture trees in one package — is built by GitHub Actions with QDK pinned by commit; there is no
-Docker or QDK on the development box. `powershell -File scripts/build-local.ps1` builds locally for a quick check.
+The QPKGs — one package per architecture, `x86_64` and `arm_64`, with one `SHA256SUMS` covering both — are built by
+GitHub Actions with QDK pinned by commit; there is no Docker or QDK on the development box.
+`powershell -File scripts/build-local.ps1` builds locally for a quick check.
 
 ## Documents
 
@@ -163,6 +168,7 @@ Docker or QDK on the development box. `powershell -File scripts/build-local.ps1`
 - [docs/design/roadmap-deliberation.md](docs/design/roadmap-deliberation.md) and
   [docs/design/stabilization-contract.md](docs/design/stabilization-contract.md): recommendations to the owner for
   1.0.0 and after, and the patch before 1.0.0 taken from them.
+- [docs/design/rename-contract.md](docs/design/rename-contract.md): the rename to Taproot, with every old and new name.
 - [docs/design/astra-per-user-review.md](docs/design/astra-per-user-review.md) and
   [docs/design/codex-independent-review.md](docs/design/codex-independent-review.md): independent critiques.
 - [docs/design/gitbackup-exploration.md](docs/design/gitbackup-exploration.md): what to lift from GitBackup.

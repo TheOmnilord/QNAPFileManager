@@ -20,10 +20,10 @@ import (
 	"io/fs"
 	"strings"
 
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/idmap"
-	"qnapfilemanager/internal/platform"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/fsx"
+	"taproot/internal/idmap"
+	"taproot/internal/platform"
+	"taproot/internal/wproto"
 )
 
 // Props describes one already-canonical path, and — when the caller supplies

@@ -39,9 +39,9 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/platform"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/fsx"
+	"taproot/internal/platform"
+	"taproot/internal/wproto"
 )
 
 // The maxima of contract §3.2. The route sends these; the worker clamps to

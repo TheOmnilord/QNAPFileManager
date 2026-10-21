@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"os"
 
-	"qnapfilemanager/internal/fsx"
+	"taproot/internal/fsx"
 )
 
 // dupForWire duplicates the handle's descriptor so the front-end can be given

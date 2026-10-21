@@ -14,13 +14,13 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"qnapfilemanager/internal/audit"
-	"qnapfilemanager/internal/backend"
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/guard"
-	"qnapfilemanager/internal/jobs"
-	"qnapfilemanager/internal/trashroot"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/audit"
+	"taproot/internal/backend"
+	"taproot/internal/fsx"
+	"taproot/internal/guard"
+	"taproot/internal/jobs"
+	"taproot/internal/trashroot"
+	"taproot/internal/wproto"
 )
 
 // This file wires the M2-A job spine into the web layer: recursive delete (to
@@ -838,7 +838,7 @@ func jobIntentDetail(id, what string, paths []string) string {
 	return fmt.Sprintf("job %s: %s, %d root(s): %s", id, what, len(paths), list)
 }
 
-// ensureTrashRoots prepares <mount>/.@qfm_trash for every distinct trash root
+// ensureTrashRoots prepares <mount>/.@taproot_trash for every distinct trash root
 // the selection touches. Creating a world-writable sticky directory inside
 // somebody's share is a security-relevant act, so it is audited as a durable
 // milestone naming the directory — disclosed, never hidden (decision 10).

@@ -9,8 +9,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"qnapfilemanager/internal/perm"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/perm"
+	"taproot/internal/wproto"
 )
 
 // TestChmodTreeNeverTakesTheReadRule: the mode job passes Mutating:false to the

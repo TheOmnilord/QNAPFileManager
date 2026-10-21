@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"io"
 
-	"qnapfilemanager/internal/fsx"
+	"taproot/internal/fsx"
 )
 
 // MaxFrame caps a single frame's payload. A 5 000-entry listing is roughly

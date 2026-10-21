@@ -3,7 +3,7 @@ package web
 import (
 	"encoding/json"
 	"net/http"
-	"qnapfilemanager/internal/fsx"
+	"taproot/internal/fsx"
 )
 
 func writeJSON(w http.ResponseWriter, v any) {

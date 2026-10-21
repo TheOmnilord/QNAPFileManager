@@ -9,10 +9,10 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/backend"
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/jobs"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/backend"
+	"taproot/internal/fsx"
+	"taproot/internal/jobs"
+	"taproot/internal/wproto"
 )
 
 // Stabilization contract §2.1–§2.3 at the size route: a measurement carries its

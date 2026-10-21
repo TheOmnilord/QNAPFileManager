@@ -16,7 +16,7 @@ import (
 	"strings"
 	"time"
 
-	"qnapfilemanager/internal/jsonfile"
+	"taproot/internal/jsonfile"
 )
 
 // Config is the whole file. Every field has a working default, so an absent
@@ -59,7 +59,7 @@ type Web struct {
 	// Listen is loopback by default: the app is reached through the QTS
 	// Apache proxy, which is the smallest attack surface for a root daemon.
 	Listen string `json:"listen"`
-	// ProxyPrefix is QPKG_PROXY_PATH, e.g. "/qnapfilemanager". The mux is
+	// ProxyPrefix is QPKG_PROXY_PATH, e.g. "/taproot". The mux is
 	// served at both "/" and the prefix, so it works whether or not QTS's
 	// generated rule strips it. No trailing slash.
 	ProxyPrefix    string     `json:"proxyPrefix"`
@@ -97,7 +97,7 @@ type Auth struct {
 	// /etc/config/uLinux.conf, falling back to 8080.
 	QTSPort int `json:"qtsPort"`
 	// Local is the break-glass administrator account. It is written only by
-	// `qnapfilemanager break-glass` on the NAS shell; there is no HTTP route
+	// `taproot break-glass` on the NAS shell; there is no HTTP route
 	// that sets, changes, resets or reveals it (M4 contract §4.1).
 	Local Local `json:"local"`
 }

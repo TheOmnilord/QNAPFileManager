@@ -8,7 +8,7 @@ import (
 	"runtime"
 	"time"
 
-	"qnapfilemanager/internal/fsx"
+	"taproot/internal/fsx"
 )
 
 // Transport is one framed connection between the front-end and a worker. Two

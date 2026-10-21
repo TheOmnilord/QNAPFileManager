@@ -13,9 +13,9 @@ import (
 	"strings"
 	"testing"
 
-	"qnapfilemanager/internal/config"
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/idmap"
+	"taproot/internal/config"
+	"taproot/internal/fsx"
+	"taproot/internal/idmap"
 )
 
 // The -worker switch has to be recognised before anything else runs: a worker
@@ -140,9 +140,9 @@ func TestSessionRejectsWrongMethod(t *testing.T) {
 // (identity plan §5.2), so both shapes have to reach the same handler.
 func TestProxyPrefixServedBothWays(t *testing.T) {
 	cfg := config.Default()
-	cfg.Web.ProxyPrefix = "/qnapfilemanager"
+	cfg.Web.ProxyPrefix = "/taproot"
 	s := newServer(cfg, fsx.Root{}, log.New(io.Discard, "", 0))
-	for _, p := range []string{"/api/session", "/qnapfilemanager/api/session"} {
+	for _, p := range []string{"/api/session", "/taproot/api/session"} {
 		rec := httptest.NewRecorder()
 		s.handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, p, nil))
 		if rec.Code != http.StatusOK {
@@ -154,22 +154,22 @@ func TestProxyPrefixServedBothWays(t *testing.T) {
 func TestParseServeFlags(t *testing.T) {
 	o, err := parseServeFlags([]string{
 		"-config", "dev-config.json", "-jail", "testdata/fakeroot",
-		"-addr", "127.0.0.1:8899", "-proxy-prefix", "/qnapfilemanager",
-		"-readonly=false", "-impersonate", "sveinung", "-log", "qfm.log",
+		"-addr", "127.0.0.1:8899", "-proxy-prefix", "/taproot",
+		"-readonly=false", "-impersonate", "sveinung", "-log", "taproot.log",
 	}, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if o.configPath != "dev-config.json" || o.jail != "testdata/fakeroot" ||
-		o.addr != "127.0.0.1:8899" || o.proxyPrefix != "/qnapfilemanager" ||
-		o.impersonate != "sveinung" || o.logPath != "qfm.log" || o.readOnly {
+		o.addr != "127.0.0.1:8899" || o.proxyPrefix != "/taproot" ||
+		o.impersonate != "sveinung" || o.logPath != "taproot.log" || o.readOnly {
 		t.Fatalf("options = %+v", o)
 	}
 	c := o.apply(config.Default())
 	if c.ReadOnly {
 		t.Error("-readonly=false must turn it off")
 	}
-	if c.Web.Listen != "127.0.0.1:8899" || c.Web.ProxyPrefix != "/qnapfilemanager" || c.Logging.File != "qfm.log" {
+	if c.Web.Listen != "127.0.0.1:8899" || c.Web.ProxyPrefix != "/taproot" || c.Logging.File != "taproot.log" {
 		t.Errorf("config = %+v", c.Web)
 	}
 	if err := c.Validate(); err != nil {

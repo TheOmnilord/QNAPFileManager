@@ -5,7 +5,7 @@ import (
 	"net/url"
 	"strings"
 
-	"qnapfilemanager/internal/idmap"
+	"taproot/internal/idmap"
 )
 
 // Credential kinds.

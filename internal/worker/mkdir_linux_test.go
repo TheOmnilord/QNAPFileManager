@@ -6,7 +6,7 @@ import (
 	"syscall"
 	"testing"
 
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/wproto"
 )
 
 // TestMkdirAsOwnerRoundTrips proves the MkdirReq.As owner survives the wire and

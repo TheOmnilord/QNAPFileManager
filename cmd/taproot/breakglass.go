@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"qnapfilemanager/internal/breakglass"
-	"qnapfilemanager/internal/config"
+	"taproot/internal/breakglass"
+	"taproot/internal/config"
 )
 
 // The break-glass credential is written here and nowhere else. There is no HTTP
@@ -26,7 +26,7 @@ import (
 // process that is not the daemon would be a second writer to a single-writer
 // file (§6.4). What they change is audited the moment the daemon notices.
 
-const breakGlassUsage = `qnapfilemanager break-glass <subcommand>
+const breakGlassUsage = `taproot break-glass <subcommand>
 
   set-password [-config <path>] [-cost <n>] [-stdin]
         set or replace the emergency password (prompted twice, echo off)
@@ -62,12 +62,12 @@ func runBreakGlass(args []string, stdin io.Reader, stdout, stderr io.Writer) int
 		fmt.Fprint(stdout, breakGlassUsage)
 		return 0
 	default:
-		fmt.Fprintf(stderr, "qnapfilemanager break-glass: unknown subcommand %q\n", sub)
+		fmt.Fprintf(stderr, "taproot break-glass: unknown subcommand %q\n", sub)
 		fmt.Fprint(stderr, breakGlassUsage)
 		return 2
 	}
 	if err != nil {
-		fmt.Fprintf(stderr, "qnapfilemanager break-glass %s: %v\n", sub, err)
+		fmt.Fprintf(stderr, "taproot break-glass %s: %v\n", sub, err)
 		return 1
 	}
 	return 0
@@ -82,13 +82,13 @@ func runBreakGlass(args []string, stdin io.Reader, stdout, stderr io.Writer) int
 // fails, because `status` then reports "no password" while the listener is
 // armed, and `disable` cannot revoke anything (Astra r1 #14).
 const (
-	legacyConfigPath = "/share/CACHEDEV1_DATA/.qpkg/QNAPFileManager/config/config.json"
-	qpkgSection      = "QNAPFileManager"
+	legacyConfigPath = "/share/CACHEDEV1_DATA/.qpkg/Taproot/config/config.json"
+	qpkgSection      = "Taproot"
 	qpkgConfigKey    = "Install_Path"
 )
 
 // qpkgConfPath is where App Center records every installed QPKG's real install
-// path. It is a variable so a test can point it at a fixture; QNAPFileManager.sh
+// path. It is a variable so a test can point it at a fixture; Taproot.sh
 // reads the same file with getcfg.
 var qpkgConfPath = "/etc/config/qpkg.conf"
 
@@ -104,8 +104,8 @@ func defaultConfigPath() (path, source string) {
 	if dir := qpkgInstallPath(qpkgConfPath, qpkgSection); dir != "" {
 		return filepath.Join(dir, "config", "config.json"), "qpkg.conf"
 	}
-	// The executable's own tree: <install>/bin/qnapfilemanager (or
-	// <install>/qnapfilemanager) beside <install>/config/config.json. Only
+	// The executable's own tree: <install>/bin/taproot (or
+	// <install>/taproot) beside <install>/config/config.json. Only
 	// accepted when the file is really there — an executable run from a build
 	// directory must not name a config that does not exist and thereby hide the
 	// fallback below.
@@ -528,7 +528,7 @@ func breakGlassStatus(args []string, stdout, stderr io.Writer) error {
 	// fingerprint is read (Astra r2 #3): nothing rotates this pair on its own,
 	// so the only way an operator learns it is running out is by being told.
 	if !time.Now().Add(breakglass.RenewWithin).Before(cert.NotAfter) {
-		fmt.Fprintf(stdout, "warning:     this certificate expires in %d days; run `qnapfilemanager break-glass cert -regenerate` and restart the app when you are ready to compare a new fingerprint.\n", daysUntil(cert.NotAfter, time.Now()))
+		fmt.Fprintf(stdout, "warning:     this certificate expires in %d days; run `taproot break-glass cert -regenerate` and restart the app when you are ready to compare a new fingerprint.\n", daysUntil(cert.NotAfter, time.Now()))
 	}
 	return nil
 }

@@ -11,8 +11,8 @@ import (
 	"testing"
 	"unicode/utf8"
 
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/fsx"
+	"taproot/internal/wproto"
 )
 
 // The findings of M2-C review round 1's adversarial pass that live in this

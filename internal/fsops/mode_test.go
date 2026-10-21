@@ -13,9 +13,9 @@ import (
 	"strings"
 	"testing"
 
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/perm"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/fsx"
+	"taproot/internal/perm"
+	"taproot/internal/wproto"
 )
 
 // collect gathers a job's warnings so a test can read them back.

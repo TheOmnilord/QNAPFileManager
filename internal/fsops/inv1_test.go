@@ -21,8 +21,8 @@ import (
 // be fooled by an indirection.
 func TestINV1WebDoesNotImportFsops(t *testing.T) {
 	const (
-		web   = "qnapfilemanager/internal/web"
-		fsops = "qnapfilemanager/internal/fsops"
+		web   = "taproot/internal/web"
+		fsops = "taproot/internal/fsops"
 	)
 	if _, err := exec.LookPath("go"); err != nil {
 		t.Skip("the go tool is not on PATH; the import graph is checked in CI")

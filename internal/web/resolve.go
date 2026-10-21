@@ -4,8 +4,8 @@ import (
 	"context"
 	"path/filepath"
 
-	"qnapfilemanager/internal/backend"
-	"qnapfilemanager/internal/fsx"
+	"taproot/internal/backend"
+	"taproot/internal/fsx"
 )
 
 // resolveForGuard hardens an API path against parent-symlink aliasing before it

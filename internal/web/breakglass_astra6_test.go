@@ -120,7 +120,7 @@ func TestTheLogoutRouteObeysThePinAsWell(t *testing.T) {
 	_, csrf := bgSessionAnswer(t, bgRequestFrom(s, operator, "GET", "/api/session", bgWithCookie(cookie), ""))
 
 	headers := bgWithCookie(cookie)
-	headers["X-QFM-CSRF"] = csrf
+	headers["X-Taproot-CSRF"] = csrf
 	if w := bgRequestFrom(s, elsewhere, "POST", bgLogoutPath, headers, ""); w.Code != statusCode("permission") {
 		t.Fatalf("logout from %s = %d %s, want %d", elsewhere, w.Code, w.Body, statusCode("permission"))
 	}

@@ -14,10 +14,10 @@ import (
 	"syscall"
 	"testing"
 
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/platform"
-	"qnapfilemanager/internal/trashroot"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/fsx"
+	"taproot/internal/platform"
+	"taproot/internal/trashroot"
+	"taproot/internal/wproto"
 )
 
 // selfUID is the uid the worker would use: the one the kernel gave this
@@ -31,7 +31,7 @@ func selfUID() int {
 }
 
 // trashFixture builds a temporary directory that the mount table declares to be
-// an ext4 storage mount, with the .@qfm_trash directory already in place — the
+// an ext4 storage mount, with the .@taproot_trash directory already in place — the
 // two things the real system provides and this package refuses to invent: the
 // mount (the kernel's) and the sticky trash directory (the root front-end's,
 // internal/trashroot).
@@ -104,7 +104,7 @@ func TestTrashDirNameMatchesTheFrontEnd(t *testing.T) {
 }
 
 // TestTrashRoundTrip is the whole of decision 10 in one test: a delete to trash
-// is a same-device rename into <mount>/.@qfm_trash/<uid>/<id>/, described by a
+// is a same-device rename into <mount>/.@taproot_trash/<uid>/<id>/, described by a
 // sidecar written first, listed for its owner, put back where it came from, and
 // finally emptied.
 func TestTrashRoundTrip(t *testing.T) {

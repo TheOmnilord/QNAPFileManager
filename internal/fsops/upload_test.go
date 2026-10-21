@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/fsx"
+	"taproot/internal/wproto"
 )
 
 // The M2-C upload's tests. The conflict policies, the declared-size gate, the
@@ -79,7 +79,7 @@ func noLeftovers(t *testing.T, base, rel string) {
 	}
 }
 
-// forceNamedUpload makes every upload take the `.qfm-upload-*.part` fallback,
+// forceNamedUpload makes every upload take the `.taproot-upload-*.part` fallback,
 // as it does on a filesystem with no O_TMPFILE or on a host with no /proc for
 // the linkat that publishes an unnamed inode. It is the only way to exercise
 // that whole path on a kernel that supports O_TMPFILE perfectly well.

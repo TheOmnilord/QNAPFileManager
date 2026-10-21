@@ -15,8 +15,8 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/breakglass"
-	"qnapfilemanager/internal/config"
+	"taproot/internal/breakglass"
+	"taproot/internal/config"
 )
 
 // --- round-2 P1-1: the drain lever -------------------------------------------
@@ -306,8 +306,8 @@ func TestLogoutWithoutTheTokenChangesNothing(t *testing.T) {
 		headers map[string]string
 	}{
 		{"no token", map[string]string{}},
-		{"a wrong token", map[string]string{"X-QFM-CSRF": "not-the-token"}},
-		{"a cross-site fetch", map[string]string{"X-QFM-CSRF": csrf, "Sec-Fetch-Site": "cross-site"}},
+		{"a wrong token", map[string]string{"X-Taproot-CSRF": "not-the-token"}},
+		{"a cross-site fetch", map[string]string{"X-Taproot-CSRF": csrf, "Sec-Fetch-Site": "cross-site"}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			w := bgRequest(s, "POST", bgLogoutPath, []*http.Cookie{cookie}, c.headers, "{}")
@@ -325,7 +325,7 @@ func TestLogoutWithoutTheTokenChangesNothing(t *testing.T) {
 		})
 	}
 	// The real thing still works.
-	w := bgRequest(s, "POST", bgLogoutPath, []*http.Cookie{cookie}, map[string]string{"X-QFM-CSRF": csrf}, "{}")
+	w := bgRequest(s, "POST", bgLogoutPath, []*http.Cookie{cookie}, map[string]string{"X-Taproot-CSRF": csrf}, "{}")
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("a verified logout = %d %s", w.Code, w.Body)
 	}
@@ -640,7 +640,7 @@ func TestFlushCommitsTheHeaderThroughTheCheck(t *testing.T) {
 func TestSuccessfulMutationsKeepTheConnectionAlive(t *testing.T) {
 	s, _, _ := bgFixture(t)
 	cookie, csrf := bgSignIn(t, s)
-	headers := map[string]string{"X-QFM-CSRF": csrf, "Content-Type": "application/json"}
+	headers := map[string]string{"X-Taproot-CSRF": csrf, "Content-Type": "application/json"}
 	for i, body := range []string{
 		`{"dir":"/","name":"alive-one"}`,
 		// Trailing whitespace is what a pretty-printer leaves behind, and it

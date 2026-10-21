@@ -16,9 +16,9 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/platform"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/fsx"
+	"taproot/internal/platform"
+	"taproot/internal/wproto"
 )
 
 // The M2-C archive's tests. The formats, the names, the notes and the

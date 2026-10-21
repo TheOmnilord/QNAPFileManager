@@ -15,7 +15,7 @@ import (
 	"strings"
 	"testing"
 
-	"qnapfilemanager/internal/perm"
+	"taproot/internal/perm"
 )
 
 // TestTraversedDirectoryIsRecordedWithItsBirthTime is Astra r10 #1.

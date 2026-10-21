@@ -13,20 +13,20 @@ test('bootstrap forwards only the first SID and optional user, preserving encodi
 });
 
 test('cleanup removes every credential query field and preserves route and other parameters', () => {
- const href='https://nas/qnapfilemanager/?sid=secret&view=a%2Bb&user=alice&sid=again&user=bob#/etc';
+ const href='https://nas/taproot/?sid=secret&view=a%2Bb&user=alice&sid=again&user=bob#/etc';
  const clean=cleanSessionURL(href);
- assert.equal(clean,'/qnapfilemanager/?view=a%2Bb#/etc');
+ assert.equal(clean,'/taproot/?view=a%2Bb#/etc');
  assert.deepEqual(sessionQuery(new URL(clean,'https://nas').search),{});
- assert.equal(cleanSessionURL('https://nas/qnapfilemanager/?sid=secret&user=alice#/share'),'/qnapfilemanager/#/share');
- assert.equal(cleanSessionURL('https://nas/qnapfilemanager/#/share'),'/qnapfilemanager/#/share');
+ assert.equal(cleanSessionURL('https://nas/taproot/?sid=secret&user=alice#/share'),'/taproot/#/share');
+ assert.equal(cleanSessionURL('https://nas/taproot/#/share'),'/taproot/#/share');
 });
 
 test('capture scrubs history before authentication; transient retries retain credentials until success', async () => {
  const calls=[],delays=[];
  let cleaned=false;
  const failures=[{status:503},{status:504},{network:true}];
- const connect=sessionBootstrap('https://nas/qnapfilemanager/?sid=a%2Bb&user=dev&view=list#/etc',url => {
-  assert.equal(url,'/qnapfilemanager/?view=list#/etc');
+ const connect=sessionBootstrap('https://nas/taproot/?sid=a%2Bb&user=dev&view=list#/etc',url => {
+  assert.equal(url,'/taproot/?view=list#/etc');
   cleaned=true;
  },async params => {
   assert.equal(cleaned,true);
@@ -105,8 +105,8 @@ test('429 exhaustion remains terminal for a pending SID, including an empty SID'
    calls.push({...params});
    throw {status:429,retryAfter:'1'};
   },async ms => delays.push(ms));
-  await assert.rejects(connect(),/Reopen QNAPFileManager/);
-  await assert.rejects(connect(),/Reopen QNAPFileManager/);
+  await assert.rejects(connect(),/Reopen Taproot/);
+  await assert.rejects(connect(),/Reopen Taproot/);
   assert.deepEqual(calls,Array.from({length:4},() => ({sid})));
   assert.deepEqual(delays,[1000,1000,1000]);
  }

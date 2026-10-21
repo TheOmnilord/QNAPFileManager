@@ -3,8 +3,8 @@ package wproto
 import (
 	"encoding/json"
 
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/perm"
+	"taproot/internal/fsx"
+	"taproot/internal/perm"
 )
 
 // Limits are the front-end's caps, handed to the worker at hello time so the
@@ -304,7 +304,7 @@ type OpenReadResp struct {
 // OpenWriteReq asks the worker to create the upload's file AS THE USER and hand
 // back its descriptor (M2-C contract §1): unnamed (O_TMPFILE) where the kernel
 // allows, so no name can reach it before Finalize publishes it, else a
-// .qfm-upload-<hex>.part created O_EXCL in the destination directory. The
+// .taproot-upload-<hex>.part created O_EXCL in the destination directory. The
 // front-end streams the request body into that descriptor and never creates
 // a file itself. Size is the declared length for the free-space check (0 =
 // unknown); As is the owner an admin's upload is chowned to, gated by the
@@ -557,7 +557,7 @@ func (a FSIdentityResp) Same(b FSIdentityResp) bool {
 type DeleteReq struct {
 	Paths     [][]byte `json:"p"`
 	Recursive bool     `json:"r,omitempty"`
-	// Trash renames into the nearest .@qfm_trash instead of unlinking.
+	// Trash renames into the nearest .@taproot_trash instead of unlinking.
 	Trash bool `json:"t,omitempty"`
 	// CrossMounts lets the recursive walk descend into mounts of the same
 	// storage domain ("include mounted sub-folders"); see CopyOptions.CrossMounts.
@@ -713,7 +713,7 @@ type TrashItem struct {
 	// directory everything under it including itself. -1 when unknown.
 	Files     int64  `json:"f"`
 	DeletedAt int64  `json:"d"` // unix seconds
-	Trash     []byte `json:"r"` // API path of the .@qfm_trash root holding it
+	Trash     []byte `json:"r"` // API path of the .@taproot_trash root holding it
 }
 
 type TrashListResp struct {

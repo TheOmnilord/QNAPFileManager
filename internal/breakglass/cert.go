@@ -395,13 +395,13 @@ func (l Location) generate(now time.Time) (Cert, error) {
 		return Cert{}, fmt.Errorf("breakglass: generating a serial: %w", err)
 	}
 	names, ips := SANs()
-	cn := "qnapfilemanager"
+	cn := "taproot"
 	if len(names) > 0 {
 		cn = names[0]
 	}
 	tmpl := &x509.Certificate{
 		SerialNumber: serial,
-		Subject:      pkix.Name{CommonName: cn, Organization: []string{"QNAPFileManager break-glass"}},
+		Subject:      pkix.Name{CommonName: cn, Organization: []string{"Taproot break-glass"}},
 		NotBefore:    now.Add(-time.Hour), // tolerate a NAS clock a little behind the browser's
 		NotAfter:     now.Add(Validity),
 		// A SERVER leaf, never a certificate authority (round-1 P2-6). An

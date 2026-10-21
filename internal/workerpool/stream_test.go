@@ -12,9 +12,9 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/backend"
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/backend"
+	"taproot/internal/fsx"
+	"taproot/internal/wproto"
 )
 
 // M2-C review round 1, finding 1: an archive and an upload outlive their own

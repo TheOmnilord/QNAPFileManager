@@ -52,9 +52,9 @@ import (
 	"sync"
 	"time"
 
-	"qnapfilemanager/internal/backend"
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/backend"
+	"taproot/internal/fsx"
+	"taproot/internal/wproto"
 )
 
 // uploadPinTimeout is the pool's backstop on an upload handle, and it is

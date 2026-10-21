@@ -15,8 +15,8 @@ import (
 	"os"
 	"strconv"
 
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/fsx"
+	"taproot/internal/wproto"
 )
 
 // Principal is the resolved identity a request runs as. Root is true only for

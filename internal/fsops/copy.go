@@ -166,9 +166,9 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/platform"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/fsx"
+	"taproot/internal/platform"
+	"taproot/internal/wproto"
 )
 
 const (
@@ -221,7 +221,7 @@ const (
 	// before it is renamed over its target (§1.3). It is a dot-name so a
 	// listing hides it, and it carries eight random hex digits so two copies
 	// running at once in one directory cannot collide.
-	copyTmpPrefix = ".qfm-copy-"
+	copyTmpPrefix = ".taproot-copy-"
 	copyTmpSuffix = ".part"
 )
 

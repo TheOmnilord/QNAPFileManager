@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/fsx"
+	"taproot/internal/wproto"
 )
 
 // The review-round-1 findings, one test per probe. Everything here is about

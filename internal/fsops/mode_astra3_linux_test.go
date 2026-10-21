@@ -17,10 +17,10 @@ import (
 	"strings"
 	"testing"
 
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/perm"
-	"qnapfilemanager/internal/platform"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/fsx"
+	"taproot/internal/perm"
+	"taproot/internal/platform"
+	"taproot/internal/wproto"
 )
 
 // TestEmptyExpectationStillRefusesAnACLTheReprobeCanSee is Astra r3 #7.

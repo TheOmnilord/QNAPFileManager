@@ -17,8 +17,8 @@ import (
 	"syscall"
 	"time"
 
-	"qnapfilemanager/internal/backend"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/backend"
+	"taproot/internal/wproto"
 )
 
 // spawnProcess re-executes this binary as the user (identity plan §2.4).
@@ -39,8 +39,8 @@ func (p *Pool) spawnProcess(who backend.Principal) (*client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("creating the worker socketpair: %w", err)
 	}
-	parentFile := os.NewFile(uintptr(fds[0]), "qfm-worker-parent")
-	childFile := os.NewFile(uintptr(fds[1]), "qfm-worker-child")
+	parentFile := os.NewFile(uintptr(fds[0]), "taproot-worker-parent")
+	childFile := os.NewFile(uintptr(fds[1]), "taproot-worker-child")
 	// The child's end must be closed in this process once it has been handed
 	// over, or the worker's death never shows up as EOF here.
 	defer childFile.Close()
@@ -255,7 +255,7 @@ func stageWorkerBinary(src, tmpDir string) (string, error) {
 	if err := requireSafeParent(tmpDir); err != nil {
 		return "", fmt.Errorf("unsafe staging parent %s: %w", tmpDir, err)
 	}
-	dir := filepath.Join(tmpDir, ".qnapfilemanager")
+	dir := filepath.Join(tmpDir, ".taproot")
 	if err := ensureRootOwnedDir(dir); err != nil {
 		return "", err
 	}
@@ -266,7 +266,7 @@ func stageWorkerBinary(src, tmpDir string) (string, error) {
 	}
 	defer in.Close()
 
-	tmp, err := os.CreateTemp(dir, "qfm-*")
+	tmp, err := os.CreateTemp(dir, "taproot-*")
 	if err != nil {
 		return "", err
 	}
@@ -287,7 +287,7 @@ func stageWorkerBinary(src, tmpDir string) (string, error) {
 		os.Remove(tmpName)
 		return "", err
 	}
-	dst := filepath.Join(dir, "qnapfilemanager")
+	dst := filepath.Join(dir, "taproot")
 	if err := os.Rename(tmpName, dst); err != nil {
 		os.Remove(tmpName)
 		return "", err

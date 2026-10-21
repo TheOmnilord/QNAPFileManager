@@ -15,9 +15,9 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/backend"
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/idmap"
+	"taproot/internal/backend"
+	"taproot/internal/fsx"
+	"taproot/internal/idmap"
 )
 
 // The tests in this file spawn real worker processes with real credentials.
@@ -36,14 +36,14 @@ func requireLinuxRoot(t *testing.T) {
 	}
 }
 
-// buildDaemon builds cmd/qnapfilemanager, because the test binary itself does
+// buildDaemon builds cmd/taproot, because the test binary itself does
 // not understand -worker.
 func buildDaemon(t *testing.T, dir string) string {
 	t.Helper()
-	exe := filepath.Join(dir, "qnapfilemanager")
+	exe := filepath.Join(dir, "taproot")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "go", "build", "-o", exe, "./cmd/qnapfilemanager")
+	cmd := exec.CommandContext(ctx, "go", "build", "-o", exe, "./cmd/taproot")
 	cmd.Dir = filepath.Join("..", "..")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Skipf("building the daemon: %v\n%s", err, out)
@@ -86,7 +86,7 @@ func fixtureUser(t *testing.T, name, groupName string) idmap.Ident {
 // on the way down has to be traversable, which t.TempDir's 0700 is not.
 func rootTree(t *testing.T) string {
 	t.Helper()
-	base, err := os.MkdirTemp("", "qfm-root-test")
+	base, err := os.MkdirTemp("", "taproot-root-test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,7 +131,7 @@ func TestWorkerRunsAsTheFixtureUser(t *testing.T) {
 	requireLinuxRoot(t)
 	base := rootTree(t)
 	exe := buildDaemon(t, base)
-	alice := fixtureUser(t, "qfmalice", "qfmteam")
+	alice := fixtureUser(t, "taprootalice", "taprootteam")
 
 	p := rootPool(t, base, exe)
 	ctx := context.Background()
@@ -146,7 +146,7 @@ func TestWorkerRunsAsTheFixtureUser(t *testing.T) {
 		t.Fatalf("the worker came up as uid %d gid %d, want %d/%d", s[0].HelloUID, s[0].HelloGID, alice.UID, alice.GID)
 	}
 	ids := idmap.Open("", "")
-	team, ok := ids.GroupGID("qfmteam")
+	team, ok := ids.GroupGID("taprootteam")
 	if !ok {
 		t.Fatal("the fixture group vanished")
 	}
@@ -168,8 +168,8 @@ func TestTheKernelDecidesPermissions(t *testing.T) {
 	requireLinuxRoot(t)
 	base := rootTree(t)
 	exe := buildDaemon(t, base)
-	alice := fixtureUser(t, "qfmalice", "qfmteam")
-	bob := fixtureUser(t, "qfmbob", "qfmother")
+	alice := fixtureUser(t, "taprootalice", "taprootteam")
+	bob := fixtureUser(t, "taprootbob", "taprootother")
 
 	secret := filepath.Join(base, "secret.txt")
 	if err := os.WriteFile(secret, []byte("only alice"), 0o600); err != nil {
@@ -220,8 +220,8 @@ func TestPassedDescriptorsDoNotLeakIntoTheNextWorker(t *testing.T) {
 	requireLinuxRoot(t)
 	base := rootTree(t)
 	exe := buildDaemon(t, base)
-	alice := fixtureUser(t, "qfmalice", "qfmteam")
-	bob := fixtureUser(t, "qfmbob", "qfmother")
+	alice := fixtureUser(t, "taprootalice", "taprootteam")
+	bob := fixtureUser(t, "taprootbob", "taprootother")
 
 	target := filepath.Join(base, "held.txt")
 	if err := os.WriteFile(target, []byte("held open"), 0o644); err != nil {

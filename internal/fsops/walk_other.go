@@ -5,7 +5,7 @@ package fsops
 import (
 	"os"
 
-	"qnapfilemanager/internal/fsx"
+	"taproot/internal/fsx"
 )
 
 // The walk off Linux goes through os.Root, exactly as the rest of this package

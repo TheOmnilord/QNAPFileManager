@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/audit"
+	"taproot/internal/audit"
 )
 
 // --- Astra r9 #1 and #4: where the peer is, and when that is decided ---------

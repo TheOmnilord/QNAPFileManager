@@ -1,12 +1,15 @@
 # Changelog
 
-All notable changes to QNAPFileManager are recorded here. The format follows
+All notable changes to Taproot are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Versions below 1.0.0 were never tagged: `main` builds carry a `0.0.<run>` version stamped by CI, and the first tagged
 release is 1.0.0. The milestone sections under it are the development history of that release, in user terms. The
 reasoning behind any decision named here is in [PLAN.md](PLAN.md) and in `docs/design/`.
+
+Taproot was called QNAPFileManager before its first release. The milestone sections were written under that name and
+keep the names of their day; the rename itself is recorded under `Unreleased`.
 
 ## [Unreleased]
 
@@ -18,6 +21,13 @@ reasoning behind any decision named here is in [PLAN.md](PLAN.md) and in `docs/d
 
 ### Changed
 
+- **Renamed to Taproot.** App Center lists the app as Taproot and its package identity is `Taproot`, so the packages
+  are `Taproot_<version>_x86_64.qpkg` and `Taproot_<version>_arm_64.qpkg`, and they install under `.qpkg/Taproot`.
+  The app is served at `/taproot/`; the binary and its CLI are `taproot` (`taproot break-glass set-password`); each
+  volume's Trash is `.@taproot_trash`; the app log is `logs/taproot.log`; and every QuLog line starts with `[Taproot]`,
+  the keyword an alert rule matches. Only names changed, not behaviour. A unit that ran a pre-1.0 QNAPFileManager build
+  has a different package installed, not an older version of this one: remove it first, as
+  [docs/qnap-install.md](docs/qnap-install.md#units-that-ran-a-pre-10-build-named-qnapfilemanager) describes.
 - **Folders are listed first**, whichever column you sort by and in either direction, and **names sort without regard
   to case**: `apple`, `Banana`, `cherry` rather than `Banana`, `apple`, `cherry`.
 - **Sizes and dates read like a file manager's.** Sizes are shown in KiB, MiB, GiB and so on, with the exact byte count
@@ -57,9 +67,10 @@ reasoning behind any decision named here is in [PLAN.md](PLAN.md) and in `docs/d
 
 ### Security
 
-- **Built with Go 1.26.9**, which fixes ten standard-library advisories reachable from the daemon — in `net/http`,
-  `net/textproto` and `crypto/tls` (GO-2026-6603 to GO-2026-6617). The package is built by CI with the pinned
-  toolchain, so the fix ships in the binary.
+- **Built with Go 1.26.10**, which fixes eleven standard-library advisories reachable from the daemon — in `net/http`,
+  `net/textproto` and `crypto/tls` (GO-2026-6603 to GO-2026-6617, fixed in 1.26.9), and `crypto/x509`'s distrust of
+  compromised intermediate certificates (GO-2026-6809, fixed in 1.26.10). The package is built by CI with the pinned
+  toolchain, so the fixes ship in the binary.
 
 ### Deferred to 1.1
 

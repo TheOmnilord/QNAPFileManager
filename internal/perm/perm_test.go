@@ -6,7 +6,7 @@ import (
 	"reflect"
 	"testing"
 
-	"qnapfilemanager/internal/fsx"
+	"taproot/internal/fsx"
 )
 
 // TestModeSpecApply is the whole of contract §1.1 as a table: mask and value,

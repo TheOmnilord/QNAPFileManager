@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"qnapfilemanager/internal/backend"
+	"taproot/internal/backend"
 )
 
 func TestRequestPathsRejectDotComponents(t *testing.T) {

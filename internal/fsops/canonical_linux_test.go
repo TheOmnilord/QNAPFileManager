@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"qnapfilemanager/internal/fsx"
+	"taproot/internal/fsx"
 )
 
 // M2-C review round 14 adversarial: the worker is given the spelling the

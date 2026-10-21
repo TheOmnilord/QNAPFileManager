@@ -16,10 +16,10 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/audit"
-	"qnapfilemanager/internal/breakglass"
-	"qnapfilemanager/internal/config"
-	"qnapfilemanager/internal/qtsauth"
+	"taproot/internal/audit"
+	"taproot/internal/breakglass"
+	"taproot/internal/config"
+	"taproot/internal/qtsauth"
 )
 
 // The break-glass password used throughout. Cost 10 is the configured floor:
@@ -146,13 +146,13 @@ func TestTheTwoDoorsNeverMix(t *testing.T) {
 	bgCookieValue, bgCSRF := bgSignIn(t, s)
 	mainCookie, mainCSRF := sessionCookie(t, s)
 
-	t.Run("a qfm_sid cookie is ignored on the break-glass listener", func(t *testing.T) {
+	t.Run("a taproot_sid cookie is ignored on the break-glass listener", func(t *testing.T) {
 		w := bgRequest(s, "GET", "/api/fs/list?path=/", []*http.Cookie{mainCookie}, nil, "")
 		if w.Code != http.StatusUnauthorized {
 			t.Fatalf("a main-listener cookie was honoured on 8771: %d %s", w.Code, w.Body)
 		}
 	})
-	t.Run("a __Host-qfm_bg cookie is ignored on the main listener", func(t *testing.T) {
+	t.Run("a __Host-taproot_bg cookie is ignored on the main listener", func(t *testing.T) {
 		// A server with no pinned identity, so the ONLY thing that could
 		// authenticate this request is the break-glass cookie — and it must not.
 		plain, _ := fixture(t, false)
@@ -176,7 +176,7 @@ func TestTheTwoDoorsNeverMix(t *testing.T) {
 		}
 		for _, path := range []string{bgLoginPath, bgLogoutPath} {
 			w := request(s, "POST", path, mainCookie, map[string]string{
-				"X-QFM-CSRF": mainCSRF, "Origin": "http://example.com", "Content-Type": "application/json",
+				"X-Taproot-CSRF": mainCSRF, "Origin": "http://example.com", "Content-Type": "application/json",
 			})
 			// Authenticated, so routing is reached; the route simply is not there.
 			if w.Code != http.StatusNotFound {
@@ -185,7 +185,7 @@ func TestTheTwoDoorsNeverMix(t *testing.T) {
 		}
 	})
 	t.Run("the break-glass session works on its own listener", func(t *testing.T) {
-		w := bgRequest(s, "GET", "/api/fs/list?path=/", []*http.Cookie{bgCookieValue}, map[string]string{"X-QFM-CSRF": bgCSRF}, "")
+		w := bgRequest(s, "GET", "/api/fs/list?path=/", []*http.Cookie{bgCookieValue}, map[string]string{"X-Taproot-CSRF": bgCSRF}, "")
 		if w.Code != http.StatusOK {
 			t.Fatalf("the break-glass session could not list: %d %s", w.Code, w.Body)
 		}
@@ -207,7 +207,7 @@ func TestBreakGlassNeverConsultsQTS(t *testing.T) {
 	}})
 	cookie, csrf := bgSignIn(t, s)
 	// A full QTS cookie pair presented alongside: it must change nothing.
-	headers := map[string]string{"X-QFM-CSRF": csrf, "Cookie": "NAS_USER=admin; qtoken=0123456789abcdef0123456789abcdef"}
+	headers := map[string]string{"X-Taproot-CSRF": csrf, "Cookie": "NAS_USER=admin; qtoken=0123456789abcdef0123456789abcdef"}
 	w := bgRequest(s, "GET", "/api/fs/list?path=/", []*http.Cookie{cookie}, headers, "")
 	if w.Code != http.StatusOK {
 		t.Fatalf("list: %d %s", w.Code, w.Body)
@@ -347,7 +347,7 @@ func TestBreakGlassCookieAttributes(t *testing.T) {
 		t.Fatalf("no %s cookie", bgCookie)
 	}
 	// The contract's table, field by field (§13.2).
-	if c.Name != "__Host-qfm_bg" {
+	if c.Name != "__Host-taproot_bg" {
 		t.Errorf("name = %q", c.Name)
 	}
 	if c.Path != "/" {
@@ -367,7 +367,7 @@ func TestBreakGlassCookieAttributes(t *testing.T) {
 	}
 	// And the main listener's cookie is unchanged beside it.
 	mainCookie, _ := sessionCookie(t, s)
-	if mainCookie.Name != "qfm_sid" || mainCookie.SameSite != http.SameSiteLaxMode {
+	if mainCookie.Name != "taproot_sid" || mainCookie.SameSite != http.SameSiteLaxMode {
 		t.Errorf("the main cookie changed: %+v", mainCookie)
 	}
 }
@@ -461,7 +461,7 @@ func TestBreakGlassCreatesRootOwnedContent(t *testing.T) {
 	cookie, csrf := bgSignIn(t, s)
 	b.lastAs = nil
 	w := bgRequest(s, "POST", "/api/fs/mkdir", []*http.Cookie{cookie},
-		map[string]string{"X-QFM-CSRF": csrf, "Content-Type": "application/json"},
+		map[string]string{"X-Taproot-CSRF": csrf, "Content-Type": "application/json"},
 		`{"dir":"/","name":"support"}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("mkdir: %d %s", w.Code, w.Body)
@@ -474,7 +474,7 @@ func TestBreakGlassCreatesRootOwnedContent(t *testing.T) {
 	mainCookie, mainCSRF := sessionCookie(t, s)
 	b.lastAs = nil
 	w = request(s, "POST", "/api/fs/mkdir", mainCookie, map[string]string{
-		"X-QFM-CSRF": mainCSRF, "Origin": "http://example.com", "Content-Type": "application/json",
+		"X-Taproot-CSRF": mainCSRF, "Origin": "http://example.com", "Content-Type": "application/json",
 	})
 	_ = w
 	if got := b.lastAs; got == nil && w.Code == http.StatusOK {
@@ -577,7 +577,7 @@ func TestBreakGlassLogoutDestroysTheSession(t *testing.T) {
 		t.Run(path, func(t *testing.T) {
 			cookie, csrf := bgSignIn(t, s)
 			w := bgRequest(s, "POST", path, []*http.Cookie{cookie},
-				map[string]string{"X-QFM-CSRF": csrf, "Content-Type": "application/json"}, "{}")
+				map[string]string{"X-Taproot-CSRF": csrf, "Content-Type": "application/json"}, "{}")
 			if w.Code != http.StatusNoContent && w.Code != http.StatusOK {
 				t.Fatalf("logout: %d %s", w.Code, w.Body)
 			}
@@ -598,7 +598,7 @@ func TestBreakGlassRequiresCSRFAndOrigin(t *testing.T) {
 	}
 	// A cross-site fetch, token and all.
 	if w := bgRequest(s, "POST", "/api/fs/mkdir", []*http.Cookie{cookie}, map[string]string{
-		"X-QFM-CSRF": csrf, "Sec-Fetch-Site": "cross-site", "Content-Type": "application/json",
+		"X-Taproot-CSRF": csrf, "Sec-Fetch-Site": "cross-site", "Content-Type": "application/json",
 	}, body); w.Code != http.StatusForbidden {
 		t.Errorf("Sec-Fetch-Site: cross-site = %d %s, want 403", w.Code, w.Body)
 	}
@@ -613,7 +613,7 @@ func TestBreakGlassRequiresCSRFAndOrigin(t *testing.T) {
 		if w.Code != http.StatusNoContent {
 			t.Fatalf("login without a CSRF token = %d %s, want 204", w.Code, w.Body)
 		}
-		if w.Header().Get("X-QFM-CSRF") != "" {
+		if w.Header().Get("X-Taproot-CSRF") != "" {
 			t.Error("the login response must not echo a token; the UI reads it from /api/session")
 		}
 	})
@@ -651,7 +651,7 @@ func TestReadOnlyCoversTheBreakGlassDoor(t *testing.T) {
 	s, _, _ := bgFixture(t)
 	cookie, csrf := bgSignIn(t, s)
 	s.guard.SetReadOnly(true)
-	headers := map[string]string{"X-QFM-CSRF": csrf, "Content-Type": "application/json"}
+	headers := map[string]string{"X-Taproot-CSRF": csrf, "Content-Type": "application/json"}
 	for _, c := range []struct{ path, body string }{
 		{"/api/fs/mkdir", `{"dir":"/","name":"x"}`},
 		{"/api/fs/rename", `{"path":"/a.txt","to":"b.txt"}`},

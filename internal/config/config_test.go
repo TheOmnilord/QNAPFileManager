@@ -75,7 +75,7 @@ func TestLoadPartialOverlaysDefaults(t *testing.T) {
 	// A non-default loopback address: M4 §13.1 refuses anything that is not
 	// loopback on web.listen, so the overlay is exercised with 127.0.0.5 rather
 	// than the 0.0.0.0 this test used before the rule existed.
-	body := `{"readOnly":false,"web":{"listen":"127.0.0.5:9000","proxyPrefix":"/qnapfilemanager/"},"worker":{"max":2}}`
+	body := `{"readOnly":false,"web":{"listen":"127.0.0.5:9000","proxyPrefix":"/taproot/"},"worker":{"max":2}}`
 	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -90,9 +90,9 @@ func TestLoadPartialOverlaysDefaults(t *testing.T) {
 		t.Errorf("listen = %q", c.Web.Listen)
 	}
 	// Normalize strips the trailing slash: the mux mounts at the prefix and
-	// "/qnapfilemanager//" would not match anything.
-	if c.Web.ProxyPrefix != "/qnapfilemanager" {
-		t.Errorf("proxyPrefix = %q, want /qnapfilemanager", c.Web.ProxyPrefix)
+	// "/taproot//" would not match anything.
+	if c.Web.ProxyPrefix != "/taproot" {
+		t.Errorf("proxyPrefix = %q, want /taproot", c.Web.ProxyPrefix)
 	}
 	if c.Worker.Max != 2 {
 		t.Errorf("worker.max = %d", c.Worker.Max)
@@ -166,7 +166,7 @@ func TestSaveRoundTrip(t *testing.T) {
 	p := filepath.Join(dir, "config.json")
 	c := Default()
 	c.ReadOnly = false
-	c.Web.ProxyPrefix = "qnapfilemanager/"
+	c.Web.ProxyPrefix = "taproot/"
 	c.Trash.Days = 7
 	if err := Save(p, c); err != nil {
 		t.Fatal(err)
@@ -180,7 +180,7 @@ func TestSaveRoundTrip(t *testing.T) {
 	}
 	// Save normalizes before writing, so what lands on disk is what Load
 	// would produce — no drift between the two paths.
-	if got.Web.ProxyPrefix != "/qnapfilemanager" {
+	if got.Web.ProxyPrefix != "/taproot" {
 		t.Fatalf("proxyPrefix = %q", got.Web.ProxyPrefix)
 	}
 	// The file holds the break-glass password hash.
@@ -264,10 +264,10 @@ func TestNormalizeProxyPrefix(t *testing.T) {
 		{"", ""},
 		{"/", ""},
 		{"//", ""},
-		{"qnapfilemanager", "/qnapfilemanager"},
-		{"/qnapfilemanager", "/qnapfilemanager"},
-		{"/qnapfilemanager/", "/qnapfilemanager"},
-		{"  /qnapfilemanager//  ", "/qnapfilemanager"},
+		{"taproot", "/taproot"},
+		{"/taproot", "/taproot"},
+		{"/taproot/", "/taproot"},
+		{"  /taproot//  ", "/taproot"},
 	}
 	for _, c := range cases {
 		got := Config{Web: Web{ProxyPrefix: c.in}}

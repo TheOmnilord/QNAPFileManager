@@ -5,11 +5,11 @@ import (
 	"strings"
 	"testing"
 
-	"qnapfilemanager/internal/config"
+	"taproot/internal/config"
 )
 
 // TestProxyJoinedPathsAreNotRedirected pins the first hardware finding: the QTS
-// proxy forwards "/qnapfilemanager/app.css" as "//app.css". Before the fix the
+// proxy forwards "/taproot/app.css" as "//app.css". Before the fix the
 // mux answered 307 to "/app.css", which the proxy mapped back to the original
 // URL, so the QTS desktop window showed unstyled HTML and a script that never
 // ran. The doubled slash must be served as the single-slash path, with no
@@ -21,7 +21,7 @@ func TestProxyJoinedPathsAreNotRedirected(t *testing.T) {
 		ctype  string
 		body   string
 	}{
-		"//":            {http.StatusOK, "text/html", "QNAPFileManager"},
+		"//":            {http.StatusOK, "text/html", "Taproot"},
 		"//app.css":     {http.StatusOK, "text/css", ""},
 		"//js/app.js":   {http.StatusOK, "text/javascript", ""},
 		"//api/session": {http.StatusOK, "application/json", `"authenticated":false`},
@@ -43,18 +43,18 @@ func TestProxyJoinedPathsAreNotRedirected(t *testing.T) {
 
 // TestProxyJoinedPathsUnderThePrefix is the shape actually observed on both
 // NAS units once the shell used absolute URLs: the proxy keeps the prefix and
-// doubles the slash after it ("/qnapfilemanager//app.css"), so a leading-only
+// doubles the slash after it ("/taproot//app.css"), so a leading-only
 // collapse was not enough.
 func TestProxyJoinedPathsUnderThePrefix(t *testing.T) {
 	cfg := config.Default()
-	cfg.Web.ProxyPrefix = "/qnapfilemanager"
+	cfg.Web.ProxyPrefix = "/taproot"
 	s := New(cfg, nil, nil, nil, nil, nil, "test", nil, nil, nil, nil)
 	for path, ctype := range map[string]string{
-		"/qnapfilemanager//app.css":     "text/css",
-		"/qnapfilemanager//js/app.js":   "text/javascript",
-		"/qnapfilemanager//api/session": "application/json",
-		"/qnapfilemanager//":            "text/html",
-		"/qnapfilemanager/":             "text/html",
+		"/taproot//app.css":     "text/css",
+		"/taproot//js/app.js":   "text/javascript",
+		"/taproot//api/session": "application/json",
+		"/taproot//":            "text/html",
+		"/taproot/":             "text/html",
 	} {
 		w := request(s, "GET", path, nil, nil)
 		if w.Code != http.StatusOK {

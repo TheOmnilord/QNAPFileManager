@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/audit"
-	"qnapfilemanager/internal/qnap"
+	"taproot/internal/audit"
+	"taproot/internal/qnap"
 )
 
 // --- Astra r8 #1: the peer is this machine ----------------------------------
@@ -106,7 +106,7 @@ func TestTheMachinesOwnAddressNeverRedeemsASession(t *testing.T) {
 		t.Fatal("the refused request was not tracked, so the count below proves nothing")
 	}
 	headers := bgWithCookie(cookie)
-	headers["X-QFM-CSRF"] = csrf
+	headers["X-Taproot-CSRF"] = csrf
 	if w := bgRequestFrom(s, own, "POST", bgLogoutPath, headers, ""); w.Code != statusCode("permission") {
 		t.Fatalf("a relayed logout with a VALID token = %d %s, want %d", w.Code, w.Body, statusCode("permission"))
 	}

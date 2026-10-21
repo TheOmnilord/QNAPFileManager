@@ -5,11 +5,11 @@ import (
 	"strings"
 	"testing"
 
-	"qnapfilemanager/internal/fsx"
+	"taproot/internal/fsx"
 )
 
 func TestContains(t *testing.T) {
-	const install = "/share/CACHEDEV1_DATA/.qpkg/QNAPFileManager"
+	const install = "/share/CACHEDEV1_DATA/.qpkg/Taproot"
 	g := New(install, true)
 	g.CanonicalizeRoots(func(p string) (string, bool) {
 		if strings.HasPrefix(p, install) {
@@ -80,14 +80,14 @@ func TestContainsSeverityAndExactRules(t *testing.T) {
 // built from a symlink-resolved path can be surfaced to the client without ever
 // disclosing that resolved spelling.
 func TestReasonsArePathFree(t *testing.T) {
-	g := New("/share/CACHEDEV1_DATA/.qpkg/QNAPFileManager", true)
+	g := New("/share/CACHEDEV1_DATA/.qpkg/Taproot", true)
 	g.SetMountPointChecker(func(p string) bool { return p == "/share/CACHEDEV1_DATA" })
 	paths := []string{
 		"/proc/1/mem", "/sys/class", "/x/.zfs/snap", "/share/new",
 		"/etc/config/smb.conf", "/mnt/HDA_ROOT/.config/x",
 		"/dev/sda", "/share/CACHEDEV1_DATA",
-		"/share/CACHEDEV1_DATA/.qpkg/QNAPFileManager/config/config.json",
-		"/share/CACHEDEV1_DATA/.qpkg/QNAPFileManager/logs/audit.jsonl",
+		"/share/CACHEDEV1_DATA/.qpkg/Taproot/config/config.json",
+		"/share/CACHEDEV1_DATA/.qpkg/Taproot/logs/audit.jsonl",
 	}
 	ops := []Op{OpRead, OpTraverse, OpCreate, OpWrite, OpDelete, OpRename, OpChmod, OpChown}
 	for _, p := range paths {
@@ -132,7 +132,7 @@ func outcome(err error) string {
 	}
 }
 
-const testInstall = "/share/CACHEDEV1_DATA/.qpkg/QNAPFileManager"
+const testInstall = "/share/CACHEDEV1_DATA/.qpkg/Taproot"
 
 // newMatrixGuard is the guard the golden matrix is written against: /share is
 // the RAM disk, the QPKG lives at testInstall, and CACHEDEV1_DATA is a mount
@@ -270,10 +270,10 @@ func TestRAMDiskCreate(t *testing.T) {
 // on its config/logs.
 func TestInstallDirProtection(t *testing.T) {
 	g := New(testInstall, false)
-	if err := g.Check(OpWrite, testInstall+"/bin/qnapfilemanager"); !errors.Is(err, ErrProtected) {
+	if err := g.Check(OpWrite, testInstall+"/bin/taproot"); !errors.Is(err, ErrProtected) {
 		t.Errorf("write inside the install dir should be protected, got %v", err)
 	}
-	if err := g.Check(OpRead, testInstall+"/bin/qnapfilemanager"); err != nil {
+	if err := g.Check(OpRead, testInstall+"/bin/taproot"); err != nil {
 		t.Errorf("reading the binary itself is allowed (only config/logs are read-denied), got %v", err)
 	}
 	for _, p := range []string{testInstall + "/config/config.json", testInstall + "/logs/audit.jsonl"} {
@@ -297,7 +297,7 @@ func TestInstallDirProtection(t *testing.T) {
 // relocate the whole protected subtree out of protection. Reads and creates on
 // such an ancestor stay allowed; only delete/rename of it are refused.
 func TestAncestorContainmentProtection(t *testing.T) {
-	g := New(testInstall, false) // testInstall = /share/CACHEDEV1_DATA/.qpkg/QNAPFileManager
+	g := New(testInstall, false) // testInstall = /share/CACHEDEV1_DATA/.qpkg/Taproot
 	// The .qpkg folder and the volume data dir both contain the install tree.
 	ancestors := []string{
 		"/share/CACHEDEV1_DATA/.qpkg",

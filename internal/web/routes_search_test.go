@@ -19,9 +19,9 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/jobs"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/fsx"
+	"taproot/internal/jobs"
+	"taproot/internal/wproto"
 )
 
 func TestSearchJobListOmitsHits(t *testing.T) {

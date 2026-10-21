@@ -91,7 +91,7 @@ func TestEnsureRootOwnedDirRejectsADecoy(t *testing.T) {
 	if err := os.Chmod(parent, 0o777|os.ModeSticky); err != nil { // root-owned + sticky
 		t.Fatal(err)
 	}
-	dir := filepath.Join(parent, ".qnapfilemanager")
+	dir := filepath.Join(parent, ".taproot")
 
 	// A symlink decoy must be removed, not followed.
 	target := filepath.Join(t.TempDir(), "elsewhere")
@@ -123,7 +123,7 @@ func TestStageWorkerBinaryRootGated(t *testing.T) {
 	if err := os.Chmod(parent, 0o777|os.ModeSticky); err != nil {
 		t.Fatal(err)
 	}
-	src := filepath.Join(t.TempDir(), "qnapfilemanager")
+	src := filepath.Join(t.TempDir(), "taproot")
 	want := []byte("\x7fELF stand-in bytes")
 	if err := os.WriteFile(src, want, 0o755); err != nil {
 		t.Fatal(err)

@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"qnapfilemanager/internal/platform"
+	"taproot/internal/platform"
 )
 
 // mountinfo builds a Platform from the given mountinfo lines. FromMountinfo is
@@ -76,8 +76,8 @@ func TestEnsureRefusesANonStorageLocation(t *testing.T) {
 // front-end creates it and the user's worker moves files into it; if the two
 // ever disagree, deletes fail as permission errors on a path nobody made.
 func TestDirNameIsTheAgreedOne(t *testing.T) {
-	if DirName != ".@qfm_trash" {
-		t.Fatalf("DirName = %q, want .@qfm_trash (PLAN.md decision 10)", DirName)
+	if DirName != ".@taproot_trash" {
+		t.Fatalf("DirName = %q, want .@taproot_trash (PLAN.md decision 10)", DirName)
 	}
 	if Mode.Perm() != 0o777 {
 		t.Fatalf("Mode permissions = %v, want 0777", Mode.Perm())

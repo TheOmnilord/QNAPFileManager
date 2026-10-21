@@ -12,15 +12,15 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/audit"
-	"qnapfilemanager/internal/backend"
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/guard"
-	"qnapfilemanager/internal/idmap"
-	"qnapfilemanager/internal/jobs"
-	"qnapfilemanager/internal/perm"
-	"qnapfilemanager/internal/platform"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/audit"
+	"taproot/internal/backend"
+	"taproot/internal/fsx"
+	"taproot/internal/guard"
+	"taproot/internal/idmap"
+	"taproot/internal/jobs"
+	"taproot/internal/perm"
+	"taproot/internal/platform"
+	"taproot/internal/wproto"
 )
 
 // The M3 route tests (contract §15, "web"): all four routes against the fakes,
@@ -1461,7 +1461,7 @@ func TestPropertiesShape(t *testing.T) {
 	b.propsFS = wproto.FSInfo{FSType: "zfs", Mount: "/share/ZFS530_DATA", Avail: 7, Total: 9}
 	b.propsACL = wproto.ACLInfo{Backend: platform.ACLNFS4, State: fsx.ACLNFS4Trivial, Aclmode: "discard", Dataset: "zpool1/x"}
 	c, csrf := sessionCookie(t, s)
-	w := request(s, "GET", "/api/fs/properties?path=/data/file.txt", c, map[string]string{"X-QFM-CSRF": csrf})
+	w := request(s, "GET", "/api/fs/properties?path=/data/file.txt", c, map[string]string{"X-Taproot-CSRF": csrf})
 	if w.Code != 200 {
 		t.Fatalf("status %d: %s", w.Code, w.Body)
 	}
@@ -1506,7 +1506,7 @@ func TestPropertiesDispatchesTheResolvedSpelling(t *testing.T) {
 	stub := &resolveStub{fakeBackend: b, aliases: map[string]string{"/share/Public": "/share/CACHEDEV1_DATA/Public"}}
 	s.backend, s.mutator = stub, stub
 	c, csrf := sessionCookie(t, s)
-	w := request(s, "GET", "/api/fs/properties?path=/share/Public/file.txt", c, map[string]string{"X-QFM-CSRF": csrf})
+	w := request(s, "GET", "/api/fs/properties?path=/share/Public/file.txt", c, map[string]string{"X-Taproot-CSRF": csrf})
 	if w.Code != 200 {
 		t.Fatalf("status %d: %s", w.Code, w.Body)
 	}
@@ -1535,7 +1535,7 @@ func TestPropertiesGuardsTheResolvedSpelling(t *testing.T) {
 	stub := &resolveStub{fakeBackend: b, aliases: map[string]string{"/data/ordinary": "/data/app/config"}}
 	s.backend, s.mutator = stub, stub
 	c, csrf := sessionCookie(t, s)
-	w := request(s, "GET", "/api/fs/properties?path=/data/ordinary/settings.json", c, map[string]string{"X-QFM-CSRF": csrf})
+	w := request(s, "GET", "/api/fs/properties?path=/data/ordinary/settings.json", c, map[string]string{"X-Taproot-CSRF": csrf})
 	if w.Code != 403 || !strings.Contains(w.Body.String(), `"code":"protected"`) {
 		t.Fatalf("status %d: %s", w.Code, w.Body)
 	}
@@ -1559,7 +1559,7 @@ func TestPropertiesGuardsTheFollowedTarget(t *testing.T) {
 	stub := &resolveStub{fakeBackend: b, aliases: map[string]string{"/data/link": "/data/app/config/settings.json"}}
 	s.backend, s.mutator = stub, stub
 	c, csrf := sessionCookie(t, s)
-	w := request(s, "GET", "/api/fs/properties?path=/data/link&follow=1", c, map[string]string{"X-QFM-CSRF": csrf})
+	w := request(s, "GET", "/api/fs/properties?path=/data/link&follow=1", c, map[string]string{"X-Taproot-CSRF": csrf})
 	if w.Code != 403 || !strings.Contains(w.Body.String(), `"code":"protected"`) {
 		t.Fatalf("status %d: %s", w.Code, w.Body)
 	}
@@ -1570,7 +1570,7 @@ func TestPropertiesGuardsTheFollowedTarget(t *testing.T) {
 		t.Fatal("a refused follow must never reach the worker")
 	}
 	// The same link WITHOUT follow describes the link itself, which is ordinary.
-	if ok := request(s, "GET", "/api/fs/properties?path=/data/link", c, map[string]string{"X-QFM-CSRF": csrf}); ok.Code != 200 {
+	if ok := request(s, "GET", "/api/fs/properties?path=/data/link", c, map[string]string{"X-Taproot-CSRF": csrf}); ok.Code != 200 {
 		t.Fatalf("unfollowed: %d %s", ok.Code, ok.Body)
 	}
 	if len(b.propsReqs) != 1 || b.propsReqs[0].Follow {
@@ -1591,7 +1591,7 @@ func TestPropertiesSendsTheGuardedTarget(t *testing.T) {
 	stub := &resolveStub{fakeBackend: b, aliases: map[string]string{"/data/link": "/data/real.txt"}}
 	s.backend, s.mutator = stub, stub
 	c, csrf := sessionCookie(t, s)
-	w := request(s, "GET", "/api/fs/properties?path=/data/link&follow=1", c, map[string]string{"X-QFM-CSRF": csrf})
+	w := request(s, "GET", "/api/fs/properties?path=/data/link&follow=1", c, map[string]string{"X-Taproot-CSRF": csrf})
 	if w.Code != 200 {
 		t.Fatalf("status %d: %s", w.Code, w.Body)
 	}
@@ -1627,7 +1627,7 @@ func TestPropertiesDoesNotFollowWhatItCannotGuard(t *testing.T) {
 	stub := &resolveStub{fakeBackend: b, dangling: map[string]bool{"/data/dangling": true}}
 	s.backend, s.mutator = stub, stub
 	c, csrf := sessionCookie(t, s)
-	w := request(s, "GET", "/api/fs/properties?path=/data/dangling&follow=1", c, map[string]string{"X-QFM-CSRF": csrf})
+	w := request(s, "GET", "/api/fs/properties?path=/data/dangling&follow=1", c, map[string]string{"X-Taproot-CSRF": csrf})
 	if w.Code != 200 {
 		t.Fatalf("a link whose target does not resolve must not fail the dialog: %d %s", w.Code, w.Body)
 	}
@@ -1644,7 +1644,7 @@ func TestPropertiesCapsForRootAndProtectedClass(t *testing.T) {
 	mkAPIFile(t, b, "/etc/config/thing", "x")
 	c, csrf := sessionCookie(t, s)
 	sessionFlags(t, s, c.Value, true, true)
-	w := request(s, "GET", "/api/fs/properties?path=/etc/config/thing", c, map[string]string{"X-QFM-CSRF": csrf})
+	w := request(s, "GET", "/api/fs/properties?path=/etc/config/thing", c, map[string]string{"X-Taproot-CSRF": csrf})
 	if w.Code != 200 {
 		t.Fatalf("status %d: %s", w.Code, w.Body)
 	}
@@ -1670,7 +1670,7 @@ func TestPropertiesRefusesAProtectedRead(t *testing.T) {
 	mkAPIFile(t, b, "/data/app/config/settings.json", "{}")
 	mkAPIFile(t, b, "/data/ordinary.txt", "x")
 	c, csrf := sessionCookie(t, s)
-	w := request(s, "GET", "/api/fs/properties?path=/data/app/config/settings.json", c, map[string]string{"X-QFM-CSRF": csrf})
+	w := request(s, "GET", "/api/fs/properties?path=/data/app/config/settings.json", c, map[string]string{"X-Taproot-CSRF": csrf})
 	if w.Code != 403 {
 		t.Fatalf("status %d, want 403: %s", w.Code, w.Body)
 	}
@@ -1681,10 +1681,10 @@ func TestPropertiesRefusesAProtectedRead(t *testing.T) {
 		t.Fatal("a protected read must never reach the worker")
 	}
 	// A dot component never reaches the guard at all.
-	if bad := request(s, "GET", "/api/fs/properties?path=/data/../etc", c, map[string]string{"X-QFM-CSRF": csrf}); bad.Code != 400 {
+	if bad := request(s, "GET", "/api/fs/properties?path=/data/../etc", c, map[string]string{"X-Taproot-CSRF": csrf}); bad.Code != 400 {
 		t.Fatalf("dot component: %d %s", bad.Code, bad.Body)
 	}
-	if ok := request(s, "GET", "/api/fs/properties?path=/data/ordinary.txt", c, map[string]string{"X-QFM-CSRF": csrf}); ok.Code != 200 {
+	if ok := request(s, "GET", "/api/fs/properties?path=/data/ordinary.txt", c, map[string]string{"X-Taproot-CSRF": csrf}); ok.Code != 200 {
 		t.Fatalf("an ordinary path must still answer: %d %s", ok.Code, ok.Body)
 	}
 }
@@ -1700,7 +1700,7 @@ func TestListAsksForTheACLProbe(t *testing.T) {
 	s, b, _ := permFixture(t)
 	mkAPIFile(t, b, "/data/file.txt", "x")
 	c, csrf := sessionCookie(t, s)
-	if w := request(s, "GET", "/api/fs/list?path=/data", c, map[string]string{"X-QFM-CSRF": csrf}); w.Code != 200 {
+	if w := request(s, "GET", "/api/fs/list?path=/data", c, map[string]string{"X-Taproot-CSRF": csrf}); w.Code != 200 {
 		t.Fatalf("status %d: %s", w.Code, w.Body)
 	}
 	if !b.opts.ACLProbe {
@@ -1717,11 +1717,11 @@ func TestIdentitiesNarrowedForANonAdmin(t *testing.T) {
 	s, _, _ := permFixture(t)
 	s.ids = idmapFixture(t)
 	c, csrf := sessionCookie(t, s)
-	users := decodeIDs(t, request(s, "GET", "/api/ids?kind=users", c, map[string]string{"X-QFM-CSRF": csrf}))
+	users := decodeIDs(t, request(s, "GET", "/api/ids?kind=users", c, map[string]string{"X-Taproot-CSRF": csrf}))
 	if len(users.Items) != 1 || users.Items[0].ID != 1000 || users.Items[0].Name != "dev" {
 		t.Fatalf("a non-admin must see only itself: %+v", users.Items)
 	}
-	groups := decodeIDs(t, request(s, "GET", "/api/ids?kind=groups", c, map[string]string{"X-QFM-CSRF": csrf}))
+	groups := decodeIDs(t, request(s, "GET", "/api/ids?kind=groups", c, map[string]string{"X-Taproot-CSRF": csrf}))
 	if len(groups.Items) != 2 {
 		t.Fatalf("a non-admin must see only its own groups: %+v", groups.Items)
 	}
@@ -1739,26 +1739,26 @@ func TestIdentitiesForAnAdminAreBoundedAndFilterable(t *testing.T) {
 	s.ids = idmapFixture(t)
 	c, csrf := sessionCookie(t, s)
 	sessionFlags(t, s, c.Value, false, true)
-	all := decodeIDs(t, request(s, "GET", "/api/ids?kind=users", c, map[string]string{"X-QFM-CSRF": csrf}))
+	all := decodeIDs(t, request(s, "GET", "/api/ids?kind=users", c, map[string]string{"X-Taproot-CSRF": csrf}))
 	if len(all.Items) != 3 || all.Truncated {
 		t.Fatalf("admin users %+v truncated=%v", all.Items, all.Truncated)
 	}
-	filtered := decodeIDs(t, request(s, "GET", "/api/ids?kind=users&q=BA", c, map[string]string{"X-QFM-CSRF": csrf}))
+	filtered := decodeIDs(t, request(s, "GET", "/api/ids?kind=users&q=BA", c, map[string]string{"X-Taproot-CSRF": csrf}))
 	if len(filtered.Items) != 1 || filtered.Items[0].Name != "backup" {
 		t.Fatalf("prefix filter is case-insensitive over names: %+v", filtered.Items)
 	}
-	byID := decodeIDs(t, request(s, "GET", "/api/ids?kind=users&q=100", c, map[string]string{"X-QFM-CSRF": csrf}))
+	byID := decodeIDs(t, request(s, "GET", "/api/ids?kind=users&q=100", c, map[string]string{"X-Taproot-CSRF": csrf}))
 	if len(byID.Items) == 0 {
 		t.Fatalf("the prefix also matches the id a picker displays: %+v", byID.Items)
 	}
-	groups := decodeIDs(t, request(s, "GET", "/api/ids?kind=groups", c, map[string]string{"X-QFM-CSRF": csrf}))
+	groups := decodeIDs(t, request(s, "GET", "/api/ids?kind=groups", c, map[string]string{"X-Taproot-CSRF": csrf}))
 	if len(groups.Items) != 2 {
 		t.Fatalf("admin groups %+v", groups.Items)
 	}
-	if w := request(s, "GET", "/api/ids?kind=nonsense", c, map[string]string{"X-QFM-CSRF": csrf}); w.Code != 400 {
+	if w := request(s, "GET", "/api/ids?kind=nonsense", c, map[string]string{"X-Taproot-CSRF": csrf}); w.Code != 400 {
 		t.Fatalf("unknown kind %d", w.Code)
 	}
-	if w := request(s, "GET", "/api/ids?kind=users&q="+strings.Repeat("x", idsQueryMax+1), c, map[string]string{"X-QFM-CSRF": csrf}); w.Code != 400 {
+	if w := request(s, "GET", "/api/ids?kind=users&q="+strings.Repeat("x", idsQueryMax+1), c, map[string]string{"X-Taproot-CSRF": csrf}); w.Code != 400 {
 		t.Fatalf("an unbounded prefix %d", w.Code)
 	}
 }

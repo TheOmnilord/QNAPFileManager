@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/qnap"
+	"taproot/internal/qnap"
 )
 
 // --- Astra r7 #1: the QuLog mirror is not on the path of the record ----------

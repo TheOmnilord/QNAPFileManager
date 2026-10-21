@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/config"
+	"taproot/internal/config"
 )
 
 func certPaths(t *testing.T) (string, string) {

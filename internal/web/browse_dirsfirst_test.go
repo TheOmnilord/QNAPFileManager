@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"qnapfilemanager/internal/fsx"
+	"taproot/internal/fsx"
 )
 
 // TestListDirsFirstQuery: GET /api/fs/list groups folders first unless the

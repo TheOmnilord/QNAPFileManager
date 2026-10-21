@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/audit"
-	"qnapfilemanager/internal/breakglass"
-	"qnapfilemanager/internal/config"
+	"taproot/internal/audit"
+	"taproot/internal/breakglass"
+	"taproot/internal/config"
 )
 
 // --- Astra r1 #3: sessionless denials go through the refusal throttle --------
@@ -247,7 +247,7 @@ func TestEveryBreakGlassSessionRemovalIsAudited(t *testing.T) {
 		read := withAudit(t, s)
 		cookie, csrf := bgSignIn(t, s)
 		// /api/logout, not /api/breakglass/logout: only the latter ever audited.
-		w := bgRequest(s, "POST", "/api/logout", []*http.Cookie{cookie}, map[string]string{"X-QFM-CSRF": csrf}, "")
+		w := bgRequest(s, "POST", "/api/logout", []*http.Cookie{cookie}, map[string]string{"X-Taproot-CSRF": csrf}, "")
 		if w.Code != http.StatusOK {
 			t.Fatalf("logout = %d %s", w.Code, w.Body)
 		}

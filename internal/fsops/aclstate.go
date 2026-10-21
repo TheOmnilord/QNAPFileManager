@@ -47,9 +47,9 @@ import (
 	"io/fs"
 	"os"
 
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/perm"
-	"qnapfilemanager/internal/platform"
+	"taproot/internal/fsx"
+	"taproot/internal/perm"
+	"taproot/internal/platform"
 )
 
 // aclBudget is one listing page's allowance: how many entries may be probed and

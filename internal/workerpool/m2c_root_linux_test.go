@@ -11,7 +11,7 @@ import (
 	"syscall"
 	"testing"
 
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/wproto"
 )
 
 // ownerOf reads the uid behind a FileInfo, so a test can assert that what a
@@ -38,7 +38,7 @@ func TestUploadThroughARealWorker(t *testing.T) {
 	requireLinuxRoot(t)
 	base := rootTree(t)
 	exe := buildDaemon(t, base)
-	alice := fixtureUser(t, "qfmalice", "qfmteam")
+	alice := fixtureUser(t, "taprootalice", "taprootteam")
 
 	dir := filepath.Join(base, "drop")
 	if err := os.Mkdir(dir, 0o755); err != nil {
@@ -102,8 +102,8 @@ func TestUploadThroughARealWorkerRefusesWhatTheKernelRefuses(t *testing.T) {
 	requireLinuxRoot(t)
 	base := rootTree(t)
 	exe := buildDaemon(t, base)
-	alice := fixtureUser(t, "qfmalice", "qfmteam")
-	bob := fixtureUser(t, "qfmbob", "qfmother")
+	alice := fixtureUser(t, "taprootalice", "taprootteam")
+	bob := fixtureUser(t, "taprootbob", "taprootother")
 
 	private := filepath.Join(base, "alice-only")
 	if err := os.Mkdir(private, 0o700); err != nil {
@@ -133,7 +133,7 @@ func TestArchiveThroughARealWorker(t *testing.T) {
 	requireLinuxRoot(t)
 	base := rootTree(t)
 	exe := buildDaemon(t, base)
-	alice := fixtureUser(t, "qfmalice", "qfmteam")
+	alice := fixtureUser(t, "taprootalice", "taprootteam")
 
 	tree := filepath.Join(base, "tree")
 	if err := os.MkdirAll(filepath.Join(tree, "sub"), 0o755); err != nil {
@@ -191,7 +191,7 @@ func TestSearchJobThroughARealWorker(t *testing.T) {
 	requireLinuxRoot(t)
 	base := rootTree(t)
 	exe := buildDaemon(t, base)
-	alice := fixtureUser(t, "qfmalice", "qfmteam")
+	alice := fixtureUser(t, "taprootalice", "taprootteam")
 
 	tree := filepath.Join(base, "tree")
 	if err := os.MkdirAll(filepath.Join(tree, "sub"), 0o755); err != nil {

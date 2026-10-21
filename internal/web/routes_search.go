@@ -13,11 +13,11 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"qnapfilemanager/internal/audit"
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/guard"
-	"qnapfilemanager/internal/jobs"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/audit"
+	"taproot/internal/fsx"
+	"taproot/internal/guard"
+	"taproot/internal/jobs"
+	"taproot/internal/wproto"
 )
 
 func (s *Server) jobSearch(w http.ResponseWriter, r *http.Request, sess *session) {

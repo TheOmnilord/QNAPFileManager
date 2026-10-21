@@ -13,13 +13,13 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/audit"
-	"qnapfilemanager/internal/backend"
-	"qnapfilemanager/internal/guard"
-	"qnapfilemanager/internal/jobs"
-	"qnapfilemanager/internal/platform"
-	"qnapfilemanager/internal/trashroot"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/audit"
+	"taproot/internal/backend"
+	"taproot/internal/guard"
+	"taproot/internal/jobs"
+	"taproot/internal/platform"
+	"taproot/internal/trashroot"
+	"taproot/internal/wproto"
 )
 
 // fakeJobs is a backend.Jobs that behaves like the worker RPC without a worker:
@@ -628,7 +628,7 @@ func otherSession(s *Server, id, user string, uid int, admin bool) (*http.Cookie
 	s.mu.Lock()
 	s.sessions[id] = sess
 	s.mu.Unlock()
-	return &http.Cookie{Name: "qfm_sid", Value: id}, sess.csrf
+	return &http.Cookie{Name: "taproot_sid", Value: id}, sess.csrf
 }
 
 func TestJobsListIsNewestFirstAndScopedToItsOwner(t *testing.T) {
@@ -838,8 +838,8 @@ func trashFixture(t *testing.T) (*Server, *fakeJobs, *http.Cookie, string) {
 	t.Helper()
 	s, _, fj := jobsFixture(t, jobs.Limits{})
 	fj.trash = wproto.TrashListResp{Items: []wproto.TrashItem{
-		{ID: "1700000000-abcdef01", Name: []byte("notes.txt"), OrigPath: []byte("/notes.txt"), Type: "file", Size: 12, DeletedAt: 1700000000, Trash: []byte("/.@qfm_trash")},
-		{ID: "1700000001-abcdef02", Name: []byte("bad\xffname"), OrigPath: []byte("/bad\xffname"), Type: "file", Size: 3, DeletedAt: 1700000001, Trash: []byte("/.@qfm_trash")},
+		{ID: "1700000000-abcdef01", Name: []byte("notes.txt"), OrigPath: []byte("/notes.txt"), Type: "file", Size: 12, DeletedAt: 1700000000, Trash: []byte("/.@taproot_trash")},
+		{ID: "1700000001-abcdef02", Name: []byte("bad\xffname"), OrigPath: []byte("/bad\xffname"), Type: "file", Size: 3, DeletedAt: 1700000001, Trash: []byte("/.@taproot_trash")},
 	}}
 	c, csrf := sessionCookie(t, s)
 	return s, fj, c, csrf
@@ -901,7 +901,7 @@ func TestTrashRestoreRefusals(t *testing.T) {
 	// example: /bin only denies delete and rename, not creating inside it.
 	s.guard = guard.New("/install", false)
 	s.guard.SetReadOnly(false)
-	fj.trash.Items = append(fj.trash.Items, wproto.TrashItem{ID: "1700000002-abcdef03", Name: []byte("sh"), OrigPath: []byte("/install/bin/qfm"), Type: "file"})
+	fj.trash.Items = append(fj.trash.Items, wproto.TrashItem{ID: "1700000002-abcdef03", Name: []byte("sh"), OrigPath: []byte("/install/bin/taproot"), Type: "file"})
 	if resp := post(s, "/api/trash/restore", c, csrf, `{"ids":["1700000002-abcdef03"]}`); resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("protected restore: %d %s", resp.StatusCode, readBody(resp))
 	}

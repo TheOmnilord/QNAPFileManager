@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"qnapfilemanager/internal/audit"
+	"taproot/internal/audit"
 )
 
 // The transfer notices are a contract between the two halves (see the const

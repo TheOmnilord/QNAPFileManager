@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/fsops"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/fsops"
+	"taproot/internal/wproto"
 )
 
 // TestSizeOptionsCarryTheBounds is stabilization contract §2.1 at the worker:

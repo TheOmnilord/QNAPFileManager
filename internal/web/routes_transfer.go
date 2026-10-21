@@ -9,12 +9,12 @@ import (
 	"sort"
 	"strconv"
 
-	"qnapfilemanager/internal/audit"
-	"qnapfilemanager/internal/backend"
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/guard"
-	"qnapfilemanager/internal/jobs"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/audit"
+	"taproot/internal/backend"
+	"taproot/internal/fsx"
+	"taproot/internal/guard"
+	"taproot/internal/jobs"
+	"taproot/internal/wproto"
 )
 
 // The route's own notice sentences. They are a contract with the client, like

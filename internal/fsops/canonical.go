@@ -36,7 +36,7 @@ import (
 	"fmt"
 	"os"
 
-	"qnapfilemanager/internal/fsx"
+	"taproot/internal/fsx"
 )
 
 // canonicalTarget names an already-canonical API path inside the jail, without

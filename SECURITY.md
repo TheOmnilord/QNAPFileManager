@@ -1,6 +1,6 @@
 # Security policy
 
-QNAPFileManager runs as root on a NAS, and administrators operate as root through it. Please report a suspected
+Taproot runs as root on a NAS, and administrators operate as root through it. Please report a suspected
 vulnerability privately — never in a public issue, pull request or discussion.
 
 ## Reporting a vulnerability

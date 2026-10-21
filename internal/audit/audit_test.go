@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/qnap"
+	"taproot/internal/qnap"
 )
 
 // recorder captures milestone mirror calls in place of qnap.Log.

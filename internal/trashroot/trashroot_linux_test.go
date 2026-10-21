@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/platform"
+	"taproot/internal/platform"
 )
 
 // storageAt declares dir as an ext4 storage mount root, which is what makes it
@@ -147,7 +147,7 @@ func leftovers(t *testing.T, root string) []string {
 
 // TestEnsurePublishesUnderATemporaryName is B3's happy path. The directory is
 // created under an unpredictable name, proved and given its mode through its own
-// descriptor, and only then renamed onto ".@qfm_trash" — so there is no instant
+// descriptor, and only then renamed onto ".@taproot_trash" — so there is no instant
 // at which the published name refers to a directory this process has not
 // examined, and no instant at which something else could be standing at it while
 // a root fchmod is aimed there.
@@ -604,7 +604,7 @@ func TestEnsureBoundsPublicationsAcrossAMixedSequence(t *testing.T) {
 // temporary directory was its own and left it behind (R3-BA2) — and when the
 // failure is "somebody else published first", Ensure swallows that error,
 // validates the winner and returns SUCCESS, so the sentence an operator needs in
-// order to understand an abandoned .@qfm_trash.tmp-* on their volume was never
+// order to understand an abandoned .@taproot_trash.tmp-* on their volume was never
 // written anywhere. It now goes to the daemon log before the retry.
 func TestEnsureLogsALeftoverWhenAnotherPublisherWins(t *testing.T) {
 	root := tempMount(t)

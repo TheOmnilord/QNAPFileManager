@@ -14,12 +14,12 @@ import (
 	"strings"
 	"testing"
 
-	"qnapfilemanager/internal/audit"
-	"qnapfilemanager/internal/backend"
-	"qnapfilemanager/internal/config"
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/guard"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/audit"
+	"taproot/internal/backend"
+	"taproot/internal/config"
+	"taproot/internal/fsx"
+	"taproot/internal/guard"
+	"taproot/internal/wproto"
 )
 
 // resolveStub overrides the fake backend's Resolve to model a worker resolving a
@@ -84,7 +84,7 @@ func mustSymlink(t *testing.T, oldname, newname string) {
 func post(s *Server, target string, cookie *http.Cookie, csrf, body string) *http.Response {
 	r := httptest.NewRequest("POST", target, strings.NewReader(body))
 	r.AddCookie(cookie)
-	r.Header.Set("X-QFM-CSRF", csrf)
+	r.Header.Set("X-Taproot-CSRF", csrf)
 	r.Header.Set("Origin", "http://example.com")
 	r.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -395,7 +395,7 @@ func TestMutationRequiresCSRF(t *testing.T) {
 	c, _ := sessionCookie(t, s)
 	r := httptest.NewRequest("POST", "/api/fs/mkdir", strings.NewReader(`{"dir":"/","name":"x"}`))
 	r.AddCookie(c)
-	r.Header.Set("Origin", "http://example.com") // no X-QFM-CSRF header
+	r.Header.Set("Origin", "http://example.com") // no X-Taproot-CSRF header
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, r)
 	if w.Code != 403 {
@@ -776,7 +776,7 @@ func TestCSRFRejectedMutationAudited(t *testing.T) {
 	}
 	s.auditor = logger
 	c, _ := sessionCookie(t, s)
-	// POST with the cookie but no X-QFM-CSRF header.
+	// POST with the cookie but no X-Taproot-CSRF header.
 	r := httptest.NewRequest("POST", "/api/fs/mkdir", strings.NewReader(`{"dir":"/","name":"x"}`))
 	r.AddCookie(c)
 	r.Header.Set("Origin", "http://example.com")

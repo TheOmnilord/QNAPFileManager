@@ -16,11 +16,11 @@ import (
 	"strings"
 	"testing"
 
-	"qnapfilemanager/internal/backend"
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/perm"
-	"qnapfilemanager/internal/platform"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/backend"
+	"taproot/internal/fsx"
+	"taproot/internal/perm"
+	"taproot/internal/platform"
+	"taproot/internal/wproto"
 )
 
 // m3Pool is testPool over a tree deep enough for a recursive job: the engine

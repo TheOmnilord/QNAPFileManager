@@ -1,4 +1,4 @@
-# Cross-compiles the qnapfilemanager binary for both QNAP architectures.
+# Cross-compiles the taproot binary for both QNAP architectures.
 # The full QPKG is built by GitHub Actions; this is for copying a binary onto
 # the NAS by hand between releases.
 param([string]$Version = "0.0.0-local")
@@ -12,9 +12,9 @@ try {
     $env:GOOS = "linux"
     foreach ($arch in "amd64", "arm64") {
         $env:GOARCH = $arch
-        go build -trimpath -ldflags "-s -w -X main.version=$Version" -o "dist/$arch/bin/qnapfilemanager" ./cmd/qnapfilemanager
+        go build -trimpath -ldflags "-s -w -X main.version=$Version" -o "dist/$arch/bin/taproot" ./cmd/taproot
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-        Write-Host "built dist/$arch/bin/qnapfilemanager"
+        Write-Host "built dist/$arch/bin/taproot"
     }
 } finally {
     Remove-Item env:GOOS, env:GOARCH, env:CGO_ENABLED -ErrorAction SilentlyContinue

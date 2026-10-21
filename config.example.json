@@ -1,7 +1,7 @@
 {
   "web": {
     "listen": "127.0.0.1:8770",
-    "proxyPrefix": "/qnapfilemanager",
+    "proxyPrefix": "/taproot",
     "breakGlass": {
       "enabled": true,
       "addr": "0.0.0.0:8771"

@@ -15,10 +15,10 @@ import (
 	"syscall"
 	"testing"
 
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/perm"
-	"qnapfilemanager/internal/platform"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/fsx"
+	"taproot/internal/perm"
+	"taproot/internal/platform"
+	"taproot/internal/wproto"
 )
 
 // modeOf reads the 07777 of a path with a plain lstat, which is the check every

@@ -18,7 +18,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"qnapfilemanager/internal/fsx"
+	"taproot/internal/fsx"
 )
 
 // Op is a bit flag naming one class of filesystem operation the guard reasons

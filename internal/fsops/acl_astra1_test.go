@@ -21,9 +21,9 @@ import (
 	"runtime"
 	"testing"
 
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/perm"
-	"qnapfilemanager/internal/platform"
+	"taproot/internal/fsx"
+	"taproot/internal/perm"
+	"taproot/internal/platform"
 )
 
 // TestPosixACLBadgeSurvivesAChmod is the ext4 half of contract §6: a file with

@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/wproto"
 )
 
 // TestMoveOfATreeWithHardLinksCompletes is the round-3 finding: two names for

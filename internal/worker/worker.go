@@ -32,11 +32,11 @@ import (
 	"syscall"
 	"time"
 
-	"qnapfilemanager/internal/fsops"
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/idmap"
-	"qnapfilemanager/internal/platform"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/fsops"
+	"taproot/internal/fsx"
+	"taproot/internal/idmap"
+	"taproot/internal/platform"
+	"taproot/internal/wproto"
 )
 
 // DefaultMaxConcurrent bounds the goroutines one worker will run at once. It

@@ -12,9 +12,9 @@ import (
 	"sync"
 	"time"
 
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/guard"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/fsx"
+	"taproot/internal/guard"
+	"taproot/internal/wproto"
 )
 
 func (s *Server) archive(w http.ResponseWriter, r *http.Request, sess *session) {

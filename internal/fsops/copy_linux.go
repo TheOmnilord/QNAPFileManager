@@ -19,7 +19,7 @@ import (
 	"time"
 	"unsafe"
 
-	"qnapfilemanager/internal/fsx"
+	"taproot/internal/fsx"
 )
 
 // copyReadFlags open a source file for reading.

@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"qnapfilemanager/internal/idmap"
+	"taproot/internal/idmap"
 )
 
 func req(cookies map[string]string, target string, headers map[string]string) *http.Request {

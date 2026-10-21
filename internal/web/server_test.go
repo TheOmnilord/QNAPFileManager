@@ -17,15 +17,15 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/backend"
-	"qnapfilemanager/internal/config"
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/guard"
-	"qnapfilemanager/internal/idmap"
-	"qnapfilemanager/internal/perm"
-	"qnapfilemanager/internal/platform"
-	"qnapfilemanager/internal/qtsauth"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/backend"
+	"taproot/internal/config"
+	"taproot/internal/fsx"
+	"taproot/internal/guard"
+	"taproot/internal/idmap"
+	"taproot/internal/perm"
+	"taproot/internal/platform"
+	"taproot/internal/qtsauth"
+	"taproot/internal/wproto"
 )
 
 // fakeBackend intentionally uses os only in the test package. No fsops import:
@@ -388,9 +388,9 @@ func sessionCookie(t *testing.T, s *Server) (*http.Cookie, string) {
 
 func TestStaticAndHeaders(t *testing.T) {
 	s, _ := fixture(t, false)
-	s.cfg.Web.ProxyPrefix = "/qnapfilemanager"
+	s.cfg.Web.ProxyPrefix = "/taproot"
 	s.cfg.Web.FrameAncestors = []string{"https://desktop.example"}
-	for _, prefix := range []string{"", "/qnapfilemanager"} {
+	for _, prefix := range []string{"", "/taproot"} {
 		for _, asset := range []struct{ path, ct string }{{"/", "text/html"}, {"/index.html", "text/html"}, {"/app.css", "text/css"}, {"/favicon.svg", "image/svg+xml"}, {"/js/app.js", "text/javascript"}} {
 			w := request(s, "GET", prefix+asset.path, nil, nil)
 			if w.Code != 200 || !strings.HasPrefix(w.Header().Get("Content-Type"), asset.ct) {
@@ -425,17 +425,17 @@ func TestStaticShellWithInvalidSession(t *testing.T) {
 	for _, switched := range []bool{false, true} {
 		t.Run(map[bool]string{false: "expired", true: "QTS user switch"}[switched], func(t *testing.T) {
 			s, _ := fixture(t, false)
-			s.cfg.Web.ProxyPrefix = "/qnapfilemanager"
+			s.cfg.Web.ProxyPrefix = "/taproot"
 			old := &session{id: "old-session", csrf: "private-csrf", who: backend.Principal{User: "private-user"}, expires: time.Now().Add(-time.Second)}
 			headers := map[string]string{}
 			if switched {
 				old.expires = time.Now().Add(time.Hour)
 				old.binding = qtsauth.CacheKey(qtsauth.Cred{Kind: "qtoken", User: "private-user", Token: "old-token"})
-				headers["Cookie"] = "qfm_sid=old-session; NAS_USER=new-user; qtoken=new-token"
+				headers["Cookie"] = "taproot_sid=old-session; NAS_USER=new-user; qtoken=new-token"
 			}
 			s.sessions[old.id] = old
-			cookie := &http.Cookie{Name: "qfm_sid", Value: old.id}
-			for _, prefix := range []string{"", "/qnapfilemanager"} {
+			cookie := &http.Cookie{Name: "taproot_sid", Value: old.id}
+			for _, prefix := range []string{"", "/taproot"} {
 				for _, asset := range []struct{ path, name, ct string }{
 					{"/", "index.html", "text/html"},
 					{"/index.html", "index.html", "text/html"},
@@ -498,19 +498,19 @@ func TestEveryAPIRequiresAuthentication(t *testing.T) {
 
 func TestPinnedSessionCookieAndIdentity(t *testing.T) {
 	s, b := fixture(t, true)
-	s.cfg.Web.ProxyPrefix = "/qnapfilemanager"
+	s.cfg.Web.ProxyPrefix = "/taproot"
 	for _, secure := range []bool{false, true} {
 		headers := map[string]string{}
 		if secure {
 			headers["X-Forwarded-Proto"] = "https"
 		}
-		w := request(s, "GET", "/qnapfilemanager/api/session", nil, headers)
+		w := request(s, "GET", "/taproot/api/session", nil, headers)
 		cookies := w.Result().Cookies()
 		if len(cookies) != 1 {
 			t.Fatal("expected session cookie")
 		}
 		c := cookies[0]
-		if c.Name != "qfm_sid" || !c.HttpOnly || c.SameSite != http.SameSiteLaxMode || c.Secure != secure || c.Path != "/qnapfilemanager/" || c.MaxAge != 43200 {
+		if c.Name != "taproot_sid" || !c.HttpOnly || c.SameSite != http.SameSiteLaxMode || c.Secure != secure || c.Path != "/taproot/" || c.MaxAge != 43200 {
 			t.Fatalf("cookie: %+v", c)
 		}
 		if !strings.Contains(w.Body.String(), `"rootMode":false`) || !strings.Contains(w.Body.String(), `"user":"dev"`) {
@@ -601,16 +601,16 @@ func TestCSRFAndLogout(t *testing.T) {
 	c, csrf := sessionCookie(t, s)
 	for _, h := range []map[string]string{
 		{"Origin": "http://example.com"},
-		{"X-QFM-CSRF": csrf, "Origin": "https://evil.example"},
-		{"X-QFM-CSRF": csrf},
-		{"X-QFM-CSRF": csrf, "Origin": "http://example.com", "Sec-Fetch-Site": "cross-site"},
+		{"X-Taproot-CSRF": csrf, "Origin": "https://evil.example"},
+		{"X-Taproot-CSRF": csrf},
+		{"X-Taproot-CSRF": csrf, "Origin": "http://example.com", "Sec-Fetch-Site": "cross-site"},
 	} {
 		w := request(s, "POST", "/api/logout", c, h)
 		if w.Code != 403 {
 			t.Errorf("CSRF %v: %d", h, w.Code)
 		}
 	}
-	w := request(s, "POST", "/api/logout", c, map[string]string{"X-QFM-CSRF": csrf, "Referer": "http://example.com/qnapfilemanager/"})
+	w := request(s, "POST", "/api/logout", c, map[string]string{"X-Taproot-CSRF": csrf, "Referer": "http://example.com/taproot/"})
 	if w.Code != 200 {
 		t.Fatalf("logout %d %s", w.Code, w.Body)
 	}
@@ -684,7 +684,7 @@ func TestQTSRevalidationAndBinding(t *testing.T) {
 	reject.Store(false)
 	s.verifier.InvalidateAll()
 	c = login()
-	w = request(s, "GET", "/api/fs/list?path=/", nil, map[string]string{"Cookie": "qfm_sid=" + c.Value + "; NAS_USER=dev; qtoken=rotated"})
+	w = request(s, "GET", "/api/fs/list?path=/", nil, map[string]string{"Cookie": "taproot_sid=" + c.Value + "; NAS_USER=dev; qtoken=rotated"})
 	if w.Code != 401 {
 		t.Fatalf("changed binding: %d", w.Code)
 	}
@@ -801,7 +801,7 @@ func TestWebDoesNotImportFSOps(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if strings.Contains(string(data), `"qnapfilemanager/internal/fsops"`) {
+		if strings.Contains(string(data), `"taproot/internal/fsops"`) {
 			t.Errorf("INV-1: %s imports fsops", file.Name())
 		}
 	}

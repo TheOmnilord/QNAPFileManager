@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/platform"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/platform"
+	"taproot/internal/wproto"
 )
 
 // send writes one request frame without waiting for anything. A job is not a
@@ -457,7 +457,7 @@ func TestJobSizeMeasuresWithoutChangingAnything(t *testing.T) {
 
 // trashHost builds the one fixture the trash needs and cannot invent: an
 // unjailed worker whose synthetic mount table declares the test's own temporary
-// directory to be an ext4 storage mount, with .@qfm_trash already standing in it
+// directory to be an ext4 storage mount, with .@taproot_trash already standing in it
 // as the root front-end would have made it (1777, sticky).
 //
 // It is unjailed because the mount table speaks host paths (PLAN.md decision
@@ -465,7 +465,7 @@ func TestJobSizeMeasuresWithoutChangingAnything(t *testing.T) {
 // request below is addressed by.
 func trashHost(t *testing.T) (wproto.Transport, string, string) {
 	t.Helper()
-	// The worker demands that .@qfm_trash be owned by uid 0 — the root
+	// The worker demands that .@taproot_trash be owned by uid 0 — the root
 	// front-end is what makes it (round-1 finding 2) — and an unprivileged test
 	// process cannot produce a root-owned directory, so on Linux this fixture
 	// is only honest as root. fsops proves the ownership rule itself on every
@@ -487,7 +487,7 @@ func trashHost(t *testing.T) (wproto.Transport, string, string) {
 	}
 	api := path.Clean("/" + strings.TrimPrefix(filepath.ToSlash(strings.TrimPrefix(base, vol)), "/"))
 
-	trash := filepath.Join(base, ".@qfm_trash")
+	trash := filepath.Join(base, ".@taproot_trash")
 	if err := os.Mkdir(trash, 0o777); err != nil {
 		t.Fatal(err)
 	}
@@ -507,7 +507,7 @@ func trashHost(t *testing.T) (wproto.Transport, string, string) {
 }
 
 // TestTrashJobAndTrashListRoundTrip drives the trash over the wire: a delete
-// with Trash set moves the item into .@qfm_trash, OpTrashList shows it, and a
+// with Trash set moves the item into .@taproot_trash, OpTrashList shows it, and a
 // trash-restore job puts it back.
 //
 // The worker is unjailed here, because the mount table speaks host paths: the
@@ -593,7 +593,7 @@ func TestTrashJobReportsTheEntryIDsItCreated(t *testing.T) {
 		uid = id
 	}
 	for i, want := range []string{"first.txt", "second.txt"} {
-		entry := filepath.Join(base, ".@qfm_trash", strconv.Itoa(uid), res.TrashIDs[i])
+		entry := filepath.Join(base, ".@taproot_trash", strconv.Itoa(uid), res.TrashIDs[i])
 		raw, err := os.ReadFile(filepath.Join(entry, "meta.json"))
 		if err != nil {
 			t.Fatalf("TrashIDs[%d] = %q names no entry on disk: %v", i, res.TrashIDs[i], err)

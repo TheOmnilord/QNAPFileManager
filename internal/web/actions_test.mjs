@@ -143,7 +143,7 @@ test('runMutation abandons the exchange when the page changes hands (Astra r8 #2
  update({session:{user:'alice',uid:1000,csrf:'ALICE'}});
  const posts=[];
  t.mock.method(globalThis,'fetch',async (url,opts) => {
-  posts.push(opts.headers.get('X-QFM-CSRF'));
+  posts.push(opts.headers.get('X-Taproot-CSRF'));
   // Bob signs in while Alice's redemption is on the wire.
   if (posts.length===2) update({session:{user:'administrator',uid:0,csrf:'BOB'}});
   return new Response(JSON.stringify({
@@ -167,7 +167,7 @@ test('runMutation carries on across a same-user refresh (Astra r8 #2)', async t 
  update({session:{user:'alice',uid:1000,csrf:'ALICE'}});
  const posts=[];
  t.mock.method(globalThis,'fetch',async (url,opts) => {
-  posts.push(opts.headers.get('X-QFM-CSRF'));
+  posts.push(opts.headers.get('X-Taproot-CSRF'));
   if (posts.length===1) {
    update({session:{user:'alice',uid:1000,csrf:'ROTATED'}});   // the minute poll, with a rotated token
    return new Response(JSON.stringify({error:{code:'confirm_required',message:'m'},confirm:{token:'T1'}}),{status:409});

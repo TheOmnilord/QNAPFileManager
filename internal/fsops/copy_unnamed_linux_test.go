@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/wproto"
 )
 
 // Round 14 adversarial: the three findings that changed how this engine creates

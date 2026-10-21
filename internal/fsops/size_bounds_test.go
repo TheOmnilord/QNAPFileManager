@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/wproto"
 )
 
 // The size walk's own bounds (stabilization contract §2.1): MaxDuration beside

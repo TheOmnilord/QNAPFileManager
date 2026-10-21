@@ -31,8 +31,8 @@ import (
 	"fmt"
 	"strings"
 
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/platform"
+	"taproot/internal/fsx"
+	"taproot/internal/platform"
 )
 
 // Protect says which never-write components a walk refuses to enter (F10).

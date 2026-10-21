@@ -6,7 +6,7 @@ import (
 	"io/fs"
 	"os"
 
-	"qnapfilemanager/internal/fsx"
+	"taproot/internal/fsx"
 )
 
 // The mutations off Linux go through os.Root's own methods, exactly as the read

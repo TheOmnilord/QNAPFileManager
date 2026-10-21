@@ -16,9 +16,9 @@ import (
 	"syscall"
 	"time"
 
-	"qnapfilemanager/internal/backend"
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/backend"
+	"taproot/internal/fsx"
+	"taproot/internal/wproto"
 )
 
 // client is the pool's end of one worker: the transport, the table of

@@ -7,13 +7,13 @@
 #
 # What it builds:
 #
-#   /share                      tmpfs          (QTS keeps /share on a RAM disk)
-#   /share/ZFS1_DATA            zfs qfmpool    volume root
-#   /share/ZFS1_DATA/Public     zfs qfmpool/Public    aclmode=discard
-#   /share/ZFS1_DATA/Media      zfs qfmpool/Media     aclmode=passthrough
-#   /share/ZFS2_DATA            zfs qfmpool2   second volume root, second domain
-#   /share/ZFS2_DATA/Backup     zfs qfmpool2/Backup
-#   /share/Public -> ZFS1_DATA/Public          the symlinks QTS registers
+#   /share                      tmpfs              (QTS keeps /share on a RAM disk)
+#   /share/ZFS1_DATA            zfs taprootpool    volume root
+#   /share/ZFS1_DATA/Public     zfs taprootpool/Public    aclmode=discard
+#   /share/ZFS1_DATA/Media      zfs taprootpool/Media     aclmode=passthrough
+#   /share/ZFS2_DATA            zfs taprootpool2   second volume root, second domain
+#   /share/ZFS2_DATA/Backup     zfs taprootpool2/Backup
+#   /share/Public -> ZFS1_DATA/Public              the symlinks QTS registers
 #   /share/Media  -> ZFS1_DATA/Media
 #
 # That is enough to exercise: per-dataset st_dev, MayCross inside one pool and
@@ -30,9 +30,9 @@ set -euo pipefail
 
 export DEBIAN_FRONTEND=noninteractive
 
-IMG_DIR=${QFM_ZFS_IMG_DIR:-/tmp/qfm-zfs}
-POOL1=qfmpool
-POOL2=qfmpool2
+IMG_DIR=${TAPROOT_ZFS_IMG_DIR:-/tmp/taproot-zfs}
+POOL1=taprootpool
+POOL2=taprootpool2
 VOL1=/share/ZFS1_DATA
 VOL2=/share/ZFS2_DATA
 # 512 MiB each: comfortably above OpenZFS's 64 MiB minimum vdev, small enough
@@ -112,9 +112,9 @@ ensure_share() {
 
 # FIXTURE_PROP is stamped on the root dataset at creation time and is the only
 # thing that makes a pool this script's to modify. A pool that happens to be
-# called qfmpool on somebody's machine is not this fixture, and a script running
-# as root must not decide otherwise from a name.
-FIXTURE_PROP=qfm:fixture
+# called taprootpool on somebody's machine is not this fixture, and a script
+# running as root must not decide otherwise from a name.
+FIXTURE_PROP=taproot:fixture
 
 # pool_vdevs <pool> — the full paths of a pool's leaf vdevs, one per line.
 # -P asks for whole paths; the pool's own summary line is the first one and is
@@ -257,4 +257,4 @@ cat /proc/self/mountinfo | grep -E 'zfs|share' || true
 log "ls /share"
 ls -la /share
 
-log "fixture ready: QFM_ZFS_TEST=1 go test -run ZFS ./internal/platform/... ./internal/fsops/..."
+log "fixture ready: TAPROOT_ZFS_TEST=1 go test -run ZFS ./internal/platform/... ./internal/fsops/..."

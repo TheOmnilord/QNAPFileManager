@@ -17,9 +17,9 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/breakglass"
-	"qnapfilemanager/internal/config"
-	"qnapfilemanager/internal/web"
+	"taproot/internal/breakglass"
+	"taproot/internal/config"
+	"taproot/internal/web"
 )
 
 func armFixture(t *testing.T, mutate func(*config.Config)) (*server, config.Config, string, *bytes.Buffer) {

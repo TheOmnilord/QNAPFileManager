@@ -11,9 +11,9 @@ import (
 	"os"
 	"time"
 
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/platform"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/fsx"
+	"taproot/internal/platform"
+	"taproot/internal/wproto"
 )
 
 // scanTimeCheck is how many items the scan counts between two clock readings.

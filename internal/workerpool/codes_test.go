@@ -3,8 +3,8 @@ package workerpool
 import (
 	"testing"
 
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/fsx"
+	"taproot/internal/wproto"
 )
 
 // TestEveryWorkerCodeIsReassembled is the pool's half of the M3 code-coverage

@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/wproto"
 )
 
 // jobLog collects what a job reported, so a test can assert on the warnings and

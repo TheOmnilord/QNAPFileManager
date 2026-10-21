@@ -7,7 +7,7 @@ import (
 	"os"
 	"syscall"
 
-	"qnapfilemanager/internal/fsx"
+	"taproot/internal/fsx"
 )
 
 // openCanonicalDir opens the directory named by an already-canonical

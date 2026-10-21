@@ -15,16 +15,16 @@ import (
 	"sync"
 	"time"
 
-	"qnapfilemanager/internal/audit"
-	"qnapfilemanager/internal/backend"
-	"qnapfilemanager/internal/config"
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/guard"
-	"qnapfilemanager/internal/idmap"
-	"qnapfilemanager/internal/jobs"
-	"qnapfilemanager/internal/platform"
-	"qnapfilemanager/internal/qtsauth"
-	"qnapfilemanager/internal/trashroot"
+	"taproot/internal/audit"
+	"taproot/internal/backend"
+	"taproot/internal/config"
+	"taproot/internal/fsx"
+	"taproot/internal/guard"
+	"taproot/internal/idmap"
+	"taproot/internal/jobs"
+	"taproot/internal/platform"
+	"taproot/internal/qtsauth"
+	"taproot/internal/trashroot"
 )
 
 //go:embed static
@@ -237,13 +237,13 @@ func (s *Server) Handler() http.Handler {
 	return s.security(collapseDoubleSlashes(h))
 }
 
-// collapseDoubleSlashes rewrites "/qnapfilemanager//app.css" to
-// "/qnapfilemanager/app.css" before routing.
+// collapseDoubleSlashes rewrites "/taproot//app.css" to
+// "/taproot/app.css" before routing.
 //
-// QTS's reverse proxy joins its target "http://127.0.0.1:8770/qnapfilemanager/"
-// with the remainder of the request path, so "/qnapfilemanager/app.css" reaches
-// this daemon as "/qnapfilemanager//app.css" (and the bare "/qnapfilemanager"
-// as "/qnapfilemanager/", which is why the shell alone loaded). Left alone,
+// QTS's reverse proxy joins its target "http://127.0.0.1:8770/taproot/"
+// with the remainder of the request path, so "/taproot/app.css" reaches
+// this daemon as "/taproot//app.css" (and the bare "/taproot"
+// as "/taproot/", which is why the shell alone loaded). Left alone,
 // http.ServeMux cleans the doubled slash and answers a 307 to the cleaned path,
 // which is the very URL the browser asked for, so it loops forever — observed
 // on QTS 5.2.9 and QuTS hero alike as a shell with no stylesheet and no
@@ -574,10 +574,10 @@ func (s *Server) basePath() string {
 // operator reaches directly at https://<nas>:8771/ precisely BECAUSE Apache may
 // be what is broken. BreakGlassHandler therefore installs no prefix mux — so a
 // shell served there with the global base would point at
-// "/qnapfilemanager/app.css" and "/qnapfilemanager/api/session", neither of
+// "/taproot/app.css" and "/taproot/api/session", neither of
 // which exists on that listener, and the emergency door would answer 404 for
 // its own stylesheet, its own script and every API call. The prefix comes from
-// the QPKG service script in production (-proxy-prefix /qnapfilemanager), so
+// the QPKG service script in production (-proxy-prefix /taproot), so
 // this is the configuration that actually ships.
 func (s *Server) baseFor(r *http.Request) string {
 	if breakGlassRequest(r) {
@@ -589,7 +589,7 @@ func (s *Server) baseFor(r *http.Request) string {
 // shellWithBase rewrites the shell's three asset references to absolute URLs
 // under basePath and injects that base for the scripts.
 //
-// The QTS desktop opens the app at the bare proxy path, "/qnapfilemanager"
+// The QTS desktop opens the app at the bare proxy path, "/taproot"
 // with no trailing slash (seen in the browser's network tab on the first
 // hardware test): a relative "app.css" then resolves to "/app.css" on the QTS
 // origin, outside the proxy, and QTS answers its own 404. Absolute URLs under
@@ -607,6 +607,6 @@ func (s *Server) shellWithBaseAt(shell []byte, base string) []byte {
 	out = strings.Replace(out, `href="app.css"`, `href="`+base+`app.css"`, 1)
 	out = strings.Replace(out, `href="favicon.svg"`, `href="`+base+`favicon.svg"`, 1)
 	out = strings.Replace(out, `src="js/app.js"`, `src="`+base+`js/app.js"`, 1)
-	out = strings.Replace(out, `<meta charset="utf-8">`, `<meta charset="utf-8"><meta name="qfm-base" content="`+base+`">`, 1)
+	out = strings.Replace(out, `<meta charset="utf-8">`, `<meta charset="utf-8"><meta name="taproot-base" content="`+base+`">`, 1)
 	return []byte(out)
 }

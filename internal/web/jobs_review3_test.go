@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/audit"
-	"qnapfilemanager/internal/jobs"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/audit"
+	"taproot/internal/jobs"
+	"taproot/internal/wproto"
 )
 
 // The M2-A round-3 web/jobs findings, one test group per finding:

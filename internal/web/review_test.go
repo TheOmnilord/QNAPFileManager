@@ -12,9 +12,9 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/backend"
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/qtsauth"
+	"taproot/internal/backend"
+	"taproot/internal/fsx"
+	"taproot/internal/qtsauth"
 )
 
 func TestBusyVerificationDoesNotBlockOtherSessions(t *testing.T) {
@@ -33,7 +33,7 @@ func TestBusyVerificationDoesNotBlockOtherSessions(t *testing.T) {
 	s.sessions["expired"] = &session{id: "expired", expires: now.Add(-time.Second)}
 	slowDone := make(chan *httptest.ResponseRecorder, 1)
 	go func() {
-		slowDone <- request(s, "GET", "/api/session", &http.Cookie{Name: "qfm_sid", Value: "slow"}, nil)
+		slowDone <- request(s, "GET", "/api/session", &http.Cookie{Name: "taproot_sid", Value: "slow"}, nil)
 	}()
 	defer func() {
 		close(release)
@@ -48,7 +48,7 @@ func TestBusyVerificationDoesNotBlockOtherSessions(t *testing.T) {
 	}
 	fastDone := make(chan *httptest.ResponseRecorder, 1)
 	go func() {
-		fastDone <- request(s, "GET", "/api/session", &http.Cookie{Name: "qfm_sid", Value: "fast"}, nil)
+		fastDone <- request(s, "GET", "/api/session", &http.Cookie{Name: "taproot_sid", Value: "fast"}, nil)
 	}()
 	select {
 	case w := <-fastDone:
@@ -59,7 +59,7 @@ func TestBusyVerificationDoesNotBlockOtherSessions(t *testing.T) {
 		t.Fatal("unrelated session blocked on QTS verification")
 	}
 	// Expiration is checked on indexed lookup; unrelated requests no longer sweep.
-	if w := request(s, "GET", "/api/session", &http.Cookie{Name: "qfm_sid", Value: "expired"}, nil); w.Code != http.StatusUnauthorized {
+	if w := request(s, "GET", "/api/session", &http.Cookie{Name: "taproot_sid", Value: "expired"}, nil); w.Code != http.StatusUnauthorized {
 		t.Fatalf("expired session: %d", w.Code)
 	}
 	s.mu.Lock()

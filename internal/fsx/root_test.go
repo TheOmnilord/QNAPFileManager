@@ -40,7 +40,7 @@ func TestRootIdentity(t *testing.T) {
 }
 
 // A jail base with a drive letter and a space in it is the everyday case on
-// the Windows dev box: C:\Dev\QNAPFileManager\testdata\fakeroot, and the
+// the Windows dev box: C:\Dev\<checkout>\testdata\fakeroot, and the
 // operator's own directories are worse.
 func TestRootWindowsStyleBase(t *testing.T) {
 	base := `C:\Dev\QNAP File Manager\testdata\fakeroot`

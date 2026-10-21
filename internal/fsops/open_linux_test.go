@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/fsx"
+	"taproot/internal/fsx"
 )
 
 // TestOpenReadDoesNotBlockOnAFifo is the reason the Linux open carries

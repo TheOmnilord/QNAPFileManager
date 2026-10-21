@@ -34,7 +34,7 @@ package fsops
 //
 // Where O_TMPFILE is unavailable — an old kernel, a filesystem without it, or
 // no /proc for the linkat that publishes one — the file is created under a
-// hidden `.qfm-upload-<16 hex>.part` name with O_EXCL, and the window between
+// hidden `.taproot-upload-<16 hex>.part` name with O_EXCL, and the window between
 // that creation and the chown is the documented residual (contract §1.2). Off
 // Linux there is no unnamed form at all and nothing chowns, which is the dev
 // box's degradation and not the NAS's (INV-2).
@@ -56,9 +56,9 @@ import (
 	"syscall"
 	"time"
 
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/platform"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/fsx"
+	"taproot/internal/platform"
+	"taproot/internal/wproto"
 )
 
 const (
@@ -74,7 +74,7 @@ const (
 	// dot-name so a listing hides it, and it carries sixteen random hex digits
 	// so two uploads into one directory cannot collide and nobody can guess the
 	// name in order to race it.
-	uploadTmpPrefix = ".qfm-upload-"
+	uploadTmpPrefix = ".taproot-upload-"
 	uploadTmpSuffix = ".part"
 )
 

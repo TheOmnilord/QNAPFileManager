@@ -1,12 +1,12 @@
-// Command icongen renders the QNAPFileManager app icon ("root prompt": an
+// Command icongen renders the Taproot app icon ("root prompt": an
 // amber folder carrying a '#_' root shell prompt on a slate rounded tile) and
 // writes every derived file from one geometry:
 //
 //	docs/brand/icon.svg                     canonical vector source
 //	internal/web/static/favicon.svg         the UI favicon (same bytes)
-//	qpkg/icons/QNAPFileManager.gif          64x64, App Center
-//	qpkg/icons/QNAPFileManager_80.gif       80x80, App Center
-//	qpkg/icons/QNAPFileManager_gray.gif     64x64, "disabled" state
+//	qpkg/icons/Taproot.gif                  64x64, App Center
+//	qpkg/icons/Taproot_80.gif               80x80, App Center
+//	qpkg/icons/Taproot_gray.gif             64x64, "disabled" state
 //
 // Run it from the repository root:
 //
@@ -193,7 +193,7 @@ func preview(path string, icons []*image.Paletted) {
 }
 
 const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="80" height="80" viewBox="0 0 80 80">
-  <title>QNAPFileManager — root access</title>
+  <title>Taproot — root access</title>
   <rect x="3" y="3" width="74" height="74" rx="16" fill="#253445"/>
   <path fill="#edaa42" d="M18 22H32L40 29H62A4 4 0 0 1 66 33V57A4 4 0 0 1 62 61H18A4 4 0 0 1 14 57V26A4 4 0 0 1 18 22Z"/>
   <g fill="#253445">
@@ -213,9 +213,9 @@ func main() {
 	must(os.WriteFile(join("docs", "brand", "icon.svg"), []byte(svg), 0644))
 	must(os.WriteFile(join("internal", "web", "static", "favicon.svg"), []byte(svg), 0644))
 	slate, amber := color.NRGBA{37, 52, 69, 255}, color.NRGBA{237, 170, 66, 255}
-	a := saveGIF(join("qpkg", "icons", "QNAPFileManager.gif"), render(64, slate, amber))
-	b := saveGIF(join("qpkg", "icons", "QNAPFileManager_80.gif"), render(80, slate, amber))
-	c := saveGIF(join("qpkg", "icons", "QNAPFileManager_gray.gif"), render(64, color.NRGBA{169, 169, 169, 255}, color.NRGBA{220, 220, 220, 255}))
+	a := saveGIF(join("qpkg", "icons", "Taproot.gif"), render(64, slate, amber))
+	b := saveGIF(join("qpkg", "icons", "Taproot_80.gif"), render(80, slate, amber))
+	c := saveGIF(join("qpkg", "icons", "Taproot_gray.gif"), render(64, color.NRGBA{169, 169, 169, 255}, color.NRGBA{220, 220, 220, 255}))
 	if *previewPath != "" {
 		preview(*previewPath, []*image.Paletted{a, b, c})
 	}

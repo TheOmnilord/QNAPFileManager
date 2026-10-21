@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/qnap"
+	"taproot/internal/qnap"
 )
 
 // --- Astra r8 #5: an overflow of mirrors is not an overflow of stderr --------

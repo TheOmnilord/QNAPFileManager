@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/wproto"
 )
 
 // TestOverwriteRefusesATargetThatChangedKind is round 5's third finding: place

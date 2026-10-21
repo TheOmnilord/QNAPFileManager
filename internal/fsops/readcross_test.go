@@ -19,8 +19,8 @@ import (
 	"strings"
 	"testing"
 
-	"qnapfilemanager/internal/platform"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/platform"
+	"taproot/internal/wproto"
 )
 
 // ramDiskShare builds the hero shape under a temporary directory:

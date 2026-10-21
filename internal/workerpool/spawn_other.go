@@ -5,8 +5,8 @@ package workerpool
 import (
 	"fmt"
 
-	"qnapfilemanager/internal/backend"
-	"qnapfilemanager/internal/fsx"
+	"taproot/internal/backend"
+	"taproot/internal/fsx"
 )
 
 // spawnProcess needs SysProcAttr.Credential, socketpair(2) and SCM_RIGHTS,

@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/audit"
+	"taproot/internal/audit"
 )
 
 // bgOverTheLAN presents a real loopback socket as a peer on the LAN (Astra r7
@@ -105,7 +105,7 @@ func TestTheLogoutRouteRecordsAPeerMismatch(t *testing.T) {
 	cookie := bgSignInFrom(t, s, operator)
 	_, csrf := bgSessionAnswer(t, bgRequestFrom(s, operator, "GET", "/api/session", bgWithCookie(cookie), ""))
 	headers := bgWithCookie(cookie)
-	headers["X-QFM-CSRF"] = csrf
+	headers["X-Taproot-CSRF"] = csrf
 
 	if w := bgRequestFrom(s, elsewhere, "POST", bgLogoutPath, headers, ""); w.Code != statusCode("permission") {
 		t.Fatalf("a replayed logout from %s = %d %s, want %d", elsewhere, w.Code, w.Body, statusCode("permission"))
@@ -320,7 +320,7 @@ func TestALoopbackRequestNeverRedeemsASession(t *testing.T) {
 		t.Fatal("the refused loopback request was not tracked, so the count below proves nothing")
 	}
 	headers := bgWithCookie(cookie)
-	headers["X-QFM-CSRF"] = csrf
+	headers["X-Taproot-CSRF"] = csrf
 	if w := bgRequestFrom(s, "127.0.0.1", "POST", bgLogoutPath, headers, ""); w.Code != statusCode("permission") {
 		t.Fatalf("a loopback logout with a VALID token = %d %s, want %d", w.Code, w.Body, statusCode("permission"))
 	}

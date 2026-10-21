@@ -8,9 +8,9 @@ import (
 	"context"
 	"fmt"
 
-	"qnapfilemanager/internal/fsops"
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/fsops"
+	"taproot/internal/fsx"
+	"taproot/internal/wproto"
 )
 
 // chmod changes one entry's mode as the user and replies with the before, the

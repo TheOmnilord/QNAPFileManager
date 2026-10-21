@@ -11,7 +11,7 @@ import (
 func safeMethod(method string) bool { return method == "GET" || method == "HEAD" }
 
 func validCSRF(r *http.Request, token string) bool {
-	if token == "" || subtle.ConstantTimeCompare([]byte(r.Header.Get("X-QFM-CSRF")), []byte(token)) != 1 {
+	if token == "" || subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Taproot-CSRF")), []byte(token)) != 1 {
 		return false
 	}
 	return validOrigin(r)

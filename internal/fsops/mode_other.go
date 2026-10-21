@@ -16,7 +16,7 @@ import (
 	"io/fs"
 	"os"
 
-	"qnapfilemanager/internal/fsx"
+	"taproot/internal/fsx"
 )
 
 // chmodHeld applies a mode best effort. Windows mode bits are a fiction — the

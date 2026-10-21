@@ -47,7 +47,7 @@ export function sessionBootstrap(href,replaceURL,request,sleep=ms => new Promise
      const pendingSID=Object.hasOwn(params,'sid');
      params={};
      const exhausted=Object.assign(new Error(pendingSID ?
-      'Connection temporarily unavailable. Reopen QNAPFileManager from QTS to try again.' :
+      'Connection temporarily unavailable. Reopen Taproot from QTS to try again.' :
       'Connection temporarily unavailable. Please retry.'),{network:true});
      if (pendingSID) failure=exhausted;
      throw exhausted;

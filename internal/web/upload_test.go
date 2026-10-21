@@ -20,10 +20,10 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/backend"
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/guard"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/backend"
+	"taproot/internal/fsx"
+	"taproot/internal/guard"
+	"taproot/internal/wproto"
 )
 
 // Extend the existing fixture by embedding it, keeping M2-C's seams entirely
@@ -106,7 +106,7 @@ func uploadRequest(target string, c *http.Cookie, csrf string, body io.Reader) *
 	if c != nil {
 		r.AddCookie(c)
 	}
-	r.Header.Set("X-QFM-CSRF", csrf)
+	r.Header.Set("X-Taproot-CSRF", csrf)
 	r.Header.Set("Origin", "http://example.com")
 	r.Header.Set("Content-Type", "application/octet-stream")
 	return r
@@ -384,7 +384,7 @@ func uploadConn(t *testing.T, server *httptest.Server, c *http.Cookie, csrf, que
 	}
 	t.Cleanup(func() { _ = conn.Close() })
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
-	_, err = fmt.Fprintf(conn, "POST /api/fs/upload?%s HTTP/1.1\r\nHost: %s\r\nCookie: %s\r\nOrigin: %s\r\nX-QFM-CSRF: %s\r\nContent-Type: %s\r\nContent-Length: %d\r\n\r\n",
+	_, err = fmt.Fprintf(conn, "POST /api/fs/upload?%s HTTP/1.1\r\nHost: %s\r\nCookie: %s\r\nOrigin: %s\r\nX-Taproot-CSRF: %s\r\nContent-Type: %s\r\nContent-Length: %d\r\n\r\n",
 		query, u.Host, c.String(), server.URL, csrf, contentType, length)
 	if err != nil {
 		t.Fatal(err)
@@ -485,7 +485,7 @@ func TestUploadConfirmationHTTPBeforeBody(t *testing.T) {
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
-	_, err = fmt.Fprintf(conn, "POST /api/fs/upload?dir=/dest&name=a&conflict=overwrite HTTP/1.1\r\nHost: %s\r\nCookie: %s\r\nOrigin: %s\r\nX-QFM-CSRF: %s\r\nContent-Type: application/octet-stream\r\nContent-Length: 3145728\r\n\r\n", u.Host, c.String(), server.URL, csrf)
+	_, err = fmt.Fprintf(conn, "POST /api/fs/upload?dir=/dest&name=a&conflict=overwrite HTTP/1.1\r\nHost: %s\r\nCookie: %s\r\nOrigin: %s\r\nX-Taproot-CSRF: %s\r\nContent-Type: application/octet-stream\r\nContent-Length: 3145728\r\n\r\n", u.Host, c.String(), server.URL, csrf)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -932,7 +932,7 @@ func TestUploadStallWindowDoesNotOutlastTheBody(t *testing.T) {
 		t.Fatal(err)
 	}
 	req.AddCookie(c)
-	req.Header.Set("X-QFM-CSRF", csrf)
+	req.Header.Set("X-Taproot-CSRF", csrf)
 	req.Header.Set("Origin", server.URL)
 	req.Header.Set("Content-Type", "application/octet-stream")
 	resp, err := server.Client().Do(req)
@@ -1112,7 +1112,7 @@ func TestUploadWithheldMultipartTailDoesNotHangTheSlot(t *testing.T) {
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
-	head := fmt.Sprintf("POST /api/fs/upload?dir=%s&name=a.bin&conflict=skip HTTP/1.1\r\nHost: %s\r\nCookie: %s\r\nOrigin: %s\r\nX-QFM-CSRF: %s\r\nContent-Type: multipart/form-data; boundary=%s\r\nContent-Length: %d\r\n\r\n",
+	head := fmt.Sprintf("POST /api/fs/upload?dir=%s&name=a.bin&conflict=skip HTTP/1.1\r\nHost: %s\r\nCookie: %s\r\nOrigin: %s\r\nX-Taproot-CSRF: %s\r\nContent-Type: multipart/form-data; boundary=%s\r\nContent-Length: %d\r\n\r\n",
 		url.QueryEscape(deep), u.Host, c.String(), server.URL, csrf, boundary, len(part)+len(tail))
 	if _, err := io.WriteString(conn, head+part); err != nil {
 		t.Fatal(err)

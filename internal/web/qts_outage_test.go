@@ -90,7 +90,7 @@ func TestQTSOutageRecoveryAndRejection(t *testing.T) {
 	// Once it fails, following reads must also validate instead of using it.
 	mode.Store(1)
 	assertAuthError(t, request(s, "POST", "/api/logout", cookie, map[string]string{
-		"X-QFM-CSRF": old.csrf, "Origin": "http://example.com",
+		"X-Taproot-CSRF": old.csrf, "Origin": "http://example.com",
 	}), 503, "qts_unavailable", "2")
 	assertAuthError(t, request(s, "GET", "/api/session", cookie, nil), 503, "qts_unavailable", "2")
 	mode.Store(0)

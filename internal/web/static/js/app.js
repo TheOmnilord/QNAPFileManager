@@ -29,9 +29,9 @@ function theme(value) {
  if (!['auto','light','dark'].includes(value)) value='auto';
  if (value==='auto') delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme=value;
  $('#theme').value=value;
- try { localStorage.setItem('qfm-theme',value); } catch { /* QTS/private storage can be unavailable. */ }
+ try { localStorage.setItem('taproot-theme',value); } catch { /* QTS/private storage can be unavailable. */ }
 }
-try { theme(localStorage.getItem('qfm-theme') || 'auto'); } catch { theme('auto'); }
+try { theme(localStorage.getItem('taproot-theme') || 'auto'); } catch { theme('auto'); }
 $('#theme').addEventListener('change',ev => theme(ev.target.value));
 
 function navigate() {

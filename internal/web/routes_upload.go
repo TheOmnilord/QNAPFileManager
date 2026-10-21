@@ -13,10 +13,10 @@ import (
 	"sync"
 	"time"
 
-	"qnapfilemanager/internal/audit"
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/guard"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/audit"
+	"taproot/internal/fsx"
+	"taproot/internal/guard"
+	"taproot/internal/wproto"
 )
 
 // The upload route emits exactly one notice sentence (noticeOverwrite from

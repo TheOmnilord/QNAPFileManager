@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	"qnapfilemanager/internal/platform"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/platform"
+	"taproot/internal/wproto"
 )
 
 // Round 15's first finding: everything this job builds is built inside a

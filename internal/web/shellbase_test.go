@@ -5,16 +5,16 @@ import (
 	"strings"
 	"testing"
 
-	"qnapfilemanager/internal/config"
+	"taproot/internal/config"
 )
 
 // TestShellUsesAbsoluteURLsUnderTheProxyPrefix pins the second hardware
-// finding: the QTS desktop opens the app at the bare "/qnapfilemanager", so
+// finding: the QTS desktop opens the app at the bare "/taproot", so
 // the shell's relative "app.css" resolved to "/app.css" on the QTS origin and
 // QTS answered 404. The shell must reference its assets absolutely under the
 // configured prefix and hand that base to the scripts.
 func TestShellUsesAbsoluteURLsUnderTheProxyPrefix(t *testing.T) {
-	for prefix, base := range map[string]string{"": "/", "/qnapfilemanager": "/qnapfilemanager/"} {
+	for prefix, base := range map[string]string{"": "/", "/taproot": "/taproot/"} {
 		cfg := config.Default()
 		cfg.Web.ProxyPrefix = prefix
 		s := New(cfg, nil, nil, nil, nil, nil, "test", nil, nil, nil, nil)
@@ -27,7 +27,7 @@ func TestShellUsesAbsoluteURLsUnderTheProxyPrefix(t *testing.T) {
 			`href="` + base + `app.css"`,
 			`href="` + base + `favicon.svg"`,
 			`src="` + base + `js/app.js"`,
-			`<meta name="qfm-base" content="` + base + `">`,
+			`<meta name="taproot-base" content="` + base + `">`,
 		} {
 			if !strings.Contains(body, want) {
 				t.Errorf("prefix %q: shell lacks %s", prefix, want)

@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/wproto"
 )
 
 // The portable half of the M2-C worker tests: the job dispatch, which needs no

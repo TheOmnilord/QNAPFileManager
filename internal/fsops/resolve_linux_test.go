@@ -9,7 +9,7 @@ import (
 	"syscall"
 	"testing"
 
-	"qnapfilemanager/internal/fsx"
+	"taproot/internal/fsx"
 )
 
 // TestResolvePathUnsearchableIntermediateIsPermission is round-3 finding 2 as a

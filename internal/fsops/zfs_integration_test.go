@@ -10,9 +10,9 @@ import (
 	"syscall"
 	"testing"
 
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/platform"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/fsx"
+	"taproot/internal/platform"
+	"taproot/internal/wproto"
 )
 
 // The QuTS hero half of fsops, against the real file-backed pool built by
@@ -21,7 +21,7 @@ import (
 // there is no simulated dataset boundary.
 //
 //	sudo bash scripts/ci-zfs-setup.sh
-//	sudo -E env "PATH=$PATH" QFM_ZFS_TEST=1 go test -run ZFS ./internal/fsops/...
+//	sudo -E env "PATH=$PATH" TAPROOT_ZFS_TEST=1 go test -run ZFS ./internal/fsops/...
 const (
 	zfsShare  = "/share"
 	zfsVol1   = "/share/ZFS1_DATA"
@@ -36,12 +36,12 @@ func zfsFixture(t *testing.T) *platform.Platform {
 	if runtime.GOOS != "linux" {
 		t.Skip("the ZFS fixture is Linux only")
 	}
-	if os.Getenv("QFM_ZFS_TEST") != "1" {
-		t.Skip("set QFM_ZFS_TEST=1 after running scripts/ci-zfs-setup.sh")
+	if os.Getenv("TAPROOT_ZFS_TEST") != "1" {
+		t.Skip("set TAPROOT_ZFS_TEST=1 after running scripts/ci-zfs-setup.sh")
 	}
 	p := platform.Detect()
 	if c := p.For(zfsPublic); c.FSType != "zfs" {
-		t.Fatalf("QFM_ZFS_TEST=1 but %s is not on zfs (fstype %q): run scripts/ci-zfs-setup.sh first", zfsPublic, c.FSType)
+		t.Fatalf("TAPROOT_ZFS_TEST=1 but %s is not on zfs (fstype %q): run scripts/ci-zfs-setup.sh first", zfsPublic, c.FSType)
 	}
 	return p
 }
@@ -105,8 +105,8 @@ func TestZFSFixtureListShareClassifiesSharesAndVolumeRoots(t *testing.T) {
 func TestZFSFixtureRenameAcrossDatasetsIsEXDEV(t *testing.T) {
 	zfsFixture(t)
 
-	src := filepath.Join(zfsPublic, ".qfm-exdev-probe")
-	dst := filepath.Join(zfsMedia, ".qfm-exdev-probe")
+	src := filepath.Join(zfsPublic, ".taproot-exdev-probe")
+	dst := filepath.Join(zfsMedia, ".taproot-exdev-probe")
 	if err := os.WriteFile(src, []byte("exdev"), 0o644); err != nil {
 		t.Fatalf("writing the probe file: %v", err)
 	}
@@ -123,7 +123,7 @@ func TestZFSFixtureRenameAcrossDatasetsIsEXDEV(t *testing.T) {
 		t.Fatalf("os.Rename across datasets: got %v, want EXDEV", err)
 	}
 	// Same dataset, same st_dev: the rename that must keep working.
-	within := filepath.Join(zfsPublic, ".qfm-exdev-probe-moved")
+	within := filepath.Join(zfsPublic, ".taproot-exdev-probe-moved")
 	if err := os.Rename(src, within); err != nil {
 		t.Fatalf("rename inside one dataset: %v", err)
 	}
@@ -204,8 +204,8 @@ func TestZFSFixtureMoveAcrossPoolsCopiesThenDeletes(t *testing.T) {
 	ctx := context.Background()
 	var r fsx.Root
 
-	src := filepath.Join(zfsPublic, ".qfm-move-probe")
-	dst := filepath.Join(zfsBackup, ".qfm-move-probe")
+	src := filepath.Join(zfsPublic, ".taproot-move-probe")
+	dst := filepath.Join(zfsBackup, ".taproot-move-probe")
 	t.Cleanup(func() {
 		_ = os.RemoveAll(src)
 		_ = os.RemoveAll(dst)
@@ -259,19 +259,19 @@ func TestZFSFixtureSearchCrossesDatasetsOnlyWhenAsked(t *testing.T) {
 	ctx := context.Background()
 	var r fsx.Root
 
-	probe := filepath.Join(zfsPublic, ".qfm-search-probe.txt")
+	probe := filepath.Join(zfsPublic, ".taproot-search-probe.txt")
 	t.Cleanup(func() { _ = os.Remove(probe) })
 	if err := os.WriteFile(probe, []byte("x"), 0o644); err != nil {
 		t.Fatalf("building the probe: %v", err)
 	}
 
-	req := wproto.SearchReq{Roots: [][]byte{[]byte(zfsVol1)}, Query: "qfm-search-probe", Hidden: true}
+	req := wproto.SearchReq{Roots: [][]byte{[]byte(zfsVol1)}, Query: "taproot-search-probe", Hidden: true}
 	res, err := Search(ctx, r, plat, req, Emit{})
 	if err != nil {
 		t.Fatalf("Search without CrossMounts: %v", err)
 	}
 	for _, h := range res.Hits {
-		if strings.Contains(h.Path, ".qfm-search-probe") {
+		if strings.Contains(h.Path, ".taproot-search-probe") {
 			t.Fatalf("the search crossed into %s without being asked: %+v", zfsPublic, h)
 		}
 	}
@@ -296,7 +296,7 @@ func TestZFSFixtureSearchCrossesDatasetsOnlyWhenAsked(t *testing.T) {
 	// of /share reached nothing at all. The read rule enters the volume, and the
 	// same-pool rule then carries it into Public; unticked, the volumes are
 	// counted as not searched rather than passed over in silence.
-	shareReq := wproto.SearchReq{Roots: [][]byte{[]byte(zfsShare)}, Query: "qfm-search-probe", Hidden: true, CrossMounts: true}
+	shareReq := wproto.SearchReq{Roots: [][]byte{[]byte(zfsShare)}, Query: "taproot-search-probe", Hidden: true, CrossMounts: true}
 	res, err = Search(ctx, r, plat, shareReq, Emit{})
 	if err != nil {
 		t.Fatalf("Search of %s with CrossMounts: %v", zfsShare, err)
@@ -329,7 +329,7 @@ func TestZFSFixtureArchiveOfADataset(t *testing.T) {
 	ctx := context.Background()
 	var r fsx.Root
 
-	dir := filepath.Join(zfsPublic, ".qfm-archive-probe")
+	dir := filepath.Join(zfsPublic, ".taproot-archive-probe")
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	_ = os.RemoveAll(dir)
 	if err := os.MkdirAll(filepath.Join(dir, "sub"), 0o755); err != nil {
@@ -345,10 +345,10 @@ func TestZFSFixtureArchiveOfADataset(t *testing.T) {
 		t.Fatalf("Archive of a dataset: %v", err)
 	}
 	m := zipMembers(t, s.buf.Bytes())
-	if m[".qfm-archive-probe/sub/deep.txt"] == nil {
+	if m[".taproot-archive-probe/sub/deep.txt"] == nil {
 		t.Fatalf("members = %v", memberNames(m))
 	}
-	if got := zipContent(t, m[".qfm-archive-probe/sub/deep.txt"]); got != "deeper" {
+	if got := zipContent(t, m[".taproot-archive-probe/sub/deep.txt"]); got != "deeper" {
 		t.Errorf("content = %q", got)
 	}
 	if m["ERROR.txt"] != nil {
@@ -364,7 +364,7 @@ func TestZFSFixtureUploadIntoADataset(t *testing.T) {
 	ctx := context.Background()
 	var r fsx.Root
 
-	name := ".qfm-upload-probe.txt"
+	name := ".taproot-upload-probe.txt"
 	target := filepath.Join(zfsPublic, name)
 	t.Cleanup(func() { _ = os.Remove(target) })
 	_ = os.Remove(target)

@@ -5,7 +5,7 @@ package fsops
 import (
 	"os"
 
-	"qnapfilemanager/internal/fsx"
+	"taproot/internal/fsx"
 )
 
 // The jail handle off Linux is os.Root itself (fsx.Jail is an alias for

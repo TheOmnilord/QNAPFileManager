@@ -14,9 +14,9 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/backend"
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/backend"
+	"taproot/internal/fsx"
+	"taproot/internal/wproto"
 )
 
 // The job tests run against a worker that never was: a goroutine on the other
@@ -678,7 +678,7 @@ func TestJobRefusesAnIncompleteRequest(t *testing.T) {
 func TestTrashListIsAPlainCall(t *testing.T) {
 	raw := []byte("/share/Public/\xff\xfe")
 	p, made, _, _ := jobPool(t, jobScript{trash: wproto.TrashListResp{Items: []wproto.TrashItem{
-		{ID: "1757600000-0a1b2c3d", Name: []byte("\xff\xfe"), OrigPath: raw, Type: "file", Size: 12, DeletedAt: 1757600000, Trash: []byte("/share/CACHEDEV1_DATA/.@qfm_trash")},
+		{ID: "1757600000-0a1b2c3d", Name: []byte("\xff\xfe"), OrigPath: raw, Type: "file", Size: 12, DeletedAt: 1757600000, Trash: []byte("/share/CACHEDEV1_DATA/.@taproot_trash")},
 	}}})
 	who := alice()
 	spawnWorker(t, p, made, who)

@@ -11,10 +11,10 @@ import (
 	"strings"
 	"testing"
 
-	"qnapfilemanager/internal/backend"
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/jobs"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/backend"
+	"taproot/internal/fsx"
+	"taproot/internal/jobs"
+	"taproot/internal/wproto"
 )
 
 func TestSearchMountsSkippedSurvivesTheHitsHandoff(t *testing.T) {

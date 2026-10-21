@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/guard"
-	"qnapfilemanager/internal/jobs"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/guard"
+	"taproot/internal/jobs"
+	"taproot/internal/wproto"
 )
 
 func transferFixture(t *testing.T) (*Server, *fakeJobs) {
@@ -34,7 +34,7 @@ func transferBody(src, dst, conflict string, cross bool) string {
 }
 
 func TestTransferContainedDenials(t *testing.T) {
-	const install = "/share/CACHEDEV1_DATA/.qpkg/QNAPFileManager"
+	const install = "/share/CACHEDEV1_DATA/.qpkg/Taproot"
 	for _, mode := range []string{"copy", "move"} {
 		for _, tc := range []struct{ name, src, dst, alias, target string }{
 			{"firmware source requested", "/etc", "/dest", "/", "/ordinary"},

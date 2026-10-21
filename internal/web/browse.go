@@ -12,9 +12,9 @@ import (
 	"strconv"
 	"strings"
 
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/guard"
-	"qnapfilemanager/internal/platform"
+	"taproot/internal/fsx"
+	"taproot/internal/guard"
+	"taproot/internal/platform"
 )
 
 // guardRead enforces the guard's READ denials on the REQUESTED (cleaned) path

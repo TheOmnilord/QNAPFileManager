@@ -23,10 +23,10 @@ import (
 	"strings"
 	"testing"
 
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/idmap"
-	"qnapfilemanager/internal/perm"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/fsx"
+	"taproot/internal/idmap"
+	"taproot/internal/perm"
+	"taproot/internal/wproto"
 )
 
 // rootVol adds one level of depth to a fixture tree. A recursive job refuses a
@@ -113,8 +113,8 @@ func TestRootChmodByANonOwnerIsRefused(t *testing.T) {
 	requireLinuxRoot(t)
 	base := rootTree(t)
 	exe := buildDaemon(t, base)
-	alice := fixtureUser(t, "qfmalice", "qfmteam")
-	bob := fixtureUser(t, "qfmbob", "qfmother")
+	alice := fixtureUser(t, "taprootalice", "taprootteam")
+	bob := fixtureUser(t, "taprootbob", "taprootother")
 	if alice.UID == bob.UID {
 		t.Skip("the two fixture users resolved to one uid")
 	}
@@ -187,16 +187,16 @@ func TestRootChgrpFollowsGroupMembership(t *testing.T) {
 	requireLinuxRoot(t)
 	base := rootTree(t)
 	exe := buildDaemon(t, base)
-	alice := fixtureUser(t, "qfmalice", "qfmteam")
-	_ = fixtureUser(t, "qfmbob", "qfmother")
+	alice := fixtureUser(t, "taprootalice", "taprootteam")
+	_ = fixtureUser(t, "taprootbob", "taprootother")
 
-	team := fixtureGID(t, "qfmteam")
-	other := fixtureGID(t, "qfmother")
+	team := fixtureGID(t, "taprootteam")
+	other := fixtureGID(t, "taprootother")
 	if !hasGroup(alice.Groups, team) {
-		t.Skipf("the fixture user is not in qfmteam (groups %v)", alice.Groups)
+		t.Skipf("the fixture user is not in taprootteam (groups %v)", alice.Groups)
 	}
 	if hasGroup(alice.Groups, other) {
-		t.Skipf("the fixture user is in qfmother (groups %v), so there is no non-member group to test", alice.Groups)
+		t.Skipf("the fixture user is in taprootother (groups %v), so there is no non-member group to test", alice.Groups)
 	}
 
 	vol := rootVol(t, base)
@@ -262,12 +262,12 @@ func TestRootSetgidIsDroppedSilentlyAndTheDiffSaysSo(t *testing.T) {
 	requireLinuxRoot(t)
 	base := rootTree(t)
 	exe := buildDaemon(t, base)
-	alice := fixtureUser(t, "qfmalice", "qfmteam")
-	_ = fixtureUser(t, "qfmbob", "qfmother")
+	alice := fixtureUser(t, "taprootalice", "taprootteam")
+	_ = fixtureUser(t, "taprootbob", "taprootother")
 
-	other := fixtureGID(t, "qfmother")
+	other := fixtureGID(t, "taprootother")
 	if hasGroup(alice.Groups, other) {
-		t.Skipf("the fixture user is in qfmother (groups %v); the kernel would keep the bit", alice.Groups)
+		t.Skipf("the fixture user is in taprootother (groups %v); the kernel would keep the bit", alice.Groups)
 	}
 
 	vol := rootVol(t, base)
@@ -311,8 +311,8 @@ func TestRootRecursiveChmodOverAMixedTreeIsPartialSuccess(t *testing.T) {
 	requireLinuxRoot(t)
 	base := rootTree(t)
 	exe := buildDaemon(t, base)
-	alice := fixtureUser(t, "qfmalice", "qfmteam")
-	bob := fixtureUser(t, "qfmbob", "qfmother")
+	alice := fixtureUser(t, "taprootalice", "taprootteam")
+	bob := fixtureUser(t, "taprootbob", "taprootother")
 	if alice.UID == bob.UID {
 		t.Skip("the two fixture users resolved to one uid")
 	}

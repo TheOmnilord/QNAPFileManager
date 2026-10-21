@@ -10,8 +10,8 @@ import (
 	"syscall"
 	"testing"
 
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/fsx"
+	"taproot/internal/wproto"
 )
 
 // The upload's Linux half: the things the kernel decides. Mode bits, uids,

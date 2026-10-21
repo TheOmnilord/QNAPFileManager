@@ -21,10 +21,10 @@ import (
 	"syscall"
 	"testing"
 
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/perm"
-	"qnapfilemanager/internal/platform"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/fsx"
+	"taproot/internal/perm"
+	"taproot/internal/platform"
+	"taproot/internal/wproto"
 )
 
 // TestChmodRefusesAnObjectSwappedAfterTheConfirmation is finding 4: Props and
@@ -229,7 +229,7 @@ func TestACLProbeWeighsTheAttributeAgainstWhatIsLeft(t *testing.T) {
 	write(t, base, "f.txt", "x")
 	target := filepath.Join(base, "f.txt")
 
-	const attr = "user.qfm_probe_budget"
+	const attr = "user.taproot_probe_budget"
 	blob := make([]byte, 512)
 	for i := range blob {
 		blob[i] = 'a'

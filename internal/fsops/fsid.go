@@ -29,9 +29,9 @@ import (
 	"context"
 	"os"
 
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/platform"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/fsx"
+	"taproot/internal/platform"
+	"taproot/internal/wproto"
 )
 
 // FSIdentity reports which filesystem holds apiPath.

@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/qtsauth"
+	"taproot/internal/qtsauth"
 )
 
 func TestQuerySIDBootstrapWithoutCookies(t *testing.T) {
@@ -33,7 +33,7 @@ func TestQuerySIDBootstrapWithoutCookies(t *testing.T) {
 		t.Fatalf("bootstrap: %d %s", w.Code, w.Body)
 	}
 	cookies := w.Result().Cookies()
-	if len(cookies) != 1 || cookies[0].Name != "qfm_sid" || cookies[0].Value == "" {
+	if len(cookies) != 1 || cookies[0].Name != "taproot_sid" || cookies[0].Value == "" {
 		t.Fatalf("session cookie: %v", cookies)
 	}
 	w = request(s, "GET", "/api/session", cookies[0], nil)
@@ -44,7 +44,7 @@ func TestQuerySIDBootstrapWithoutCookies(t *testing.T) {
 
 func TestMalformedCredentialPresence(t *testing.T) {
 	s, _ := fixture(t, false)
-	for _, cookie := range []string{"NAS_USER=-bad; qtoken=expired", "qfm_sid=", "NAS_USER=", "qtoken=", "NAS_SID=", "qtoken=\"unterminated"} {
+	for _, cookie := range []string{"NAS_USER=-bad; qtoken=expired", "taproot_sid=", "NAS_USER=", "qtoken=", "NAS_SID=", "qtoken=\"unterminated"} {
 		t.Run(cookie, func(t *testing.T) {
 			assertAuthError(t, request(s, "GET", "/api/session", nil, map[string]string{"Cookie": cookie}), 401, "unauthorized", "")
 		})
@@ -73,8 +73,8 @@ func TestCSRFRejectedBeforeRevalidation(t *testing.T) {
 	old.checked = time.Now().Add(-time.Minute)
 	for _, headers := range []map[string]string{
 		{"Origin": "http://example.com"},
-		{"X-QFM-CSRF": "wrong", "Origin": "http://example.com"},
-		{"X-QFM-CSRF": old.csrf, "Origin": "https://evil.example"},
+		{"X-Taproot-CSRF": "wrong", "Origin": "http://example.com"},
+		{"X-Taproot-CSRF": old.csrf, "Origin": "https://evil.example"},
 	} {
 		assertAuthError(t, request(s, "POST", "/api/logout", cookie, headers), 403, "permission", "")
 	}
@@ -86,7 +86,7 @@ func TestCSRFRejectedBeforeRevalidation(t *testing.T) {
 	if calls.Load() != 1 || len(s.authAdmission.slots) != 0 || len(s.authAdmission.waiters) != 0 {
 		t.Fatal("invalid CSRF consumed authentication work")
 	}
-	w = request(s, "POST", "/api/logout", cookie, map[string]string{"X-QFM-CSRF": old.csrf, "Origin": "http://example.com"})
+	w = request(s, "POST", "/api/logout", cookie, map[string]string{"X-Taproot-CSRF": old.csrf, "Origin": "http://example.com"})
 	if w.Code != 200 || calls.Load() != 2 {
 		t.Fatalf("valid CSRF must force revalidation: calls=%d status=%d body=%s", calls.Load(), w.Code, w.Body)
 	}

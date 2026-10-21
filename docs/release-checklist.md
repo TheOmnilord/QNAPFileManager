@@ -40,13 +40,17 @@ release nobody tested.
 
 This item is a human reading the documents. Nothing executes them, and that is the weakest link in this checklist.
 
-## 3. Hardware, on **both** units, against a package built from the release commit
+## 3. Hardware, on **both** units, against packages built from the release commit
 
-Build the package from that commit (the `package` job's `qpkg` artifact, 7-day retention), install it on the QuTS hero
-unit and on the QTS unit, and work through the list. Anything that fails here stops the release.
+Take the packages built from that commit (the `package` job's `qpkg` artifact, 7-day retention: one `.qpkg` per
+architecture and their `SHA256SUMS`), install the one matching each unit's `uname -m` on the QuTS hero unit and on the
+QTS unit, and work through the list. Anything that fails here stops the release.
 
 ### Browse and identity
 
+- [ ] **The old package goes first.** On each unit that ran a pre-1.0 build, the QNAPFileManager package is removed as
+      [docs/qnap-install.md](qnap-install.md#units-that-ran-a-pre-10-build-named-qnapfilemanager) describes, and
+      Taproot then installs and opens at `/taproot/`.
 - [ ] App Center installs the package on **both** units with no firmware-compatibility warning, now that it declares
       `QTS_MINI_VERSION="5.2.0"` (the unsigned-package warning is expected, and is a different one). Record what
       `getcfg System Version` and `uname -m` print on each unit: on the QuTS hero unit that settles how its version
@@ -198,7 +202,7 @@ unit and the build, in PLAN.md (§6 below): they are the baseline later releases
 
 - [ ] Read-only mode blocks writes and the banner explains it; turning it off writes a QuLog milestone.
 - [ ] QuLog Center shows the app's milestones and is not flooded by ordinary file operations.
-- [ ] Stop and start from App Center leaves no stray worker processes (`ps | grep qnapfilemanager`).
+- [ ] Stop and start from App Center leaves no stray worker processes (`ps | grep taproot`).
 
 ## 4. Tag
 
@@ -207,7 +211,7 @@ unit and the build, in PLAN.md (§6 below): they are the baseline later releases
 - [ ] The tag is **annotated**, never lightweight, so the tagger and the date are recorded — and signed if a key is
       configured:
 
-      git tag -a v1.0.0 -m "QNAPFileManager 1.0.0"
+      git tag -a v1.0.0 -m "Taproot 1.0.0"
       git push origin v1.0.0
 
 - [ ] **One tag per released version, never moved.** A bad release is superseded by `v1.0.1`; `v1.0.0` is never
@@ -216,17 +220,19 @@ unit and the build, in PLAN.md (§6 below): they are the baseline later releases
 
 ## 5. Publish, then install what was published
 
-CI stamps the version from the tag (`${GITHUB_REF_NAME#v}`), rewrites `QPKG_VER` in `qpkg/qpkg.cfg`, builds both
-architecture trees into one package, and attaches it to a GitHub release with `--generate-notes`.
+CI stamps the version from the tag (`${GITHUB_REF_NAME#v}`), rewrites `QPKG_VER` in `qpkg/qpkg.cfg`, builds one
+package per architecture, and attaches both, with their checksums, to a GitHub release with `--generate-notes`.
 
-- [ ] The release carries exactly two things:
-      - `QNAPFileManager_<version>.qpkg` — one package, both architecture trees inside; QDK names it from `qpkg.cfg`.
-      - `SHA256SUMS` — the checksum of that package, so a download can be verified.
+- [ ] The release carries exactly three files:
+      - `Taproot_<version>_x86_64.qpkg` — the package for x86_64 units; QDK names each package from `qpkg.cfg` and its
+        architecture.
+      - `Taproot_<version>_arm_64.qpkg` — the package for arm_64 (aarch64) units.
+      - `SHA256SUMS` — the checksums of both packages, so a download can be verified.
 - [ ] Pre-release builds from `main` stay workflow artifacts with 7-day retention and are **never** attached to a
       release. The account-wide artifact quota is the reason; it has blocked releases on the sibling project twice.
 - [ ] Verify the checksum of the file you downloaded from the release page against `SHA256SUMS`.
-- [ ] **Install the released artifact** from a clean App Center install on one unit, and confirm that the version string
-      in `api/session` matches the tag.
+- [ ] **Install the released package** on one unit — the one for its architecture — from a clean App Center install,
+      and confirm that the version string in `api/session` matches the tag.
 
 ## 6. Afterwards
 

@@ -19,7 +19,7 @@ package fsops
 import (
 	"os"
 
-	"qnapfilemanager/internal/fsx"
+	"taproot/internal/fsx"
 )
 
 func openCanonicalDir(j fsx.Jail, rel, apiPath string) (*dirRef, error) {

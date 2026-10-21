@@ -54,9 +54,9 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/platform"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/fsx"
+	"taproot/internal/platform"
+	"taproot/internal/wproto"
 )
 
 // Archive formats. They are the wire's spellings (ArchiveReq.Format).

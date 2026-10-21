@@ -3,7 +3,7 @@ package fsops
 // The NFSv4 half of the ACL badge on the real file-backed ZFS fixture, and the
 // aclmode the properties dialog reads off the dataset (Astra M3 round 1,
 // finding 16). The gate and the reason there is no simulated dataset are
-// zfs_integration_test.go's; these run in the same QFM_ZFS_TEST job.
+// zfs_integration_test.go's; these run in the same TAPROOT_ZFS_TEST job.
 //
 // The ACE is written with setxattr(2) directly and never with nfs4_setfacl: the
 // tool is not present on the fixture and depending on it would make the test a
@@ -21,13 +21,13 @@ import (
 	"syscall"
 	"testing"
 
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/platform"
+	"taproot/internal/fsx"
+	"taproot/internal/platform"
 )
 
 // nfs4Unavailable reports that this fixture's ZFS cannot stage an NFSv4 ACL.
 //
-// It is a SKIP on an ordinary runner and a FAILURE under QFM_NFS4_TEST=1 (Astra
+// It is a SKIP on an ordinary runner and a FAILURE under TAPROOT_NFS4_TEST=1 (Astra
 // M3 round-2 finding 11). A skip is the honest outcome where the attribute does
 // not exist — CI's upstream OpenZFS on Linux does not implement
 // system.nfs4_acl, and nothing this app does can stage one — but on a runner
@@ -39,10 +39,10 @@ func nfs4Unavailable(t *testing.T, format string, args ...any) {
 	t.Helper()
 	msg := fmt.Sprintf(format, args...)
 	msg += fmt.Sprintf("; %s is QNAP's fork, and CI's upstream OpenZFS on Linux cannot stage it"+
-		" — set QFM_NFS4_TEST=1 on a runner that has the attribute to make this a failure"+
+		" — set TAPROOT_NFS4_TEST=1 on a runner that has the attribute to make this a failure"+
 		" (contract §6.1: the hardware check)", platform.XattrNFS4ACL)
-	if os.Getenv("QFM_NFS4_TEST") == "1" {
-		t.Fatalf("QFM_NFS4_TEST=1: %s", msg)
+	if os.Getenv("TAPROOT_NFS4_TEST") == "1" {
+		t.Fatalf("TAPROOT_NFS4_TEST=1: %s", msg)
 	}
 	t.Skip(msg)
 }
@@ -50,18 +50,18 @@ func nfs4Unavailable(t *testing.T, format string, args ...any) {
 // nfs4Fixture is zfsFixture with the NFSv4 opt-in's own prerequisites checked
 // FIRST (Astra r3 #6).
 //
-// QFM_NFS4_TEST=1 is a runner saying "the attribute exists here, so a detection
+// TAPROOT_NFS4_TEST=1 is a runner saying "the attribute exists here, so a detection
 // regression must fail rather than skip" — but zfsFixture skips before any of
-// that is reached unless QFM_ZFS_TEST=1 is set as well, so the opt-in alone
+// that is reached unless TAPROOT_ZFS_TEST=1 is set as well, so the opt-in alone
 // bought nothing and did so silently, which is exactly the outcome it exists to
 // prevent. Asking for the NFSv4 tests therefore now asks for the fixture they
 // run on, and a missing prerequisite is named rather than skipped past. Without
 // the opt-in nothing changes: an ordinary runner still skips.
 func nfs4Fixture(t *testing.T) *platform.Platform {
 	t.Helper()
-	if os.Getenv("QFM_NFS4_TEST") == "1" && os.Getenv("QFM_ZFS_TEST") != "1" {
-		t.Fatal("QFM_NFS4_TEST=1 asks for the NFSv4 ACL tests, and those need the ZFS fixture:" +
-			" set QFM_ZFS_TEST=1 after running scripts/ci-zfs-setup.sh, or unset QFM_NFS4_TEST to skip")
+	if os.Getenv("TAPROOT_NFS4_TEST") == "1" && os.Getenv("TAPROOT_ZFS_TEST") != "1" {
+		t.Fatal("TAPROOT_NFS4_TEST=1 asks for the NFSv4 ACL tests, and those need the ZFS fixture:" +
+			" set TAPROOT_ZFS_TEST=1 after running scripts/ci-zfs-setup.sh, or unset TAPROOT_NFS4_TEST to skip")
 	}
 	return zfsFixture(t)
 }
@@ -106,7 +106,7 @@ func TestZFSFixtureNamedNFS4ACEBadgesAsNFS4(t *testing.T) {
 			b, zfsPublic, platform.ACLNFS4)
 	}
 
-	name := ".qfm-nfs4-acl-probe.txt"
+	name := ".taproot-nfs4-acl-probe.txt"
 	osPath := filepath.Join(zfsPublic, name)
 	t.Cleanup(func() { _ = os.Remove(osPath) })
 	_ = os.Remove(osPath)
@@ -118,7 +118,7 @@ func TestZFSFixtureNamedNFS4ACEBadgesAsNFS4(t *testing.T) {
 	if xattr == "" {
 		xattr = platform.XattrNFS4ACL
 	}
-	if err := syscall.Setxattr(osPath, xattr, nfs4ACLWithNamedACE("qfmacl@qfm.test"), 0); err != nil {
+	if err := syscall.Setxattr(osPath, xattr, nfs4ACLWithNamedACE("taprootacl@taproot.test"), 0); err != nil {
 		nfs4Unavailable(t, "this fixture refuses setxattr of %s: %v (errno %d)", xattr, err, errnoOf(err))
 	}
 
@@ -163,8 +163,8 @@ func TestZFSFixturePropsReportsTheDatasetAclmode(t *testing.T) {
 	var r fsx.Root
 
 	for _, tc := range []struct{ mount, dataset, aclmode string }{
-		{zfsPublic, "qfmpool/Public", "discard"},
-		{zfsMedia, "qfmpool/Media", "passthrough"},
+		{zfsPublic, "taprootpool/Public", "discard"},
+		{zfsMedia, "taprootpool/Media", "passthrough"},
 	} {
 		pr, err := Props(ctx, r, plat, tc.mount, "")
 		if err != nil {

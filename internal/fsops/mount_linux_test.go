@@ -8,8 +8,8 @@ import (
 	"syscall"
 	"testing"
 
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/platform"
+	"taproot/internal/fsx"
+	"taproot/internal/platform"
 )
 
 // TestSymlinkOutOfTheJailIsNotProbed is the regression test for the containment

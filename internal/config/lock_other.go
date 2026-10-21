@@ -47,7 +47,7 @@ const lockReleaseTries = 20
 // cheaply.
 //
 // It is left because of where it runs. The two writers this lock exists to
-// serialise — the daemon's settings route and `qnapfilemanager break-glass` —
+// serialise — the daemon's settings route and `taproot break-glass` —
 // never both run on a dev box, the config there holds no real credential, and
 // the path that matters has no break logic at all. Anything that changes that
 // (a NAS without flock, a second real writer here) makes this a bug again.

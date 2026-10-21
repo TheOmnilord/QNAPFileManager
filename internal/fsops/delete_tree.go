@@ -28,9 +28,9 @@ import (
 	"syscall"
 	"time"
 
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/platform"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/fsx"
+	"taproot/internal/platform"
+	"taproot/internal/wproto"
 )
 
 // The pre-scan's bounds, from backend plan §3: a scan that takes longer than

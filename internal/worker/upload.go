@@ -13,7 +13,7 @@ package worker
 // The table is per SESSION, and that word carries the guarantee. A handle
 // expires ten minutes after it was opened without a Finalize, and every handle
 // still in the table when the session ends is closed — the unnamed ones vanish
-// with their descriptors and the named `.qfm-upload-*.part` files are unlinked
+// with their descriptors and the named `.taproot-upload-*.part` files are unlinked
 // by identity. A worker that dies takes them all with it for free, which is the
 // same property the descriptor discipline gives everything else here.
 
@@ -26,9 +26,9 @@ import (
 	"os"
 	"time"
 
-	"qnapfilemanager/internal/fsops"
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/fsops"
+	"taproot/internal/fsx"
+	"taproot/internal/wproto"
 )
 
 // uploadIdleTimeout is contract §1.3's ten minutes: how long a handle survives

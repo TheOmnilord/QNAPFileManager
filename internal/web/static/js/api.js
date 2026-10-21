@@ -37,18 +37,18 @@ export function signInNotice() {
  hideLocalSignIn();
  connectionNotice('Sign in to QTS to continue','Your session has ended. Sign in on the QTS desktop, then retry here.');
 }
-// The server injects the absolute base ("/qnapfilemanager/" behind the QTS
+// The server injects the absolute base ("/taproot/" behind the QTS
 // proxy, "/" otherwise): the QTS desktop opens the app at the bare proxy path,
 // so a relative "api/..." would resolve outside the proxy and hit QTS's 404.
-const base = (typeof document !== 'undefined' && document.querySelector('meta[name="qfm-base"]')?.content) || '';
+const base = (typeof document !== 'undefined' && document.querySelector('meta[name="taproot-base"]')?.content) || '';
 export function apiURL(endpoint,params={}) { return base + endpoint + (Object.keys(params).length ? '?' + new URLSearchParams(params) : ''); }
 export async function api(endpoint,params={},options={}) {
  const valid=sessionGuard();
  const headers = new Headers(options.headers);
- if (state.session?.csrf) headers.set('X-QFM-CSRF',state.session.csrf);
+ if (state.session?.csrf) headers.set('X-Taproot-CSRF',state.session.csrf);
  let response;
  try { response = await fetch(apiURL(endpoint,params),{...options,headers,credentials:'same-origin',cache:'no-store'}); }
- catch { throw Object.assign(new Error('Cannot reach the QNAPFileManager service — is it still running?'),{network:true}); }
+ catch { throw Object.assign(new Error('Cannot reach the Taproot service — is it still running?'),{network:true}); }
  if (response.status === 401 && valid()) signInNotice();
  const failure={status:response.status,retryAfter:response.headers.get('Retry-After')};
  // An answer with NO BODY is not a failure. The break-glass login route replies

@@ -13,7 +13,7 @@ import (
 // simulation rather than the product (INV-2).
 //
 //	sudo bash scripts/ci-zfs-setup.sh
-//	sudo -E env "PATH=$PATH" QFM_ZFS_TEST=1 go test -run ZFS ./internal/platform/...
+//	sudo -E env "PATH=$PATH" TAPROOT_ZFS_TEST=1 go test -run ZFS ./internal/platform/...
 //
 // Everything the hero delta turns on is here: the per-dataset FSCaps, the
 // pool-wide crossing domain, the refusal to cross into a second pool or the
@@ -27,12 +27,12 @@ const (
 	zfsMedia  = zfsVol1 + "/Media"
 	zfsBackup = zfsVol2 + "/Backup"
 
-	zfsPool1Domain = "zfs:qfmpool"
-	zfsPool2Domain = "zfs:qfmpool2"
+	zfsPool1Domain = "zfs:taprootpool"
+	zfsPool2Domain = "zfs:taprootpool2"
 )
 
 // zfsFixture skips unless this is a Linux box that was told it has the
-// fixture. Once QFM_ZFS_TEST=1 is set the fixture must actually be there: a
+// fixture. Once TAPROOT_ZFS_TEST=1 is set the fixture must actually be there: a
 // silent pass on a job whose whole purpose is the ZFS check would be worse
 // than a failure.
 func zfsFixture(t *testing.T) *Platform {
@@ -40,12 +40,12 @@ func zfsFixture(t *testing.T) *Platform {
 	if runtime.GOOS != "linux" {
 		t.Skip("the ZFS fixture is Linux only")
 	}
-	if os.Getenv("QFM_ZFS_TEST") != "1" {
-		t.Skip("set QFM_ZFS_TEST=1 after running scripts/ci-zfs-setup.sh")
+	if os.Getenv("TAPROOT_ZFS_TEST") != "1" {
+		t.Skip("set TAPROOT_ZFS_TEST=1 after running scripts/ci-zfs-setup.sh")
 	}
 	p := Detect()
 	if c := p.For(zfsPublic); c.FSType != "zfs" {
-		t.Fatalf("QFM_ZFS_TEST=1 but %s is not on zfs (fstype %q): run scripts/ci-zfs-setup.sh first", zfsPublic, c.FSType)
+		t.Fatalf("TAPROOT_ZFS_TEST=1 but %s is not on zfs (fstype %q): run scripts/ci-zfs-setup.sh first", zfsPublic, c.FSType)
 	}
 	return p
 }
@@ -159,8 +159,8 @@ func TestZFSFixtureAclmodeFromTheRealBinary(t *testing.T) {
 	p := zfsFixture(t)
 
 	for _, tc := range []struct{ dataset, want string }{
-		{"qfmpool/Public", "discard"},
-		{"qfmpool/Media", "passthrough"},
+		{"taprootpool/Public", "discard"},
+		{"taprootpool/Media", "passthrough"},
 	} {
 		if got := p.ZFSAclmode(tc.dataset); got != tc.want {
 			t.Errorf("ZFSAclmode(%q) = %q, want %q", tc.dataset, got, tc.want)

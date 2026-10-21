@@ -31,8 +31,8 @@ import (
 	"sync"
 	"time"
 
-	"qnapfilemanager/internal/config"
-	"qnapfilemanager/internal/fsx"
+	"taproot/internal/config"
+	"taproot/internal/fsx"
 )
 
 // Kind is what a job does. The values are exactly the wproto job kinds, so a

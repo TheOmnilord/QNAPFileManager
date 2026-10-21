@@ -103,7 +103,7 @@ func TestTrashListSkipsAnOrphanSidecar(t *testing.T) {
 	}
 }
 
-// TestTrashRefusesAnAttackerOwnedRoot is F2. .@qfm_trash is 1777 and the OWNER
+// TestTrashRefusesAnAttackerOwnedRoot is F2. .@taproot_trash is 1777 and the OWNER
 // of a sticky directory is exempt from its restrictions — they may rename and
 // unlink everything inside it — so a sticky directory that does not belong to
 // root has the mode bits of a safe trash and none of the safety. It is treated

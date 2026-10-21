@@ -44,7 +44,7 @@ import (
 	"syscall"
 	"unsafe"
 
-	"qnapfilemanager/internal/platform"
+	"taproot/internal/platform"
 )
 
 // fgetxattr is fgetxattr(2), which the syscall package does not export. A nil

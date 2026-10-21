@@ -52,33 +52,33 @@ falling back to `linux-modules-extra-$(uname -r)` and then `zfs-dkms`), mounts a
 builds two 512 MiB file-backed pools:
 
 ```
-/share/ZFS1_DATA          qfmpool           /share/Public -> ZFS1_DATA/Public
-/share/ZFS1_DATA/Public   qfmpool/Public    aclmode=discard
-/share/ZFS1_DATA/Media    qfmpool/Media     aclmode=passthrough
-/share/ZFS2_DATA          qfmpool2          second pool, second crossing domain
+/share/ZFS1_DATA          taprootpool          /share/Public -> ZFS1_DATA/Public
+/share/ZFS1_DATA/Public   taprootpool/Public   aclmode=discard
+/share/ZFS1_DATA/Media    taprootpool/Media    aclmode=passthrough
+/share/ZFS2_DATA          taprootpool2         second pool, second crossing domain
 ```
 
 The tests (`internal/platform/zfs_integration_test.go`, `internal/fsops/zfs_integration_test.go`) skip unless
-`QFM_ZFS_TEST=1` and `runtime.GOOS == "linux"`, and once the variable is set a missing fixture is a failure rather than a
-skip. They verify what only a real pool can: `Detect` reports `zfs` `FSCaps` with `Domain` `zfs:qfmpool` per dataset; the
-datasets of one pool share that domain so `MayCross` allows a walk between them while refusing the second pool and the
-tmpfs `/share`; every dataset root is an `IsMountPoint`; `VolumeRoots` derives `/share/ZFS1_DATA` and `/share/ZFS2_DATA`
-from the table; `ZFSAclmode` reads `discard` and `passthrough` through the real `zfs` binary; the ACL backend probe
-returns one of `posix`/`nfs4`/`none` (logged, never asserted — upstream OpenZFS and QNAP's fork differ); `List` at
-`/share` labels the symlinks `ShareLink` and `ZFS1_DATA` `VolumeRoot`; `os.Rename` between two datasets is `EXDEV`; and
-`st_dev` differs per dataset, which is why the walk rule is a storage domain and not one filesystem.
+`TAPROOT_ZFS_TEST=1` and `runtime.GOOS == "linux"`, and once the variable is set a missing fixture is a failure rather
+than a skip. They verify what only a real pool can: `Detect` reports `zfs` `FSCaps` with `Domain` `zfs:taprootpool` per
+dataset; the datasets of one pool share that domain so `MayCross` allows a walk between them while refusing the second
+pool and the tmpfs `/share`; every dataset root is an `IsMountPoint`; `VolumeRoots` derives `/share/ZFS1_DATA` and
+`/share/ZFS2_DATA` from the table; `ZFSAclmode` reads `discard` and `passthrough` through the real `zfs` binary; the ACL
+backend probe returns one of `posix`/`nfs4`/`none` (logged, never asserted — upstream OpenZFS and QNAP's fork differ);
+`List` at `/share` labels the symlinks `ShareLink` and `ZFS1_DATA` `VolumeRoot`; `os.Rename` between two datasets is
+`EXDEV`; and `st_dev` differs per dataset, which is why the walk rule is a storage domain and not one filesystem.
 
-To run it on a Linux VM (it creates a tmpfs on `/share` and two pools named `qfmpool`/`qfmpool2`, so do not run it on a
-machine that already has either):
+To run it on a Linux VM (it creates a tmpfs on `/share` and two pools named `taprootpool`/`taprootpool2`, so do not run
+it on a machine that already has either):
 
 ```bash
 sudo bash scripts/ci-zfs-setup.sh
-sudo -E env "PATH=$PATH" QFM_ZFS_TEST=1 go test -count=1 -run 'ZFS' ./internal/platform/... ./internal/fsops/...
+sudo -E env "PATH=$PATH" TAPROOT_ZFS_TEST=1 go test -count=1 -run 'ZFS' ./internal/platform/... ./internal/fsops/...
 ```
 
 The script is idempotent — re-running it re-imports the pools, re-asserts the properties and re-mounts anything a fresh
-tmpfs hid. To tear the fixture down: `sudo zpool destroy qfmpool && sudo zpool destroy qfmpool2 && sudo umount /share &&
-sudo rm -rf /tmp/qfm-zfs`.
+tmpfs hid. To tear the fixture down: `sudo zpool destroy taprootpool && sudo zpool destroy taprootpool2 && sudo umount
+/share && sudo rm -rf /tmp/taproot-zfs`.
 
 ## Design reviews on file
 

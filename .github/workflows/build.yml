@@ -16,8 +16,9 @@ env:
   # whatever toolchain built the tree, so a floating minor means a Go security
   # release reddens CI until the runner image catches up.
   # 1.26.9 (2026-10): security fixes in net/http, net/textproto and crypto/tls
-  # (GO-2026-6603 … GO-2026-6617), all reachable from this daemon.
-  GO_VERSION: '1.26.9'
+  # (GO-2026-6603 … GO-2026-6617); 1.26.10: crypto/x509 distrusts compromised
+  # intermediates (GO-2026-6809). All reachable from this daemon.
+  GO_VERSION: '1.26.10'
 
 jobs:
   test:
@@ -47,13 +48,13 @@ jobs:
           # may come from only x/crypto. `go list -m all` is the wrong oracle: it
           # prints x/crypto's own transitive graph (x/net, x/sys, x/term, x/text)
           # even though none of it is linked.
-          requires=$(go mod edit -json | grep -o '"Path": "[^"]*"' | sed 's/"Path": "//; s/"//' | grep -v '^qnapfilemanager$' || true)
+          requires=$(go mod edit -json | grep -o '"Path": "[^"]*"' | sed 's/"Path": "//; s/"//' | grep -v '^taproot$' || true)
           echo "go.mod requires: $requires"
           [ "$requires" = "golang.org/x/crypto" ] || {
             echo "go.mod must require exactly golang.org/x/crypto; got: $requires"
             exit 1
           }
-          linked=$(go list -deps -f '{{if .Module}}{{.Module.Path}}{{end}}' ./... | sort -u | grep -v '^qnapfilemanager$' || true)
+          linked=$(go list -deps -f '{{if .Module}}{{.Module.Path}}{{end}}' ./... | sort -u | grep -v '^taproot$' || true)
           echo "modules linked: $linked"
           [ "$linked" = "golang.org/x/crypto" ] || {
             echo "the build must link only golang.org/x/crypto; got: $linked"
@@ -137,13 +138,13 @@ jobs:
       # pair's ownership refusals — a key given away to another uid is the one
       # that only root can even set up — skip everywhere else, so the rule that
       # decides whether the emergency door binds was never executed in CI.
-      - run: sudo -E env "PATH=$PATH" go test ./internal/workerpool/... ./internal/fsops/... ./internal/worker/... ./internal/breakglass/... ./cmd/qnapfilemanager/... -run . -count=1
+      - run: sudo -E env "PATH=$PATH" go test ./internal/workerpool/... ./internal/fsops/... ./internal/worker/... ./internal/breakglass/... ./cmd/taproot/... -run . -count=1
 
   # QuTS hero mounts one ZFS dataset per shared folder, and that single fact
   # drives the crossing rule, the EXDEV pre-flight, the trash root and the
   # aclmode warning (PLAN.md decisions 9-11). Synthetic mountinfo proves the
   # parser, not the kernel — so this job builds a real file-backed pool and
-  # runs the tests gated by QFM_ZFS_TEST against it. It is the only hero
+  # runs the tests gated by TAPROOT_ZFS_TEST against it. It is the only hero
   # coverage that exists without hardware.
   test-zfs:
     runs-on: ubuntu-latest
@@ -164,7 +165,7 @@ jobs:
       # keeps the toolchain setup-go put on the runner's PATH, which a plain
       # sudo drops with secure_path.
       - name: Run the ZFS integration tests
-        run: sudo -E env "PATH=$PATH" QFM_ZFS_TEST=1 go test -count=1 -run 'ZFS' ./internal/platform/... ./internal/fsops/...
+        run: sudo -E env "PATH=$PATH" TAPROOT_ZFS_TEST=1 go test -count=1 -run 'ZFS' ./internal/platform/... ./internal/fsops/...
 
   package:
     needs: [test, test-windows, test-linux-root, test-zfs]
@@ -205,7 +206,7 @@ jobs:
           for arch in amd64 arm64; do
             CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath \
               -ldflags "-s -w -X main.version=$VERSION" \
-              -o "dist/$arch/bin/qnapfilemanager" ./cmd/qnapfilemanager
+              -o "dist/$arch/bin/taproot" ./cmd/taproot
           done
 
       - name: Assemble the QPKG trees
@@ -233,8 +234,8 @@ jobs:
           cp /etc/passwd /etc/group /tmp/fakeroot/etc/
           for arch in x86_64 arm_64; do
             tree="qpkg/$arch"
-            [ "$("$tree/bin/qnapfilemanager" version)" = "$VERSION" ]
-            "$tree/bin/qnapfilemanager" serve -addr 127.0.0.1:18770 \
+            [ "$("$tree/bin/taproot" version)" = "$VERSION" ]
+            "$tree/bin/taproot" serve -addr 127.0.0.1:18770 \
               -jail /tmp/fakeroot -readonly &
             pid=$!
             ok=
@@ -264,11 +265,11 @@ jobs:
             fi
             # The CLI subcommand runs on the packaged binary, on both trees.
             # `status` reads only: no bcrypt, so qemu emulation stays cheap.
-            "$tree/bin/qnapfilemanager" break-glass status -config /tmp/fakeroot/bg.json \
+            "$tree/bin/taproot" break-glass status -config /tmp/fakeroot/bg.json \
               | grep -q 'password:    not set'
             kill $pid
             wait $pid 2>/dev/null || true
-            echo "$arch ok: qnapfilemanager $VERSION"
+            echo "$arch ok: taproot $VERSION"
           done
 
       - name: Install QDK

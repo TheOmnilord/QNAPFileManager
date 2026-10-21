@@ -16,9 +16,9 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/guard"
-	"qnapfilemanager/internal/platform"
+	"taproot/internal/fsx"
+	"taproot/internal/guard"
+	"taproot/internal/platform"
 )
 
 func selectArchive(t *testing.T, s *Server, c *http.Cookie, body string) string {
@@ -270,7 +270,7 @@ func TestArchiveSelectionOversizedURL(t *testing.T) {
 	}
 	r.AddCookie(c)
 	r.Header.Set("Origin", ts.URL)
-	r.Header.Set("X-QFM-CSRF", s.sessions[c.Value].csrf)
+	r.Header.Set("X-Taproot-CSRF", s.sessions[c.Value].csrf)
 	r.Header.Set("Content-Type", "application/json")
 	resp, err = client.Do(r)
 	if err != nil {

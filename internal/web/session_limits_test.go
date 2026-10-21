@@ -10,10 +10,10 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/backend"
-	"qnapfilemanager/internal/config"
-	"qnapfilemanager/internal/idmap"
-	"qnapfilemanager/internal/qtsauth"
+	"taproot/internal/backend"
+	"taproot/internal/config"
+	"taproot/internal/idmap"
+	"taproot/internal/qtsauth"
 )
 
 func TestCookielessSessionReuseAndUserLimit(t *testing.T) {
@@ -148,7 +148,7 @@ func TestSessionLookupConstantWork(t *testing.T) {
 			}
 			before := s.sessionLookups
 			for i := 0; i < 100; i++ {
-				w := request(s, "GET", "/api/session", &http.Cookie{Name: "qfm_sid", Value: "0"}, nil)
+				w := request(s, "GET", "/api/session", &http.Cookie{Name: "taproot_sid", Value: "0"}, nil)
 				if w.Code != http.StatusOK {
 					t.Fatal(w.Body.String())
 				}
@@ -169,7 +169,7 @@ func BenchmarkAuthenticateIndexed(b *testing.B) {
 				s.insertSession(indexedTestSession(fmt.Sprint(i), "dev"))
 			}
 			r := httptest.NewRequest("GET", "/api/session", nil)
-			r.AddCookie(&http.Cookie{Name: "qfm_sid", Value: "0"})
+			r.AddCookie(&http.Cookie{Name: "taproot_sid", Value: "0"})
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {

@@ -18,9 +18,9 @@ import (
 	"syscall"
 	"testing"
 
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/perm"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/fsx"
+	"taproot/internal/perm"
+	"taproot/internal/wproto"
 )
 
 // TestPostOrderRefusesADirectoryReplacedByAFile is Astra r2 #2.

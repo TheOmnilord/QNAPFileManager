@@ -25,9 +25,9 @@ import (
 	"os"
 	"time"
 
-	"qnapfilemanager/internal/fsops"
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/fsops"
+	"taproot/internal/fsx"
+	"taproot/internal/wproto"
 )
 
 // maxArchiveStreams bounds the producers one session may run at once (M2-C

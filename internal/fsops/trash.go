@@ -1,10 +1,10 @@
 package fsops
 
 // Trash: delete as a same-device rename into the nearest enclosing storage
-// mount's .@qfm_trash (PLAN.md decision 10, identity plan §4.2).
+// mount's .@taproot_trash (PLAN.md decision 10, identity plan §4.2).
 //
 // The threat model is what shapes every function here, and it is worth stating
-// plainly because it is not the usual one. .@qfm_trash is mode 1777: a sticky
+// plainly because it is not the usual one. .@taproot_trash is mode 1777: a sticky
 // directory SHARED by every uid on the volume. Any local user may create
 // entries in it, including entries named for somebody else's uid, and an
 // administrator's worker runs as ROOT (PLAN.md decision 6) — so root's own trash
@@ -34,7 +34,7 @@ package fsops
 // Four rules of the older design still hold.
 //
 //   - The trash directory is never created by this package. The root front-end
-//     creates <mountRoot>/.@qfm_trash once, mode 1777, as an audited and
+//     creates <mountRoot>/.@taproot_trash once, mode 1777, as an audited and
 //     disclosed act (internal/trashroot). If it is not there — or is not the
 //     directory described above — the answer is "no_trash" and the item is left
 //     exactly where it is. A trash that cannot be reached must never become a
@@ -70,14 +70,14 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/platform"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/fsx"
+	"taproot/internal/platform"
+	"taproot/internal/wproto"
 )
 
 const (
 	// TrashDirName is the per-mount trash directory the front-end creates 1777.
-	TrashDirName = ".@qfm_trash"
+	TrashDirName = ".@taproot_trash"
 	// trashMetaName is the sidecar inside one entry directory.
 	trashMetaName = "meta.json"
 	// trashMetaTmpPrefix and trashMetaTmpSuffix bracket the name a REWRITTEN
@@ -131,7 +131,7 @@ const (
 
 // ErrNoTrash means there is no usable trash directory for a path: it is not on
 // a storage mount, the mount is a network one, the mount root is outside the
-// jail, or .@qfm_trash is missing, is not a directory, is not sticky, or does
+// jail, or .@taproot_trash is missing, is not a directory, is not sticky, or does
 // not belong to root. Every caller turns it into a "no_trash" warning and leaves
 // the item alone — it is never an excuse to delete something permanently.
 var ErrNoTrash = errors.New("there is no trash directory for this path")
@@ -148,7 +148,7 @@ var ErrNoTrash = errors.New("there is no trash directory for this path")
 // that writes an attacker's file to an attacker's chosen path.
 var ErrUntrustedTrash = fmt.Errorf("untrusted trash entry: %w", fsx.ErrProtected)
 
-// trashRootUID is the uid .@qfm_trash must belong to: root, because the root
+// trashRootUID is the uid .@taproot_trash must belong to: root, because the root
 // front-end is the only thing that creates it (trashroot.Ensure).
 //
 // It is a variable solely so that this package's own tests can run as an
@@ -205,7 +205,7 @@ func (m trashMeta) orig() ([]byte, error) {
 	return []byte(m.OrigPath), nil
 }
 
-// trashLoc is one .@qfm_trash directory: the API path it is known by and the
+// trashLoc is one .@taproot_trash directory: the API path it is known by and the
 // already-resolved, jail-relative name a descriptor for it is opened from.
 //
 // It holds no descriptor of its own. Each operation opens one, validates it, and
@@ -245,7 +245,7 @@ func trashFor(r fsx.Root, plat *platform.Platform, apiPath string) (trashLoc, er
 	return locateTrash(r, fsx.Join(rootAPI, TrashDirName))
 }
 
-// locateTrash resolves where a .@qfm_trash would be, with the leaf kept literal
+// locateTrash resolves where a .@taproot_trash would be, with the leaf kept literal
 // so a symlink standing there is never followed. It decides nothing about what
 // is actually at that name: that is trashLoc.open's job, on a descriptor.
 func locateTrash(r fsx.Root, trashAPI string) (trashLoc, error) {
@@ -871,7 +871,7 @@ func trashWarn(emit Emit, apiPath string, err error) {
 	emit.warn(apiPath, "no_trash", err.Error(), fsx.Errno(err))
 }
 
-// Trash moves each path into the nearest .@qfm_trash as this worker's user.
+// Trash moves each path into the nearest .@taproot_trash as this worker's user.
 //
 // A path with no usable trash is reported as no_trash and SKIPPED — never
 // deleted. That is the whole safety property of this function: "delete to
@@ -1119,7 +1119,7 @@ func removeEntryDir(user, entry *dirRef, id string) {
 	_ = user.unlink(id, true)
 }
 
-// trashRoots enumerates every place a .@qfm_trash could be for this worker: one
+// trashRoots enumerates every place a .@taproot_trash could be for this worker: one
 // per Storage, non-network mount in the table, skipping the ones outside the
 // jail. Whether anything usable is actually AT that name is decided later, on a
 // descriptor (trashLoc.open).

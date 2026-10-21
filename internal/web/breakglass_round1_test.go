@@ -15,22 +15,22 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/audit"
-	"qnapfilemanager/internal/breakglass"
-	"qnapfilemanager/internal/config"
+	"taproot/internal/audit"
+	"taproot/internal/breakglass"
+	"taproot/internal/config"
 )
 
 // --- round-1 P1-1: the break-glass listener serves at "/" ---------------------
 
-// In production the QPKG service script passes -proxy-prefix /qnapfilemanager,
+// In production the QPKG service script passes -proxy-prefix /taproot,
 // because that is where QTS's Apache mounts the app. The break-glass listener
 // is reached DIRECTLY, precisely because Apache may be what is broken — so a
-// shell served there with the proxy base would ask for /qnapfilemanager/app.css
-// and /qnapfilemanager/api/session, neither of which that listener serves. The
+// shell served there with the proxy base would ask for /taproot/app.css
+// and /taproot/api/session, neither of which that listener serves. The
 // emergency door would 404 its own stylesheet.
 func TestBreakGlassServesAtTheRootRegardlessOfTheProxyPrefix(t *testing.T) {
 	s, _, _ := bgFixture(t)
-	s.cfg.Web.ProxyPrefix = "/qnapfilemanager"
+	s.cfg.Web.ProxyPrefix = "/taproot"
 
 	shell := bgRequest(s, "GET", "/", nil, nil, "")
 	if shell.Code != http.StatusOK {
@@ -42,7 +42,7 @@ func TestBreakGlassServesAtTheRootRegardlessOfTheProxyPrefix(t *testing.T) {
 			t.Errorf("the break-glass shell does not carry %s:\n%s", want, firstLines(body, 12))
 		}
 	}
-	if strings.Contains(body, "/qnapfilemanager/") {
+	if strings.Contains(body, "/taproot/") {
 		t.Errorf("the break-glass shell references the proxy prefix:\n%s", firstLines(body, 12))
 	}
 	// The URLs it names actually answer on that listener.
@@ -54,12 +54,12 @@ func TestBreakGlassServesAtTheRootRegardlessOfTheProxyPrefix(t *testing.T) {
 	// And the prefixed spellings, which the old base would have produced, are
 	// exactly the 404s this test exists to prevent — proving the assertion above
 	// is load-bearing rather than cosmetic.
-	if w := bgRequest(s, "GET", "/qnapfilemanager/app.css", nil, nil, ""); w.Code == http.StatusOK {
+	if w := bgRequest(s, "GET", "/taproot/app.css", nil, nil, ""); w.Code == http.StatusOK {
 		t.Error("the break-glass listener unexpectedly serves the prefixed path; the base assertion above proves nothing")
 	}
 	// The MAIN listener is unchanged: it still serves the prefixed base.
 	main := request(s, "GET", "/", nil, nil)
-	if !strings.Contains(main.Body.String(), `href="/qnapfilemanager/app.css"`) {
+	if !strings.Contains(main.Body.String(), `href="/taproot/app.css"`) {
 		t.Errorf("the main listener lost its proxy base:\n%s", firstLines(main.Body.String(), 12))
 	}
 }
@@ -114,7 +114,7 @@ func TestBreakGlassSignInFlow(t *testing.T) {
 		t.Error("the main listener's session shape changed")
 	}
 
-	// 2. POST the password with no X-QFM-CSRF header at all: the login route is
+	// 2. POST the password with no X-Taproot-CSRF header at all: the login route is
 	//    exempt, because there is no session yet to bind a token to.
 	lw := bgRequest(s, "POST", bgLoginPath, nil, map[string]string{"Content-Type": "application/json"},
 		fmt.Sprintf(`{"password":%q}`, bgTestPassword))
@@ -150,14 +150,14 @@ func TestBreakGlassSignInFlow(t *testing.T) {
 
 	// 4. That token is what every later mutating request uses.
 	if mw := bgRequest(s, "POST", "/api/fs/mkdir", []*http.Cookie{cookie},
-		map[string]string{"X-QFM-CSRF": csrf, "Content-Type": "application/json"},
+		map[string]string{"X-Taproot-CSRF": csrf, "Content-Type": "application/json"},
 		`{"dir":"/","name":"flow"}`); mw.Code != http.StatusOK {
 		t.Fatalf("mkdir with the issued token: %d %s", mw.Code, mw.Body)
 	}
 
 	// 5. /api/logout works on this listener and destroys the session.
 	ow := bgRequest(s, "POST", "/api/logout", []*http.Cookie{cookie},
-		map[string]string{"X-QFM-CSRF": csrf, "Content-Type": "application/json"}, "{}")
+		map[string]string{"X-Taproot-CSRF": csrf, "Content-Type": "application/json"}, "{}")
 	if ow.Code != http.StatusOK {
 		t.Fatalf("logout: %d %s", ow.Code, ow.Body)
 	}
@@ -461,7 +461,7 @@ func TestBreakGlassNeverTrustsForwardedHeaders(t *testing.T) {
 	bgRequest(s, "POST", bgLoginPath, nil, forged, `{"password":"the wrong password!!"}`)
 	// Post-login: a real mutation.
 	cookie, csrf := bgSignIn(t, s)
-	headers := map[string]string{"X-QFM-CSRF": csrf, "X-Forwarded-For": "198.51.100.7", "Content-Type": "application/json"}
+	headers := map[string]string{"X-Taproot-CSRF": csrf, "X-Forwarded-For": "198.51.100.7", "Content-Type": "application/json"}
 	if w := bgRequest(s, "POST", "/api/fs/mkdir", []*http.Cookie{cookie}, headers, `{"dir":"/","name":"forged"}`); w.Code != http.StatusOK {
 		t.Fatalf("mkdir: %d %s", w.Code, w.Body)
 	}

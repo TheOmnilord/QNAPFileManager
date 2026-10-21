@@ -5,9 +5,9 @@ import (
 	"strings"
 	"testing"
 
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/jobs"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/fsx"
+	"taproot/internal/jobs"
+	"taproot/internal/wproto"
 )
 
 // The route half of the gpt-6-astra M3 round-8 review: finding 4. Rounds 6 and 7

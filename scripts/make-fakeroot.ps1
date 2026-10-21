@@ -70,13 +70,13 @@ Force SSL = FALSE
 "@
 
 Set-LinuxFile "$root\etc\config\qpkg.conf" @"
-[QNAPFileManager]
-Name = QNAPFileManager
+[Taproot]
+Name = Taproot
 Version = 0.1.0
 Enable = TRUE
-Install_Path = /share/CACHEDEV1_DATA/.qpkg/QNAPFileManager
+Install_Path = /share/CACHEDEV1_DATA/.qpkg/Taproot
 Web_Port = 8770
-Proxy_Path = /qnapfilemanager
+Proxy_Path = /taproot
 "@
 
 # '/etc/configuration' exists only to catch a prefix test that is not path
@@ -87,7 +87,7 @@ Set-LinuxFile "$root\etc\configuration\readme.txt" "Not /etc/config. If the guar
 foreach ($share in "Public", "Multimedia", "Web", "homes") {
     New-Dir "$root\share\CACHEDEV1_DATA\$share"
 }
-New-Dir "$root\share\CACHEDEV1_DATA\.qpkg\QNAPFileManager"
+New-Dir "$root\share\CACHEDEV1_DATA\.qpkg\Taproot"
 New-Dir "$root\share\CACHEDEV1_DATA\homes\sveinung"
 
 Set-LinuxFile "$root\share\CACHEDEV1_DATA\Public\notes.txt" "hello from the fake NAS`n"
@@ -143,4 +143,4 @@ foreach ($d in "proc", "sys", "dev", "mnt\HDA_ROOT", "root", "tmp") {
 Set-LinuxFile "$root\proc\readme.txt" "A stand-in. Nothing may walk into /proc.`n"
 
 Write-Host "fakeroot ready at $root"
-Write-Host "run: go run ./cmd/qnapfilemanager serve -config dev-config.json -jail testdata\fakeroot -addr 127.0.0.1:8899"
+Write-Host "run: go run ./cmd/taproot serve -config dev-config.json -jail testdata\fakeroot -addr 127.0.0.1:8899"

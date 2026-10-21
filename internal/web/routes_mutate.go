@@ -13,10 +13,10 @@ import (
 	"strings"
 	"time"
 
-	"qnapfilemanager/internal/audit"
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/guard"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/audit"
+	"taproot/internal/fsx"
+	"taproot/internal/guard"
+	"taproot/internal/wproto"
 )
 
 // This file wires the M1 mutations (mkdir, rename, single/batch delete) into the

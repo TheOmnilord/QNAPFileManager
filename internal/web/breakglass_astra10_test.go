@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/breakglass"
+	"taproot/internal/breakglass"
 )
 
 // --- Astra r10 #1: the interval is a wait, never a stale answer --------------

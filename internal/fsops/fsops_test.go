@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/platform"
+	"taproot/internal/fsx"
+	"taproot/internal/platform"
 )
 
 // requireSymlinks skips the caller when this box cannot create a symlink.

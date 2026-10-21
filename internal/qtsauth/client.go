@@ -296,7 +296,7 @@ func (c *Client) getFrom(ctx context.Context, base, query string) (Result, strin
 		return Result{}, "", fmt.Errorf("qtsauth: build request for %s: %w", redactQuery(query), ErrUnreachable)
 	}
 	req.Header.Set("Accept", "text/xml, application/xml, */*")
-	req.Header.Set("User-Agent", "qnapfilemanager")
+	req.Header.Set("User-Agent", "taproot")
 
 	resp, err := c.clientFor(base).Do(req)
 	if err != nil {

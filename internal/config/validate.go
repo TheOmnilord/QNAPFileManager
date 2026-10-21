@@ -116,7 +116,7 @@ func (c Config) validate(dev, lenientHash bool) error {
 		switch {
 		case err != nil:
 			// Never echoed: this is the credential. What it is not is enough.
-			add("auth.local.hash is not a bcrypt hash (%v); it is written only by `qnapfilemanager break-glass set-password`", err)
+			add("auth.local.hash is not a bcrypt hash (%v); it is written only by `taproot break-glass set-password`", err)
 		case cost < MinLocalCost || cost > MaxLocalCost:
 			add("auth.local.hash carries bcrypt cost %d, outside %d-%d", cost, MinLocalCost, MaxLocalCost)
 		default:
@@ -128,11 +128,11 @@ func (c Config) validate(dev, lenientHash bool) error {
 			// that anything is wrong. Checked structurally rather than by
 			// running a comparison, because validation must not cost a bcrypt.
 			if err := checkBcryptShape(c.Auth.Local.Hash); err != nil {
-				add("auth.local.hash %v; it is written only by `qnapfilemanager break-glass set-password`", err)
+				add("auth.local.hash %v; it is written only by `taproot break-glass set-password`", err)
 			}
 		}
 	} else if c.Auth.Local.Hash != "" {
-		add("auth.local.hash is whitespace; use `qnapfilemanager break-glass disable` to clear it")
+		add("auth.local.hash is whitespace; use `taproot break-glass disable` to clear it")
 	}
 	if c.Auth.Local.Updated != "" {
 		if _, err := time.Parse(time.RFC3339, c.Auth.Local.Updated); err != nil {

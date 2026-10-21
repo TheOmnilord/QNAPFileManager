@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/fsx"
+	"taproot/internal/fsx"
 )
 
 func TestTextStreamCancellation(t *testing.T) {

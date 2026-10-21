@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/wproto"
 )
 
 // TestTheComparisonSettlesBeforeItReads is round 7's finding, tested as what it

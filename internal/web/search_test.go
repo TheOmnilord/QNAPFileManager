@@ -10,11 +10,11 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/guard"
-	"qnapfilemanager/internal/jobs"
-	"qnapfilemanager/internal/platform"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/fsx"
+	"taproot/internal/guard"
+	"taproot/internal/jobs"
+	"taproot/internal/platform"
+	"taproot/internal/wproto"
 )
 
 func TestSearchRootMountBeforeResolve(t *testing.T) {

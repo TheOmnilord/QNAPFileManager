@@ -12,9 +12,9 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/config"
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/config"
+	"taproot/internal/fsx"
+	"taproot/internal/wproto"
 )
 
 // testWait bounds every wait in this file. A job that never starts must fail

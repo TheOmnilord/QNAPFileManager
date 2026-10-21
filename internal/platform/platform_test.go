@@ -248,8 +248,8 @@ func TestUbuntuTable(t *testing.T) {
 	if !p.IsMountPoint("/home") {
 		t.Error("IsMountPoint(/home) = false")
 	}
-	if p.IsMountPoint("/home/sv/projects/qfm") {
-		t.Error("IsMountPoint(/home/sv/projects/qfm) = true, want false")
+	if p.IsMountPoint("/home/sv/projects/taproot") {
+		t.Error("IsMountPoint(/home/sv/projects/taproot) = true, want false")
 	}
 	if !p.IsMountPoint("/") {
 		t.Error("IsMountPoint(/) = false")

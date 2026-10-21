@@ -2,11 +2,11 @@
   "version": "0.0.1",
   "configurations": [
     {
-      "name": "qnapfilemanager",
+      "name": "taproot",
       "runtimeExecutable": "go",
       "runtimeArgs": [
         "run",
-        "./cmd/qnapfilemanager",
+        "./cmd/taproot",
         "serve",
         "-config",
         "dev-config.json",

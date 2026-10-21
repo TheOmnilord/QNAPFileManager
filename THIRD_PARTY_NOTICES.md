@@ -1,6 +1,6 @@
 # Third-party notices
 
-QNAPFileManager is MIT-licensed (see `LICENSE`). The binary in the QPKG is built from this repository plus the
+Taproot is MIT-licensed (see `LICENSE`). The binary in the QPKG is built from this repository plus the
 software below, whose licences require that their notices travel with a binary distribution. This file is shipped
 inside the package next to the binary for that reason.
 

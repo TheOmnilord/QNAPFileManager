@@ -16,8 +16,8 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/fsops"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/fsops"
+	"taproot/internal/wproto"
 )
 
 // The M2-C worker tests that need a transport which really passes descriptors:
@@ -168,7 +168,7 @@ func TestUploadRoundTripThroughTheWorker(t *testing.T) {
 
 // TestUnfinishedUploadIsClosedWhenTheSessionEnds is the other half of "a handle
 // is per session": a browser that was closed mid-upload must not leave a
-// `.qfm-upload-*.part` in somebody's folder.
+// `.taproot-upload-*.part` in somebody's folder.
 func TestUnfinishedUploadIsClosedWhenTheSessionEnds(t *testing.T) {
 	base := jobTree(t)
 	tr, stop := dialFD(t, Options{})
@@ -183,7 +183,7 @@ func TestUnfinishedUploadIsClosedWhenTheSessionEnds(t *testing.T) {
 
 	stop() // the front-end went away
 	for _, name := range dirEntries(t, filepath.Join(base, "a")) {
-		if strings.HasPrefix(name, ".qfm-upload-") || name == "gone.txt" {
+		if strings.HasPrefix(name, ".taproot-upload-") || name == "gone.txt" {
 			t.Fatalf("the session ended with %q left behind", name)
 		}
 	}

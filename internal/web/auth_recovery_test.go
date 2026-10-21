@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/idmap"
-	"qnapfilemanager/internal/qtsauth"
+	"taproot/internal/idmap"
+	"taproot/internal/qtsauth"
 )
 
 func authTestServer(t *testing.T, handler http.HandlerFunc) *Server {
@@ -186,7 +186,7 @@ func TestFirstLoginFollowersLeaveExecutionCapacity(t *testing.T) {
 				// Session followers consume the same waiting budget.
 				old := s.insertSession(indexedTestSession("locked", "dev"))
 				old.mu.Lock()
-				w := request(s, "GET", "/api/session", &http.Cookie{Name: "qfm_sid", Value: old.id}, nil)
+				w := request(s, "GET", "/api/session", &http.Cookie{Name: "taproot_sid", Value: old.id}, nil)
 				old.mu.Unlock()
 				assertAuthError(t, w, 503, "overloaded", "2")
 			}
@@ -280,7 +280,9 @@ func TestRevalidationReservedCapacity(t *testing.T) {
 		t.Fatalf("new logins occupy %d slots, want 6", n)
 	}
 	done := make(chan *httptest.ResponseRecorder, 1)
-	go func() { done <- request(s, "GET", "/api/session", &http.Cookie{Name: "qfm_sid", Value: old.id}, nil) }()
+	go func() {
+		done <- request(s, "GET", "/api/session", &http.Cookie{Name: "taproot_sid", Value: old.id}, nil)
+	}()
 	select {
 	case w := <-done:
 		if w.Code != 200 {

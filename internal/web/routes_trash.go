@@ -9,11 +9,11 @@ import (
 	"net/http"
 	"unicode/utf8"
 
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/guard"
-	"qnapfilemanager/internal/jobs"
-	"qnapfilemanager/internal/trashroot"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/fsx"
+	"taproot/internal/guard"
+	"taproot/internal/jobs"
+	"taproot/internal/trashroot"
+	"taproot/internal/wproto"
 )
 
 // The trash panel: list what this user has deleted, restore some of it, or
@@ -22,7 +22,7 @@ import (
 // thousands of items.
 //
 // Everything here is scoped to the caller's own per-uid subdirectory inside
-// <mount>/.@qfm_trash, which the sticky bit enforces in the kernel (INV-2):
+// <mount>/.@taproot_trash, which the sticky bit enforces in the kernel (INV-2):
 // this layer never has to decide whose file is whose.
 
 // maxTrashIDs bounds one restore. Ids are tiny, but the request is validated and
@@ -75,7 +75,7 @@ func validTrashID(id string) bool {
 
 // trashDisabled answers the three trash routes when the NAS-wide Trash switch
 // is off (config.Trash.Enabled, PLAN.md decision 10 / finding W6). With the
-// switch off no .@qfm_trash directory may be created and none is expected to
+// switch off no .@taproot_trash directory may be created and none is expected to
 // exist, so listing, restoring and emptying have nothing to act on: they say so
 // plainly rather than returning an empty panel or a worker error.
 func (s *Server) trashDisabled(w http.ResponseWriter, r *http.Request, op string) bool {

@@ -11,8 +11,8 @@ import (
 	"strings"
 	"testing"
 
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/platform"
+	"taproot/internal/fsx"
+	"taproot/internal/platform"
 )
 
 // hostRoot returns the unjailed Root — the production mapping, where an API

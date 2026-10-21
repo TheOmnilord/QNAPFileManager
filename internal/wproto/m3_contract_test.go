@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"testing"
 
-	"qnapfilemanager/internal/fsx"
-	"qnapfilemanager/internal/perm"
+	"taproot/internal/fsx"
+	"taproot/internal/perm"
 )
 
 // TestChmodReqCarriesAMaskAndAValue pins the one property the whole permissions

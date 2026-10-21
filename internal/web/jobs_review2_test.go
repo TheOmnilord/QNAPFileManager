@@ -11,12 +11,12 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/audit"
-	"qnapfilemanager/internal/guard"
-	"qnapfilemanager/internal/jobs"
-	"qnapfilemanager/internal/platform"
-	"qnapfilemanager/internal/trashroot"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/audit"
+	"taproot/internal/guard"
+	"taproot/internal/jobs"
+	"taproot/internal/platform"
+	"taproot/internal/trashroot"
+	"taproot/internal/wproto"
 )
 
 // The M2-A round-2 web/jobs findings, one test group per finding:

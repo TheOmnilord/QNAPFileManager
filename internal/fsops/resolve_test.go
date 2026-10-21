@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"qnapfilemanager/internal/fsx"
+	"taproot/internal/fsx"
 )
 
 // TestResolvePathPlainNestedResolvesToItself is the cross-platform floor: a path

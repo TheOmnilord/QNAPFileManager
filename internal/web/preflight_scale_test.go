@@ -15,9 +15,9 @@ import (
 	"testing"
 	"time"
 
-	"qnapfilemanager/internal/backend"
-	"qnapfilemanager/internal/jobs"
-	"qnapfilemanager/internal/wproto"
+	"taproot/internal/backend"
+	"taproot/internal/jobs"
+	"taproot/internal/wproto"
 )
 
 // Stabilization contract §2.4: the confirmation pre-flights of copy, move,
@@ -190,7 +190,7 @@ func scaleRefs(t *testing.T, paths []string) string {
 func scalePost(ctx context.Context, s *Server, target string, cookie *http.Cookie, csrf, body string) (*http.Response, time.Duration) {
 	r := httptest.NewRequest("POST", target, strings.NewReader(body)).WithContext(ctx)
 	r.AddCookie(cookie)
-	r.Header.Set("X-QFM-CSRF", csrf)
+	r.Header.Set("X-Taproot-CSRF", csrf)
 	r.Header.Set("Origin", "http://example.com")
 	r.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()

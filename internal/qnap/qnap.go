@@ -24,7 +24,7 @@ const LogTool = "/sbin/log_tool"
 
 // Keyword prefixes every message. Users filter on it when creating an alert
 // notification rule, so it must stay identical across releases.
-const Keyword = "QNAPFileManager"
+const Keyword = "Taproot"
 
 // Severity maps to log_tool's -t values and to the levels selectable in a
 // notification rule.

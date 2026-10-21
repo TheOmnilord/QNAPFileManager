@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"net"
 
-	"qnapfilemanager/internal/fsx"
+	"taproot/internal/fsx"
 )
 
 // WriteFrame and ReadFrame need SCM_RIGHTS, which exists only on the NAS.

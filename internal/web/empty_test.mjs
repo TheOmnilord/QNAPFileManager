@@ -80,12 +80,12 @@ test('a search with no hits names the root, the count visited and the bound that
 });
 
 test('an empty Trash NAMES the volume it is talking about (finding 5)', () => {
- const named = emptyState('trash', {items: 0, dirName: '.@qfm_trash', volume: '/share/CACHEDEV1_DATA'});
+ const named = emptyState('trash', {items: 0, dirName: '.@taproot_trash', volume: '/share/CACHEDEV1_DATA'});
  assert.equal(named.state, 'trash-empty');
  assert.equal(named.sentence, 'Trash is empty on /share/CACHEDEV1_DATA.');
- assert.equal(named.detail, 'Trash lives in .@qfm_trash on each volume.', 'and the detail says the panel covered them all');
+ assert.equal(named.detail, 'Trash lives in .@taproot_trash on each volume.', 'and the detail says the panel covered them all');
  // Only where there is no volume to name honestly does it stay generic.
- const generic = emptyState('trash', {items: 0, dirName: '.@qfm_trash'});
+ const generic = emptyState('trash', {items: 0, dirName: '.@taproot_trash'});
  assert.equal(generic.sentence, 'Trash is empty on this volume.');
  assert.equal(emptyState('trash', {items: 3}), null);
 });
